@@ -111,6 +111,9 @@ cadl parse examples/robot_delivery.cadl --ast
 
 # 全検証（型検査 + SMT検証 + デッドロック検出）
 cadl verify examples/robot_delivery.cadl
+
+# 検証済みCADL定義からPythonランタイムコードを生成
+cadl codegen examples/robot_delivery.cadl -o /tmp/robot_delivery
 ```
 
 ## アーキテクチャ
@@ -135,12 +138,26 @@ CADL処理系は標準的なコンパイラパイプラインに従います：
           v
     [検証済みAST]
           |
-     (Phase 2以降)
-          |
     +-----+-----+-----------+
     v           v           v
   SMT検証    コード生成   ランタイム監視
+  (Z3)     (codegen/)
 ```
+
+### コード生成（Phase 3）
+
+`cadl codegen` は検証済みCADL定義からPythonパッケージを生成します：
+
+| 生成モジュール | 内容 |
+|---|---|
+| `actors.py` | 役割・自律性・能力スタブを持つアクター基底クラス |
+| `contracts.py` | assume/guarantee検査を行う契約監視クラス |
+| `protocols.py` | タイムアウト処理付き非同期プロトコル状態機械 |
+| `transitions.py` | 遷移条件を持つレジームコントローラ |
+| `metrics.py` | 計算式による評価指標コレクタ |
+| `runtime.py` | 全コンポーネントを結合するオーケストレータ |
+
+生成コードは `cadl.codegen.runtime_support` の基底クラスを継承します。
 
 ### 型検査の内容（Phase 1）
 
@@ -164,12 +181,24 @@ src/cadl/
   verifier.py          SMTベース契約検証（Z3）
   deadlock.py          プロトコルデッドロック検出
   cli.py               コマンドラインインタフェース
+  codegen/
+    __init__.py        公開generate() API
+    runtime_support.py 生成コード用基底クラス
+    expr_compiler.py   式AST → Pythonソース変換
+    emitter.py         コード出力ユーティリティ
+    actor_gen.py       アクタークラス生成
+    contract_gen.py    契約監視クラス生成
+    protocol_gen.py    プロトコル状態機械生成
+    transition_gen.py  レジームコントローラ生成
+    metric_gen.py      評価指標コレクタ生成
+    runtime_gen.py     オーケストレータ生成
 
 tests/
   test_parser.py       パーサのテスト
   test_type_checker.py 型検査のテスト
   test_verifier.py     SMT検証のテスト
   test_deadlock.py     デッドロック検出のテスト
+  test_codegen.py      コード生成のテスト
 
 examples/
   robot_delivery.cadl      ロボット配送SoS（認知型）
@@ -182,7 +211,7 @@ examples/
 |---|---|---|
 | Phase 1 | 言語コア設計・パーサ・型検査器 | 完了 |
 | Phase 2 | 検証エンジン（SMTベース無矛盾性検証、デッドロック検出） | 完了 |
-| Phase 3 | ランタイム・コード生成（Python/TypeScript） | 計画中 |
+| Phase 3 | ランタイム・コード生成（Python） | 完了 |
 | Phase 4 | AI統合（LLMによる自然言語→CADL変換） | 計画中 |
 | Phase 5 | 制度遷移・レジームマップ構築 | 計画中 |
 | Phase 6 | IEC 62853連携・スマートコントラクト生成 | 計画中 |

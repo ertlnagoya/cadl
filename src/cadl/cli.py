@@ -31,6 +31,12 @@ def main(argv: list[str] | None = None) -> int:
     verify_cmd = subparsers.add_parser("verify", help="Parse, type-check, and verify a CADL file")
     verify_cmd.add_argument("file", type=Path, help="CADL file to verify")
 
+    # codegen command
+    codegen_cmd = subparsers.add_parser("codegen", help="Generate Python runtime code from a CADL file")
+    codegen_cmd.add_argument("file", type=Path, help="CADL file to generate from")
+    codegen_cmd.add_argument("--output", "-o", type=Path, default=Path("generated"),
+                             help="Output directory (default: generated/)")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -43,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_check(args)
     elif args.command == "verify":
         return _cmd_verify(args)
+    elif args.command == "codegen":
+        return _cmd_codegen(args)
 
     return 0
 
@@ -183,6 +191,48 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     else:
         print(f"Verification PASSED: {passed}/{total_checks} checks passed")
         return 0
+
+
+def _cmd_codegen(args: argparse.Namespace) -> int:
+    from .parser import parse_file
+    from .type_checker import type_check
+    from .codegen import generate
+
+    path = args.file
+    if not path.exists():
+        print(f"Error: File not found: {path}", file=sys.stderr)
+        return 1
+
+    # Parse
+    try:
+        sos = parse_file(path)
+    except Exception as e:
+        print(f"Parse error: {e}", file=sys.stderr)
+        return 1
+
+    # Type check
+    tc_result = type_check(sos)
+    if not tc_result.ok:
+        for e in tc_result.errors:
+            print(f"  {e}", file=sys.stderr)
+        print(f"Type check failed: cannot generate code", file=sys.stderr)
+        return 1
+
+    # Generate
+    output_dir = args.output
+    try:
+        generate(sos, output_dir)
+    except Exception as e:
+        print(f"Code generation error: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Code generated: {output_dir}/")
+    print(f"  SoS: {sos.name}")
+    print(f"  Actors: {len(sos.actors)}")
+    print(f"  Contracts: {len(sos.contracts)}")
+    print(f"  Protocols: {len(sos.protocols)}")
+    print(f"  Metrics: {len(sos.metrics)}")
+    return 0
 
 
 if __name__ == "__main__":
