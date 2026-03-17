@@ -12,6 +12,7 @@ license = "MIT"
 dependencies = [
     "lark>=1.1",
     "pyyaml>=6.0",
+    "z3-solver>=4.12",
 ]
 
 [project.optional-dependencies]

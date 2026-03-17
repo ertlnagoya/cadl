@@ -108,6 +108,9 @@ cadl check examples/robot_delivery.cadl
 
 # Print the full AST
 cadl parse examples/robot_delivery.cadl --ast
+
+# Full verification (type check + SMT + deadlock detection)
+cadl verify examples/robot_delivery.cadl
 ```
 
 ## Architecture
@@ -159,11 +162,15 @@ src/cadl/
   grammar.lark         Lark grammar for the expression sub-language
   parser.py            Hybrid parser (YAML structure + Lark expressions)
   type_checker.py      Static semantic checks
+  verifier.py          SMT-based contract verification (Z3)
+  deadlock.py          Protocol deadlock detection
   cli.py               Command-line interface
 
 tests/
   test_parser.py       Parser tests
   test_type_checker.py Type checker tests
+  test_verifier.py     SMT verifier tests
+  test_deadlock.py     Deadlock detector tests
 
 examples/
   robot_delivery.cadl      Robot delivery SoS (Acknowledged type)
@@ -175,7 +182,7 @@ examples/
 | Phase | Goal | Status |
 |---|---|---|
 | 1 | Core language design, parser, type checker | Done |
-| 2 | Verification engine (SMT-based consistency, deadlock detection) | Planned |
+| 2 | Verification engine (SMT-based consistency, deadlock detection) | Done |
 | 3 | Runtime code generation (Python/TypeScript) | Planned |
 | 4 | AI integration (NL-to-CADL via LLM) | Planned |
 | 5 | Regime transitions and regime map construction | Planned |

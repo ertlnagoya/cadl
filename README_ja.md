@@ -108,6 +108,9 @@ cadl check examples/robot_delivery.cadl
 
 # ASTを出力
 cadl parse examples/robot_delivery.cadl --ast
+
+# 全検証（型検査 + SMT検証 + デッドロック検出）
+cadl verify examples/robot_delivery.cadl
 ```
 
 ## アーキテクチャ
@@ -158,11 +161,15 @@ src/cadl/
   grammar.lark         式サブ言語のLark文法
   parser.py            ハイブリッドパーサ（YAML構造 + Lark式解析）
   type_checker.py      静的意味検査
+  verifier.py          SMTベース契約検証（Z3）
+  deadlock.py          プロトコルデッドロック検出
   cli.py               コマンドラインインタフェース
 
 tests/
   test_parser.py       パーサのテスト
   test_type_checker.py 型検査のテスト
+  test_verifier.py     SMT検証のテスト
+  test_deadlock.py     デッドロック検出のテスト
 
 examples/
   robot_delivery.cadl      ロボット配送SoS（認知型）
@@ -174,7 +181,7 @@ examples/
 | フェーズ | 目標 | 状態 |
 |---|---|---|
 | Phase 1 | 言語コア設計・パーサ・型検査器 | 完了 |
-| Phase 2 | 検証エンジン（SMTベース無矛盾性検証、デッドロック検出） | 計画中 |
+| Phase 2 | 検証エンジン（SMTベース無矛盾性検証、デッドロック検出） | 完了 |
 | Phase 3 | ランタイム・コード生成（Python/TypeScript） | 計画中 |
 | Phase 4 | AI統合（LLMによる自然言語→CADL変換） | 計画中 |
 | Phase 5 | 制度遷移・レジームマップ構築 | 計画中 |
