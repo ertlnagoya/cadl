@@ -1,0 +1,91 @@
+sos:
+  name: "RobotDeliverySystem"
+  type: Acknowledged
+  version: "1.0.0"
+
+  actors:
+    - id: DISPATCHER
+      role: "global_planner"
+      autonomy: low
+      capabilities:
+        - compute_routes
+        - monitor_all
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_vehicle"
+      autonomy: high
+      capabilities:
+        - local_navigation
+        - obstacle_detection
+
+    - id: "CUSTOMER[1..M]"
+      role: "service_user"
+      autonomy: medium
+
+  contracts:
+    - id: DELIVERY_SLA
+      parties:
+        - DISPATCHER
+        - "ROBOT[*]"
+        - "CUSTOMER[*]"
+      assume:
+        - "DISPATCHER.is_operational == true"
+        - "network_latency <= 200ms"
+      guarantee:
+        - "all_routes_conflict_free()"
+        - "delivery_time <= promised_time * 1.2"
+      authority:
+        decision_scope: "route_assignment"
+        decision_holder: DISPATCHER
+        beta: 0.2
+      information:
+        alpha: 0.8
+        views:
+          DISPATCHER: "global_map + all_robot_positions"
+          "ROBOT[*]": "assigned_route + local_sensors"
+        sharing:
+          - "ROBOT[*] -> DISPATCHER : position"
+          - "DISPATCHER -> ROBOT[*] : route"
+      responsibilities:
+        DISPATCHER:
+          - "compute_conflict_free_routes(all_robots)"
+          - "reassign_on_failure"
+        "ROBOT[*]":
+          - "follow_assigned_route"
+          - "report_position(period: 1s)"
+      incentives:
+        type: reputation
+        lambda: 0.5
+        rules:
+          - "reward(ROBOT[i], 10) when on_time_delivery"
+          - "penalty(ROBOT[i], -5) when route_deviation"
+      violation:
+        detect: "route_deviation > threshold OR position_report_delay > 5s"
+        action: "notify(DISPATCHER) AND log_violation"
+        escalation: "after 3 violations: suspend_contract"
+      duration: indefinite
+
+  protocols:
+    - id: FAILURE_REPLAN
+      trigger: "road_failure_detected_by(ROBOT[i])"
+      precondition: "DISPATCHER.is_operational"
+      steps:
+        - "ROBOT[i] -> DISPATCHER : failure_report"
+        - "DISPATCHER : validate_failure"
+        - "DISPATCHER : recompute_routes"
+        - "DISPATCHER -> ROBOT[*] : new_route"
+      timing:
+        max_response: 100ms
+        max_total: 500ms
+      fallback:
+        on_timeout: "ROBOT[*] : execute_safe_stop()"
+        on_failure: "switch_to_protocol(LOCAL_REPLAN)"
+      postcondition: "all_routes_conflict_free()"
+
+  metrics:
+    - id: delivery_success_rate
+      formula: "count(on_time_deliveries) / count(total_deliveries)"
+      target: ">= 0.95"
+    - id: avg_delivery_time
+      formula: "mean(delivery_times)"
+      target: "<= 30min"

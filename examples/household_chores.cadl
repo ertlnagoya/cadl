@@ -1,0 +1,59 @@
+sos:
+  name: "FamilyHousehold"
+  type: Collaborative
+  version: "1.0.0"
+  description: "Family chore sharing rules for 4 members"
+
+  actors:
+    - id: "PARENT[1..2]"
+      role: "parent"
+      autonomy: high
+    - id: "CHILD[1..2]"
+      role: "child"
+      autonomy: medium
+
+  contracts:
+    - id: CHORE_SHARING
+      parties:
+        - "PARENT[*]"
+        - "CHILD[*]"
+      assume:
+        - "CHILD[i].age >= 6"
+      guarantee:
+        - "all_chores_assigned_weekly()"
+      authority:
+        decision_holder: "PARENT[1]"
+        beta: 0.3
+      information:
+        alpha: 1.0
+      responsibilities:
+        "PARENT[*]":
+          - "assign_weekly_chores"
+          - "verify_completion"
+        "CHILD[*]":
+          - "complete_assigned_chores_before_dinner"
+      incentives:
+        type: monetary
+        lambda: 0.6
+        rules:
+          - "reward(CHILD[i], 100) when chore_completed"
+          - "penalty(CHILD[i], -50) when chore_missed"
+      duration: indefinite
+
+  protocols:
+    - id: WEEKLY_ASSIGNMENT
+      trigger: "every_monday_morning()"
+      steps:
+        - "PARENT[1] : generate_chore_list"
+        - "PARENT[1] -> CHILD[*] : chore_assignments"
+      timing:
+        max_total: 1h
+
+    - id: DISPUTE_RESOLUTION
+      trigger: "dispute_raised_by(CHILD[i])"
+      steps:
+        - "CHILD[i] -> PARENT[*] : dispute_report"
+        - "PARENT[*] : discuss_resolution"
+        - "PARENT[1] -> CHILD[*] : final_decision"
+      fallback:
+        on_timeout: "PARENT[1] : make_final_decision()"
