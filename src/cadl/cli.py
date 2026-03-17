@@ -37,6 +37,19 @@ def main(argv: list[str] | None = None) -> int:
     codegen_cmd.add_argument("--output", "-o", type=Path, default=Path("generated"),
                              help="Output directory (default: generated/)")
 
+    # ai command
+    ai_cmd = subparsers.add_parser("ai", help="Generate CADL from natural language description")
+    ai_cmd.add_argument("description", nargs="?", default=None,
+                        help="Natural language description of the SoS")
+    ai_cmd.add_argument("-f", "--file", type=Path, dest="input_file",
+                        help="Read description from a file")
+    ai_cmd.add_argument("-o", "--output", type=Path, dest="output_file",
+                        help="Save generated CADL to file")
+    ai_cmd.add_argument("--verify", action="store_true",
+                        help="Run SMT verification and deadlock detection on generated CADL")
+    ai_cmd.add_argument("--model", type=str, default=None,
+                        help="Override LLM model (default: claude-sonnet-4-20250514)")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -51,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_verify(args)
     elif args.command == "codegen":
         return _cmd_codegen(args)
+    elif args.command == "ai":
+        return _cmd_ai(args)
 
     return 0
 
@@ -233,6 +248,63 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
     print(f"  Protocols: {len(sos.protocols)}")
     print(f"  Metrics: {len(sos.metrics)}")
     return 0
+
+
+def _cmd_ai(args: argparse.Namespace) -> int:
+    from .ai import generate_cadl, ClientConfig
+
+    # Get description
+    description = args.description
+    if args.input_file:
+        if not args.input_file.exists():
+            print(f"Error: File not found: {args.input_file}", file=sys.stderr)
+            return 1
+        description = args.input_file.read_text(encoding="utf-8")
+    if not description:
+        print("Error: Provide a description as argument or via -f <file>", file=sys.stderr)
+        return 1
+
+    # Configure client
+    config = ClientConfig()
+    if args.model:
+        config.model = args.model
+
+    # Generate
+    print("Generating CADL from description...", file=sys.stderr)
+    try:
+        result = generate_cadl(description, config=config, verify=args.verify)
+    except ImportError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Generation error: {e}", file=sys.stderr)
+        return 1
+
+    if result.errors:
+        print("Warning: Generated CADL has validation issues:", file=sys.stderr)
+        for err in result.errors:
+            print(f"  {err}", file=sys.stderr)
+
+    if result.retried:
+        print("(retried after initial validation failure)", file=sys.stderr)
+
+    # Output
+    if args.output_file:
+        args.output_file.write_text(result.cadl_source, encoding="utf-8")
+        print(f"Saved to: {args.output_file}", file=sys.stderr)
+    else:
+        print(result.cadl_source)
+
+    if result.sos:
+        print(f"  SoS: {result.sos.name}", file=sys.stderr)
+        print(f"  Actors: {len(result.sos.actors)}", file=sys.stderr)
+        print(f"  Contracts: {len(result.sos.contracts)}", file=sys.stderr)
+        print(f"  Protocols: {len(result.sos.protocols)}", file=sys.stderr)
+
+    return 0 if not result.errors else 1
 
 
 if __name__ == "__main__":

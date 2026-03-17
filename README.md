@@ -95,6 +95,9 @@ Requires Python 3.9+.
 
 ```bash
 pip install -e ".[dev]"
+
+# With AI features (requires Anthropic API key)
+pip install -e ".[ai]"
 ```
 
 ## Usage
@@ -114,6 +117,10 @@ cadl verify examples/robot_delivery.cadl
 
 # Generate Python runtime code from a verified CADL definition
 cadl codegen examples/robot_delivery.cadl -o /tmp/robot_delivery
+
+# Generate CADL from natural language (requires ANTHROPIC_API_KEY)
+cadl ai "A fleet of 5 autonomous drones surveying farmland, coordinated by a ground station"
+cadl ai -f requirements.txt -o output.cadl
 ```
 
 ## Architecture
@@ -142,8 +149,19 @@ The CADL toolchain follows a standard compiler pipeline:
     v         v          v
   SMT       Code       Runtime
   Verify    Generate   Monitor
-  (Z3)     (codegen/)
+  (Z3)     (codegen/)   (ai/)
 ```
+
+### AI Integration (Phase 4)
+
+`cadl ai` generates CADL from natural language descriptions via Claude API:
+
+1. User provides an NL description (Japanese or English)
+2. Claude generates a CADL definition using few-shot examples
+3. The generated CADL is parsed and type-checked
+4. On validation errors, the system retries with error feedback
+
+Requires `ANTHROPIC_API_KEY` environment variable and `pip install cadl[ai]`.
 
 ### Code Generation (Phase 3)
 
@@ -193,6 +211,11 @@ src/cadl/
     transition_gen.py  Regime controller generation
     metric_gen.py      Metrics collector generation
     runtime_gen.py     Orchestrator generation
+  ai/
+    __init__.py        Public generate_cadl() API
+    prompts.py         System prompts and few-shot examples
+    llm_client.py      Claude API client wrapper
+    nl_to_cadl.py      NL-to-CADL generation pipeline
 
 tests/
   test_parser.py       Parser tests
@@ -200,6 +223,7 @@ tests/
   test_verifier.py     SMT verifier tests
   test_deadlock.py     Deadlock detector tests
   test_codegen.py      Code generation tests
+  test_ai.py           AI integration tests
 
 examples/
   robot_delivery.cadl      Robot delivery SoS (Acknowledged type)
@@ -213,7 +237,7 @@ examples/
 | 1 | Core language design, parser, type checker | Done |
 | 2 | Verification engine (SMT-based consistency, deadlock detection) | Done |
 | 3 | Runtime code generation (Python) | Done |
-| 4 | AI integration (NL-to-CADL via LLM) | Planned |
+| 4 | AI integration (NL-to-CADL via Claude API) | Done |
 | 5 | Regime transitions and regime map construction | Planned |
 | 6 | IEC 62853 integration, smart contract generation | Planned |
 

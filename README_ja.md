@@ -95,6 +95,9 @@ Python 3.9以上が必要です。
 
 ```bash
 pip install -e ".[dev]"
+
+# AI機能を使う場合（Anthropic APIキーが必要）
+pip install -e ".[ai]"
 ```
 
 ## 使い方
@@ -114,6 +117,10 @@ cadl verify examples/robot_delivery.cadl
 
 # 検証済みCADL定義からPythonランタイムコードを生成
 cadl codegen examples/robot_delivery.cadl -o /tmp/robot_delivery
+
+# 自然言語からCADLを生成（ANTHROPIC_API_KEYが必要）
+cadl ai "5台の自律ドローンが農地を測量するシステム。地上局が統括する。"
+cadl ai -f requirements.txt -o output.cadl
 ```
 
 ## アーキテクチャ
@@ -141,8 +148,19 @@ CADL処理系は標準的なコンパイラパイプラインに従います：
     +-----+-----+-----------+
     v           v           v
   SMT検証    コード生成   ランタイム監視
-  (Z3)     (codegen/)
+  (Z3)     (codegen/)   (ai/)
 ```
+
+### AI統合（Phase 4）
+
+`cadl ai` は自然言語の記述からClaude APIを用いてCADL定義を生成します：
+
+1. ユーザが自然言語（日本語・英語対応）でSoSを記述
+2. Claudeがfew-shot例を参考にCADL定義を生成
+3. 生成されたCADLをパース・型検査
+4. バリデーションエラー時はエラーフィードバック付きでリトライ
+
+`ANTHROPIC_API_KEY`環境変数の設定と `pip install cadl[ai]` が必要です。
 
 ### コード生成（Phase 3）
 
@@ -192,6 +210,11 @@ src/cadl/
     transition_gen.py  レジームコントローラ生成
     metric_gen.py      評価指標コレクタ生成
     runtime_gen.py     オーケストレータ生成
+  ai/
+    __init__.py        公開generate_cadl() API
+    prompts.py         システムプロンプト・few-shot例
+    llm_client.py      Claude APIクライアント
+    nl_to_cadl.py      自然言語→CADL生成パイプライン
 
 tests/
   test_parser.py       パーサのテスト
@@ -199,6 +222,7 @@ tests/
   test_verifier.py     SMT検証のテスト
   test_deadlock.py     デッドロック検出のテスト
   test_codegen.py      コード生成のテスト
+  test_ai.py           AI統合のテスト
 
 examples/
   robot_delivery.cadl      ロボット配送SoS（認知型）
@@ -212,7 +236,7 @@ examples/
 | Phase 1 | 言語コア設計・パーサ・型検査器 | 完了 |
 | Phase 2 | 検証エンジン（SMTベース無矛盾性検証、デッドロック検出） | 完了 |
 | Phase 3 | ランタイム・コード生成（Python） | 完了 |
-| Phase 4 | AI統合（LLMによる自然言語→CADL変換） | 計画中 |
+| Phase 4 | AI統合（Claude APIによる自然言語→CADL変換） | 完了 |
 | Phase 5 | 制度遷移・レジームマップ構築 | 計画中 |
 | Phase 6 | IEC 62853連携・スマートコントラクト生成 | 計画中 |
 
