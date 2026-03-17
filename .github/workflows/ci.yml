@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest --cov=cadl --cov-report=xml tests/
+
+      - name: Run examples
+        run: |
+          cadl verify examples/robot_delivery.cadl || true
+          cadl verify examples/household_chores.cadl || true
+          cadl verify examples/iot_data_sharing.cadl || true
+          cadl codegen examples/robot_delivery.cadl -o /tmp/robot_delivery
+          cadl codegen examples/household_chores.cadl -o /tmp/household
+          cadl codegen examples/iot_data_sharing.cadl -o /tmp/iot

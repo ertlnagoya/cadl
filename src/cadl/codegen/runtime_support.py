@@ -282,3 +282,50 @@ class MetricsCollectorBase:
     def check_target(self, metric_id: str) -> Optional[bool]:
         """Override with generated target checking logic."""
         return None
+
+
+# === Event Loop ===
+
+class EventLoop:
+    """CADL runtime event loop for driving protocol execution and monitoring."""
+
+    def __init__(self, runtime) -> None:
+        self.runtime = runtime
+        self._running = False
+        self._event_queue: List[Event] = []
+
+    def post_event(self, event: Event) -> None:
+        """Post an event to be processed in the next cycle."""
+        self._event_queue.append(event)
+
+    async def run(self, max_cycles: int | None = None) -> None:
+        """Run the event loop."""
+        self._running = True
+        cycle = 0
+        while self._running:
+            # 1. Process pending events -> trigger matching protocols
+            events = list(self._event_queue)
+            self._event_queue.clear()
+            for event in events:
+                for proto in self.runtime.get_protocols():
+                    if proto.matches_trigger(event):
+                        await proto.execute(self.runtime.ctx, event)
+
+            # 2. Run contract monitor cycle
+            violations = self.runtime.run_monitor_cycle()
+            for v in violations:
+                logger.warning("Violation detected: %s", v)
+
+            # 3. Evaluate regime transitions
+            if hasattr(self.runtime, 'regime_controller'):
+                new_regime = self.runtime.regime_controller.evaluate_transitions(self.runtime.ctx)
+                if new_regime:
+                    self.runtime.regime_controller.execute_transition(new_regime, self.runtime.ctx)
+
+            cycle += 1
+            if max_cycles is not None and cycle >= max_cycles:
+                break
+            await asyncio.sleep(0.01)
+
+    def stop(self) -> None:
+        self._running = False

@@ -138,6 +138,13 @@ def generate_runtime_module(sos: SoSDefinition) -> str:
         lines.append("        return []")
     lines.append("")
 
+    # create_event_loop method
+    lines.append("    def create_event_loop(self):")
+    lines.append('        """Create an EventLoop bound to this runtime."""')
+    lines.append("        from cadl.codegen.runtime_support import EventLoop")
+    lines.append("        return EventLoop(self)")
+    lines.append("")
+
     content = "\n".join(lines)
     if not content.endswith("\n"):
         content += "\n"

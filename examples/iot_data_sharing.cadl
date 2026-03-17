@@ -1,0 +1,127 @@
+sos:
+  name: "IoTDataSharing"
+  type: Virtual
+  version: "1.0.0"
+  description: "IoT sensor data sharing with gateway aggregation"
+
+  context:
+    environment:
+      num_sensors: 50
+      update_interval: "1s"
+    assumptions:
+      - "network is eventually available"
+      - "sensors have local storage for buffering"
+
+  actors:
+    - id: "SENSOR[1..K]"
+      role: "data_producer"
+      autonomy: high
+      capabilities:
+        - sense_environment
+        - buffer_data
+      interface:
+        output: [sensor_reading]
+
+    - id: GATEWAY
+      role: "aggregator"
+      autonomy: medium
+      capabilities:
+        - aggregate_data
+        - filter_anomalies
+      interface:
+        input: [sensor_reading]
+        output: [aggregated_data]
+
+    - id: CLOUD
+      role: "analytics_platform"
+      autonomy: low
+      capabilities:
+        - store_data
+        - run_analytics
+
+  contracts:
+    - id: DATA_FRESHNESS
+      parties:
+        - "SENSOR[*]"
+        - GATEWAY
+      assume:
+        - "SENSOR[i].is_active == true"
+        - "network_latency <= 500ms"
+      guarantee:
+        - "data_age <= 5s"
+        - "data_loss_rate <= 0.01"
+      information:
+        alpha: 0.6
+        sharing:
+          - "SENSOR[*] -> GATEWAY : sensor_reading"
+      incentives:
+        type: reputation
+        lambda: 0.3
+        rules:
+          - "reward(SENSOR[i], 1) when timely_report"
+          - "penalty(SENSOR[i], -2) when missed_report"
+      violation:
+        detect: "data_age > 5s OR data_loss_rate > 0.01"
+        action: "notify(GATEWAY) AND log_violation"
+        escalation: "after 5 violations: disable_sensor"
+
+    - id: PRIVACY_POLICY
+      parties:
+        - GATEWAY
+        - CLOUD
+      assume:
+        - "GATEWAY.has_valid_certificate == true"
+      guarantee:
+        - "data_anonymized == true"
+        - "retention_period <= 30d"
+      authority:
+        decision_scope: "data_retention"
+        decision_holder: CLOUD
+        beta: 0.1
+      information:
+        alpha: 0.4
+        views:
+          GATEWAY: "aggregated_data + local_config"
+          CLOUD: "aggregated_data + analytics_results"
+        sharing:
+          - "GATEWAY -> CLOUD : aggregated_data"
+
+  protocols:
+    - id: DATA_COLLECTION
+      trigger: "sensor_reading_available(SENSOR[i])"
+      precondition: "GATEWAY.is_operational"
+      steps:
+        - "SENSOR[i] -> GATEWAY : sensor_reading"
+        - "GATEWAY : aggregate_data"
+        - "GATEWAY : filter_anomalies"
+      timing:
+        max_response: 200ms
+        max_total: 2s
+      fallback:
+        on_timeout: "SENSOR[i] : buffer_locally()"
+      postcondition: "data_received_by_gateway"
+
+    - id: ANOMALY_ALERT
+      trigger: "anomaly_detected_by(GATEWAY)"
+      steps:
+        - "GATEWAY -> CLOUD : anomaly_report"
+        - "CLOUD : run_analytics"
+        - "CLOUD -> GATEWAY : recommended_action"
+      timing:
+        max_total: 10s
+
+  algorithms:
+    aggregation:
+      central: "weighted_moving_average"
+      local: "kalman_filter"
+
+  metrics:
+    - id: data_freshness
+      formula: "mean(data_ages)"
+      target: "<= 3s"
+    - id: collection_rate
+      formula: "count(received_readings) / count(expected_readings)"
+      target: ">= 0.99"
+    - id: anomaly_detection_latency
+      formula: "mean(anomaly_detection_times)"
+      target: "<= 5s"

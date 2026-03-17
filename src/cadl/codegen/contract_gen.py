@@ -57,9 +57,26 @@ def generate_contract_monitor(contract: ContractDef) -> str:
         if contract.violation.detect:
             lines.append(f"        # detect: {contract.violation.detect}")
         if contract.violation.action:
-            lines.append(f"        # action: {contract.violation.action}")
+            action = contract.violation.action
+            for part in action.split(" AND "):
+                part = part.strip()
+                if part.startswith("notify("):
+                    target = part[7:].rstrip(")")
+                    lines.append(f"        ctx.send_message(Message(sender='MONITOR', receiver='{target}', content=str(violation)))")
+                elif part == "log_violation":
+                    lines.append(f"        ctx.record_log(f'Violation: {{violation}}')")
+                else:
+                    lines.append(f"        # action: {part}")
         if contract.violation.escalation:
-            lines.append(f"        # escalation: {contract.violation.escalation}")
+            import re
+            m = re.match(r'after (\d+) violations?:\s*(.*)', contract.violation.escalation)
+            if m:
+                threshold = m.group(1)
+                esc_action = m.group(2).strip()
+                lines.append(f"        if self.violation_count >= {threshold}:")
+                lines.append(f"            ctx.record_log('Escalation: {esc_action}')")
+            else:
+                lines.append(f"        # escalation: {contract.violation.escalation}")
         lines.append("")
 
     return "\n".join(lines)
@@ -67,14 +84,19 @@ def generate_contract_monitor(contract: ContractDef) -> str:
 
 def generate_contracts_module(contracts: List[ContractDef]) -> str:
     """Generate the complete contracts.py module content."""
+    needs_message = any(c.violation and c.violation.action for c in contracts)
     imports = [
         "from cadl.codegen.runtime_support import (",
         "    CheckResult,",
         "    ContractMonitorBase,",
+    ]
+    if needs_message:
+        imports.append("    Message,")
+    imports.extend([
         "    RuntimeContext,",
         "    Violation,",
         ")",
-    ]
+    ])
 
     classes = []
     for contract in contracts:

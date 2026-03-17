@@ -343,6 +343,27 @@ class ContextBlock:
     assumptions: list[str] = field(default_factory=list)
 
 
+# === Verification / Codegen specs ===
+
+@dataclass
+class VerificationSpec:
+    """A verification directive within a CADL definition."""
+    id: str
+    type: str  # "consistency", "deadlock", "safety", "liveness"
+    target: str | None = None
+    property: str | None = None
+    loc: SourceLocation | None = None
+
+
+@dataclass
+class CodegenSpec:
+    """A code generation directive within a CADL definition."""
+    target: str  # "python", "typescript", "solidity", "opa"
+    output: str | None = None
+    mappings: dict[str, str] = field(default_factory=dict)
+    loc: SourceLocation | None = None
+
+
 # === Top-level SoS ===
 
 @dataclass
@@ -358,4 +379,6 @@ class SoSDefinition:
     algorithms: list[AlgorithmDef] = field(default_factory=list)
     transitions: list[TransitionDef] = field(default_factory=list)
     metrics: list[MetricDef] = field(default_factory=list)
+    verifications: list[VerificationSpec] = field(default_factory=list)
+    codegen: list[CodegenSpec] = field(default_factory=list)
     loc: SourceLocation | None = None

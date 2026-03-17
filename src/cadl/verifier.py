@@ -374,6 +374,67 @@ def _parse_condition(cond_str: str, ctx: Z3Context) -> Any:
         return ctx.get_bool(f"cond_{sanitized}")
 
 
+def _check_guarantee_entailment(contract: ContractDef) -> VerificationResult:
+    """Check that assumes entail guarantees: assume => guarantee.
+
+    For each guarantee, we check if assuming all 'assume' predicates
+    makes the guarantee necessarily true. If not, the assumptions
+    alone are insufficient to ensure the guarantee.
+    """
+    check_name = f"Contract '{contract.id}' entailment"
+
+    if not contract.assume or not contract.guarantee:
+        return VerificationResult(
+            check_name=check_name,
+            status="passed",
+            message="No assumes or guarantees to check entailment",
+        )
+
+    ctx = Z3Context()
+    assume_exprs = []
+    for pred in contract.assume:
+        try:
+            assume_exprs.append(expr_to_z3(pred, ctx))
+        except Exception:
+            pass
+
+    if not assume_exprs:
+        return VerificationResult(
+            check_name=check_name,
+            status="passed",
+            message="No parseable assumes",
+        )
+
+    for pred in contract.guarantee:
+        try:
+            g = expr_to_z3(pred, ctx)
+        except Exception:
+            continue
+
+        solver = z3.Solver()
+        solver.set("timeout", 5000)
+        for a in assume_exprs:
+            solver.add(a)
+        solver.add(z3.Not(g))
+
+        result = solver.check()
+        if result == z3.sat:
+            model = solver.model()
+            ce = {str(d): str(model[d]) for d in model.decls()}
+            return VerificationResult(
+                check_name=check_name,
+                status="failed",
+                message="Assumes do not entail all guarantees",
+                counterexample=ce,
+            )
+
+    return VerificationResult(
+        check_name=check_name,
+        status="passed",
+        message="All guarantees follow from assumptions",
+    )
+
+
 def verify(sos: SoSDefinition) -> List[VerificationResult]:
     """Run all SMT verification checks on a CADL SoS definition.
 
@@ -384,6 +445,10 @@ def verify(sos: SoSDefinition) -> List[VerificationResult]:
     # 1. Check each contract for internal consistency
     for contract in sos.contracts:
         results.append(_check_contract_consistency(contract))
+
+    # 1b. Check guarantee entailment
+    for contract in sos.contracts:
+        results.append(_check_guarantee_entailment(contract))
 
     # 2. Check cross-contract consistency for contracts sharing parties
     for c1, c2 in combinations(sos.contracts, 2):

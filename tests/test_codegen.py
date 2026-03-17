@@ -357,3 +357,111 @@ class TestHouseholdChoresCodegen:
             for f in output.glob("*.py"):
                 code = f.read_text()
                 compile(code, str(f), "exec")
+
+
+class TestIoTDataSharingCodegen:
+    def test_iot_data_sharing_parse_verify_codegen(self):
+        """IoT data sharing example: parse -> verify -> codegen -> compile."""
+        from cadl.parser import parse_file
+        from cadl.type_checker import type_check as check
+        from cadl.verifier import verify
+
+        cadl_file = Path(__file__).parent.parent / "examples" / "iot_data_sharing.cadl"
+        if not cadl_file.exists():
+            pytest.skip("iot_data_sharing.cadl not found")
+
+        # Parse
+        sos = parse_file(cadl_file)
+        assert sos.name == "IoTDataSharing"
+        assert len(sos.actors) == 3
+        assert len(sos.contracts) == 2
+        assert len(sos.protocols) == 2
+        assert len(sos.metrics) == 3
+
+        # Type check
+        tc_result = check(sos)
+        assert tc_result.ok, f"Type check errors: {tc_result.errors}"
+
+        # Verify (some entailment checks may fail — that's expected)
+        results = verify(sos)
+        for r in results:
+            if "consistency" in r.check_name:
+                assert r.status != "failed", f"Consistency failure: {r}"
+
+        # Codegen
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "iot"
+            generate(sos, output)
+
+            # All generated files should compile
+            for f in output.glob("*.py"):
+                code = f.read_text()
+                compile(code, str(f), "exec")
+
+            # Check expected files exist
+            assert (output / "actors.py").exists()
+            assert (output / "contracts.py").exists()
+            assert (output / "protocols.py").exists()
+            assert (output / "metrics.py").exists()
+            assert (output / "runtime.py").exists()
+
+
+class TestMinimalCodegen:
+    def test_empty_sos_generates(self):
+        """An SoS with no actors/contracts/protocols should still generate."""
+        from cadl.parser import parse as parse_cadl
+
+        cadl = '''\
+sos:
+  name: "EmptySoS"
+  type: Directed
+  version: "1.0.0"
+'''
+        sos = parse_cadl(cadl)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "empty"
+            generate(sos, output)
+
+            # Should generate at minimum __init__.py and runtime.py
+            assert (output / "__init__.py").exists()
+            assert (output / "runtime.py").exists()
+
+            for f in output.glob("*.py"):
+                code = f.read_text()
+                compile(code, str(f), "exec")
+
+    def test_transitions_codegen(self):
+        """SoS with transitions should generate transitions.py."""
+        from cadl.parser import parse as parse_cadl
+
+        cadl = '''\
+sos:
+  name: "TransitionSoS"
+  type: Directed
+  version: "1.0.0"
+
+  actors:
+    - id: AGENT
+      role: "worker"
+      autonomy: low
+
+  transitions:
+    - from: normal
+      to: degraded
+      condition: "load > 0.9"
+      safety_invariant: "system_stable == true"
+    - from: degraded
+      to: normal
+      condition: "load < 0.5"
+'''
+        sos = parse_cadl(cadl)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "transitions"
+            generate(sos, output)
+
+            assert (output / "transitions.py").exists()
+            for f in output.glob("*.py"):
+                code = f.read_text()
+                compile(code, str(f), "exec")

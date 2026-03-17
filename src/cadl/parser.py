@@ -23,6 +23,7 @@ from .ast_nodes import (
     BarrierStep,
     BinaryOp,
     BoolLiteral,
+    CodegenSpec,
     ComputeStep,
     ConditionalStep,
     ContextBlock,
@@ -55,6 +56,7 @@ from .ast_nodes import (
     TimingBlock,
     TransitionDef,
     UnaryOp,
+    VerificationSpec,
     ViewDef,
     ViolationBlock,
 )
@@ -626,6 +628,29 @@ def _build_sos(data: dict) -> SoSDefinition:
                     id=str(_get(m, 'id', '')),
                     formula=_get(m, 'formula'),
                     target=_get(m, 'target'),
+                ))
+
+    # Verifications
+    verify_data = _get(sos_data, 'verification', [])
+    if isinstance(verify_data, list):
+        for v in verify_data:
+            if isinstance(v, dict):
+                sos.verifications.append(VerificationSpec(
+                    id=str(_get(v, 'id', '')),
+                    type=str(_get(v, 'type', '')),
+                    target=_get(v, 'target'),
+                    property=_get(v, 'property'),
+                ))
+
+    # Codegen
+    codegen_data = _get(sos_data, 'codegen', [])
+    if isinstance(codegen_data, list):
+        for cg in codegen_data:
+            if isinstance(cg, dict):
+                sos.codegen.append(CodegenSpec(
+                    target=str(_get(cg, 'target', 'python')),
+                    output=_get(cg, 'output'),
+                    mappings=_get(cg, 'mappings', {}) or {},
                 ))
 
     return sos

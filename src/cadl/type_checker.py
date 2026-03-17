@@ -86,6 +86,7 @@ class TypeChecker:
         self._check_contracts(sos)
         self._check_protocols(sos)
         self._check_transitions(sos)
+        self._check_algorithms(sos)
         self._check_metrics(sos)
         return self.result
 
@@ -262,6 +263,16 @@ class TypeChecker:
                     trans.loc,
                 )
 
+    def _check_algorithms(self, sos: SoSDefinition) -> None:
+        """Check algorithm definitions for duplicates."""
+        seen: set[str] = set()
+        for algo in sos.algorithms:
+            if algo.name in seen:
+                self.result.add_warning(
+                    f"Duplicate algorithm name: '{algo.name}'",
+                )
+            seen.add(algo.name)
+
     def _check_metrics(self, sos: SoSDefinition) -> None:
         """Check metric definitions."""
         seen: set[str] = set()
@@ -272,6 +283,16 @@ class TypeChecker:
                     metric.loc,
                 )
             seen.add(metric.id)
+            # Validate formula is parseable
+            if metric.formula:
+                try:
+                    from .parser import parse_expr
+                    parse_expr(metric.formula)
+                except Exception:
+                    self.result.add_warning(
+                        f"Metric '{metric.id}' formula is not a valid expression: {metric.formula}",
+                        metric.loc,
+                    )
 
 
 def type_check(sos: SoSDefinition) -> TypeCheckResult:

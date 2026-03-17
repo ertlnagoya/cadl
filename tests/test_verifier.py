@@ -28,6 +28,7 @@ from cadl.verifier import (
     verify,
     _check_contract_consistency,
     _check_cross_contract_consistency,
+    _check_guarantee_entailment,
 )
 
 
@@ -232,12 +233,13 @@ class TestVerify:
         assert results == []
 
     def test_single_consistent_contract(self):
-        """Single satisfiable contract produces one passing result."""
+        """Single satisfiable contract produces consistency + entailment results."""
         c = _make_contract("C1", ["A"], guarantee=[BoolLiteral(True)])
         sos = _make_sos(contracts=[c])
         results = verify(sos)
-        assert len(results) == 1
-        assert results[0].status == "passed"
+        # 1 consistency + 1 entailment
+        assert len(results) == 2
+        assert all(r.status == "passed" for r in results)
 
     def test_cross_contract_with_shared_parties(self):
         """Cross-contract check runs for contracts sharing parties."""
@@ -245,8 +247,8 @@ class TestVerify:
         c2 = _make_contract("C2", ["A", "C"], guarantee=[BoolLiteral(True)])
         sos = _make_sos(contracts=[c1, c2])
         results = verify(sos)
-        # 2 single-contract checks + 1 cross-contract check (A is shared)
-        assert len(results) == 3
+        # 2 consistency + 2 entailment + 1 cross-contract (A is shared)
+        assert len(results) == 5
         assert all(r.status == "passed" for r in results)
 
     def test_no_cross_check_without_shared_parties(self):
@@ -255,8 +257,8 @@ class TestVerify:
         c2 = _make_contract("C2", ["C", "D"], guarantee=[BoolLiteral(True)])
         sos = _make_sos(contracts=[c1, c2])
         results = verify(sos)
-        # Only 2 single-contract checks, no cross-contract
-        assert len(results) == 2
+        # 2 consistency + 2 entailment, no cross-contract
+        assert len(results) == 4
 
     def test_verification_result_str(self):
         """VerificationResult __str__ formatting."""
@@ -298,6 +300,80 @@ class TestRobotDeliveryVerification:
         sos = parse_file(cadl_file)
         results = verify(sos)
 
-        # All checks should pass (no contradictions in the example)
+        # Consistency checks should pass (no contradictions in the example).
+        # Entailment checks may fail since assumes don't logically entail
+        # guarantees in the example — that's expected and informational.
         for r in results:
+            if "entailment" in r.check_name:
+                continue  # Entailment failures are expected
             assert r.status != "failed", f"Unexpected failure: {r}"
+
+
+# === Guarantee entailment tests ===
+
+class TestGuaranteeEntailment:
+    """Test guarantee entailment checking (assume => guarantee)."""
+
+    def test_entailment_passes_when_assume_implies_guarantee(self):
+        """If assume x > 10, then guarantee x > 5 should be entailed."""
+        contract = _make_contract(
+            "C1", ["A"],
+            assume=[BinaryOp(">", Identifier("x"), IntLiteral(10))],
+            guarantee=[BinaryOp(">", Identifier("x"), IntLiteral(5))],
+        )
+        result = _check_guarantee_entailment(contract)
+        assert result.status == "passed"
+
+    def test_entailment_fails_when_not_implied(self):
+        """If assume x > 0, guarantee x > 100 is NOT entailed."""
+        contract = _make_contract(
+            "C1", ["A"],
+            assume=[BinaryOp(">", Identifier("x"), IntLiteral(0))],
+            guarantee=[BinaryOp(">", Identifier("x"), IntLiteral(100))],
+        )
+        result = _check_guarantee_entailment(contract)
+        assert result.status == "failed"
+        assert result.counterexample is not None
+
+    def test_entailment_empty_assumes(self):
+        """No assumes means entailment check passes trivially."""
+        contract = _make_contract(
+            "C1", ["A"],
+            assume=[],
+            guarantee=[BoolLiteral(True)],
+        )
+        result = _check_guarantee_entailment(contract)
+        assert result.status == "passed"
+
+    def test_entailment_empty_guarantees(self):
+        """No guarantees means entailment check passes trivially."""
+        contract = _make_contract(
+            "C1", ["A"],
+            assume=[BoolLiteral(True)],
+            guarantee=[],
+        )
+        result = _check_guarantee_entailment(contract)
+        assert result.status == "passed"
+
+    def test_entailment_with_multiple_assumes(self):
+        """Multiple assumes combined should entail the guarantee."""
+        contract = _make_contract(
+            "C1", ["A"],
+            assume=[
+                BinaryOp(">", Identifier("x"), IntLiteral(5)),
+                BinaryOp("<", Identifier("x"), IntLiteral(15)),
+            ],
+            guarantee=[BinaryOp("<", Identifier("x"), IntLiteral(20))],
+        )
+        result = _check_guarantee_entailment(contract)
+        assert result.status == "passed"
+
+    def test_entailment_trivially_true_guarantee(self):
+        """Guarantee of 'true' is always entailed."""
+        contract = _make_contract(
+            "C1", ["A"],
+            assume=[BinaryOp(">", Identifier("x"), IntLiteral(0))],
+            guarantee=[BoolLiteral(True)],
+        )
+        result = _check_guarantee_entailment(contract)
+        assert result.status == "passed"

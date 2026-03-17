@@ -89,8 +89,8 @@ def _generate_steps(steps: List[Step], indent_level: int = 2) -> str:
         elif isinstance(step, ConditionalStep):
             cond_str = _expr_label(step.condition)
             lines.append(f"{prefix}# Step {i}: conditional")
-            lines.append(f"{prefix}# if {cond_str}:")
-            lines.append(f"{prefix}if True:  # TODO: evaluate condition: {cond_str}")
+            py_cond = _compile_condition(step.condition)
+            lines.append(f"{prefix}if {py_cond}:")
             then_code = _generate_steps(step.then_steps, indent_level + 1)
             if then_code.strip():
                 lines.append(then_code)
@@ -131,14 +131,25 @@ def _step_as_coroutine(step: Step, indent_level: int) -> str:
         receiver = _actor_ref_str(step.receiver)
         msg = _message_str(step.message)
         return (
-            f"{prefix}asyncio.coroutine(lambda: ctx.send_message("
-            f"Message(sender='{sender}', receiver='{receiver}', content='{msg}')))()"
+            f"{prefix}_as_coro(lambda: ctx.send_message("
+            f"Message(sender='{sender}', receiver='{receiver}', content='{msg}')))"
         )
     if isinstance(step, ComputeStep):
         actor = _actor_ref_str(step.actor)
         comp = _message_str(step.computation)
-        return f"{prefix}asyncio.coroutine(lambda: ctx.record_log('{actor}: {comp}'))()"
+        return f"{prefix}_as_coro(lambda: ctx.record_log('{actor}: {comp}'))"
     return f"{prefix}asyncio.sleep(0)"
+
+
+def _compile_condition(expr) -> str:
+    """Compile a condition expression to Python source."""
+    from .expr_compiler import CompilerContext, expr_to_python
+    try:
+        ctx = CompilerContext()
+        return expr_to_python(expr, ctx)
+    except Exception:
+        label = _expr_label(expr)
+        return f"True  # could not compile: {label}"
 
 
 def _actor_ref_str(ref) -> str:
@@ -198,6 +209,11 @@ def generate_protocols_module(protocols: List[ProtocolDef]) -> str:
     parts.append("from __future__ import annotations")
     parts.append("")
     parts.extend(imports)
+    parts.append("")
+    parts.append("")
+    parts.append("async def _as_coro(fn):")
+    parts.append('    """Wrap a synchronous callable as a coroutine for asyncio.gather."""')
+    parts.append("    return fn()")
     parts.append("")
     parts.append("")
     parts.append(body)

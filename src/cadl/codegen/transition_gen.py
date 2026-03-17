@@ -45,12 +45,19 @@ def generate_transitions_module(transitions: List[TransitionDef]) -> str:
     lines.append("    def evaluate_transitions(self, ctx: RuntimeContext) -> str | None:")
     lines.append('        """Check if any transition from current regime should fire."""')
     for t in transitions:
-        cond_str = t.condition or "True"
-        cond_comment = cond_str.replace("\n", " ").strip()
         lines.append(f"        # {t.from_regime} -> {t.to_regime}")
         lines.append(f"        if self.current_regime == '{t.from_regime}':")
-        lines.append(f"            # condition: {cond_comment}")
-        lines.append(f"            pass  # TODO: evaluate condition")
+        if t.condition:
+            py_cond = _compile_expr_str(t.condition)
+            if py_cond:
+                lines.append(f"            if {py_cond}:")
+                lines.append(f"                return '{t.to_regime}'")
+            else:
+                cond_comment = t.condition.replace("\n", " ").strip()
+                lines.append(f"            # condition: {cond_comment}")
+                lines.append(f"            pass  # could not compile condition")
+        else:
+            lines.append(f"            return '{t.to_regime}'")
         lines.append("")
     lines.append("        return None")
     lines.append("")
@@ -66,9 +73,12 @@ def generate_transitions_module(transitions: List[TransitionDef]) -> str:
         lines.append("        # Check safety invariants")
         for t in transitions:
             if t.safety_invariant:
+                py_inv = _compile_expr_str(t.safety_invariant)
                 lines.append(f"        if old == '{t.from_regime}' and target_regime == '{t.to_regime}':")
-                lines.append(f"            # safety_invariant: {t.safety_invariant}")
-                lines.append("            pass  # TODO: verify invariant")
+                if py_inv:
+                    lines.append(f"            assert {py_inv}, 'Safety invariant violated: {t.safety_invariant}'")
+                else:
+                    lines.append(f"            # safety_invariant: {t.safety_invariant} (could not compile)")
 
     lines.append("        self.current_regime = target_regime")
     lines.append("        self.transition_history.append((old, target_regime))")
@@ -80,6 +90,18 @@ def generate_transitions_module(transitions: List[TransitionDef]) -> str:
     if not content.endswith("\n"):
         content += "\n"
     return content
+
+
+def _compile_expr_str(condition: str) -> str | None:
+    """Try to parse and compile a condition string to Python source."""
+    try:
+        from ..parser import parse_expr
+        from .expr_compiler import CompilerContext, expr_to_python
+        expr = parse_expr(condition)
+        ctx = CompilerContext()
+        return expr_to_python(expr, ctx)
+    except Exception:
+        return None
 
 
 def _empty_module() -> str:

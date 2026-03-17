@@ -195,3 +195,154 @@ sos:
         result = type_check(sos)
         assert not result.ok
         assert any("Duplicate actor" in e.message for e in result.errors)
+
+
+class TestAlgorithmCheck:
+    """Test algorithm duplicate name detection."""
+
+    def test_duplicate_algorithm_name_warning(self):
+        source = '''\
+sos:
+  name: "TestSoS"
+  actors:
+    - id: A
+      role: "r"
+      autonomy: low
+  algorithms:
+    routing:
+      central: "dijkstra"
+    routing:
+      central: "a_star"
+'''
+        sos = parse(source)
+        # YAML merges duplicate keys, so this tests the checker's own logic
+        # We need to manually add a duplicate for the check
+        from cadl.ast_nodes import AlgorithmDef
+        sos.algorithms.append(AlgorithmDef(name="routing", central="a_star"))
+        result = type_check(sos)
+        assert any("Duplicate algorithm" in w.message for w in result.warnings)
+
+
+class TestMetricFormulaValidation:
+    """Test metric formula parsing validation."""
+
+    def test_valid_formula(self):
+        source = '''\
+sos:
+  name: "TestSoS"
+  actors:
+    - id: A
+      role: "r"
+      autonomy: low
+  metrics:
+    - id: latency
+      formula: "mean(response_times)"
+      target: "<= 100ms"
+'''
+        sos = parse(source)
+        result = type_check(sos)
+        # Valid formula should not produce warnings
+        assert not any("formula is not a valid" in w.message for w in result.warnings)
+
+    def test_duplicate_metric_id(self):
+        source = '''\
+sos:
+  name: "TestSoS"
+  actors:
+    - id: A
+      role: "r"
+      autonomy: low
+  metrics:
+    - id: latency
+      formula: "x"
+      target: "<= 100"
+    - id: latency
+      formula: "y"
+      target: "<= 200"
+'''
+        sos = parse(source)
+        result = type_check(sos)
+        assert not result.ok
+        assert any("Duplicate metric" in e.message for e in result.errors)
+
+
+class TestBoundaryValues:
+    """Test boundary values for institutional parameters."""
+
+    def test_alpha_zero(self):
+        source = '''\
+sos:
+  name: "TestSoS"
+  actors:
+    - id: A
+      role: "r"
+      autonomy: low
+    - id: B
+      role: "r"
+      autonomy: low
+  contracts:
+    - id: C1
+      parties:
+        - A
+        - B
+      assume:
+        - "true"
+      guarantee:
+        - "true"
+      information:
+        alpha: 0.0
+      duration: indefinite
+'''
+        sos = parse(source)
+        result = type_check(sos)
+        assert result.ok
+
+    def test_alpha_one(self):
+        source = '''\
+sos:
+  name: "TestSoS"
+  actors:
+    - id: A
+      role: "r"
+      autonomy: low
+    - id: B
+      role: "r"
+      autonomy: low
+  contracts:
+    - id: C1
+      parties:
+        - A
+        - B
+      assume:
+        - "true"
+      guarantee:
+        - "true"
+      information:
+        alpha: 1.0
+      duration: indefinite
+'''
+        sos = parse(source)
+        result = type_check(sos)
+        assert result.ok
+
+
+class TestTransitionProtocolRef:
+    """Test transition undefined protocol reference."""
+
+    def test_undefined_protocol_warning(self):
+        source = '''\
+sos:
+  name: "TestSoS"
+  actors:
+    - id: A
+      role: "r"
+      autonomy: low
+  transitions:
+    - from: normal
+      to: degraded
+      condition: "load > 0.9"
+      protocol: NONEXISTENT_PROTOCOL
+'''
+        sos = parse(source)
+        result = type_check(sos)
+        assert any("undefined protocol" in w.message.lower() for w in result.warnings)

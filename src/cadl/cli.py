@@ -30,6 +30,8 @@ def main(argv: list[str] | None = None) -> int:
     # verify command
     verify_cmd = subparsers.add_parser("verify", help="Parse, type-check, and verify a CADL file")
     verify_cmd.add_argument("file", type=Path, help="CADL file to verify")
+    verify_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                             help="Output format (default: text)")
 
     # codegen command
     codegen_cmd = subparsers.add_parser("codegen", help="Generate Python runtime code from a CADL file")
@@ -152,14 +154,57 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         print(f"Parse error: {e}", file=sys.stderr)
         return 1
 
+    # Run checks
+    tc_result = type_check(sos)
+    v_results = verify(sos)
+    d_results = detect_deadlocks(sos)
+
+    has_failures = not tc_result.ok or \
+        any(r.status == "failed" for r in v_results) or \
+        any(r.status == "failed" for r in d_results)
+
+    total_checks = len(v_results) + len(d_results) + 1  # +1 for type check
+    passed = sum(1 for r in v_results if r.status == "passed") + \
+             sum(1 for r in d_results if r.status == "passed") + \
+             (1 if tc_result.ok else 0)
+    failed = total_checks - passed
+
+    # JSON output
+    if args.format == "json":
+        import json
+        output = {
+            "file": str(path),
+            "sos": sos.name,
+            "type_check": {
+                "ok": tc_result.ok,
+                "errors": [str(e) for e in tc_result.errors],
+                "warnings": [str(w) for w in tc_result.warnings],
+            },
+            "verification": [
+                {"name": r.check_name, "status": r.status, "message": r.message,
+                 "counterexample": r.counterexample}
+                for r in v_results
+            ],
+            "deadlock": [
+                {"name": r.check_name, "status": r.status, "message": r.message,
+                 "details": getattr(r, 'details', None)}
+                for r in d_results
+            ],
+            "summary": {
+                "total": total_checks,
+                "passed": passed,
+                "failed": failed,
+            }
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        return 1 if has_failures else 0
+
+    # Text output
     print(f"Verifying: {path}")
     print(f"  SoS: {sos.name}")
     print()
-    has_failures = False
 
-    # Type check
     print("--- Type Check ---")
-    tc_result = type_check(sos)
     for w in tc_result.warnings:
         print(f"  {w}")
     for e in tc_result.errors:
@@ -168,37 +213,21 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         print("  [PASS] Type check passed")
     else:
         print(f"  [FAIL] {len(tc_result.errors)} error(s)")
-        has_failures = True
     print()
 
-    # SMT Verification
     print("--- SMT Verification ---")
-    v_results = verify(sos)
     for r in v_results:
         print(f"  {r}")
-        if r.status == "failed":
-            has_failures = True
     if not v_results:
         print("  (no contracts to verify)")
     print()
 
-    # Deadlock Detection
     print("--- Deadlock Detection ---")
-    d_results = detect_deadlocks(sos)
     for r in d_results:
         print(f"  {r}")
-        if r.status == "failed":
-            has_failures = True
     if not d_results:
         print("  (no protocols to analyze)")
     print()
-
-    # Summary
-    total_checks = len(v_results) + len(d_results) + 1  # +1 for type check
-    passed = sum(1 for r in v_results if r.status == "passed") + \
-             sum(1 for r in d_results if r.status == "passed") + \
-             (1 if tc_result.ok else 0)
-    failed = total_checks - passed
 
     if has_failures:
         print(f"Verification FAILED: {passed}/{total_checks} checks passed")
