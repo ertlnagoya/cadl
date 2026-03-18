@@ -1,0 +1,165 @@
+sos:
+  name: "SupplyChainSoS"
+  type: Collaborative
+  version: "1.0.0"
+
+  actors:
+    - id: MANUFACTURER
+      role: "goods_producer"
+      autonomy: high
+      capabilities:
+        - produce_goods
+        - quality_control
+
+    - id: "WAREHOUSE[1..K]"
+      role: "storage_facility"
+      autonomy: medium
+      capabilities:
+        - inventory_management
+        - dispatch
+
+    - id: LOGISTICS
+      role: "transport_provider"
+      autonomy: high
+      capabilities:
+        - route_optimization
+        - fleet_management
+
+    - id: RETAILER
+      role: "end_seller"
+      autonomy: medium
+      capabilities:
+        - demand_forecasting
+        - order_placement
+
+  contracts:
+    - id: SUPPLY_AGREEMENT
+      parties:
+        - MANUFACTURER
+        - "WAREHOUSE[*]"
+        - RETAILER
+      assume:
+        - "MANUFACTURER.production_capacity > 0"
+        - "demand_forecast_accuracy >= 0.8"
+      guarantee:
+        - "order_fulfillment_rate >= 0.95"
+        - "lead_time <= max_lead_time"
+      authority:
+        decision_scope: "production_scheduling"
+        decision_holder: MANUFACTURER
+        beta: 0.4
+      information:
+        alpha: 0.7
+        views:
+          MANUFACTURER: "production_schedule + raw_material_stock"
+          "WAREHOUSE[*]": "local_inventory + pending_shipments"
+          RETAILER: "demand_forecast + order_status"
+        sharing:
+          - "RETAILER -> MANUFACTURER : demand_forecast"
+          - "MANUFACTURER -> WAREHOUSE[*] : shipment_schedule"
+          - "WAREHOUSE[*] -> RETAILER : inventory_level"
+      incentives:
+        type: reputation
+        lambda: 0.6
+        rules:
+          - "reward(MANUFACTURER, 10) when on_time_production"
+          - "penalty(MANUFACTURER, -8) when quality_defect"
+      violation:
+        detect: "order_fulfillment_rate < 0.90 OR lead_time > max_lead_time * 1.5"
+        action: "notify(RETAILER) AND log_violation"
+        escalation: "after 5 violations: renegotiate_terms"
+
+    - id: TRANSPORT_SLA
+      parties:
+        - LOGISTICS
+        - "WAREHOUSE[*]"
+      assume:
+        - "LOGISTICS.fleet_available == true"
+        - "route_network_operational == true"
+      guarantee:
+        - "delivery_on_time_rate >= 0.98"
+        - "damage_rate <= 0.01"
+      authority:
+        decision_scope: "route_selection"
+        decision_holder: LOGISTICS
+        beta: 0.3
+      information:
+        alpha: 0.6
+        views:
+          LOGISTICS: "fleet_status + all_routes"
+          "WAREHOUSE[*]": "shipment_tracking"
+        sharing:
+          - "WAREHOUSE[*] -> LOGISTICS : dispatch_request"
+          - "LOGISTICS -> WAREHOUSE[*] : tracking_info"
+      incentives:
+        type: reputation
+        lambda: 0.7
+        rules:
+          - "reward(LOGISTICS, 5) when on_time_delivery"
+          - "penalty(LOGISTICS, -10) when damaged_goods"
+      violation:
+        detect: "delivery_delay > 24h OR damage_report_filed"
+        action: "notify(WAREHOUSE[*]) AND trigger_insurance_claim"
+        escalation: "after 3 violations: suspend_contract"
+
+  protocols:
+    - id: ORDER_FULFILLMENT
+      trigger: "new_order_from(RETAILER)"
+      precondition: "MANUFACTURER.production_capacity > 0"
+      steps:
+        - "RETAILER -> MANUFACTURER : purchase_order"
+        - "MANUFACTURER : schedule_production"
+        - "MANUFACTURER -> WAREHOUSE[*] : shipment_notification"
+        - "WAREHOUSE[*] -> LOGISTICS : dispatch_request"
+        - "LOGISTICS -> RETAILER : delivery_confirmation"
+      timing:
+        max_response: 500ms
+        max_total: 5000ms
+      postcondition: "order_status == fulfilled"
+
+    - id: QUALITY_RECALL
+      trigger: "quality_defect_detected()"
+      precondition: "MANUFACTURER.is_operational"
+      steps:
+        - "MANUFACTURER : identify_affected_batch"
+        - "MANUFACTURER -> WAREHOUSE[*] : recall_notice"
+        - "WAREHOUSE[*] : quarantine_stock"
+        - "WAREHOUSE[*] -> RETAILER : recall_notification"
+      timing:
+        max_response: 200ms
+        max_total: 2000ms
+      postcondition: "affected_stock_quarantined == true"
+
+  transitions:
+    - from: NORMAL
+      to: DISRUPTED
+      condition: "supply_disruption_detected == true"
+      protocol: ORDER_FULFILLMENT
+      safety_invariant: "critical_stock_level > minimum_threshold"
+    - from: DISRUPTED
+      to: RECOVERY
+      condition: "alternative_supplier_secured == true"
+      safety_invariant: "order_backlog < max_backlog"
+    - from: RECOVERY
+      to: NORMAL
+      condition: "supply_chain_metrics_restored == true"
+      safety_invariant: "order_fulfillment_rate >= 0.90"
+    - from: NORMAL
+      to: SURGE
+      condition: "demand_spike_detected == true"
+      safety_invariant: "warehouse_capacity_available == true"
+    - from: SURGE
+      to: NORMAL
+      condition: "demand_normalized == true"
+      safety_invariant: "inventory_levels_stable == true"
+
+  metrics:
+    - id: order_fulfillment_rate
+      formula: "count(fulfilled_orders) / count(total_orders)"
+      target: ">= 0.95"
+    - id: avg_lead_time
+      formula: "mean(lead_times)"
+      target: "<= 72h"
+    - id: inventory_turnover
+      formula: "cost_of_goods_sold / avg_inventory_value"
+      target: ">= 12"

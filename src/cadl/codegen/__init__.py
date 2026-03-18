@@ -1,7 +1,9 @@
-"""CADL Code Generator — generates Python runtime code from CADL definitions.
+"""CADL Code Generator — generates runtime code from CADL definitions.
 
 Public API:
-    generate(sos, output_dir) -> None
+    generate(sos, output_dir, target="python") -> None
+
+Supported targets: python, solidity, opa
 """
 
 from __future__ import annotations
@@ -9,15 +11,32 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..ast_nodes import SoSDefinition
-from .actor_gen import generate_actors_module
-from .contract_gen import generate_contracts_module
-from .metric_gen import generate_metrics_module
-from .protocol_gen import generate_protocols_module
-from .runtime_gen import generate_runtime_module
-from .transition_gen import generate_transitions_module
+
+SUPPORTED_TARGETS = {"python", "solidity", "opa"}
 
 
-def generate(sos: SoSDefinition, output_dir: Path) -> None:
+def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> None:
+    """Generate runtime code from a CADL SoS definition.
+
+    Args:
+        sos: Parsed SoS definition.
+        output_dir: Directory to write generated files.
+        target: Code generation target — "python", "solidity", or "opa".
+    """
+    if target not in SUPPORTED_TARGETS:
+        raise ValueError(f"Unsupported target: {target!r}. Choose from: {sorted(SUPPORTED_TARGETS)}")
+
+    if target == "python":
+        _generate_python(sos, output_dir)
+    elif target == "solidity":
+        from .solidity import generate_solidity
+        generate_solidity(sos, output_dir)
+    elif target == "opa":
+        from .opa import generate_rego
+        generate_rego(sos, output_dir)
+
+
+def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
     """Generate Python runtime code from a CADL SoS definition.
 
     Creates a Python package in output_dir with:
@@ -29,6 +48,13 @@ def generate(sos: SoSDefinition, output_dir: Path) -> None:
       - runtime.py         Top-level orchestrator
       - __init__.py        Package exports
     """
+    from .actor_gen import generate_actors_module
+    from .contract_gen import generate_contracts_module
+    from .metric_gen import generate_metrics_module
+    from .protocol_gen import generate_protocols_module
+    from .runtime_gen import generate_runtime_module
+    from .transition_gen import generate_transitions_module
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate each module

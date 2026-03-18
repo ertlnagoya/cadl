@@ -82,6 +82,17 @@ sos:
         on_failure: "switch_to_protocol(LOCAL_REPLAN)"
       postcondition: "all_routes_conflict_free()"
 
+  transitions:
+    - from: IDLE
+      to: ACTIVE
+      condition: "delivery_request_pending == true"
+      protocol: FAILURE_REPLAN
+      safety_invariant: "all_routes_conflict_free()"
+    - from: ACTIVE
+      to: IDLE
+      condition: "all_deliveries_complete == true"
+      safety_invariant: "all_robots_at_base == true"
+
   metrics:
     - id: delivery_success_rate
       formula: "count(on_time_deliveries) / count(total_deliveries)"

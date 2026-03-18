@@ -1,0 +1,151 @@
+sos:
+  name: "SmartCityTraffic"
+  type: Collaborative
+  version: "1.0.0"
+  description: "Smart city traffic management with multiple operational regimes"
+
+  context:
+    environment:
+      num_intersections: 120
+      num_sensors: 500
+    assumptions:
+      - "traffic sensors are operational"
+      - "central controller has network connectivity"
+
+  actors:
+    - id: CONTROLLER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities:
+        - optimize_signal_timing
+        - monitor_traffic_flow
+        - detect_congestion
+      interface:
+        input: [traffic_data, incident_report]
+        output: [signal_plan, alert]
+
+    - id: "INTERSECTION[1..N]"
+      role: "signal_node"
+      autonomy: medium
+      capabilities:
+        - local_signal_control
+        - vehicle_detection
+      interface:
+        input: [signal_plan]
+        output: [traffic_data]
+
+    - id: EMERGENCY_SERVICE
+      role: "priority_responder"
+      autonomy: high
+      capabilities:
+        - request_priority
+        - report_incident
+
+  contracts:
+    - id: TRAFFIC_FLOW
+      parties:
+        - CONTROLLER
+        - "INTERSECTION[*]"
+      assume:
+        - "CONTROLLER.is_operational == true"
+        - "sensor_accuracy >= 0.9"
+      guarantee:
+        - "avg_wait_time <= 120s"
+        - "throughput >= min_throughput"
+      authority:
+        decision_scope: "signal_timing"
+        decision_holder: CONTROLLER
+        beta: 0.3
+      information:
+        alpha: 0.7
+        sharing:
+          - "INTERSECTION[*] -> CONTROLLER : traffic_data"
+          - "CONTROLLER -> INTERSECTION[*] : signal_plan"
+      incentives:
+        type: reputation
+        lambda: 0.4
+        rules:
+          - "reward(INTERSECTION[i], 1) when throughput_above_target"
+          - "penalty(INTERSECTION[i], -1) when sensor_malfunction"
+
+    - id: EMERGENCY_PRIORITY
+      parties:
+        - CONTROLLER
+        - EMERGENCY_SERVICE
+      assume:
+        - "EMERGENCY_SERVICE.has_valid_id == true"
+      guarantee:
+        - "emergency_response_time <= 30s"
+        - "priority_route_cleared == true"
+      authority:
+        decision_scope: "route_priority"
+        decision_holder: EMERGENCY_SERVICE
+        beta: 0.9
+
+  protocols:
+    - id: CONGESTION_RESPONSE
+      trigger: "congestion_detected_by(CONTROLLER)"
+      precondition: "CONTROLLER.is_operational"
+      steps:
+        - "CONTROLLER : detect_congestion"
+        - "CONTROLLER : optimize_signal_timing"
+        - "CONTROLLER -> INTERSECTION[*] : signal_plan"
+      timing:
+        max_total: 5s
+
+    - id: EMERGENCY_OVERRIDE
+      trigger: "emergency_request_from(EMERGENCY_SERVICE)"
+      steps:
+        - "EMERGENCY_SERVICE -> CONTROLLER : incident_report"
+        - "CONTROLLER : optimize_signal_timing"
+        - "CONTROLLER -> INTERSECTION[*] : signal_plan"
+      timing:
+        max_response: 500ms
+        max_total: 3s
+      fallback:
+        on_timeout: "INTERSECTION[*] : local_signal_control()"
+
+  transitions:
+    - from: NORMAL
+      to: CONGESTED
+      condition: "congestion_level > 0.7"
+      protocol: CONGESTION_RESPONSE
+      safety_invariant: "avg_wait_time <= 300s"
+    - from: CONGESTED
+      to: NORMAL
+      condition: "congestion_level <= 0.4"
+      safety_invariant: "throughput >= min_throughput"
+    - from: NORMAL
+      to: EMERGENCY
+      condition: "emergency_active == true"
+      protocol: EMERGENCY_OVERRIDE
+      safety_invariant: "priority_route_cleared == true"
+    - from: CONGESTED
+      to: EMERGENCY
+      condition: "emergency_active == true"
+      protocol: EMERGENCY_OVERRIDE
+      safety_invariant: "priority_route_cleared == true"
+    - from: EMERGENCY
+      to: NORMAL
+      condition: "emergency_active == false AND congestion_level <= 0.4"
+      safety_invariant: "all_signals_restored == true"
+    - from: EMERGENCY
+      to: CONGESTED
+      condition: "emergency_active == false AND congestion_level > 0.4"
+      safety_invariant: "all_signals_restored == true"
+
+  algorithms:
+    signal_optimization:
+      central: "adaptive_webster"
+      local: "fixed_cycle"
+
+  metrics:
+    - id: avg_wait_time
+      formula: "mean(intersection_wait_times)"
+      target: "<= 90s"
+    - id: throughput
+      formula: "sum(vehicles_passed) / observation_period"
+      target: ">= 1000"
+    - id: emergency_response_time
+      formula: "mean(emergency_clearance_times)"
+      target: "<= 30s"

@@ -1,0 +1,208 @@
+# C-SoS: Collaborative System of Systems — Autonomous Taxi Fleet
+#
+# Each taxi decides independently; a traffic center aggregates information
+# but does not issue commands.
+#
+#   decision_holder = TAXI[*] (each taxi decides for itself)
+#   sharing_mode    = road_status broadcast (peer-to-peer)
+#   central planner = aggregation_only (statistics, no commands)
+#   local planner   = LRA* + local conflict avoidance
+#
+# Regime transitions: NORMAL ↔ PEAK_DEMAND ↔ INCIDENT_RESPONSE
+
+sos:
+  name: "AutonomousTaxiFleet"
+  type: Collaborative
+  version: "1.0.0"
+  description: "Collaborative autonomous taxi fleet with decentralized decision-making"
+
+  context:
+    environment:
+      city_blocks: 100
+      num_taxis: 50
+      num_passengers: 200
+      road_segments: 500
+    assumptions:
+      - "V2V communication available within 200m"
+      - "each taxi has full local sensor suite"
+      - "road network is known to all taxis"
+
+  actors:
+    - id: "TAXI[1..N]"
+      role: "autonomous_driver"
+      autonomy: high
+      capabilities:
+        - plan_route_lra_star
+        - avoid_conflict_local
+        - pick_up_passenger
+        - navigate_to_destination
+        - broadcast_road_status
+      interface:
+        input: [ride_request, road_status_update, incident_alert]
+        output: [road_status_update, ride_offer, position_update]
+
+    - id: "PASSENGER[1..M]"
+      role: "ride_requester"
+      autonomy: medium
+      capabilities:
+        - request_ride
+        - rate_service
+      interface:
+        input: [ride_offer, eta_update]
+        output: [ride_request, rating]
+
+    - id: TRAFFIC_CENTER
+      role: "information_aggregator"
+      autonomy: low
+      capabilities:
+        - aggregate_road_status
+        - publish_traffic_summary
+        - detect_incidents
+      interface:
+        input: [position_update, road_status_update, incident_report]
+        output: [traffic_summary, incident_alert]
+
+  contracts:
+    - id: RIDE_SERVICE
+      parties:
+        - "TAXI[*]"
+        - "PASSENGER[*]"
+      assume:
+        - "TAXI[i].fuel > 10"
+        - "TAXI[i].is_available == true"
+      guarantee:
+        - "pickup_time <= 600s"
+        - "ride_fare <= estimated_fare * 1.3"
+      authority:
+        decision_scope: "ride_acceptance"
+        decision_holder: "TAXI[*]"
+        beta: 0.1
+        mode: "decentralized"
+      information:
+        alpha: 0.4
+        views:
+          "TAXI[*]": "local_map + nearby_requests + nearby_taxis"
+          "PASSENGER[*]": "eta + fare_estimate"
+        sharing:
+          - "TAXI[*] -> TAXI[*] : road_status_update"
+          - "TAXI[*] -> TRAFFIC_CENTER : position_update"
+          - "TRAFFIC_CENTER -> TAXI[*] : traffic_summary"
+      responsibilities:
+        "TAXI[*]":
+          - "accept_or_reject_ride()"
+          - "broadcast_road_status(period: 5s)"
+      incentives:
+        type: market_price
+        lambda: 0.3
+        rules:
+          - "reward(TAXI[i], fare) when ride_completed"
+          - "penalty(TAXI[i], -20) when ride_cancelled_mid_trip"
+      violation:
+        detect: "pickup_time > 600s OR ride_cancelled_mid_trip"
+        action: "notify(PASSENGER[i]) AND log_violation"
+        escalation: "after 5 violations: reduce_priority"
+
+    - id: ROAD_SHARING
+      parties:
+        - "TAXI[*]"
+        - TRAFFIC_CENTER
+      assume:
+        - "TAXI[i].sensors_operational == true"
+      guarantee:
+        - "road_status_accuracy >= 0.9"
+        - "status_update_interval <= 10s"
+      authority:
+        decision_holder: "TAXI[*]"
+        beta: 0.05
+      information:
+        alpha: 0.6
+        sharing:
+          - "TAXI[*] -> TRAFFIC_CENTER : road_status_update"
+          - "TRAFFIC_CENTER -> TAXI[*] : incident_alert"
+      incentives:
+        type: reputation
+        lambda: 0.2
+        rules:
+          - "reward(TAXI[i], 1) when accurate_status_report"
+
+  protocols:
+    - id: RIDE_MATCHING
+      trigger: "ride_requested_by(PASSENGER[i])"
+      precondition: "nearby_taxis_available > 0"
+      steps:
+        - "PASSENGER[i] -> TAXI[*] : ride_request"
+        - "TAXI[j] : plan_route_lra_star"
+        - "TAXI[j] -> PASSENGER[i] : ride_offer"
+        - "PASSENGER[i] -> TAXI[j] : ride_acceptance"
+      timing:
+        max_matching: 30s
+        max_total: 60s
+      fallback:
+        on_timeout: "PASSENGER[i] : retry_with_expanded_radius()"
+      postcondition: "ride_assigned_to_taxi"
+
+    - id: CONFLICT_RESOLUTION
+      trigger: "path_conflict_detected(TAXI[i], TAXI[j])"
+      steps:
+        - "TAXI[i] -> TAXI[j] : conflict_notification"
+        - "TAXI[i] : avoid_conflict_local"
+        - "TAXI[j] : avoid_conflict_local"
+      timing:
+        max_response: 500ms
+        max_total: 2s
+      fallback:
+        on_timeout: "TAXI[i] : yield_and_wait()"
+      postcondition: "no_collision_between(TAXI[i], TAXI[j])"
+
+    - id: INCIDENT_BROADCAST
+      trigger: "incident_detected_by(TAXI[i])"
+      steps:
+        - "TAXI[i] -> TRAFFIC_CENTER : incident_report"
+        - "TRAFFIC_CENTER : detect_incidents"
+        - "TRAFFIC_CENTER -> TAXI[*] : incident_alert"
+        - "TAXI[*] : plan_route_lra_star"
+      timing:
+        max_total: 10s
+      postcondition: "all_taxis_rerouted_around_incident"
+
+  algorithms:
+    routing:
+      central: "aggregation_only"
+      local: "LRA_star"
+    conflict_avoidance:
+      central: "none"
+      local: "local_conflict_avoidance"
+
+  transitions:
+    - from: NORMAL
+      to: PEAK_DEMAND
+      condition: "pending_requests > available_taxis * 1.5"
+      protocol: RIDE_MATCHING
+    - from: PEAK_DEMAND
+      to: NORMAL
+      condition: "pending_requests <= available_taxis"
+    - from: NORMAL
+      to: INCIDENT_RESPONSE
+      condition: "active_incidents > 0"
+      protocol: INCIDENT_BROADCAST
+    - from: PEAK_DEMAND
+      to: INCIDENT_RESPONSE
+      condition: "active_incidents > 0"
+      protocol: INCIDENT_BROADCAST
+    - from: INCIDENT_RESPONSE
+      to: NORMAL
+      condition: "active_incidents == 0"
+
+  metrics:
+    - id: avg_pickup_time
+      formula: "mean(pickup_times)"
+      target: "<= 300s"
+    - id: fleet_utilization
+      formula: "active_taxis / total_taxis"
+      target: ">= 0.6"
+    - id: conflict_rate
+      formula: "conflicts_per_hour / active_taxis"
+      target: "<= 0.5"
+    - id: passenger_satisfaction
+      formula: "mean(ratings)"
+      target: ">= 4.0"

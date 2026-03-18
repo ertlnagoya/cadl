@@ -34,10 +34,49 @@ def main(argv: list[str] | None = None) -> int:
                              help="Output format (default: text)")
 
     # codegen command
-    codegen_cmd = subparsers.add_parser("codegen", help="Generate Python runtime code from a CADL file")
+    codegen_cmd = subparsers.add_parser("codegen", help="Generate runtime code from a CADL file")
     codegen_cmd.add_argument("file", type=Path, help="CADL file to generate from")
+    codegen_cmd.add_argument("--target", "-t", choices=["python", "solidity", "opa"],
+                             default="python", help="Code generation target (default: python)")
     codegen_cmd.add_argument("--output", "-o", type=Path, default=Path("generated"),
                              help="Output directory (default: generated/)")
+
+    # regime-map command
+    regime_cmd = subparsers.add_parser("regime-map", help="Analyze regime transitions and build a regime map")
+    regime_cmd.add_argument("file", type=Path, help="CADL file to analyze")
+    regime_cmd.add_argument("--format", choices=["text", "dot", "json"], default="text",
+                             help="Output format (default: text)")
+    regime_cmd.add_argument("--output", "-o", type=Path, default=None,
+                             help="Save output to file")
+
+    # iec62853 command
+    iec_cmd = subparsers.add_parser("iec62853", help="Generate IEC 62853 compliance report")
+    iec_cmd.add_argument("file", type=Path, help="CADL file to analyze")
+    iec_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                         help="Output format (default: text)")
+    iec_cmd.add_argument("--output", "-o", type=Path, default=None,
+                         help="Save output to file")
+
+    # sim-validate command
+    sim_val_cmd = subparsers.add_parser("sim-validate",
+        help="Parse CADL, lower to simulator IR, and validate")
+    sim_val_cmd.add_argument("file", type=Path, help="CADL file to validate")
+
+    # sim-ir command
+    sim_ir_cmd = subparsers.add_parser("sim-ir",
+        help="Print the 3-layer simulator IR for a CADL file")
+    sim_ir_cmd.add_argument("file", type=Path, help="CADL file to lower")
+    sim_ir_cmd.add_argument("--format", choices=["yaml", "json"], default="yaml",
+                            help="Output format (default: yaml)")
+
+    # sim-gen command
+    sim_gen_cmd = subparsers.add_parser("sim-gen",
+        help="Generate simulator config from a CADL file")
+    sim_gen_cmd.add_argument("file", type=Path, help="CADL file to generate from")
+    sim_gen_cmd.add_argument("--target", "-t", choices=["python", "unity", "go"],
+                             required=True, help="Simulator target")
+    sim_gen_cmd.add_argument("--output", "-o", type=Path, default=None,
+                             help="Output file (default: stdout)")
 
     # ai command
     ai_cmd = subparsers.add_parser("ai", help="Generate CADL from natural language description")
@@ -66,6 +105,16 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_verify(args)
     elif args.command == "codegen":
         return _cmd_codegen(args)
+    elif args.command == "regime-map":
+        return _cmd_regime_map(args)
+    elif args.command == "iec62853":
+        return _cmd_iec62853(args)
+    elif args.command == "sim-validate":
+        return _cmd_sim_validate(args)
+    elif args.command == "sim-ir":
+        return _cmd_sim_ir(args)
+    elif args.command == "sim-gen":
+        return _cmd_sim_gen(args)
     elif args.command == "ai":
         return _cmd_ai(args)
 
@@ -263,19 +312,246 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
         return 1
 
     # Generate
+    target = args.target
     output_dir = args.output
     try:
-        generate(sos, output_dir)
+        generate(sos, output_dir, target=target)
     except Exception as e:
         print(f"Code generation error: {e}", file=sys.stderr)
         return 1
 
-    print(f"Code generated: {output_dir}/")
+    print(f"Code generated ({target}): {output_dir}/")
     print(f"  SoS: {sos.name}")
     print(f"  Actors: {len(sos.actors)}")
     print(f"  Contracts: {len(sos.contracts)}")
     print(f"  Protocols: {len(sos.protocols)}")
-    print(f"  Metrics: {len(sos.metrics)}")
+    if target == "python":
+        print(f"  Metrics: {len(sos.metrics)}")
+    return 0
+
+
+def _cmd_regime_map(args: argparse.Namespace) -> int:
+    import json as json_mod
+    from .parser import parse_file
+    from .regime_map import RegimeMap
+
+    path = args.file
+    if not path.exists():
+        print(f"Error: File not found: {path}", file=sys.stderr)
+        return 1
+
+    try:
+        sos = parse_file(path)
+    except Exception as e:
+        print(f"Parse error: {e}", file=sys.stderr)
+        return 1
+
+    rm = RegimeMap.from_sos(sos)
+
+    if not rm.states:
+        print("No transitions defined in this CADL file.", file=sys.stderr)
+        return 0
+
+    if args.format == "dot":
+        output = rm.to_dot()
+    elif args.format == "json":
+        output = json_mod.dumps(rm.to_json(), indent=2, ensure_ascii=False)
+    else:
+        output = rm.to_text()
+
+    if args.output:
+        args.output.write_text(output, encoding="utf-8")
+        print(f"Saved to: {args.output}", file=sys.stderr)
+    else:
+        print(output)
+
+    return 0
+
+
+def _cmd_iec62853(args: argparse.Namespace) -> int:
+    import json as json_mod
+    from .parser import parse_file
+    from .iec62853 import generate_iec62853_report
+
+    path = args.file
+    if not path.exists():
+        print(f"Error: File not found: {path}", file=sys.stderr)
+        return 1
+
+    try:
+        sos = parse_file(path)
+    except Exception as e:
+        print(f"Parse error: {e}", file=sys.stderr)
+        return 1
+
+    report = generate_iec62853_report(sos)
+
+    if args.format == "json":
+        output = json_mod.dumps(report, indent=2, ensure_ascii=False)
+    else:
+        output = _format_iec62853_text(report)
+
+    if args.output:
+        args.output.write_text(output, encoding="utf-8")
+        print(f"Saved to: {args.output}", file=sys.stderr)
+    else:
+        print(output)
+
+    return 0
+
+
+def _format_iec62853_text(report: dict) -> str:
+    lines = []
+    lines.append(f"IEC 62853 Compliance Report: {report['sos_name']}")
+    lines.append("=" * 60)
+    lines.append("")
+
+    lines.append(f"System Integration Level: {report['system_integration_level']}")
+    lines.append(f"SoS Type: {report['sos_type']}")
+    lines.append("")
+
+    lines.append("--- Institutional Parameters ---")
+    for param in report.get("institutional_parameters", []):
+        lines.append(f"  {param['cadl_concept']}: {param['value']}")
+        lines.append(f"    IEC 62853: {param['iec62853_concept']}")
+    lines.append("")
+
+    lines.append("--- Service Level Agreements ---")
+    for sla in report.get("service_level_agreements", []):
+        lines.append(f"  {sla['contract_id']}:")
+        lines.append(f"    Assumptions: {sla['assumption_count']}")
+        lines.append(f"    Guarantees: {sla['guarantee_count']}")
+        if sla.get("failure_response"):
+            lines.append(f"    Failure Response: {sla['failure_response']}")
+    lines.append("")
+
+    if report.get("operational_state_machine"):
+        lines.append("--- Operational State Machine ---")
+        osm = report["operational_state_machine"]
+        lines.append(f"  States: {osm['state_count']}")
+        lines.append(f"  Transitions: {osm['transition_count']}")
+        if osm.get("initial_state"):
+            lines.append(f"  Initial State: {osm['initial_state']}")
+        lines.append("")
+
+    lines.append("--- Dependability Summary ---")
+    dep = report.get("dependability_summary", {})
+    lines.append(f"  Total Contracts: {dep.get('total_contracts', 0)}")
+    lines.append(f"  Total Actors: {dep.get('total_actors', 0)}")
+    lines.append(f"  Governance Index (avg beta): {dep.get('governance_index', 'N/A')}")
+    lines.append(f"  Transparency Level (avg alpha): {dep.get('transparency_level', 'N/A')}")
+    lines.append(f"  Alignment Metric (avg lambda): {dep.get('alignment_metric', 'N/A')}")
+
+    return "\n".join(lines)
+
+
+def _cmd_sim_validate(args: argparse.Namespace) -> int:
+    from .parser import parse_file
+    from .sim import lower_to_ir, validate_ir
+
+    path = args.file
+    if not path.exists():
+        print(f"Error: File not found: {path}", file=sys.stderr)
+        return 1
+
+    try:
+        sos = parse_file(path)
+    except Exception as e:
+        print(f"Parse error: {e}", file=sys.stderr)
+        return 1
+
+    ir = lower_to_ir(sos)
+    errors = validate_ir(ir)
+
+    if errors:
+        print(f"Validation FAILED for {path}:")
+        for err in errors:
+            print(f"  - {err}")
+        return 1
+    else:
+        print(f"Validation OK: {path}")
+        print(f"  SoS: {ir.name} ({ir.sos_type})")
+        print(f"  Actors: {len(ir.institution.actors)}")
+        print(f"  Contracts: {len(ir.institution.contracts)}")
+        print(f"  Protocols: {len(ir.protocol.protocols)}")
+        print(f"  Algorithms: {len(ir.algorithm.algorithms)}")
+        print(f"  Transitions: {len(ir.transitions)}")
+        return 0
+
+
+def _cmd_sim_ir(args: argparse.Namespace) -> int:
+    from .parser import parse_file
+    from .sim import lower_to_ir
+    from .sim.ir import SimIR
+
+    path = args.file
+    if not path.exists():
+        print(f"Error: File not found: {path}", file=sys.stderr)
+        return 1
+
+    try:
+        sos = parse_file(path)
+    except Exception as e:
+        print(f"Parse error: {e}", file=sys.stderr)
+        return 1
+
+    ir = lower_to_ir(sos)
+
+    if args.format == "json":
+        import json
+        print(json.dumps(_ir_to_dict(ir), indent=2, ensure_ascii=False))
+    else:
+        import yaml
+        print(yaml.dump(_ir_to_dict(ir), default_flow_style=False,
+                        sort_keys=False, allow_unicode=True))
+
+    return 0
+
+
+def _ir_to_dict(ir) -> dict:
+    """Serialize SimIR to a plain dict for YAML/JSON output."""
+    from dataclasses import asdict
+    d = asdict(ir)
+    # Rename lambda_ back to lambda for readability
+    for c in d.get("institution", {}).get("contracts", []):
+        gov = c.get("governance", {})
+        if "lambda_" in gov:
+            gov["lambda"] = gov.pop("lambda_")
+    return d
+
+
+def _cmd_sim_gen(args: argparse.Namespace) -> int:
+    from .parser import parse_file
+    from .sim import lower_to_ir, validate_ir, generate_config
+
+    path = args.file
+    if not path.exists():
+        print(f"Error: File not found: {path}", file=sys.stderr)
+        return 1
+
+    try:
+        sos = parse_file(path)
+    except Exception as e:
+        print(f"Parse error: {e}", file=sys.stderr)
+        return 1
+
+    ir = lower_to_ir(sos)
+    errors = validate_ir(ir)
+    if errors:
+        print(f"Validation errors:", file=sys.stderr)
+        for err in errors:
+            print(f"  - {err}", file=sys.stderr)
+        return 1
+
+    config_str = generate_config(ir, args.target)
+
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(config_str, encoding="utf-8")
+        print(f"Generated {args.target} config: {args.output}")
+    else:
+        print(config_str)
+
     return 0
 
 

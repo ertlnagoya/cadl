@@ -435,6 +435,114 @@ def _check_guarantee_entailment(contract: ContractDef) -> VerificationResult:
     )
 
 
+def _check_regime_reachability(sos: SoSDefinition) -> List[VerificationResult]:
+    """Check that all regime states are reachable from the initial state."""
+    from .regime_map import RegimeMap
+
+    rm = RegimeMap.from_sos(sos)
+    results: List[VerificationResult] = []
+
+    if not rm.states:
+        return results
+
+    unreachable = rm.find_unreachable_states()
+    if unreachable:
+        results.append(VerificationResult(
+            check_name="Regime reachability",
+            status="failed",
+            message=f"Unreachable states: {', '.join(sorted(unreachable))}",
+        ))
+    else:
+        results.append(VerificationResult(
+            check_name="Regime reachability",
+            status="passed",
+            message="All states reachable from initial state",
+        ))
+
+    return results
+
+
+def _check_regime_dead_states(sos: SoSDefinition) -> List[VerificationResult]:
+    """Check for dead-end states with no outgoing transitions."""
+    from .regime_map import RegimeMap
+
+    rm = RegimeMap.from_sos(sos)
+    results: List[VerificationResult] = []
+
+    if not rm.states:
+        return results
+
+    dead = rm.find_dead_states()
+    if dead:
+        results.append(VerificationResult(
+            check_name="Regime dead states",
+            status="failed",
+            message=f"Dead-end states (no outgoing transitions): {', '.join(sorted(dead))}",
+        ))
+    else:
+        results.append(VerificationResult(
+            check_name="Regime dead states",
+            status="passed",
+            message="No dead-end states",
+        ))
+
+    return results
+
+
+def _check_regime_safety_invariants(sos: SoSDefinition) -> List[VerificationResult]:
+    """Check that transition safety invariants are satisfiable."""
+    results: List[VerificationResult] = []
+
+    for t in sos.transitions:
+        if not t.safety_invariant:
+            continue
+
+        check_name = f"Safety invariant: {t.from_regime}->{t.to_regime}"
+        ctx = Z3Context()
+        solver = z3.Solver()
+        solver.set("timeout", 5000)
+
+        try:
+            inv = _parse_condition(t.safety_invariant, ctx)
+            solver.add(inv)
+
+            # Also add transition condition if present
+            if t.condition:
+                try:
+                    cond = _parse_condition(t.condition, ctx)
+                    solver.add(cond)
+                except Exception:
+                    pass
+
+            result = solver.check()
+            if result == z3.sat:
+                results.append(VerificationResult(
+                    check_name=check_name,
+                    status="passed",
+                    message="Safety invariant is satisfiable with transition condition",
+                ))
+            elif result == z3.unsat:
+                results.append(VerificationResult(
+                    check_name=check_name,
+                    status="failed",
+                    message="Safety invariant is unsatisfiable (contradicts transition condition)",
+                ))
+            else:
+                results.append(VerificationResult(
+                    check_name=check_name,
+                    status="unknown",
+                    message="Could not determine satisfiability",
+                ))
+        except Exception:
+            results.append(VerificationResult(
+                check_name=check_name,
+                status="unknown",
+                message="Could not parse safety invariant expression",
+            ))
+
+    return results
+
+
 def verify(sos: SoSDefinition) -> List[VerificationResult]:
     """Run all SMT verification checks on a CADL SoS definition.
 
@@ -459,5 +567,11 @@ def verify(sos: SoSDefinition) -> List[VerificationResult]:
 
     # 3. Check transition condition mutual exclusivity
     results.extend(_check_transition_exclusivity(sos))
+
+    # 4. Regime map analysis (if transitions exist)
+    if sos.transitions:
+        results.extend(_check_regime_reachability(sos))
+        results.extend(_check_regime_dead_states(sos))
+        results.extend(_check_regime_safety_invariants(sos))
 
     return results

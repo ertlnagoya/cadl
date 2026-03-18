@@ -1,0 +1,192 @@
+# A-SoS: Acknowledged System of Systems — MAPF Robot Delivery
+#
+# Central dispatcher holds decision authority; robots obey but retain
+# autonomy for local obstacle avoidance.
+#
+#   decision_holder = DISPATCHER (central authority)
+#   sharing_mode    = uplink (robots → dispatcher) + broadcast (dispatcher → robots)
+#   central planner = ECBS (Enhanced Conflict-Based Search)
+#   local planner   = tracking_only (follow assigned path)
+#
+# Regime transitions: NORMAL ↔ CONGESTED ↔ EMERGENCY
+
+sos:
+  name: "MAPFRobotDelivery"
+  type: Acknowledged
+  version: "1.0.0"
+  description: "MAPF-based multi-robot delivery with central coordination"
+
+  context:
+    environment:
+      grid_size: 30
+      num_robots: 10
+      num_customers: 20
+      time_step_ms: 100
+    assumptions:
+      - "grid map is static"
+      - "communication is reliable within the warehouse"
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities:
+        - compute_routes_ecbs
+        - assign_tasks
+        - monitor_fleet
+      interface:
+        input: [position_report, task_completion, failure_report]
+        output: [route_assignment, task_assignment, replan_command]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities:
+        - follow_path
+        - detect_obstacle
+        - pick_up
+        - deliver
+      interface:
+        input: [route_assignment, task_assignment, replan_command]
+        output: [position_report, task_completion, failure_report]
+
+    - id: "CUSTOMER[1..M]"
+      role: "service_requester"
+      autonomy: medium
+      capabilities:
+        - submit_order
+        - confirm_receipt
+      interface:
+        input: [delivery_notification]
+        output: [delivery_request]
+
+  contracts:
+    - id: DELIVERY_SLA
+      parties:
+        - DISPATCHER
+        - "ROBOT[*]"
+        - "CUSTOMER[*]"
+      assume:
+        - "DISPATCHER.is_operational == true"
+        - "ROBOT[i].battery > 20"
+      guarantee:
+        - "delivery_time <= 300s"
+        - "all_routes_conflict_free()"
+      authority:
+        decision_scope: "route_and_task_assignment"
+        decision_holder: DISPATCHER
+        beta: 0.8
+        mode: "centralized"
+      information:
+        alpha: 0.9
+        views:
+          DISPATCHER: "global_grid + all_positions + all_tasks"
+          "ROBOT[*]": "assigned_route + local_3x3_grid"
+          "CUSTOMER[*]": "order_status"
+        sharing:
+          - "ROBOT[*] -> DISPATCHER : position_report"
+          - "DISPATCHER -> ROBOT[*] : route_assignment"
+          - "DISPATCHER -> CUSTOMER[*] : delivery_notification"
+      incentives:
+        type: task_completion
+        lambda: 0.5
+        rules:
+          - "reward(ROBOT[i], 10) when on_time_delivery"
+          - "penalty(ROBOT[i], -5) when path_deviation"
+      violation:
+        detect: "path_deviation > 2 OR position_report_delay > 5s"
+        action: "notify(DISPATCHER) AND log_violation"
+        escalation: "after 3 violations: reassign_tasks"
+
+    - id: FLEET_SAFETY
+      parties:
+        - DISPATCHER
+        - "ROBOT[*]"
+      assume:
+        - "DISPATCHER.planner_running == true"
+      guarantee:
+        - "collision_count == 0"
+        - "deadlock_count == 0"
+      authority:
+        decision_holder: DISPATCHER
+        beta: 0.9
+      information:
+        alpha: 0.9
+        sharing:
+          - "ROBOT[*] -> DISPATCHER : position_report"
+
+  protocols:
+    - id: TASK_DISPATCH
+      trigger: "new_delivery_request(CUSTOMER[i])"
+      precondition: "DISPATCHER.is_operational"
+      steps:
+        - "CUSTOMER[i] -> DISPATCHER : delivery_request"
+        - "DISPATCHER : assign_tasks"
+        - "DISPATCHER : compute_routes_ecbs"
+        - "DISPATCHER -> ROBOT[i] : route_assignment"
+        - "DISPATCHER -> CUSTOMER[i] : delivery_notification"
+      timing:
+        max_planning: 2s
+        max_total: 5s
+      fallback:
+        on_timeout: "DISPATCHER : use_cached_route()"
+      postcondition: "task_assigned_to_robot"
+
+    - id: OBSTACLE_REPLAN
+      trigger: "obstacle_detected_by(ROBOT[i])"
+      steps:
+        - "ROBOT[i] -> DISPATCHER : failure_report"
+        - "DISPATCHER : compute_routes_ecbs"
+        - "DISPATCHER -> ROBOT[*] : replan_command"
+      timing:
+        max_response: 200ms
+        max_total: 1s
+      fallback:
+        on_timeout: "ROBOT[i] : wait_in_place()"
+      postcondition: "all_routes_conflict_free()"
+
+    - id: EMERGENCY_STOP
+      trigger: "collision_imminent(ROBOT[i])"
+      steps:
+        - "ROBOT[i] : execute_emergency_stop()"
+        - "ROBOT[i] -> DISPATCHER : failure_report"
+      timing:
+        max_response: 50ms
+
+  algorithms:
+    pathfinding:
+      central: "ECBS"
+      local: "tracking_only"
+    task_allocation:
+      central: "hungarian_method"
+      local: "none"
+
+  transitions:
+    - from: NORMAL
+      to: CONGESTED
+      condition: "active_tasks > capacity * 0.8"
+      protocol: TASK_DISPATCH
+    - from: CONGESTED
+      to: NORMAL
+      condition: "active_tasks <= capacity * 0.5"
+    - from: CONGESTED
+      to: EMERGENCY
+      condition: "collision_risk > 0.3"
+      protocol: EMERGENCY_STOP
+    - from: EMERGENCY
+      to: CONGESTED
+      condition: "collision_risk <= 0.1"
+
+  metrics:
+    - id: makespan
+      formula: "max(completion_times)"
+      target: "<= 600s"
+    - id: sum_of_costs
+      formula: "sum(path_lengths)"
+      target: "<= optimal * 1.5"
+    - id: collision_rate
+      formula: "collision_count / total_steps"
+      target: "== 0"
+    - id: throughput
+      formula: "completed_deliveries / elapsed_time"
+      target: ">= 2 per minute"

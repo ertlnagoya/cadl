@@ -87,6 +87,16 @@ sos:
       timing:
         max_total: 500ms
       postcondition: "all_routes_conflict_free()"
+
+  transitions:
+    - from: IDLE
+      to: ACTIVE
+      condition: "delivery_request_pending == true"
+      safety_invariant: "all_routes_conflict_free()"
+    - from: ACTIVE
+      to: IDLE
+      condition: "all_deliveries_complete == true"
+      safety_invariant: "all_robots_at_base == true"
 ```
 
 ## インストール
@@ -109,14 +119,25 @@ cadl parse examples/robot_delivery.cadl
 # パース＋型検査を実行
 cadl check examples/robot_delivery.cadl
 
-# ASTを出力
-cadl parse examples/robot_delivery.cadl --ast
-
 # 全検証（型検査 + SMT検証 + デッドロック検出）
 cadl verify examples/robot_delivery.cadl
 
-# 検証済みCADL定義からPythonランタイムコードを生成
+# Pythonランタイムコードを生成
 cadl codegen examples/robot_delivery.cadl -o /tmp/robot_delivery
+
+# Solidityスマートコントラクトを生成
+cadl codegen examples/robot_delivery.cadl --target solidity -o /tmp/solidity_out
+
+# OPA/Regoポリシーを生成
+cadl codegen examples/robot_delivery.cadl --target opa -o /tmp/rego_out
+
+# レジーム遷移を分析
+cadl regime-map examples/smart_city_traffic.cadl
+cadl regime-map examples/smart_city_traffic.cadl --format dot -o regime.dot
+
+# IEC 62853準拠レポートを生成
+cadl iec62853 examples/robot_delivery.cadl
+cadl iec62853 examples/smart_city_traffic.cadl --format json
 
 # 自然言語からCADLを生成（ANTHROPIC_API_KEYが必要）
 cadl ai "5台の自律ドローンが農地を測量するシステム。地上局が統括する。"
@@ -145,26 +166,21 @@ CADL処理系は標準的なコンパイラパイプラインに従います：
           v
     [検証済みAST]
           |
-    +-----+-----+-----------+
-    v           v           v
-  SMT検証    コード生成   ランタイム監視
-  (Z3)     (codegen/)   (ai/)
+    +-----+-----+-----------+-----------+
+    v           v           v           v
+  SMT検証    コード生成   レジーム    IEC 62853
+  (Z3)      (codegen/)   マップ     準拠検査
+              |
+        +-----+-----+
+        v     v     v
+     Python Solidity OPA/Rego
 ```
 
-### AI統合（Phase 4）
+### コード生成（Phase 3 + Phase 6）
 
-`cadl ai` は自然言語の記述からClaude APIを用いてCADL定義を生成します：
+`cadl codegen` は検証済みCADL定義から実行可能なコードを生成します。3つのターゲットに対応：
 
-1. ユーザが自然言語（日本語・英語対応）でSoSを記述
-2. Claudeがfew-shot例を参考にCADL定義を生成
-3. 生成されたCADLをパース・型検査
-4. バリデーションエラー時はエラーフィードバック付きでリトライ
-
-`ANTHROPIC_API_KEY`環境変数の設定と `pip install cadl[ai]` が必要です。
-
-### コード生成（Phase 3）
-
-`cadl codegen` は検証済みCADL定義からPythonパッケージを生成します：
+**Python** (`--target python`, デフォルト):
 
 | 生成モジュール | 内容 |
 |---|---|
@@ -177,6 +193,110 @@ CADL処理系は標準的なコンパイラパイプラインに従います：
 
 生成コードは `cadl.codegen.runtime_support` の基底クラスを継承します。
 
+**Solidity** (`--target solidity`):
+
+Ethereumスマートコントラクト（`.sol`）を生成：
+- 各CADL `ContractDef` に対応するコントラクト（`checkAssumptions()`, `checkGuarantees()`, `runMonitorCycle()`）
+- `RegimeController.sol` — enum型ベースのレジーム状態機械
+- メインオーケストレータコントラクト
+- 制度パラメータ（alpha, beta, lambda）をスケーリングされた `uint256` 定数として定義
+
+**OPA/Rego** (`--target opa`):
+
+Open Policy Agentポリシー（`.rego`）を生成：
+- 各CADL `ContractDef` に対応するRegoパッケージ（`assumptions_hold`, `guarantees_hold`, `allow`, `violation` ルール）
+- 全契約を集約するメインポリシーパッケージ
+- 情報共有・権限ポリシールール
+
+### レジーム遷移（Phase 5）
+
+`cadl regime-map` はレジーム遷移グラフを分析します：
+
+- `transitions:` 定義からレジーム状態の有向グラフを構築
+- **到達可能性分析** — 初期状態からのBFS探索で到達不能なレジームを検出
+- **デッドステート検出** — 出力遷移のない状態を特定
+- **サイクル検出** — TarjanのSCCアルゴリズムによる循環レジームパターンの検出
+- **最短経路** — 任意の2レジーム間のBFSベース最短経路
+- **出力形式**: テキスト要約、Graphviz DOT、JSON
+
+### IEC 62853準拠検査（Phase 6）
+
+`cadl iec62853` はCADL構成要素をIEC 62853オープンシステムディペンダビリティの概念にマッピングします：
+
+| CADL概念 | IEC 62853概念 |
+|---|---|
+| alpha（情報共有度） | 情報透明性レベル |
+| beta（権限集中度） | ガバナンス集中度指標 |
+| lambda（インセンティブ整合度） | ステークホルダ整合性メトリクス |
+| ContractDef | サービスレベル合意（SLA） |
+| ViolationBlock | 障害応答仕様 |
+| TransitionDef | 運用状態機械 |
+| SoSタイプ（D/A/C/V） | システム統合レベル |
+
+### シミュレータ設定生成（Phase 7）
+
+`cadl sim-*` コマンドはCADL定義を**3層中間表現（IR）**にローワリングし、シミュレータ固有の設定ファイルを生成します：
+
+```
+CADL YAML ─── パーサ ──► AST ─── ローワリング ──► 3層IR ─── ジェネレータ ──► シミュレータ設定
+                                                    │
+                                       ┌────────────┼────────────┐
+                                       ▼            ▼            ▼
+                                   Layer 1       Layer 2       Layer 3
+                                  制度/          プロトコル/    アルゴリズム/
+                                  ガバナンス      インタラクション  オペレーション
+```
+
+| レイヤ | 研究上の関心 | IR型 | 例 |
+|---|---|---|---|
+| Layer 1: 制度 | 誰が決定？ 誰が知る？ 誰が利益を得る？ | `ActorSpec`, `ContractSpec`, `GovernanceParams` | beta=0.8 → DISPATCHERが権限を持つ |
+| Layer 2: プロトコル | どう相互作用？ タイムアウト時は？ | `ProtocolSpec`, `StepSpec` | メッセージ: ROBOT→DISPATCHER : failure_report |
+| Layer 3: アルゴリズム | 中央 vs 局所で何が動く？ | `AlgorithmSpec` | central=ECBS, local=tracking_only |
+
+3種のシミュレータターゲット：
+
+| ターゲット | 形式 | キー規約 | 用途 |
+|---|---|---|---|
+| `python` | YAML | snake_case、プランナ紐付け | Python系MAPF/MASシミュレータ |
+| `unity` | JSON | camelCase、Prefabヒント | Unity3D可視化 |
+| `go` | JSON | snake_case、インタフェース仕様 | Go並行シミュレータ |
+
+```bash
+# IRを検証
+cadl sim-validate examples/a_sos_robot_delivery.cadl
+
+# IRを出力（YAML/JSON）
+cadl sim-ir examples/a_sos_robot_delivery.cadl
+cadl sim-ir examples/c_sos_taxi_fleet.cadl --format json
+
+# シミュレータ設定を生成
+cadl sim-gen examples/a_sos_robot_delivery.cadl --target python -o sim_config.yaml
+cadl sim-gen examples/a_sos_robot_delivery.cadl --target unity -o sim_config.json
+cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
+```
+
+#### A-SoS vs C-SoS の比較
+
+| 特性 | A-SoS（ロボット配送） | C-SoS（タクシー群） |
+|---|---|---|
+| SoSタイプ | 認知型（Acknowledged） | 協調型（Collaborative） |
+| 意思決定権限 | DISPATCHER（中央集権） | TAXI[*]（各タクシーが自律決定） |
+| beta | 0.8（集中型） | 0.1（分散型） |
+| 中央プランナ | ECBS | aggregation_only |
+| 局所プランナ | tracking_only | LRA* + 局所衝突回避 |
+| 共有方式 | アップリンク + ブロードキャスト | ピアツーピア ブロードキャスト |
+
+### AI統合（Phase 4）
+
+`cadl ai` は自然言語の記述からClaude APIを用いてCADL定義を生成します：
+
+1. ユーザが自然言語（日本語・英語対応）でSoSを記述
+2. Claudeがfew-shot例を参考にCADL定義を生成
+3. 生成されたCADLをパース・型検査
+4. バリデーションエラー時はエラーフィードバック付きでリトライ
+
+`ANTHROPIC_API_KEY`環境変数の設定と `pip install cadl[ai]` が必要です。
+
 ### 型検査の内容（Phase 1）
 
 型検査器は以下の5項目を検証します：
@@ -186,6 +306,35 @@ CADL処理系は標準的なコンパイラパイプラインに従います：
 3. **プロトコルステップの妥当性** — 送信者・受信者がアクター定義と一致すること
 4. **情報共有の整合性** — 共有宣言が有効なアクターを参照していること
 5. **パラメータ値域制約** — `0 <= alpha, beta, lambda <= 1`
+
+## サンプル
+
+### CADL定義ファイル
+
+| ファイル | 概要 | SoSタイプ | 主な特徴 |
+|---|---|---|---|
+| `robot_delivery.cadl` | 自律配送ロボット群 | 認知型 | 経路調整、障害時再計画、2レジーム遷移 |
+| `smart_city_traffic.cadl` | 交通信号制御 | 協調型 | 3レジーム遷移（通常/渋滞/緊急）、緊急車両優先 |
+| `supply_chain.cadl` | 製造サプライチェーン | 協調型 | 4アクター連鎖、品質リコール、5レジーム遷移 |
+| `iot_data_sharing.cadl` | IoTセンサデータ共有 | 仮想型 | データ鮮度契約、プライバシーポリシー、異常検知 |
+| `household_chores.cadl` | 家庭内家事分担 | 協調型 | 人間中心設計、金銭的インセンティブ、紛争解決 |
+| `a_sos_robot_delivery.cadl` | MAPF配送ロボット（A-SoS） | 認知型 | 中央ECBSプランナ、3レジーム遷移、安全保証 |
+| `c_sos_taxi_fleet.cadl` | 自律タクシー群（C-SoS） | 協調型 | 分散LRA*、ピア衝突解決、5レジーム遷移 |
+
+### デモスクリプト
+
+デモスクリプトを実行すると、ツールチェーン全体の動作を確認できます：
+
+```bash
+# エンドツーエンドワークフロー: パース -> 検証 -> コード生成(Python/Solidity/Rego) -> レジームマップ -> IEC 62853
+python examples/demo_robot_delivery.py
+
+# レジーム遷移分析、準拠検査、マルチターゲット生成
+python examples/demo_smart_city.py
+
+# Python / Solidity / Rego出力の比較
+python examples/demo_codegen_targets.py
+```
 
 ## プロジェクト構成
 
@@ -198,9 +347,11 @@ src/cadl/
   type_checker.py      静的意味検査
   verifier.py          SMTベース契約検証（Z3）
   deadlock.py          プロトコルデッドロック検出
+  regime_map.py        レジーム遷移グラフ分析
+  iec62853.py          IEC 62853準拠マッピング
   cli.py               コマンドラインインタフェース
   codegen/
-    __init__.py        公開generate() API
+    __init__.py        公開generate() API（マルチターゲット対応）
     runtime_support.py 生成コード用基底クラス
     expr_compiler.py   式AST → Pythonソース変換
     emitter.py         コード出力ユーティリティ
@@ -210,23 +361,52 @@ src/cadl/
     transition_gen.py  レジームコントローラ生成
     metric_gen.py      評価指標コレクタ生成
     runtime_gen.py     オーケストレータ生成
+    solidity/
+      solidity_expr.py 式AST → Solidityソース変換
+      solidity_gen.py  Solidityスマートコントラクト生成
+    opa/
+      rego_expr.py     式AST → Regoソース変換
+      rego_gen.py      OPA/Regoポリシー生成
   ai/
     __init__.py        公開generate_cadl() API
     prompts.py         システムプロンプト・few-shot例
     llm_client.py      Claude APIクライアント
     nl_to_cadl.py      自然言語→CADL生成パイプライン
+  sim/
+    __init__.py        公開API: lower_to_ir, validate_ir, generate_config
+    ir.py              3層IR dataclass定義（SimIR, InstitutionLayer等）
+    lower.py           AST → IRローワリング
+    validate.py        IR検証
+    gen_python.py      IR → Pythonシミュレータ設定（YAML）
+    gen_unity.py       IR → Unityシミュレータ設定（JSON）
+    gen_go.py          IR → Goシミュレータ設定（JSON）
 
 tests/
-  test_parser.py       パーサのテスト
-  test_type_checker.py 型検査のテスト
-  test_verifier.py     SMT検証のテスト
-  test_deadlock.py     デッドロック検出のテスト
-  test_codegen.py      コード生成のテスト
-  test_ai.py           AI統合のテスト
+  test_parser.py         パーサのテスト
+  test_type_checker.py   型検査のテスト
+  test_verifier.py       SMT検証のテスト
+  test_deadlock.py       デッドロック検出のテスト
+  test_codegen.py        Pythonコード生成のテスト
+  test_ai.py             AI統合のテスト
+  test_runtime.py        ランタイム基底クラスのテスト
+  test_regime_map.py     レジームマップ分析のテスト
+  test_solidity_gen.py   Solidityコード生成のテスト
+  test_opa_gen.py        OPA/Regoコード生成のテスト
+  test_iec62853.py       IEC 62853準拠マッピングのテスト
+  test_sim_ir.py         シミュレータIRローワリング・検証のテスト
+  test_sim_gen.py        シミュレータ設定ジェネレータのテスト
 
 examples/
-  robot_delivery.cadl      ロボット配送SoS（認知型）
-  household_chores.cadl    家庭内家事分担（協調型）
+  robot_delivery.cadl        ロボット配送SoS（認知型）
+  smart_city_traffic.cadl    スマートシティ交通制御（協調型）
+  supply_chain.cadl          サプライチェーン管理（協調型）
+  iot_data_sharing.cadl      IoTデータ共有（仮想型）
+  household_chores.cadl      家庭内家事分担（協調型）
+  demo_robot_delivery.py     エンドツーエンドワークフローデモ
+  demo_smart_city.py         レジームマップ・IEC 62853デモ
+  demo_codegen_targets.py    マルチターゲットコード生成デモ
+  a_sos_robot_delivery.cadl  A-SoS MAPFロボット配送サンプル
+  c_sos_taxi_fleet.cadl      C-SoS 自律タクシー群サンプル
 ```
 
 ## 実装ロードマップ
@@ -237,8 +417,9 @@ examples/
 | Phase 2 | 検証エンジン（SMTベース無矛盾性検証、デッドロック検出） | 完了 |
 | Phase 3 | ランタイム・コード生成（Python） | 完了 |
 | Phase 4 | AI統合（Claude APIによる自然言語→CADL変換） | 完了 |
-| Phase 5 | 制度遷移・レジームマップ構築 | 計画中 |
-| Phase 6 | IEC 62853連携・スマートコントラクト生成 | 計画中 |
+| Phase 5 | 制度遷移・レジームマップ構築 | 完了 |
+| Phase 6 | IEC 62853連携・スマートコントラクト生成（Solidity, OPA/Rego） | 完了 |
+| Phase 7 | シミュレータIR・設定生成（Python, Unity, Go） | 完了 |
 
 ## 参考文献
 

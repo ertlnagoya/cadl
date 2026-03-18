@@ -256,11 +256,49 @@ class TypeChecker:
 
     def _check_transitions(self, sos: SoSDefinition) -> None:
         """Check transition definitions."""
+        regime_names: set[str] = set()
         for trans in sos.transitions:
+            regime_names.add(trans.from_regime)
+            regime_names.add(trans.to_regime)
+
             if trans.protocol and trans.protocol not in self.protocol_ids:
                 self.result.add_warning(
                     f"Transition references undefined protocol '{trans.protocol}'",
                     trans.loc,
+                )
+
+            # Validate condition expression is parseable
+            if trans.condition:
+                try:
+                    from .parser import parse_expr
+                    parse_expr(trans.condition)
+                except Exception:
+                    self.result.add_warning(
+                        f"Transition {trans.from_regime}->{trans.to_regime} condition "
+                        f"is not a valid expression: {trans.condition}",
+                        trans.loc,
+                    )
+
+            # Validate safety_invariant expression is parseable
+            if trans.safety_invariant:
+                try:
+                    from .parser import parse_expr
+                    parse_expr(trans.safety_invariant)
+                except Exception:
+                    self.result.add_warning(
+                        f"Transition {trans.from_regime}->{trans.to_regime} safety_invariant "
+                        f"is not a valid expression: {trans.safety_invariant}",
+                        trans.loc,
+                    )
+
+        # Check for orphan regimes (from_regime that is never a to_regime and vice versa)
+        from_regimes = {t.from_regime for t in sos.transitions}
+        to_regimes = {t.to_regime for t in sos.transitions}
+        only_targets = to_regimes - from_regimes
+        if only_targets and len(regime_names) > 1:
+            for name in only_targets:
+                self.result.add_warning(
+                    f"Regime '{name}' is a dead-end (no outgoing transitions)",
                 )
 
     def _check_algorithms(self, sos: SoSDefinition) -> None:
