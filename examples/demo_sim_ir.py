@@ -185,352 +185,383 @@ for label, ir in [("A-SoS", a_ir), ("C-SoS", c_ir)]:
           f"local={algo_info.get('local')})")
 
 # =========================================================================
-# 5. A-SoS vs C-SoS Governance Structure Comparison
+# 5a. Governance Structure Comparison (Layer 1)
 # =========================================================================
 
-heading("Step 5: A-SoS vs C-SoS — Governance Structure Comparison")
+heading("Step 5a: Governance Structure Comparison (Layer 1 — Institution)")
 
 
-def _extract_profile(ir):
-    """Extract a structured governance profile from a SimIR for comparison."""
+def _extract_gov_profile(ir, sos):
+    """Extract governance-level profile from IR + original AST."""
     p = {}
 
-    # --- Institution ---
-    p["sos_type"] = ir.sos_type
+    # --- SoS type: declared vs inferred ---
+    p["type_declared"] = ir.sos_type
 
-    # Decision holders: unique set across all contracts
+    # Infer from beta
+    betas = [c.governance.beta for c in ir.institution.contracts
+             if c.governance.beta is not None]
+    avg_beta = sum(betas) / len(betas) if betas else None
+    if avg_beta is not None:
+        if avg_beta >= 0.5:
+            p["type_inferred"] = "Acknowledged"
+            p["type_rationale"] = (
+                f"β_avg={avg_beta:.2f} (≥0.5): central authority exists "
+                f"and is acknowledged by constituents"
+            )
+        elif avg_beta < 0.2:
+            p["type_inferred"] = "Collaborative"
+            p["type_rationale"] = (
+                f"β_avg={avg_beta:.2f} (<0.2): no central command; "
+                f"each actor decides autonomously"
+            )
+        else:
+            p["type_inferred"] = "Hybrid"
+            p["type_rationale"] = f"β_avg={avg_beta:.2f}: mixed authority"
+    else:
+        p["type_inferred"] = "Unknown"
+        p["type_rationale"] = "no β values defined"
+
+    # --- Decision holders ---
     holders = sorted({c.governance.decision_holder
                       for c in ir.institution.contracts
                       if c.governance.decision_holder})
     p["decision_holders"] = ", ".join(holders) if holders else "N/A"
 
-    # Authority distribution: classify as centralized / distributed / hybrid
-    betas = [(c.id, c.governance.beta) for c in ir.institution.contracts
-             if c.governance.beta is not None]
+    # Authority distribution
     if betas:
-        avg_b = sum(b for _, b in betas) / len(betas)
-        if avg_b >= 0.6:
-            auth_label = "centralized"
-        elif avg_b <= 0.2:
-            auth_label = "distributed"
+        if avg_beta >= 0.6:
+            label = "centralized"
+        elif avg_beta <= 0.2:
+            label = "distributed"
         else:
-            auth_label = "hybrid"
-        detail = ", ".join(f"β={b}" for _, b in betas)
-        p["authority_distribution"] = f"{auth_label} ({detail})"
+            label = "hybrid"
+        detail = ", ".join(f"β={b}" for b in betas)
+        p["authority_dist"] = f"{label} ({detail})"
     else:
-        p["authority_distribution"] = "N/A"
+        p["authority_dist"] = "N/A"
 
-    # Responsibility allocation: summarize as role-based
-    resp_parts = []
+    # --- Responsibility: actual obligations from contracts ---
+    resp_lines = []
     for actor in ir.institution.actors:
-        if actor.capabilities:
-            key_cap = actor.capabilities[0]
-            resp_parts.append(f"{actor.id}={actor.role}")
-    p["responsibility_allocation"] = ", ".join(resp_parts)
+        # Gather obligations from: (1) AST responsibilities, (2) guarantees
+        obligations: list[str] = []
+        # From AST responsibilities blocks
+        for ct in sos.contracts:
+            for rg in ct.responsibilities:
+                a_name = rg.actor.name
+                if a_name == actor.id:
+                    for item in rg.items:
+                        s = item if isinstance(item, str) else item.name
+                        obligations.append(s)
+        # If no explicit responsibilities, derive from capabilities + guarantees
+        if not obligations:
+            obligations = list(actor.capabilities[:3])
+        if obligations:
+            obs = "; ".join(obligations[:3])
+            if len(obligations) > 3:
+                obs += " ..."
+            resp_lines.append(f"{actor.id}: {obs}")
+    p["responsibilities"] = resp_lines
 
-    # Information visibility: classify
-    alphas = [(c.id, c.governance.alpha) for c in ir.institution.contracts
+    # Information visibility
+    alphas = [c.governance.alpha for c in ir.institution.contracts
               if c.governance.alpha is not None]
+    avg_alpha = sum(alphas) / len(alphas) if alphas else None
     if alphas:
-        avg_a = sum(a for _, a in alphas) / len(alphas)
-        if avg_a >= 0.7:
-            vis_label = "high"
-        elif avg_a >= 0.4:
-            vis_label = "moderate"
+        if avg_alpha >= 0.7:
+            label = "high"
+        elif avg_alpha >= 0.4:
+            label = "moderate"
         else:
-            vis_label = "low"
-        detail = ", ".join(f"α={a}" for _, a in alphas)
-        p["info_visibility"] = f"{vis_label} ({detail})"
+            label = "low"
+        detail = ", ".join(f"α={a}" for a in alphas)
+        p["info_visibility"] = f"{label} ({detail})"
     else:
         p["info_visibility"] = "N/A"
 
-    # Information sharing mode: derive from sharing_mode strings
+    # Sharing mode
     sharing_patterns: list[str] = []
     for c in ir.institution.contracts:
         if c.governance.sharing_mode:
             for part in c.governance.sharing_mode.split(" ; "):
                 arrow = part.split(" -> ")
                 if len(arrow) == 2:
-                    src_base = arrow[0].strip().split("[")[0]
+                    src = arrow[0].strip().split("[")[0]
                     rest = arrow[1].strip()
-                    tgt_base = rest.split(" : ")[0].split("[")[0] if " : " in rest else rest.split("[")[0]
-                    direction = f"{src_base}→{tgt_base}"
-                    if direction not in sharing_patterns:
-                        sharing_patterns.append(direction)
-    # Classify
-    if any(p == q[::-1] for p in sharing_patterns for q in sharing_patterns if p != q):
-        pass  # bidirectional exists
-    peer = [p for p in sharing_patterns if p.split("→")[0] == p.split("→")[1]]
-    uplink = []
-    downlink = []
+                    tgt = rest.split(" : ")[0].split("[")[0] if " : " in rest else rest.split("[")[0]
+                    d = f"{src}→{tgt}"
+                    if d not in sharing_patterns:
+                        sharing_patterns.append(d)
+    peer = [sp for sp in sharing_patterns if sp.split("→")[0] == sp.split("→")[1]]
+    uplink, downlink = [], []
     for pat in sharing_patterns:
-        src, tgt = pat.split("→")
-        src_actor = next((a for a in ir.institution.actors if a.id == src), None)
-        tgt_actor = next((a for a in ir.institution.actors if a.id == tgt), None)
-        if src == tgt:
-            continue  # peer
-        if src_actor and tgt_actor:
-            if src_actor.autonomy == "high" and tgt_actor.autonomy == "low":
+        s, t = pat.split("→")
+        if s == t:
+            continue
+        sa = next((a for a in ir.institution.actors if a.id == s), None)
+        ta = next((a for a in ir.institution.actors if a.id == t), None)
+        if sa and ta:
+            if sa.autonomy == "high" and ta.autonomy == "low":
                 uplink.append(pat)
-            elif src_actor.autonomy == "low" and tgt_actor.autonomy == "high":
+            elif sa.autonomy == "low" and ta.autonomy == "high":
                 downlink.append(pat)
-    mode_desc_parts = []
+    parts = []
     if peer:
-        mode_desc_parts.append("peer-to-peer")
+        parts.append("peer-to-peer")
     if uplink:
-        mode_desc_parts.append("uplink")
+        parts.append("uplink")
     if downlink:
-        mode_desc_parts.append("broadcast")
-    if not mode_desc_parts:
-        mode_desc_parts = [" + ".join(sharing_patterns[:3])]
-    p["sharing_mode"] = " + ".join(mode_desc_parts)
-    p["sharing_detail"] = ", ".join(sharing_patterns)
+        parts.append("broadcast")
+    p["sharing_mode"] = " + ".join(parts) if parts else ", ".join(sharing_patterns[:3])
+    p["sharing_channels"] = ", ".join(sharing_patterns)
 
-    # --- Protocol ---
-    # Failure handling: find the protocol triggered by failure/obstacle/incident
-    failure_protos = [proto for proto in ir.protocol.protocols
-                      if any(kw in proto.trigger.lower()
-                             for kw in ("fail", "obstacle", "collision",
-                                        "incident", "conflict", "emergency"))]
-    if failure_protos:
-        triggers = [fp.trigger.split("(")[0] for fp in failure_protos]
-        p["failure_trigger"] = ", ".join(triggers)
-    else:
-        p["failure_trigger"] = "N/A"
-
-    # Replanning flow: describe the message flow of the first failure protocol
-    if failure_protos:
-        fp = failure_protos[0]
-        msg_steps = [s for s in fp.steps if s.type == "message"]
-        flow_parts = []
-        for s in msg_steps:
-            src = s.sender.split("[")[0] if s.sender else "?"
-            tgt = s.receiver.split("[")[0] if s.receiver else "?"
-            flow_parts.append(f"{src}→{tgt}:{s.content}")
-        p["replan_flow"] = " → ".join(flow_parts) if flow_parts else "N/A"
-    else:
-        p["replan_flow"] = "N/A"
-
-    # Timeout / fallback policy — concise summary
-    fallback_parts = []
-    for proto in ir.protocol.protocols:
-        if proto.fallback:
-            for key, val in proto.fallback.items():
-                # Extract just the action name
-                action = val.split(":")[-1].strip().rstrip(")")
-                action = action.split("(")[0].strip()
-                actor_part = val.split(":")[0].strip() if ":" in val else ""
-                actor_base = actor_part.split("[")[0].strip()
-                fallback_parts.append(f"{actor_base}: {action}")
-    p["fallback_policy"] = "; ".join(fallback_parts[:3]) if fallback_parts else "N/A"
-
-    # --- Algorithm Binding ---
-    algo_bindings = []
-    for a in ir.algorithm.algorithms:
-        parts = []
-        if a.central and a.central.lower() not in ("none", "n/a"):
-            parts.append(f"central={a.central}")
-        if a.local and a.local.lower() not in ("none", "n/a"):
-            parts.append(f"local={a.local}")
-        algo_bindings.append(f"{a.name}: {', '.join(parts)}")
-    p["central_planner"] = ", ".join(
-        a.central for a in ir.algorithm.algorithms
-        if a.central and a.central.lower() not in ("none",)) or "none"
-    p["local_planner"] = ", ".join(
-        a.local for a in ir.algorithm.algorithms
-        if a.local and a.local.lower() not in ("none",)) or "none"
-
-    # --- Derived Metrics ---
-    def avg(param_name):
-        vals = [getattr(c.governance, param_name)
-                for c in ir.institution.contracts
-                if getattr(c.governance, param_name) is not None]
-        return sum(vals) / len(vals) if vals else None
-
-    p["avg_alpha"] = avg("alpha")
-    p["avg_beta"] = avg("beta")
-    p["avg_lambda"] = avg("lambda_")
-
-    # Incentive types
+    # Incentive
     itypes = sorted({c.governance.incentive_type
                      for c in ir.institution.contracts
                      if c.governance.incentive_type})
-    p["incentive_types"] = ", ".join(itypes) if itypes else "N/A"
+    p["incentive"] = ", ".join(itypes) if itypes else "N/A"
 
-    # --- Modes / Regimes ---
+    # Derived
+    p["avg_alpha"] = avg_alpha
+    p["avg_beta"] = avg_beta
+    lambdas = [c.governance.lambda_ for c in ir.institution.contracts
+               if c.governance.lambda_ is not None]
+    p["avg_lambda"] = sum(lambdas) / len(lambdas) if lambdas else None
+
+    # Modes
     regimes = sorted({t.from_regime for t in ir.transitions} |
                      {t.to_regime for t in ir.transitions})
-    p["regime_names"] = " / ".join(regimes) if regimes else "N/A"
-    # Regime triggers: what conditions drive escalation
-    escalation = [f"{t.from_regime}→{t.to_regime}"
-                  for t in ir.transitions if t.condition]
-    p["regime_transitions_summary"] = "; ".join(escalation[:4]) if escalation else "N/A"
-
-    # --- SoS type inference reasoning ---
-    if p["avg_beta"] is not None and p["avg_beta"] >= 0.5:
-        p["type_rationale"] = (
-            f"β_avg={p['avg_beta']:.2f} (>0.5): central authority "
-            f"acknowledged by constituents"
-        )
-    elif p["avg_beta"] is not None and p["avg_beta"] < 0.2:
-        p["type_rationale"] = (
-            f"β_avg={p['avg_beta']:.2f} (<0.2): no central command; "
-            f"each actor decides autonomously"
-        )
-    else:
-        beta_str = f"{p['avg_beta']:.2f}" if p['avg_beta'] is not None else "N/A"
-        p["type_rationale"] = f"β_avg={beta_str}: mixed authority pattern"
+    p["modes"] = " / ".join(regimes) if regimes else "N/A"
+    escalation = [f"{t.from_regime}→{t.to_regime}" for t in ir.transitions]
+    p["transitions"] = "; ".join(escalation) if escalation else "N/A"
 
     return p
 
 
-a_prof = _extract_profile(a_ir)
-c_prof = _extract_profile(c_ir)
+def _extract_proto_profile(ir):
+    """Extract protocol & algorithm binding profile from IR."""
+    p = {}
+    FAILURE_KW = ("fail", "obstacle", "collision", "incident", "conflict", "emergency")
 
-# --- Render comparison table ---
+    failure_protos = [proto for proto in ir.protocol.protocols
+                      if any(kw in proto.trigger.lower() for kw in FAILURE_KW)]
 
-COL_CAT = 20
-COL_PROP = 26
-COL_A = 42
-COL_C = 42
+    # Replanning: structured as Trigger / Computation / Enforcement
+    replan_rows = []
+    for fp in failure_protos:
+        trigger = fp.trigger.split("(")[0]
+        comp_steps = [s for s in fp.steps if s.type == "compute"]
+        msg_steps = [s for s in fp.steps if s.type == "message"]
+
+        comp_actors = sorted({s.sender.split("[")[0]
+                              for s in comp_steps if s.sender})
+        comp_loc = ", ".join(comp_actors) if comp_actors else "N/A"
+
+        # Enforcement: how is the computed result distributed?
+        # Find the last message(s) in the protocol — these carry the result.
+        if msg_steps:
+            last_msg = msg_steps[-1]
+            last_sender = last_msg.sender.split("[")[0] if last_msg.sender else "?"
+            last_receiver = last_msg.receiver.split("[")[0] if last_msg.receiver else "?"
+            is_broadcast = last_msg.receiver and "[*]" in last_msg.receiver
+            if last_sender in comp_actors and last_sender != last_receiver:
+                enforce = f"broadcast → {last_receiver}" if is_broadcast else f"notify → {last_receiver}"
+            elif last_receiver in comp_actors:
+                # The computing actor receives a report — enforcement is local
+                enforce = "local (self-enforced)"
+            else:
+                enforce = f"{last_sender} → {last_receiver}"
+        elif fp.postcondition:
+            enforce = "local (self-enforced)"
+        else:
+            enforce = "local (self-enforced)"
+
+        replan_rows.append({
+            "proto": fp.id,
+            "trigger": trigger,
+            "computation": comp_loc,
+            "enforcement": enforce,
+        })
+    p["replan_rows"] = replan_rows
+
+    # Timeout / fallback
+    fb_parts = []
+    for proto in ir.protocol.protocols:
+        for key, val in proto.fallback.items():
+            actor = val.split(":")[0].strip().split("[")[0] if ":" in val else "?"
+            action = val.split(":")[-1].strip() if ":" in val else val
+            # Clean action
+            action = action.strip().rstrip(")").split("(")[0].strip()
+            fb_parts.append(f"{actor}: {action}")
+    p["fallback"] = "; ".join(fb_parts) if fb_parts else "N/A"
+
+    # Algorithm binding
+    p["central"] = ", ".join(
+        f"{a.name}={a.central}" for a in ir.algorithm.algorithms
+        if a.central and a.central.lower() != "none") or "none"
+    p["local"] = ", ".join(
+        f"{a.name}={a.local}" for a in ir.algorithm.algorithms
+        if a.local and a.local.lower() != "none") or "none"
+
+    return p
+
+
+a_gov = _extract_gov_profile(a_ir, a_sos)
+c_gov = _extract_gov_profile(c_ir, c_sos)
+a_proto = _extract_proto_profile(a_ir)
+c_proto = _extract_proto_profile(c_ir)
+
+# --- Table rendering ---
+
+COL_PROP = 28
+COL_A = 40
+COL_C = 40
+TABLE_W = COL_PROP + COL_A + COL_C + 2
+
 
 def _trunc(s: str, w: int) -> str:
     if len(s) <= w:
         return s.ljust(w)
     return s[:w - 1] + "…"
 
-def row(cat, prop, a_val, c_val, note=""):
-    """Print one row of the comparison table."""
-    cat_s = cat.ljust(COL_CAT)
-    prop_s = prop.ljust(COL_PROP)
-    a_s = _trunc(str(a_val), COL_A)
-    c_s = _trunc(str(c_val), COL_C)
-    line = f"  {cat_s}{prop_s}{a_s}{c_s}"
+
+def tbl_header(a_label="A-SoS", c_label="C-SoS"):
+    print(f"  {'Property'.ljust(COL_PROP)}{a_label.ljust(COL_A)}{c_label.ljust(COL_C)}")
+    tbl_sep()
+
+
+def tbl_sep():
+    print(f"  {'─' * TABLE_W}")
+
+
+def tbl_row(prop, a_val, c_val):
+    print(f"  {prop.ljust(COL_PROP)}{_trunc(str(a_val), COL_A)}{_trunc(str(c_val), COL_C)}")
+
+
+def tbl_row_note(prop, a_val, c_val, note):
+    tbl_row(prop, a_val, c_val)
     if note:
-        line += f" {note}"
-    print(line)
+        print(f"  {''.ljust(COL_PROP)}  └ {note}")
 
 
-def separator():
-    total = COL_CAT + COL_PROP + COL_A + COL_C + 2
-    print(f"  {'─' * total}")
+# --- Table (a): Governance Structure ---
+print()
+tbl_header("A-SoS (MAPFRobotDelivery)", "C-SoS (AutonomousTaxiFleet)")
 
+tbl_row("SoS type (declared)", a_gov["type_declared"], c_gov["type_declared"])
+tbl_row("SoS type (inferred)", a_gov["type_inferred"], c_gov["type_inferred"])
+tbl_row_note("", a_gov["type_rationale"], c_gov["type_rationale"],
+             "inferred from avg β across contracts")
+
+tbl_sep()
+tbl_row("Decision holder(s)", a_gov["decision_holders"], c_gov["decision_holders"])
+tbl_row("Authority distribution", a_gov["authority_dist"], c_gov["authority_dist"])
+tbl_row("Information visibility", a_gov["info_visibility"], c_gov["info_visibility"])
+tbl_row("Sharing mode", a_gov["sharing_mode"], c_gov["sharing_mode"])
+tbl_row("Sharing channels", a_gov["sharing_channels"], c_gov["sharing_channels"])
+tbl_row("Incentive mechanism", a_gov["incentive"], c_gov["incentive"])
+
+tbl_sep()
+print(f"  {'Responsibilities'.ljust(COL_PROP)}{'A-SoS'.ljust(COL_A)}{'C-SoS'.ljust(COL_C)}")
+max_resp = max(len(a_gov["responsibilities"]), len(c_gov["responsibilities"]))
+for i in range(max_resp):
+    a_r = a_gov["responsibilities"][i] if i < len(a_gov["responsibilities"]) else ""
+    c_r = c_gov["responsibilities"][i] if i < len(c_gov["responsibilities"]) else ""
+    prop = "" if i > 0 else "(per-actor obligations)"
+    tbl_row(prop, a_r, c_r)
+
+tbl_sep()
+print(f"  {'Derived Metrics'.ljust(COL_PROP)}{'A-SoS'.ljust(COL_A)}{'C-SoS'.ljust(COL_C)}")
+
+
+def fmt(v):
+    return f"{v:.2f}" if v is not None else "N/A"
+
+
+tbl_row_note("Avg α (transparency)", fmt(a_gov["avg_alpha"]), fmt(c_gov["avg_alpha"]),
+             "0 = local only, 1 = full sharing")
+tbl_row_note("Avg β (centralization)", fmt(a_gov["avg_beta"]), fmt(c_gov["avg_beta"]),
+             "0 = distributed, 1 = centralized")
+tbl_row_note("Avg λ (incentive)", fmt(a_gov["avg_lambda"]), fmt(c_gov["avg_lambda"]),
+             "0 = directive, 1 = market")
+
+tbl_sep()
+tbl_row("Operational modes", a_gov["modes"], c_gov["modes"])
+tbl_row("Transitions", a_gov["transitions"], c_gov["transitions"])
+
+# =========================================================================
+# 5b. Protocol & Algorithm Binding Comparison (Layer 2 + 3)
+# =========================================================================
+
+heading("Step 5b: Protocol & Algorithm Binding Comparison (Layer 2 + 3)")
+
+# Replanning structure: Trigger / Computation Location / Enforcement
+print()
+print("  Replanning Structure (normalized)")
+tbl_sep()
+print(f"  {'Protocol'.ljust(20)}{'Trigger'.ljust(28)}{'Computation'.ljust(18)}{'Enforcement'.ljust(28)}")
+tbl_sep()
+
+for label, prof in [("A-SoS", a_proto), ("C-SoS", c_proto)]:
+    for i, rr in enumerate(prof["replan_rows"]):
+        prefix = label if i == 0 else ""
+        print(f"  {prefix.ljust(20)}"
+              f"{_trunc(rr['trigger'], 28)}"
+              f"{_trunc(rr['computation'], 18)}"
+              f"{_trunc(rr['enforcement'], 28)}")
+    if not prof["replan_rows"]:
+        print(f"  {label.ljust(20)}(no failure protocols)")
+
+tbl_sep()
+
+# Timeout / fallback
+print()
+tbl_header("A-SoS", "C-SoS")
+tbl_row("Timeout / fallback", a_proto["fallback"], c_proto["fallback"])
+
+tbl_sep()
+print(f"  {'Algorithm Binding'.ljust(COL_PROP)}{'A-SoS'.ljust(COL_A)}{'C-SoS'.ljust(COL_C)}")
+tbl_sep()
+tbl_row_note("Central planner", a_proto["central"], c_proto["central"],
+             "← implementation choice, not governance")
+tbl_row_note("Local planner", a_proto["local"], c_proto["local"],
+             "← implementation choice, not governance")
+
+# --- Structural Summary ---
 
 print()
-row("Category", "Property", "A-SoS (MAPFRobotDelivery)", "C-SoS (AutonomousTaxiFleet)", "Notes")
-separator()
-
-# Institution
-row("Institution", "SoS type (inferred)",
-    a_prof["sos_type"], c_prof["sos_type"],
-    "← declared; see rationale below")
-row("", "Decision holder(s)",
-    a_prof["decision_holders"], c_prof["decision_holders"], "")
-row("", "Authority distribution",
-    a_prof["authority_distribution"], c_prof["authority_distribution"],
-    "per-contract β")
-row("", "Responsibility alloc.",
-    a_prof["responsibility_allocation"], c_prof["responsibility_allocation"], "")
-row("", "Information visibility",
-    a_prof["info_visibility"], c_prof["info_visibility"],
-    "per-contract α")
-row("", "Sharing mode",
-    a_prof["sharing_mode"], c_prof["sharing_mode"], "")
-row("", "Sharing channels",
-    a_prof["sharing_detail"], c_prof["sharing_detail"], "")
-row("", "Incentive mechanism",
-    a_prof["incentive_types"], c_prof["incentive_types"], "")
-
-separator()
-
-# Protocol
-row("Protocol", "Failure trigger",
-    a_prof["failure_trigger"], c_prof["failure_trigger"], "")
-row("", "Replanning flow",
-    a_prof["replan_flow"], c_prof["replan_flow"], "")
-row("", "Timeout / fallback",
-    a_prof["fallback_policy"], c_prof["fallback_policy"], "")
-
-separator()
-
-# Algorithm Binding
-row("Algorithm Binding", "Central planner",
-    a_prof["central_planner"], c_prof["central_planner"],
-    "← implementation, not governance")
-row("", "Local planner",
-    a_prof["local_planner"], c_prof["local_planner"],
-    "← implementation, not governance")
-
-separator()
-
-# Derived Metrics
-def fmt_param(val):
-    return f"{val:.2f}" if val is not None else "N/A"
-
-row("Derived Metrics", "Avg α (transparency)",
-    fmt_param(a_prof["avg_alpha"]),
-    fmt_param(c_prof["avg_alpha"]),
-    "0=local only, 1=full sharing")
-row("", "Avg β (centralization)",
-    fmt_param(a_prof["avg_beta"]),
-    fmt_param(c_prof["avg_beta"]),
-    "0=distributed, 1=centralized")
-row("", "Avg λ (incentive align.)",
-    fmt_param(a_prof["avg_lambda"]),
-    fmt_param(c_prof["avg_lambda"]),
-    "0=directive, 1=market")
-
-separator()
-
-# Modes / Regimes
-row("Modes", "Operational modes",
-    a_prof["regime_names"], c_prof["regime_names"], "")
-row("", "Transitions",
-    a_prof["regime_transitions_summary"],
-    c_prof["regime_transitions_summary"], "")
-
-separator()
-
-# Interpretation
-row("Interpretation", "SoS type rationale",
-    a_prof["type_rationale"], c_prof["type_rationale"], "")
-
-# --- Structural summary ---
-
-print()
-print("  Structural Summary")
-print("  " + "─" * 70)
+heading("Structural Summary")
 print(textwrap.dedent("""\
-      Layer 1 — Institution (who decides / who knows / who is responsible):
-        A-SoS: Single decision holder (DISPATCHER) with high authority (β≈0.85).
-               Robots report upward; dispatcher broadcasts commands downward.
-               Responsibility is vertically separated: planner vs executor.
-        C-SoS: Every TAXI decides independently (β≈0.08). TRAFFIC_CENTER only
-               aggregates — it cannot command. Information flows peer-to-peer.
-               Each taxi bears its own responsibility for routing and safety.
+  Layer 1 — Institution (who decides / who knows / who is responsible):
+    A-SoS: Single decision holder (DISPATCHER) with high authority (β≈0.85).
+           Robots report upward; dispatcher broadcasts commands downward.
+           Responsibility is vertically separated: planner vs executor.
+    C-SoS: Every TAXI decides independently (β≈0.08). TRAFFIC_CENTER only
+           aggregates — it cannot command. Information flows peer-to-peer.
+           Each taxi bears full responsibility for routing, pickup, and safety.
 
-      Layer 2 — Protocol (how actors interact and handle failures):
-        A-SoS: Failure triggers upward escalation (ROBOT→DISPATCHER).
-               Dispatcher replans centrally and broadcasts new routes.
-               Fallback: robots stop-in-place and wait for instructions.
-        C-SoS: Conflict triggers bilateral negotiation (TAXI↔TAXI).
-               Each taxi replans locally. No central replanning exists.
-               Fallback: the yielding taxi waits; passengers retry with wider radius.
+  Layer 2 — Protocol (how actors interact and handle failures):
+    A-SoS: Failure triggers upward escalation (ROBOT→DISPATCHER).
+           Dispatcher replans centrally and broadcasts new routes.
+           Fallback: robots stop-in-place and wait for instructions.
+    C-SoS: Conflict triggers bilateral negotiation (TAXI↔TAXI).
+           Each taxi replans locally. No central replanning authority exists.
+           Fallback: yielding taxi waits; passengers retry with wider radius.
 
-      Layer 3 — Algorithm Binding (what runs where):
-        A-SoS: Central=ECBS (optimal MAPF solver), Local=tracking_only.
-               The algorithm matches the governance: central authority ↔ central solver.
-        C-SoS: Central=aggregation_only, Local=LRA* + conflict_avoidance.
-               The algorithm matches the governance: distributed authority ↔ local solver.
+  Layer 3 — Algorithm Binding (what runs where):
+    A-SoS: Central=ECBS (optimal MAPF solver), Local=tracking_only.
+           Governance ↔ algorithm alignment: central authority ↔ central solver.
+    C-SoS: Central=aggregation_only, Local=LRA* + conflict_avoidance.
+           Governance ↔ algorithm alignment: distributed authority ↔ local solver.
 
-      Why this is a governance comparison, not just an algorithm comparison:
-        The same algorithm (e.g. ECBS) could run in either A-SoS or C-SoS,
-        but the institutional design determines WHO invokes it, WHAT information
-        it receives, and HOW its output is enforced. The 3-layer IR makes this
-        distinction explicit: Layer 1 (Institution) defines the decision
-        structure; Layer 3 (Algorithm Binding) is an implementation choice
-        that should be consistent with — but is logically separate from —
-        the governance design.
-  """))
+  Why governance comparison ≠ algorithm comparison:
+    The same algorithm (e.g. ECBS) could in principle run in a C-SoS, but the
+    institutional design determines WHO invokes it, WHAT information it receives,
+    and HOW its output is enforced. The 3-layer IR makes this distinction explicit:
+    Layer 1 defines the decision structure (governance); Layer 3 is an
+    implementation binding that should be consistent with — but is logically
+    separate from — the governance design.
+"""))
 
 print("Done.")
