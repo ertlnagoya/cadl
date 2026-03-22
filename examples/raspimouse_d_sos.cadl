@@ -1,0 +1,150 @@
+# D-SoS: Directed System of Systems — Raspimouse Swarm Simulator
+#
+# Five RaspberryPi Mouse robots navigate a shared 11-node graph network.
+# A central arbitrator holds decision authority for edge allocation;
+# robots query the arbitrator at each intersection for their next hop.
+#
+#   decision_holder = ARBITRATOR (central authority)
+#   sharing_mode    = request-response via NATS (robot → arbitrator)
+#   central planner = NaiveDijkstra (shortest path by edge length)
+#   local planner   = none (robots follow arbitrator decisions)
+#
+# Regime transitions: NORMAL ↔ CONGESTED
+
+sos:
+  name: "RaspimouseSwarmDSoS"
+  type: Directed
+  version: "4.0.0"
+  description: "Directed SoS swarm simulation with centralized arbitration via NATS messaging"
+
+  context:
+    environment:
+      num_nodes: 11
+      num_edges: 17
+      num_robots: 5
+      nats_url: "nats://localhost:4222"
+      edge_length_min: 0.8
+      edge_length_max: 3.0
+    assumptions:
+      - "NATS server is running and reachable"
+      - "graph topology is static (11 nodes, 17 bidirectional edges)"
+      - "all robots share the same physical road network"
+      - "collision detection via distance sensors (threshold 0.1m)"
+
+  actors:
+    - id: ARBITRATOR
+      role: "traffic_arbiter"
+      autonomy: low
+      capabilities:
+        - manage_edge_flags
+        - manage_cross_flags
+        - compute_naive_dijkstra
+        - track_agent_state
+      interface:
+        input: [init_request, next_request, ret_request, fin_request, disp_request]
+        output: [next_node_id, rejection, occupation_status]
+
+    - id: "ROBOT[1..5]"
+      role: "line_trace_agent"
+      autonomy: low
+      capabilities:
+        - line_trace_follow
+        - intersection_detection
+        - collision_back
+        - nats_request_response
+      interface:
+        input: [next_node_id, rejection]
+        output: [init_request, next_request, ret_request]
+
+  contracts:
+    - id: EDGE_ALLOCATION
+      parties:
+        - ARBITRATOR
+        - "ROBOT[*]"
+      assume:
+        - "ARBITRATOR.is_operational == true"
+        - "ROBOT[i].sensors_operational == true"
+      guarantee:
+        - "no_head_on_collision()"
+        - "edge_mutual_exclusion()"
+      authority:
+        decision_scope: "edge_allocation"
+        decision_holder: ARBITRATOR
+        beta: 0.9
+        mode: "centralized"
+      information:
+        alpha: 0.2
+        views:
+          ARBITRATOR: "full_edge_flags + full_cross_flags + all_agent_states"
+          "ROBOT[*]": "own_position + next_node_response_only"
+        sharing:
+          - "ROBOT[*] -> ARBITRATOR : init_request"
+          - "ROBOT[*] -> ARBITRATOR : next_request"
+          - "ROBOT[*] -> ARBITRATOR : ret_request"
+          - "ARBITRATOR -> ROBOT[*] : next_node_id"
+      incentives:
+        type: task_completion
+        lambda: 0.1
+        rules:
+          - "reward(ROBOT[i], 1) when goal_reached"
+      violation:
+        detect: "head_on_collision_detected OR edge_double_occupied"
+        action: "log_violation AND force_back(ROBOT[i])"
+        escalation: "reset_all_flags"
+
+  protocols:
+    - id: EDGE_REQUEST
+      trigger: "ROBOT[i] enters intersection node"
+      precondition: "ROBOT[i].at_intersection == true"
+      steps:
+        - "ROBOT[i] -> ARBITRATOR : next_request(id, src, dst, goal)"
+        - "ARBITRATOR : compute_naive_dijkstra(src, goal)"
+        - "ARBITRATOR -> ROBOT[i] : next_node_id"
+        - "ROBOT[i] : move_to_next_node()"
+      timing:
+        max_response: 10s
+      fallback:
+        on_timeout: "ROBOT[i] : retry_after(1s)"
+      postcondition: "ROBOT[i].moving_to_next_node"
+
+    - id: EDGE_RELEASE
+      trigger: "ROBOT[i] leaves edge"
+      steps:
+        - "ROBOT[i] -> ARBITRATOR : ret_request(id, src, dst)"
+        - "ARBITRATOR : release_edge_flags(src, dst)"
+      postcondition: "edge(src, dst).occupied == false"
+
+    - id: COLLISION_RECOVERY
+      trigger: "ROBOT[i].distance_sensor < 0.1m for > maxT"
+      steps:
+        - "ROBOT[i] : execute_back_handler()"
+        - "ROBOT[i] -> ARBITRATOR : next_request(id, src, dst, goal, re=true)"
+        - "ARBITRATOR -> ROBOT[i] : next_node_id"
+      timing:
+        back_duration: 2s
+        max_total: 15s
+      postcondition: "ROBOT[i].collision_resolved"
+
+  algorithms:
+    routing:
+      central: "NaiveDijkstra"
+      local: "none"
+
+  transitions:
+    - from: NORMAL
+      to: CONGESTED
+      condition: "occupied_edges > total_edges * 0.6"
+    - from: CONGESTED
+      to: NORMAL
+      condition: "occupied_edges <= total_edges * 0.4"
+
+  metrics:
+    - id: goal_sum
+      formula: "sum(ROBOT[i].goal_count for i in 1..5)"
+      target: ">= 0"
+    - id: goal_min
+      formula: "min(ROBOT[i].goal_count for i in 1..5)"
+      target: ">= 0"
+    - id: collision_rate
+      formula: "collisions_per_minute / num_robots"
+      target: "<= 1.0"

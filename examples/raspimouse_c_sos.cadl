@@ -1,0 +1,178 @@
+# C-SoS: Collaborative System of Systems — Raspimouse Swarm Simulator
+#
+# Five RaspberryPi Mouse robots navigate a shared 11-node graph network.
+# Each robot performs local Dijkstra route search and proposes a next hop;
+# the central arbitrator verifies the proposal against global edge/node
+# occupancy and returns a structured permission state.
+#
+#   decision_holder = ROBOT[*] (propose) + ARBITRATOR (verify)
+#   sharing_mode    = resource query (robot ← arbitrator) + request-response
+#   central planner = DirectionDijkstra (with occupancy penalties)
+#   local planner   = DirectionDijkstra (same algorithm, local graph copy)
+#
+# Regime transitions: NORMAL ↔ CONGESTED
+# Discrete-time synchronization for reproducible results.
+
+sos:
+  name: "RaspimouseSwarmCSoS"
+  type: Collaborative
+  version: "4.0.0"
+  description: "Collaborative SoS with local route search, centralized verification, and discrete-time synchronization"
+
+  context:
+    environment:
+      num_nodes: 11
+      num_edges: 17
+      num_robots: 5
+      nats_url: "nats://localhost:4222"
+      edge_length_min: 0.8
+      edge_length_max: 3.0
+      discrete_time_sync: true
+    assumptions:
+      - "NATS server is running and reachable"
+      - "graph topology is static (11 nodes, 17 bidirectional edges)"
+      - "all robots have an identical local copy of the graph"
+      - "discrete-time communication ensures reproducible simulation"
+
+  actors:
+    - id: ARBITRATOR
+      role: "traffic_verifier"
+      autonomy: low
+      capabilities:
+        - manage_edge_flags
+        - manage_cross_flags
+        - compute_direction_dijkstra
+        - serve_resource_query
+        - track_agent_state
+        - verify_proposed_next_node
+      interface:
+        input: [init_request, next_request_csос, ret_request, resource_query]
+        output: [permit_state, resource_response, rejection]
+
+    - id: "ROBOT[1..5]"
+      role: "autonomous_navigator"
+      autonomy: high
+      capabilities:
+        - line_trace_follow
+        - intersection_detection
+        - collision_back
+        - local_direction_dijkstra
+        - query_global_resource
+        - nats_request_response
+      interface:
+        input: [permit_state, resource_response]
+        output: [next_request_csос, resource_query, ret_request]
+
+  contracts:
+    - id: ROUTE_VERIFICATION
+      parties:
+        - ARBITRATOR
+        - "ROBOT[*]"
+      assume:
+        - "ARBITRATOR.is_operational == true"
+        - "ROBOT[i].local_graph == ARBITRATOR.global_graph"
+      guarantee:
+        - "no_head_on_collision()"
+        - "edge_mutual_exclusion()"
+        - "same_conditions_produce_same_results()"
+      authority:
+        decision_scope: "route_verification"
+        decision_holder: "ROBOT[*]"
+        beta: 0.3
+        mode: "collaborative"
+      information:
+        alpha: 0.7
+        views:
+          ARBITRATOR: "full_edge_flags + full_cross_flags + all_agent_states"
+          "ROBOT[*]": "local_graph + queried_edge_flags + queried_cross_flags"
+        sharing:
+          - "ROBOT[*] -> ARBITRATOR : next_request_csос"
+          - "ARBITRATOR -> ROBOT[*] : permit_state"
+          - "ROBOT[*] -> ARBITRATOR : resource_query"
+          - "ARBITRATOR -> ROBOT[*] : resource_response"
+      responsibilities:
+        "ROBOT[*]":
+          - "compute_local_dijkstra()"
+          - "propose_next_node()"
+          - "retry_on_rejection(max=3)"
+        ARBITRATOR:
+          - "verify_proposal_against_flags()"
+          - "serve_resource_snapshot()"
+      incentives:
+        type: task_completion
+        lambda: 0.3
+        rules:
+          - "reward(ROBOT[i], 1) when goal_reached"
+          - "penalty(ROBOT[i], -0.5) when excessive_retries"
+      violation:
+        detect: "permit_state == -2 OR collision_detected"
+        action: "force_reverse(ROBOT[i]) AND log_violation"
+        escalation: "after 5 violations: reset_all_flags"
+
+  protocols:
+    - id: COLLABORATIVE_ROUTING
+      trigger: "ROBOT[i] enters intersection node"
+      precondition: "ROBOT[i].at_intersection == true"
+      steps:
+        - "ROBOT[i] : compute_local_dijkstra(src, goal)"
+        - "ROBOT[i] -> ARBITRATOR : next_request_csос(id, src, dst, next, goal)"
+        - "ARBITRATOR : verify_proposed_next_node(id, src, next)"
+        - "ARBITRATOR -> ROBOT[i] : permit_state(1=approved, -1=retry, -2=reverse)"
+        - if "permit_state == 1": ["ROBOT[i] : move_to_next_node()"]
+        - if "permit_state == -1": ["ROBOT[i] : retry_after(recount_delay)"]
+        - if "permit_state == -2": ["ROBOT[i] : execute_reverse()"]
+      timing:
+        max_response: 10s
+        retry_delay_base: 1s
+      fallback:
+        on_timeout: "ROBOT[i] : retry_with_random_dijkstra()"
+      postcondition: "ROBOT[i].moving_or_retrying"
+
+    - id: RESOURCE_QUERY
+      trigger: "ROBOT[i] needs global occupancy state"
+      steps:
+        - "ROBOT[i] -> ARBITRATOR : resource_query(id)"
+        - "ARBITRATOR -> ROBOT[i] : resource_response(edge_flags, cross_flags)"
+        - "ROBOT[i] : update_local_flags(edge_flags, cross_flags)"
+      timing:
+        max_response: 5s
+      postcondition: "ROBOT[i].local_flags_updated"
+
+    - id: COLLISION_RECOVERY
+      trigger: "ROBOT[i].distance_sensor < 0.1m for > maxT"
+      steps:
+        - "ROBOT[i] : execute_back_handler()"
+        - "ROBOT[i] -> ARBITRATOR : next_request_csос(id, src, dst, next, goal, re=true)"
+        - "ARBITRATOR -> ROBOT[i] : permit_state"
+      timing:
+        back_duration: 2s
+        max_retries: 3
+      postcondition: "ROBOT[i].collision_resolved"
+
+  algorithms:
+    routing:
+      central: "DirectionDijkstra"
+      local: "DirectionDijkstra"
+
+  transitions:
+    - from: NORMAL
+      to: CONGESTED
+      condition: "occupied_edges > total_edges * 0.6"
+      protocol: RESOURCE_QUERY
+    - from: CONGESTED
+      to: NORMAL
+      condition: "occupied_edges <= total_edges * 0.4"
+
+  metrics:
+    - id: goal_sum
+      formula: "sum(ROBOT[i].goal_count for i in 1..5)"
+      target: ">= 0"
+    - id: goal_min
+      formula: "min(ROBOT[i].goal_count for i in 1..5)"
+      target: ">= 0"
+    - id: collision_rate
+      formula: "collisions_per_minute / num_robots"
+      target: "<= 0.5"
+    - id: retry_rate
+      formula: "total_retries / total_requests"
+      target: "<= 0.3"

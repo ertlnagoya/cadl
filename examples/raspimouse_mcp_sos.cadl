@@ -1,0 +1,229 @@
+# MCP-SoS: LLM-Controlled System of Systems — Raspimouse Swarm Simulator
+#
+# Five RaspberryPi Mouse robots navigate a shared 11-node graph network.
+# An LLM agent controls robots via Model Context Protocol (MCP) tools,
+# querying world state and issuing path/yield/resume commands.
+# No Go arbitrator is needed; OccupancyManager runs in-process.
+#
+#   decision_holder = LLM_AGENT (external intelligence)
+#   sharing_mode    = MCP tools (full world state access)
+#   central planner = LLM-based Dijkstra (via MCP set_path)
+#   local planner   = NaiveDijkstra (Static mode) or OccupancyAware (Dynamic mode)
+#
+# Regime transitions: NORMAL ↔ COLLISION_RESOLUTION ↔ DEADLOCK
+
+sos:
+  name: "RaspimouseSwarmMCPSoS"
+  type: Acknowledged
+  version: "4.0.0"
+  description: "LLM-controlled SoS via MCP tools with Static and Dynamic path modes"
+
+  context:
+    environment:
+      num_nodes: 11
+      num_edges: 17
+      num_robots: 5
+      path_mode: "dynamic"
+      mcp_server: "unity-mcp-custom"
+    assumptions:
+      - "MCP server is running within Unity editor"
+      - "LLM agent has access to world_state and control tools"
+      - "graph topology is static (11 nodes, 17 bidirectional edges)"
+      - "OccupancyManager tracks edge/node occupation in real-time"
+
+  actors:
+    - id: LLM_AGENT
+      role: "intelligent_coordinator"
+      autonomy: high
+      capabilities:
+        - query_world_state
+        - compute_dijkstra_path
+        - set_agent_path
+        - yield_agent
+        - resume_agent
+        - emergency_stop
+        - switch_path_mode
+      interface:
+        input: [world_state_response, agent_status_update]
+        output: [set_path_command, yield_command, resume_command, emergency_stop_command]
+
+    - id: "ROBOT[1..5]"
+      role: "mcp_controlled_agent"
+      autonomy: medium
+      capabilities:
+        - line_trace_follow
+        - intersection_detection
+        - collision_detection
+        - local_naive_dijkstra
+        - occupancy_aware_routing
+        - yield_and_wait
+        - accept_external_path
+      interface:
+        input: [set_path_command, yield_command, resume_command]
+        output: [agent_status_update, collision_event]
+
+    - id: OCCUPANCY_MANAGER
+      role: "resource_tracker"
+      autonomy: low
+      capabilities:
+        - track_edge_occupation
+        - track_node_occupation
+        - check_availability
+        - try_occupy_edge
+        - release_edge
+      interface:
+        input: [occupy_request, release_request, availability_query]
+        output: [occupy_result, availability_response]
+
+  contracts:
+    - id: MCP_CONTROL
+      parties:
+        - LLM_AGENT
+        - "ROBOT[*]"
+      assume:
+        - "LLM_AGENT.mcp_connection == active"
+        - "ROBOT[i].sensors_operational == true"
+      guarantee:
+        - "collision_resolved_within(30s)"
+        - "no_permanent_deadlock()"
+      authority:
+        decision_scope: "path_planning_and_collision_resolution"
+        decision_holder: LLM_AGENT
+        beta: 0.6
+        mode: "acknowledged"
+      information:
+        alpha: 0.9
+        views:
+          LLM_AGENT: "all_agent_states + occupancy_map + graph_topology + path_mode"
+          "ROBOT[*]": "own_state + local_occupancy + planned_path"
+        sharing:
+          - "ROBOT[*] -> LLM_AGENT : agent_status_update"
+          - "LLM_AGENT -> ROBOT[*] : set_path_command"
+          - "LLM_AGENT -> ROBOT[*] : yield_command"
+          - "LLM_AGENT -> ROBOT[*] : resume_command"
+      responsibilities:
+        LLM_AGENT:
+          - "poll_world_state(interval: 2s)"
+          - "detect_collision_agents()"
+          - "compute_resolution_path()"
+          - "resolve_deadlocks()"
+        "ROBOT[*]":
+          - "report_status_on_change()"
+          - "follow_assigned_path()"
+          - "yield_when_instructed()"
+      incentives:
+        type: task_completion
+        lambda: 0.5
+        rules:
+          - "reward(ROBOT[i], 1) when goal_reached"
+          - "reward(LLM_AGENT, 5) when collision_resolved"
+          - "penalty(LLM_AGENT, -10) when deadlock_timeout"
+      violation:
+        detect: "collision_unresolved_for > 30s OR permanent_deadlock"
+        action: "emergency_stop_all() AND log_violation"
+        escalation: "switch_to_static_mode"
+
+    - id: OCCUPANCY_TRACKING
+      parties:
+        - OCCUPANCY_MANAGER
+        - "ROBOT[*]"
+      assume:
+        - "OCCUPANCY_MANAGER.is_operational == true"
+      guarantee:
+        - "edge_occupation_accurate()"
+        - "no_double_occupation()"
+      authority:
+        decision_holder: OCCUPANCY_MANAGER
+        beta: 0.8
+      information:
+        alpha: 0.8
+        sharing:
+          - "ROBOT[*] -> OCCUPANCY_MANAGER : occupy_request"
+          - "ROBOT[*] -> OCCUPANCY_MANAGER : release_request"
+          - "OCCUPANCY_MANAGER -> ROBOT[*] : occupy_result"
+
+  protocols:
+    - id: AUTONOMOUS_MOVE
+      trigger: "ROBOT[i] enters intersection node"
+      precondition: "ROBOT[i].status == Moving"
+      steps:
+        - "ROBOT[i] : check_goal_reached()"
+        - if "goal_reached": ["ROBOT[i] : assign_new_random_goal()"]
+        - "ROBOT[i] -> OCCUPANCY_MANAGER : availability_query(src, dst)"
+        - if "available": ["ROBOT[i] -> OCCUPANCY_MANAGER : occupy_request(id, src, dst)", "ROBOT[i] : move_to_next_node()"]
+        - if "not_available": ["ROBOT[i] : retry_with_alternative()"]
+      postcondition: "ROBOT[i].moving_or_waiting"
+
+    - id: COLLISION_RESOLUTION
+      trigger: "ROBOT[i].status == Collision"
+      steps:
+        - "LLM_AGENT : query_world_state(get_all)"
+        - "LLM_AGENT : identify_collision_agents()"
+        - "LLM_AGENT : query_world_state(get_graph)"
+        - "LLM_AGENT : query_world_state(get_occupancy)"
+        - "LLM_AGENT : compute_safe_path(avoiding_occupied_edges)"
+        - "LLM_AGENT -> ROBOT[i] : set_path_command(new_path)"
+        - "ROBOT[i] : follow_assigned_path()"
+      timing:
+        max_detection: 5s
+        max_resolution: 30s
+      fallback:
+        on_timeout: "LLM_AGENT : emergency_stop(ROBOT[i])"
+      postcondition: "ROBOT[i].status != Collision"
+
+    - id: DEADLOCK_RESOLUTION
+      trigger: "multiple ROBOT[*].status == Collision for > 10s"
+      precondition: "count(ROBOT[*].status == Collision) >= 2"
+      steps:
+        - "LLM_AGENT : query_world_state(get_all)"
+        - "LLM_AGENT : detect_deadlock_pattern()"
+        - parallel:
+          - "LLM_AGENT -> ROBOT[i] : yield_command()"
+          - "LLM_AGENT -> ROBOT[j] : set_path_command(detour_path)"
+        - "LLM_AGENT -> ROBOT[i] : resume_command()"
+      timing:
+        max_total: 60s
+      fallback:
+        on_timeout: "LLM_AGENT : switch_path_mode(static)"
+      postcondition: "all(ROBOT[*].status != Collision)"
+
+  algorithms:
+    routing:
+      central: "LLM_Dijkstra"
+      local: "NaiveDijkstra"
+    collision_avoidance:
+      central: "LLM_resolution"
+      local: "occupancy_aware_routing"
+
+  transitions:
+    - from: NORMAL
+      to: COLLISION_RESOLUTION
+      condition: "any(ROBOT[*].status == Collision)"
+      protocol: COLLISION_RESOLUTION
+    - from: COLLISION_RESOLUTION
+      to: NORMAL
+      condition: "all(ROBOT[*].status != Collision)"
+    - from: COLLISION_RESOLUTION
+      to: DEADLOCK
+      condition: "collision_unresolved_for > 30s"
+      protocol: DEADLOCK_RESOLUTION
+    - from: DEADLOCK
+      to: NORMAL
+      condition: "all(ROBOT[*].status != Collision)"
+
+  metrics:
+    - id: goal_sum
+      formula: "sum(ROBOT[i].goal_count for i in 1..5)"
+      target: ">= 0"
+    - id: goal_min
+      formula: "min(ROBOT[i].goal_count for i in 1..5)"
+      target: ">= 0"
+    - id: collision_resolution_time
+      formula: "mean(resolution_times)"
+      target: "<= 15s"
+    - id: deadlock_count
+      formula: "count(deadlock_events)"
+      target: "<= 2"
+    - id: llm_interventions
+      formula: "count(set_path_commands + yield_commands)"
+      target: "<= 50"
