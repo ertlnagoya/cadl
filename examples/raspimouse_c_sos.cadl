@@ -46,7 +46,7 @@ sos:
         - track_agent_state
         - verify_proposed_next_node
       interface:
-        input: [init_request, next_request_csос, ret_request, resource_query]
+        input: [init_request, next_request_csos, ret_request, resource_query]
         output: [permit_state, resource_response, rejection]
 
     - id: "ROBOT[1..5]"
@@ -61,7 +61,7 @@ sos:
         - nats_request_response
       interface:
         input: [permit_state, resource_response]
-        output: [next_request_csос, resource_query, ret_request]
+        output: [next_request_csos, resource_query, ret_request]
 
   contracts:
     - id: ROUTE_VERIFICATION
@@ -86,7 +86,7 @@ sos:
           ARBITRATOR: "full_edge_flags + full_cross_flags + all_agent_states"
           "ROBOT[*]": "local_graph + queried_edge_flags + queried_cross_flags"
         sharing:
-          - "ROBOT[*] -> ARBITRATOR : next_request_csос"
+          - "ROBOT[*] -> ARBITRATOR : next_request_csos"
           - "ARBITRATOR -> ROBOT[*] : permit_state"
           - "ROBOT[*] -> ARBITRATOR : resource_query"
           - "ARBITRATOR -> ROBOT[*] : resource_response"
@@ -115,7 +115,7 @@ sos:
       precondition: "ROBOT[i].at_intersection == true"
       steps:
         - "ROBOT[i] : compute_local_dijkstra(src, goal)"
-        - "ROBOT[i] -> ARBITRATOR : next_request_csос(id, src, dst, next, goal)"
+        - "ROBOT[i] -> ARBITRATOR : next_request_csos(id, src, dst, next, goal)"
         - "ARBITRATOR : verify_proposed_next_node(id, src, next)"
         - "ARBITRATOR -> ROBOT[i] : permit_state(1=approved, -1=retry, -2=reverse)"
         - if "permit_state == 1": ["ROBOT[i] : move_to_next_node()"]
@@ -142,7 +142,7 @@ sos:
       trigger: "ROBOT[i].distance_sensor < 0.1m for > maxT"
       steps:
         - "ROBOT[i] : execute_back_handler()"
-        - "ROBOT[i] -> ARBITRATOR : next_request_csос(id, src, dst, next, goal, re=true)"
+        - "ROBOT[i] -> ARBITRATOR : next_request_csos(id, src, dst, next, goal, re=true)"
         - "ARBITRATOR -> ROBOT[i] : permit_state"
       timing:
         back_duration: 2s
