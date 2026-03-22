@@ -287,6 +287,27 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
 | Local Planner | tracking_only | LRA* + conflict avoidance |
 | Sharing Mode | uplink + broadcast | peer-to-peer broadcast |
 
+#### Raspimouse Swarm Simulator — D-SoS / C-SoS / MCP-SoS Comparison
+
+Three CADL definitions model the same 5-robot swarm on an 11-node graph network under different SoS paradigms. These connect to the [raspimouse-swarm-simulator](https://github.com/ertlnagoya/raspimouse-swarm-simulator) via the Unity config generator (`cadl sim-gen --target unity`).
+
+| Property | D-SoS (Directed) | C-SoS (Collaborative) | MCP-SoS (Acknowledged) |
+|---|---|---|---|
+| Decision Authority | ARBITRATOR | ROBOT[*] (propose) + ARBITRATOR (verify) | LLM_AGENT |
+| beta | 0.9 | 0.3 | 0.6 |
+| alpha | 0.2 | 0.7 | 0.9 |
+| Central Planner | NaiveDijkstra | DirectionDijkstra | LLM_Dijkstra |
+| Local Planner | none | DirectionDijkstra | NaiveDijkstra + OccupancyAware |
+| Communication | NATS req/res | NATS req/res + resource query | MCP tools |
+| Regimes | NORMAL ↔ CONGESTED | NORMAL ↔ CONGESTED | NORMAL ↔ COLLISION_RESOLUTION ↔ DEADLOCK |
+
+```bash
+# Generate Unity configs for all three modes
+cadl sim-gen examples/raspimouse_d_sos.cadl --target unity -o output/raspimouse_d_sos_unity.json
+cadl sim-gen examples/raspimouse_c_sos.cadl --target unity -o output/raspimouse_c_sos_unity.json
+cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimouse_mcp_sos_unity.json
+```
+
 ### AI Integration (Phase 4)
 
 `cadl ai` generates CADL from natural language descriptions via Claude API:
@@ -321,6 +342,9 @@ The type checker validates:
 | `household_chores.cadl` | Family chore sharing | Collaborative | Human-centric, monetary incentives, dispute resolution |
 | `a_sos_robot_delivery.cadl` | MAPF robot delivery (A-SoS) | Acknowledged | Central ECBS planner, 3-regime transitions, fleet safety |
 | `c_sos_taxi_fleet.cadl` | Autonomous taxi fleet (C-SoS) | Collaborative | Decentralized LRA*, peer conflict resolution, 5-regime transitions |
+| `raspimouse_d_sos.cadl` | Raspimouse swarm (D-SoS) | Directed | Centralized arbitration via NATS, NaiveDijkstra, beta=0.9 |
+| `raspimouse_c_sos.cadl` | Raspimouse swarm (C-SoS) | Collaborative | Local DirectionDijkstra + central verification, discrete-time sync |
+| `raspimouse_mcp_sos.cadl` | Raspimouse swarm (MCP-SoS) | Acknowledged | LLM-controlled via MCP tools, Static/Dynamic path modes, 3 regimes |
 
 ### Demo Scripts
 
@@ -408,6 +432,10 @@ examples/
   demo_codegen_targets.py    Multi-target code generation demo
   a_sos_robot_delivery.cadl  A-SoS MAPF robot delivery sample
   c_sos_taxi_fleet.cadl      C-SoS autonomous taxi fleet sample
+  raspimouse_d_sos.cadl      Raspimouse swarm D-SoS (Directed)
+  raspimouse_c_sos.cadl      Raspimouse swarm C-SoS (Collaborative)
+  raspimouse_mcp_sos.cadl    Raspimouse swarm MCP-SoS (LLM-controlled)
+  test_raspimouse.sh         Parse, validate, and generate Unity configs for Raspimouse
 ```
 
 ## Roadmap
@@ -421,6 +449,10 @@ examples/
 | 5 | Regime transitions and regime map construction | Done |
 | 6 | IEC 62853 integration, smart contract generation (Solidity, OPA/Rego) | Done |
 | 7 | Simulator IR & config generation (Python, Unity, Go) | Done |
+
+## Related Projects
+
+- [raspimouse-swarm-simulator](https://github.com/ertlnagoya/raspimouse-swarm-simulator) — Multi-agent swarm robotics simulation platform. CADL files in `examples/raspimouse_*.cadl` describe its three SoS modes, and the Unity config generator produces configuration JSON for the simulator.
 
 ## References
 

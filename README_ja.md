@@ -286,6 +286,27 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
 | 局所プランナ | tracking_only | LRA* + 局所衝突回避 |
 | 共有方式 | アップリンク + ブロードキャスト | ピアツーピア ブロードキャスト |
 
+#### Raspimouse群ロボットシミュレータ — D-SoS / C-SoS / MCP-SoS の比較
+
+同一の5台ロボット・11ノードグラフネットワーク上で、異なるSoSパラダイムを記述する3つのCADL定義です。`cadl sim-gen --target unity` により、[raspimouse-swarm-simulator](https://github.com/ertlnagoya/raspimouse-swarm-simulator) のUnity設定JSONを自動生成できます。
+
+| 特性 | D-SoS（指示型） | C-SoS（協調型） | MCP-SoS（認知型） |
+|---|---|---|---|
+| 意思決定主体 | ARBITRATOR | ROBOT[*]（提案）+ ARBITRATOR（検証） | LLM_AGENT |
+| beta | 0.9 | 0.3 | 0.6 |
+| alpha | 0.2 | 0.7 | 0.9 |
+| 中央プランナ | NaiveDijkstra | DirectionDijkstra | LLM_Dijkstra |
+| 局所プランナ | なし | DirectionDijkstra | NaiveDijkstra + OccupancyAware |
+| 通信方式 | NATS req/res | NATS req/res + リソースクエリ | MCPツール |
+| レジーム | NORMAL ↔ CONGESTED | NORMAL ↔ CONGESTED | NORMAL ↔ COLLISION_RESOLUTION ↔ DEADLOCK |
+
+```bash
+# 3モードのUnity設定を生成
+cadl sim-gen examples/raspimouse_d_sos.cadl --target unity -o output/raspimouse_d_sos_unity.json
+cadl sim-gen examples/raspimouse_c_sos.cadl --target unity -o output/raspimouse_c_sos_unity.json
+cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimouse_mcp_sos_unity.json
+```
+
 ### AI統合（Phase 4）
 
 `cadl ai` は自然言語の記述からClaude APIを用いてCADL定義を生成します：
@@ -320,6 +341,9 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
 | `household_chores.cadl` | 家庭内家事分担 | 協調型 | 人間中心設計、金銭的インセンティブ、紛争解決 |
 | `a_sos_robot_delivery.cadl` | MAPF配送ロボット（A-SoS） | 認知型 | 中央ECBSプランナ、3レジーム遷移、安全保証 |
 | `c_sos_taxi_fleet.cadl` | 自律タクシー群（C-SoS） | 協調型 | 分散LRA*、ピア衝突解決、5レジーム遷移 |
+| `raspimouse_d_sos.cadl` | Raspimouse群ロボット（D-SoS） | 指示型 | NATS経由の集中調停、NaiveDijkstra、beta=0.9 |
+| `raspimouse_c_sos.cadl` | Raspimouse群ロボット（C-SoS） | 協調型 | ローカルDirectionDijkstra＋中央検証、離散時間同期 |
+| `raspimouse_mcp_sos.cadl` | Raspimouse群ロボット（MCP-SoS） | 認知型 | MCPツールによるLLM制御、Static/Dynamicパスモード、3レジーム |
 
 ### デモスクリプト
 
@@ -407,6 +431,10 @@ examples/
   demo_codegen_targets.py    マルチターゲットコード生成デモ
   a_sos_robot_delivery.cadl  A-SoS MAPFロボット配送サンプル
   c_sos_taxi_fleet.cadl      C-SoS 自律タクシー群サンプル
+  raspimouse_d_sos.cadl      Raspimouse群ロボット D-SoS（指示型）
+  raspimouse_c_sos.cadl      Raspimouse群ロボット C-SoS（協調型）
+  raspimouse_mcp_sos.cadl    Raspimouse群ロボット MCP-SoS（LLM制御）
+  test_raspimouse.sh         Raspimouse用パース・検証・Unity設定生成テスト
 ```
 
 ## 実装ロードマップ
@@ -420,6 +448,10 @@ examples/
 | Phase 5 | 制度遷移・レジームマップ構築 | 完了 |
 | Phase 6 | IEC 62853連携・スマートコントラクト生成（Solidity, OPA/Rego） | 完了 |
 | Phase 7 | シミュレータIR・設定生成（Python, Unity, Go） | 完了 |
+
+## 関連プロジェクト
+
+- [raspimouse-swarm-simulator](https://github.com/ertlnagoya/raspimouse-swarm-simulator) — マルチエージェント群ロボットシミュレーションプラットフォーム。`examples/raspimouse_*.cadl` で3つのSoSモードを記述し、Unity設定ジェネレータでシミュレータ用の構成JSONを生成できます。
 
 ## 参考文献
 
