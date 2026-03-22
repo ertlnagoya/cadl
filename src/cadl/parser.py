@@ -571,10 +571,17 @@ def _build_sos(data: dict) -> SoSDefinition:
         if env_data and isinstance(env_data, dict):
             env = EnvironmentDef()
             for k, v in env_data.items():
-                try:
-                    env.entries[str(k)] = parse_expr(str(v))
-                except Exception:
-                    env.entries[str(k)] = StringLiteral(value=str(v))
+                sk = str(k)
+                sv = str(v)
+                # Preserve quoted strings from YAML as-is (avoid
+                # expression parsing of e.g. "unity-mcp-custom")
+                if isinstance(v, str):
+                    env.entries[sk] = StringLiteral(value=sv)
+                else:
+                    try:
+                        env.entries[sk] = parse_expr(sv)
+                    except Exception:
+                        env.entries[sk] = StringLiteral(value=sv)
             ctx.environment = env
         assumptions = _get(ctx_data, 'assumptions', [])
         if isinstance(assumptions, list):
