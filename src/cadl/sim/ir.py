@@ -12,6 +12,10 @@ Layer 2 — Interaction Protocol
 
 Layer 3 — Operational Algorithm
     Central planner reference, local planner reference.
+
+Cross-cutting:
+    Task Arbitration  — FCFS delivery assignment, claim resolution, retirement.
+    Motivation Config — agent motivation delays, max deliveries, wandering goal mode.
 """
 
 from __future__ import annotations
@@ -122,6 +126,43 @@ class AlgorithmLayer:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class TaskArbitrationSpec:
+    """FCFS task arbitration configuration (DELIVERY_ASSIGNMENT protocol).
+
+    Maps directly to the Unity ``taskArbitration`` JSON block.
+    """
+    enabled: bool = False
+    protocol: str = "fcfs"            # "fcfs" | "priority" | ...
+    max_claim_delay_sec: float = 5.0
+    delivery_interval_sec: float = 1.0
+    goal_sequence: list[int] = field(default_factory=list)
+    startup_delay_sec: float = 0.0
+    parallel: bool = True
+    deadlock_recovery_enabled: bool = False
+    deadlock_detection_sec: float = 15.0
+    claim_resolution: str = "all-robot-wait"  # "all-robot-wait" | "first-come"
+
+
+@dataclass
+class MotivationSpec:
+    """Agent motivation and wandering-goal configuration.
+
+    Maps directly to the Unity ``motivationConfig`` JSON block.
+
+    agent_motivation:     per-robot claim-delay weight (0 = first to claim).
+    max_deliveries:       per-robot delivery cap before retirement.
+    wandering_goal_mode:  "random" (default) | "select" (deterministic list).
+    wandering_goal_list:  ordered goal IDs used when wandering_goal_mode == "select".
+    """
+    enabled: bool = False
+    model: str = "none"               # "none" | "fatigue" | ...
+    agent_motivation: list[float] = field(default_factory=list)
+    max_deliveries: list[int] = field(default_factory=list)
+    wandering_goal_mode: str = "random"
+    wandering_goal_list: list[int] = field(default_factory=list)
+
+
+@dataclass
 class MetricSpec:
     """A metric definition."""
     id: str
@@ -155,6 +196,8 @@ class SimIR:
         algorithm: Layer 3 — operational algorithms.
         metrics: cross-cutting metric definitions.
         transitions: cross-cutting regime transitions.
+        task_arbitration: optional FCFS task arbitration config (→ Unity taskArbitration).
+        motivation: optional agent motivation / wandering-goal config (→ Unity motivationConfig).
     """
     name: str
     sos_type: str = ""
@@ -165,3 +208,5 @@ class SimIR:
     algorithm: AlgorithmLayer = field(default_factory=AlgorithmLayer)
     metrics: list[MetricSpec] = field(default_factory=list)
     transitions: list[TransitionSpec] = field(default_factory=list)
+    task_arbitration: TaskArbitrationSpec | None = None
+    motivation: MotivationSpec | None = None

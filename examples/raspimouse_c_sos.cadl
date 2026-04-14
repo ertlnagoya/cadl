@@ -2,13 +2,21 @@
 #
 # Five RaspberryPi Mouse robots navigate a shared 11-node graph network.
 # Each robot performs local Dijkstra route search and proposes a next hop;
-# the central arbitrator verifies the proposal against global edge/node
+# the central ARBITRATOR verifies the proposal against global edge/node
 # occupancy and returns a structured permission state.
 #
-#   decision_holder = ROBOT[*] (propose) + ARBITRATOR (verify)
+# A separate TASK_OWNER process (FCFS Go arbitrator) manages the delivery
+# goal sequence, broadcasts claim requests to all robots, waits for all
+# active robots to submit a claim (with per-robot motivation delay), assigns
+# the next goal to the earliest claimer, and removes retired robots from the
+# active pool when their per-robot delivery cap is reached.
+#
+#   decision_holder = ROBOT[*] (propose) + ARBITRATOR (verify route)
+#                   + TASK_OWNER (assign delivery goal, FCFS)
 #   sharing_mode    = resource query (robot ← arbitrator) + request-response
 #   central planner = DirectionDijkstra (with occupancy penalties)
 #   local planner   = DirectionDijkstra (same algorithm, local graph copy)
+#   task arbitration = FCFS, all-robot-wait claim resolution
 #
 # Regime transitions: NORMAL ↔ CONGESTED
 # Discrete-time synchronization for reproducible results.
@@ -16,8 +24,8 @@
 sos:
   name: "RaspimouseSwarmCSoS"
   type: Collaborative
-  version: "4.0.0"
-  description: "Collaborative SoS with local route search, centralized verification, and discrete-time synchronization"
+  version: "5.0.0"
+  description: "Collaborative SoS with FCFS task arbitration, local route search, centralized verification, and discrete-time synchronization"
 
   context:
     environment:
@@ -28,11 +36,17 @@ sos:
       edge_length_min: 0.8
       edge_length_max: 3.0
       discrete_time_sync: true
+      random_seed: -1              # -1 = skip InitState (thesis-compatible, time-based seed)
+      start_nodes: [9, 8, 3, 2, 5]
+      task_arbitration: "fcfs"
+      wanderingGoalMode: "select"  # "random" | "select" (deterministic goal list)
+      wanderingGoalList: [9, 8, 3, 2, 5, 10, 7, 8, 0, 4, 6, 1]
     assumptions:
       - "NATS server is running and reachable"
       - "graph topology is static (11 nodes, 17 bidirectional edges)"
       - "all robots have an identical local copy of the graph"
       - "discrete-time communication ensures reproducible simulation"
+      - "TASK_OWNER process runs independently of the route arbitrator"
 
   actors:
     - id: ARBITRATOR
@@ -49,6 +63,20 @@ sos:
         input: [init_request, next_request_csos, ret_request, resource_query]
         output: [permit_state, resource_response, rejection]
 
+    - id: TASK_OWNER
+      role: "fcfs_task_arbitrator"
+      autonomy: low
+      capabilities:
+        - manage_goal_sequence
+        - broadcast_claim_request
+        - wait_for_all_claims
+        - assign_delivery_goal
+        - enforce_claim_delay
+        - manage_retirement_list
+      interface:
+        input: [claim_request, delivery_complete, retirement_notification]
+        output: [delivery_assignment, claim_ack]
+
     - id: "ROBOT[1..5]"
       role: "autonomous_navigator"
       autonomy: high
@@ -59,9 +87,11 @@ sos:
         - local_direction_dijkstra
         - query_global_resource
         - nats_request_response
+        - wait_motivation_delay
+        - notify_retirement
       interface:
-        input: [permit_state, resource_response]
-        output: [next_request_csos, resource_query, ret_request]
+        input: [permit_state, resource_response, delivery_assignment]
+        output: [next_request_csos, resource_query, ret_request, claim_request, delivery_complete, retirement_notification]
 
   contracts:
     - id: ROUTE_VERIFICATION
@@ -109,6 +139,55 @@ sos:
         action: "force_reverse(ROBOT[i]) AND log_violation"
         escalation: "after 5 violations: reset_all_flags"
 
+    - id: DELIVERY_ASSIGNMENT_CONTRACT
+      parties:
+        - TASK_OWNER
+        - "ROBOT[*]"
+      assume:
+        - "TASK_OWNER.is_operational == true"
+        - "goal_sequence is non-empty"
+        - "active_robot_count >= 1"
+      guarantee:
+        - "each_goal_assigned_to_exactly_one_robot()"
+        - "fcfs_priority_order_respected()"
+        - "all_active_robots_claim_before_assignment()"
+        - "retired_robots_excluded_from_future_assignments()"
+      authority:
+        decision_scope: "task_assignment"
+        decision_holder: "TASK_OWNER"
+        beta: 0.1
+        mode: "directed"
+      information:
+        alpha: 0.5
+        views:
+          TASK_OWNER: "goal_sequence + active_robot_list + claim_timestamps"
+          "ROBOT[*]": "assigned_goal + own_delivery_count"
+        sharing:
+          - "ROBOT[*] -> TASK_OWNER : claim_request(id, delay=agentMotivation[i])"
+          - "TASK_OWNER -> ROBOT[winner] : delivery_assignment(goal)"
+          - "ROBOT[winner] -> TASK_OWNER : delivery_complete(id)"
+          - "ROBOT[i] -> TASK_OWNER : retirement_notification(id)"
+      responsibilities:
+        "ROBOT[*]":
+          - "wait_motivation_delay(agentMotivation[i])"
+          - "send_claim_request()"
+          - "deliver_to_assigned_goal()"
+          - "send_retirement_notification() when delivery_count >= maxDeliveries[i]"
+        TASK_OWNER:
+          - "wait_for_all_active_claims(maxClaimDelaySec)"
+          - "assign_goal_to_earliest_claimer()"
+          - "remove_retired_robot_from_active_list()"
+          - "advance_goal_sequence_after_delivery_interval()"
+      incentives:
+        type: task_completion
+        lambda: 0.5
+        rules:
+          - "reward(ROBOT[i], 1) when delivery_completed"
+          - "retire(ROBOT[i]) when delivery_count >= maxDeliveries[i]"
+      violation:
+        detect: "duplicate_assignment OR robot_skips_claim OR claim_timeout"
+        action: "reassign_goal AND log_violation"
+
   protocols:
     - id: COLLABORATIVE_ROUTING
       trigger: "ROBOT[i] enters intersection node"
@@ -149,10 +228,41 @@ sos:
         max_retries: 3
       postcondition: "ROBOT[i].collision_resolved"
 
+    - id: DELIVERY_ASSIGNMENT
+      trigger: "TASK_OWNER issues next delivery goal from goal_sequence"
+      precondition: "goal_sequence.has_next() AND active_robot_count >= 1"
+      steps:
+        - "TASK_OWNER : select_next_goal_from_sequence()"
+        - "TASK_OWNER : broadcast_claim_request() to all active ROBOT[*]"
+        - "ROBOT[i] : wait(agentMotivation[i] * maxClaimDelaySec)"
+        - "ROBOT[i] -> TASK_OWNER : claim_request(id)"
+        - "TASK_OWNER : wait_for_all_active_robots_to_claim(timeout=maxClaimDelaySec)"
+        - "TASK_OWNER : select_earliest_claimer() -> winner"
+        - "TASK_OWNER -> ROBOT[winner] : delivery_assignment(goal)"
+        - "ROBOT[winner] : navigate_and_deliver(goal)"
+        - "ROBOT[winner] -> TASK_OWNER : delivery_complete(id)"
+        - "TASK_OWNER : wait(deliveryIntervalSec)"
+      timing:
+        max_claim_delay: 5s
+        delivery_interval: 1s
+      postcondition: "goal_delivered AND goal_sequence.advanced"
+
+    - id: RETIREMENT
+      trigger: "ROBOT[i].delivery_count >= maxDeliveries[i]"
+      steps:
+        - "ROBOT[i] -> TASK_OWNER : retirement_notification(id)"
+        - "TASK_OWNER : remove_from_active_list(i)"
+        - "ROBOT[i] : enter_idle_state()"
+      postcondition: "ROBOT[i].is_retired == true AND TASK_OWNER.active_list excludes i"
+
   algorithms:
     routing:
       central: "DirectionDijkstra"
       local: "DirectionDijkstra"
+    task_arbitration:
+      protocol: "FCFS"
+      claim_resolution: "all-robot-wait"
+      claim_delay_model: "agentMotivation * maxClaimDelaySec"
 
   transitions:
     - from: NORMAL

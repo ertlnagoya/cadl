@@ -75,6 +75,34 @@ def _build_config(ir: SimIR) -> dict:
             _transition_unity(t) for t in ir.transitions
         ]
 
+    # Task arbitration (FCFS / DELIVERY_ASSIGNMENT)
+    if ir.task_arbitration is not None:
+        ta = ir.task_arbitration
+        cfg["taskArbitration"] = {
+            "enabled": ta.enabled,
+            "protocol": ta.protocol,
+            "maxClaimDelaySec": ta.max_claim_delay_sec,
+            "deliveryIntervalSec": ta.delivery_interval_sec,
+            "goalSequence": ta.goal_sequence,
+            "startupDelaySec": ta.startup_delay_sec,
+            "parallel": ta.parallel,
+            "deadlockRecoveryEnabled": ta.deadlock_recovery_enabled,
+            "deadlockDetectionSec": ta.deadlock_detection_sec,
+            "claimResolution": ta.claim_resolution,
+        }
+
+    # Motivation config (agent delays, retirement, wandering goal mode)
+    if ir.motivation is not None:
+        mo = ir.motivation
+        cfg["motivationConfig"] = {
+            "enabled": mo.enabled,
+            "model": mo.model,
+            "agentMotivation": mo.agent_motivation,
+            "maxDeliveries": mo.max_deliveries,
+            "wanderingGoalMode": mo.wandering_goal_mode,
+            "wanderingGoalList": mo.wandering_goal_list,
+        }
+
     # Metrics
     if ir.metrics:
         cfg["metrics"] = [
