@@ -4,7 +4,7 @@ English | [日本語](README_ja.md)
 
 CADL is a domain-specific language for formally describing, verifying, and deploying institutional designs in Systems of Systems (SoS). It enables stakeholders — from engineers to citizens — to define governance rules, contracts, protocols, and incentive structures in a machine-readable, verifiable format.
 
-CADL is developed at the Matsubara Laboratory, Graduate School of Informatics, Nagoya University.
+CADL is developed at ERTL, Graduate School of Informatics, Nagoya University.
 
 ## Motivation
 

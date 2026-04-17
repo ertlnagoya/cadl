@@ -5,10 +5,34 @@ build-backend = "hatchling.build"
 [project]
 name = "cadl"
 version = "0.1.0"
-description = "CADL: Contract Architecture Description Language"
+description = "Contract Architecture Description Language — a DSL for formally specifying, verifying, and deploying institutional designs in System of Systems"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
+authors = [
+    {name = "ERTL, Nagoya University"},
+]
+keywords = [
+    "cadl",
+    "dsl",
+    "system-of-systems",
+    "governance",
+    "formal-verification",
+    "multi-agent",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Compilers",
+]
 dependencies = [
     "lark>=1.1",
     "pyyaml>=6.0",
@@ -22,10 +46,31 @@ ai = [
 dev = [
     "pytest>=7.0",
     "pytest-cov",
+    "build",
+    "twine",
 ]
+
+[project.urls]
+Homepage = "https://ertlnagoya.github.io/cadl-spec/"
+Documentation = "https://ertlnagoya.github.io/cadl-spec/"
+Repository = "https://github.com/ertlnagoya/cadl"
 
 [project.scripts]
 cadl = "cadl.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cadl"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/cadl",
+    "tests",
+    "examples",
+    "README.md",
+    "README_ja.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
