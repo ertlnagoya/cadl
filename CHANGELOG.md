@@ -12,10 +12,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - GitHub Actions workflow running `pytest` on Python 3.9–3.12 and building
   the sdist + wheel on every push.
 - `CHANGELOG.md` (this file).
+- `VerificationSpec.method` / `expr` / `bound` fields and
+  `cadl.verifier.dispatch_spec()` implementing explicit `not_supported`
+  results for `model_check` / `simulation` / `proof` methods per
+  Appendix A §A.8 (previously these were silently skipped).
+- Optional `MotivationBlock` / `AgentMotivationBlock` /
+  `GovernanceMotivationBlock` AST nodes and `SoSDefinition.motivation`
+  field for CADL Appendix C (v0.1-ext) motivation extension parity with
+  `cadl-explorer`.
+- Integration tests `tests/test_method_dispatch.py` (11 new cases).
 
 ### Changed
 - Fixed attribution in `README.md` / `README_ja.md` from "Matsubara
   Laboratory" / "松原研究室" to "ERTL".
+- `CodegenSpec.target` docstring updated to enumerate the canonical
+  target catalog (`unity` / `ros2` / `python` / `solidity` / `opa` /
+  user identifier) to match Appendix D of the spec.
 
 ## [0.1.0] — 2026-03-17
 

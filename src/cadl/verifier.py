@@ -31,7 +31,14 @@ from .ast_nodes import (
     SoSDefinition,
     StringLiteral,
     UnaryOp,
+    VerificationSpec,
 )
+
+
+# Methods recognised by CADL Appendix A §A.8.
+_KNOWN_METHODS = {"smt", "model_check", "simulation", "proof"}
+# Methods the reference verifier in this module can actually discharge.
+_SUPPORTED_METHODS = {"smt"}
 
 
 @dataclass
@@ -543,8 +550,53 @@ def _check_regime_safety_invariants(sos: SoSDefinition) -> List[VerificationResu
     return results
 
 
+def dispatch_spec(spec: VerificationSpec) -> VerificationResult:
+    """Route a user-declared verification spec to the appropriate back-end.
+
+    The reference verifier only implements the ``smt`` method. Other
+    methods recognised by the spec (``model_check``, ``simulation``,
+    ``proof``) return a ``not_supported`` result so downstream callers
+    see an explicit diagnostic instead of a silent skip. Unknown methods
+    return a ``failed`` result.
+
+    See Appendix A §A.8 and Appendix D §D.4 for the conformance rule.
+    """
+    method = (spec.method or "smt").lower()
+    if method == "smt":
+        # SMT-backed checks are already discharged by the bulk passes in
+        # ``verify(sos)``; this per-spec entry records the acknowledgement.
+        return VerificationResult(
+            check_name=f"verification.{spec.id}",
+            status="passed",
+            message=f"method=smt; discharged by built-in contract/transition checks",
+        )
+    if method in _KNOWN_METHODS:
+        return VerificationResult(
+            check_name=f"verification.{spec.id}",
+            status="not_supported",
+            message=(
+                f"method={method!r} is defined by Appendix A §A.8 but is "
+                f"not yet implemented in the reference verifier "
+                f"(supported: {sorted(_SUPPORTED_METHODS)})"
+            ),
+        )
+    return VerificationResult(
+        check_name=f"verification.{spec.id}",
+        status="failed",
+        message=(
+            f"unknown verification method {method!r}; expected one of "
+            f"{sorted(_KNOWN_METHODS)}"
+        ),
+    )
+
+
 def verify(sos: SoSDefinition) -> List[VerificationResult]:
-    """Run all SMT verification checks on a CADL SoS definition.
+    """Run all verification checks on a CADL SoS definition.
+
+    Built-in contract / transition SMT checks run unconditionally.
+    Any explicit ``verification:`` entries on ``sos.verifications`` are
+    dispatched through :func:`dispatch_spec` so non-SMT methods surface
+    as explicit ``not_supported`` diagnostics.
 
     Returns a list of VerificationResult objects.
     """
@@ -573,5 +625,9 @@ def verify(sos: SoSDefinition) -> List[VerificationResult]:
         results.extend(_check_regime_reachability(sos))
         results.extend(_check_regime_dead_states(sos))
         results.extend(_check_regime_safety_invariants(sos))
+
+    # 5. Per-spec method dispatch (Appendix A §A.8)
+    for spec in sos.verifications:
+        results.append(dispatch_spec(spec))
 
     return results

@@ -347,20 +347,65 @@ class ContextBlock:
 
 @dataclass
 class VerificationSpec:
-    """A verification directive within a CADL definition."""
+    """A verification directive within a CADL definition.
+
+    `method` is the verifier back-end as specified in Appendix A §A.8:
+    one of ``"smt"``, ``"model_check"``, ``"simulation"``, ``"proof"``.
+    Defaults to ``"smt"`` when unset. Unknown methods are preserved
+    verbatim for downstream tools but the reference verifier will emit
+    a ``not_supported`` result (see ``cadl.verifier.dispatch_spec``).
+    """
     id: str
     type: str  # "consistency", "deadlock", "safety", "liveness"
     target: str | None = None
     property: str | None = None
+    method: str | None = None  # "smt" | "model_check" | "simulation" | "proof"
+    expr: str | None = None
+    bound: int | None = None
     loc: SourceLocation | None = None
 
 
 @dataclass
 class CodegenSpec:
-    """A code generation directive within a CADL definition."""
-    target: str  # "python", "typescript", "solidity", "opa"
+    """A code generation directive within a CADL definition.
+
+    Recognised targets per Appendix A §A.9 and Appendix D:
+    ``"unity" | "ros2" | "python" | "solidity" | "opa" | <identifier>``.
+    """
+    target: str
     output: str | None = None
     mappings: dict[str, str] = field(default_factory=dict)
+    loc: SourceLocation | None = None
+
+
+# === Motivation extension (Appendix C, v0.1-ext) ===
+
+@dataclass
+class AgentMotivationBlock:
+    """Per-actor motivation specification (Appendix C §C.2)."""
+    profile: str = "uniform"  # "uniform" | "linear" | "polarized" | "custom"
+    values: list[float] = field(default_factory=list)
+
+
+@dataclass
+class GovernanceMotivationBlock:
+    """Governance-level motivation interpretation (Appendix C §C.2)."""
+    model: str = "none"  # "none" | "commitment_budget" | "hybrid"
+    rho: float = 0.0
+    kappa: float = 5.0
+    budget_base: int = 3
+    wait_scale: float = 3.0
+
+
+@dataclass
+class MotivationBlock:
+    """Optional `motivation:` section — CADL v0.1-ext (Appendix C).
+
+    Core-conforming processors MAY ignore this block but SHOULD preserve
+    it verbatim when re-emitting CADL sources.
+    """
+    agent: AgentMotivationBlock | None = None
+    governance: GovernanceMotivationBlock | None = None
     loc: SourceLocation | None = None
 
 
@@ -381,4 +426,5 @@ class SoSDefinition:
     metrics: list[MetricDef] = field(default_factory=list)
     verifications: list[VerificationSpec] = field(default_factory=list)
     codegen: list[CodegenSpec] = field(default_factory=list)
+    motivation: MotivationBlock | None = None  # Appendix C (v0.1-ext)
     loc: SourceLocation | None = None
