@@ -174,7 +174,7 @@ namespace {ns} {{
         private static readonly Regex _tokenRe = new Regex(
             @"\\s*(?:" +
             @"(?<NUM>\\d+(?:\\.\\d+)?)" +
-            "|(?<STR>\"[^\"]*\")" +
+            @"|(?<STR>""[^""]*"")" +
             @"|(?<OP><=|>=|==|!=|<|>)" +
             @"|(?<KW>AND|OR|NOT|IN|in)" +
             @"|(?<LB>\\[)|(?<RB>\\])|(?<LP>\\()|(?<RP>\\))" +
