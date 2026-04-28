@@ -40,15 +40,21 @@ from .ast_nodes import (
     InformationBlock,
     InterfaceDef,
     IntLiteral,
+    LifecycleSpec,
+    LifecycleTransition,
     MemberAccess,
     MessageStep,
     MetricDef,
+    MonitorDef,
+    OnMatchSpec,
+    OnViolationSpec,
     ParallelStep,
     ProtocolDef,
     QuantifiedExpr,
     RangeExpr,
     ResponsibilityGroup,
     RollbackBlock,
+    SamplingSpec,
     SharingDef,
     SoSDefinition,
     SoSType,
@@ -411,7 +417,174 @@ def _build_contract(data: dict) -> ContractDef:
     if dur is not None:
         contract.duration = str(dur)
 
+    # === SoS-DSL extension (Appendix E) ===
+
+    # lifecycle:
+    lc_data = _get(data, 'lifecycle')
+    if lc_data and isinstance(lc_data, dict):
+        contract.lifecycle = _build_lifecycle(lc_data)
+
+    # monitors:
+    mon_data = _get(data, 'monitors')
+    if isinstance(mon_data, list):
+        contract.monitors = [
+            _build_monitor(m) for m in mon_data if isinstance(m, dict)
+        ]
+
     return contract
+
+
+# === SoS-DSL extension builders (Appendix E) ===
+
+_DURATION_RE = re.compile(r'^\s*(\d+)\s*(ms|s|min|h)\s*$')
+
+
+def _duration_to_ms(value) -> int | None:
+    """Normalize a duration literal (e.g. '5s', '500ms') to milliseconds.
+
+    Accepts ints/floats (interpreted as seconds) and strings.
+    Returns None if the value cannot be parsed.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(float(value) * 1000)
+    s = str(value).strip()
+    m = _DURATION_RE.match(s)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == 'ms':
+        return n
+    if unit == 's':
+        return n * 1000
+    if unit == 'min':
+        return n * 60 * 1000
+    if unit == 'h':
+        return n * 60 * 60 * 1000
+    return None
+
+
+def _as_str_list(value) -> list[str]:
+    """Coerce a YAML scalar / list to a list of stripped strings."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value]
+    return [str(value).strip()]
+
+
+def _build_on_violation(data: dict) -> OnViolationSpec:
+    return OnViolationSpec(
+        transition=(_get(data, 'transition') or None),
+        severity=str(_get(data, 'severity', 'Major')),
+    )
+
+
+def _build_on_match(data: dict) -> OnMatchSpec:
+    return OnMatchSpec(
+        violation=(_get(data, 'violation') or None),
+        transition=(_get(data, 'transition') or None),
+        severity=str(_get(data, 'severity', 'Major')),
+    )
+
+
+def _yaml_on_key(data: dict, default=''):
+    """Read the 'on' key, tolerating PyYAML's YAML-1.1 quirk that maps
+    'on' to boolean True. We try the canonical string key first, then
+    fall back to the boolean key produced by PyYAML.
+    """
+    if 'on' in data:
+        return data['on']
+    if True in data:
+        return data[True]
+    return default
+
+
+def _build_lifecycle_transition(data: dict) -> LifecycleTransition:
+    """Build a single lifecycle transition; normalizes from: to a list."""
+    raw_from = _get(data, 'from')
+    from_states = _as_str_list(raw_from)
+    on_viol_data = _get(data, 'on_violation')
+    on_viol = (
+        _build_on_violation(on_viol_data)
+        if isinstance(on_viol_data, dict)
+        else None
+    )
+    emit = _as_str_list(_get(data, 'emit', []))
+    return LifecycleTransition(
+        id=str(_get(data, 'id', '')),
+        from_states=from_states,
+        to_state=str(_get(data, 'to', '')),
+        on=str(_yaml_on_key(data, '')),
+        when=(_get(data, 'when') or None),
+        deadline_ms=_duration_to_ms(_get(data, 'deadline')),
+        on_violation=on_viol,
+        emit=emit,
+    )
+
+
+def _build_lifecycle(data: dict) -> LifecycleSpec:
+    """Build a LifecycleSpec from a YAML mapping."""
+    spec = LifecycleSpec(
+        states=_as_str_list(_get(data, 'states', [])),
+        initial=(_get(data, 'initial') or None),
+        terminal=_as_str_list(_get(data, 'terminal', [])),
+    )
+    trans_data = _get(data, 'transitions')
+    if isinstance(trans_data, list):
+        spec.transitions = [
+            _build_lifecycle_transition(t)
+            for t in trans_data
+            if isinstance(t, dict)
+        ]
+    return spec
+
+
+_SAMPLING_PERIODIC_RE = re.compile(
+    r'^\s*periodic\s*\(\s*(\d+)\s*(ms|s|min|h)\s*\)\s*$'
+)
+
+
+def _build_sampling(value) -> SamplingSpec:
+    """Parse a sampling spec string ('event' or 'periodic(500ms)')."""
+    if value is None:
+        return SamplingSpec(kind='event')
+    if isinstance(value, dict):
+        # Already-normalized form: {kind: ..., period_ms: ...}
+        return SamplingSpec(
+            kind=str(_get(value, 'kind', 'event')),
+            period_ms=_get(value, 'period_ms'),
+        )
+    s = str(value).strip()
+    if s == 'event':
+        return SamplingSpec(kind='event')
+    m = _SAMPLING_PERIODIC_RE.match(s)
+    if m:
+        period = int(m.group(1))
+        unit = m.group(2)
+        period_ms = _duration_to_ms(f"{period}{unit}")
+        return SamplingSpec(kind='periodic', period_ms=period_ms)
+    # Unknown form -> treat as event-driven, preserve raw on rule via sampling.kind
+    return SamplingSpec(kind='event')
+
+
+def _build_monitor(data: dict) -> MonitorDef:
+    """Build a MonitorDef from a YAML mapping."""
+    on_match_data = _get(data, 'on_match')
+    on_match = (
+        _build_on_match(on_match_data)
+        if isinstance(on_match_data, dict)
+        else None
+    )
+    return MonitorDef(
+        id=str(_get(data, 'id', '')),
+        observe=_as_str_list(_get(data, 'observe', [])),
+        sampling=_build_sampling(_get(data, 'sampling')),
+        rule=str(_get(data, 'rule', '')),
+        on_match=on_match,
+    )
 
 
 def _build_step(data) -> Optional[Any]:

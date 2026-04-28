@@ -329,6 +329,34 @@ The type checker validates:
 4. **Information sharing coherence** — Sharing declarations reference valid actors
 5. **Parameter range constraints** — `0 <= alpha, beta, lambda <= 1`
 
+## Hands-on
+
+A 90-minute self-paced workshop (or a 5-session PBL course) walks you through the complete CADL toolchain end-to-end on a robot delivery System of Systems: **CADL modelling → SoS-DSL contracts (lifecycle + monitors) → visualisation → code generation → live simulation**.
+
+The hands-on materials include:
+
+- **Main textbook** — six 15-minute steps, with full bilingual EN / JA pages and a runnable end-to-end script (`scripts/sos_dsl_handson_e2e.sh`).
+- **Exercises booklet** — a 5-session structured course (compact 3-session version available) with graded ★ / ★★ / ★★★ tasks and a rubric.
+- **Academic background** — Maier's five SoS criteria, the **ISO/IEC/IEEE 21839 / 21840 / 21841** standards, related research (ADLs, Normative MAS, Runtime Verification), and an annotated bibliography.
+- **PBL course design (instructor-facing)** — full lesson plans with academic significance and learning perspective annotated per session, common student pitfalls, "aha moment" engineering, and links to graduation-thesis research themes.
+
+| Audience | Entry point |
+| --- | --- |
+| Self-learner — quick tour | [`docs/handson/sos-dsl-handson-textbook.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-handson-textbook.en.md) (EN) / [`.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-handson-textbook.ja.md) (JA) |
+| Student in a class | [`docs/handson/sos-dsl-exercises.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-exercises.en.md) (EN) / [`.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-exercises.ja.md) (JA) |
+| Instructor designing a course | [`docs/handson/sos-dsl-pbl-course-design.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-pbl-course-design.en.md) (EN) / [`.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-pbl-course-design.ja.md) (JA) |
+| Researcher needing citations | [`docs/handson/sos-academic-background.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-academic-background.en.md) (EN) / [`.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-academic-background.ja.md) (JA) |
+
+The materials are hosted in the [cadl-spec repository](https://github.com/ertlnagoya/cadl-spec) under `docs/handson/` and rendered on the [Hands-on section of the spec website](https://ertlnagoya.github.io/cadl-spec/docs/handson/).
+
+To run the full pipeline locally on the bundled robot-delivery example:
+
+```bash
+./scripts/sos_dsl_handson_e2e.sh
+```
+
+This generates the IR JSON, the Unity C# tree, and drops the latter into the `raspimouse-swarm-simulator` Unity project. See the hands-on textbook for the rest of the walkthrough.
+
 ## Examples
 
 ### CADL Definitions

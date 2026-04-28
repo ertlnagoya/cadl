@@ -33,7 +33,10 @@ from .ir import (
     ContractSpec,
     GovernanceParams,
     InstitutionLayer,
+    LifecycleSpecIR,
+    LifecycleTransitionSpec,
     MetricSpec,
+    MonitorSpecIR,
     ProtocolLayer,
     ProtocolSpec,
     SimIR,
@@ -173,6 +176,53 @@ def _lower_contract(contract) -> ContractSpec:
         governance=governance,
         violation_detect=contract.violation.detect if contract.violation else None,
         violation_action=contract.violation.action if contract.violation else None,
+        lifecycle=_lower_lifecycle(contract.lifecycle),
+        monitors=[_lower_monitor(m) for m in contract.monitors],
+    )
+
+
+def _lower_lifecycle(lc) -> LifecycleSpecIR | None:
+    """Lower a LifecycleSpec AST node to LifecycleSpecIR."""
+    if lc is None:
+        return None
+    return LifecycleSpecIR(
+        states=list(lc.states),
+        initial=lc.initial,
+        terminal=list(lc.terminal),
+        transitions=[
+            LifecycleTransitionSpec(
+                id=t.id,
+                from_states=list(t.from_states),
+                to_state=t.to_state,
+                on=t.on,
+                when=t.when,
+                deadline_ms=t.deadline_ms,
+                on_violation_transition=(
+                    t.on_violation.transition if t.on_violation else None
+                ),
+                on_violation_severity=(
+                    t.on_violation.severity if t.on_violation else None
+                ),
+                emit=list(t.emit),
+            )
+            for t in lc.transitions
+        ],
+    )
+
+
+def _lower_monitor(m) -> MonitorSpecIR:
+    """Lower a MonitorDef AST node to MonitorSpecIR."""
+    return MonitorSpecIR(
+        id=m.id,
+        observe=list(m.observe),
+        sampling_kind=m.sampling.kind if m.sampling else "event",
+        sampling_period_ms=(
+            m.sampling.period_ms if m.sampling else None
+        ),
+        rule=m.rule,
+        on_match_violation=(m.on_match.violation if m.on_match else None),
+        on_match_transition=(m.on_match.transition if m.on_match else None),
+        on_match_severity=(m.on_match.severity if m.on_match else None),
     )
 
 

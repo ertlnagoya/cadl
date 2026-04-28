@@ -3,7 +3,7 @@
 Public API:
     generate(sos, output_dir, target="python") -> None
 
-Supported targets: python, solidity, opa
+Supported targets: python, solidity, opa, unity-csharp
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from pathlib import Path
 
 from ..ast_nodes import SoSDefinition
 
-SUPPORTED_TARGETS = {"python", "solidity", "opa"}
+SUPPORTED_TARGETS = {"python", "solidity", "opa", "unity-csharp"}
 
 
 def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> None:
@@ -21,7 +21,9 @@ def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> No
     Args:
         sos: Parsed SoS definition.
         output_dir: Directory to write generated files.
-        target: Code generation target — "python", "solidity", or "opa".
+        target: Code generation target — "python", "solidity", "opa",
+            or "unity-csharp" (Unity C# for the SoS-DSL extension,
+            Appendix E).
     """
     if target not in SUPPORTED_TARGETS:
         raise ValueError(f"Unsupported target: {target!r}. Choose from: {sorted(SUPPORTED_TARGETS)}")
@@ -34,6 +36,9 @@ def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> No
     elif target == "opa":
         from .opa import generate_rego
         generate_rego(sos, output_dir)
+    elif target == "unity-csharp":
+        from .unity_csharp import generate_unity_csharp
+        generate_unity_csharp(sos, output_dir)
 
 
 def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:

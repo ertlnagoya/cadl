@@ -51,6 +51,44 @@ class GovernanceParams:
     incentive_type: str | None = None
 
 
+# --- SoS-DSL extension (Appendix E) IR specs --------------------------------
+
+@dataclass
+class LifecycleTransitionSpec:
+    """Lifecycle transition in normalized IR form."""
+    id: str
+    from_states: list[str] = field(default_factory=list)
+    to_state: str = ""
+    on: str = ""
+    when: str | None = None
+    deadline_ms: int | None = None
+    on_violation_transition: str | None = None
+    on_violation_severity: str | None = None
+    emit: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LifecycleSpecIR:
+    """Per-instance lifecycle in normalized IR form."""
+    states: list[str] = field(default_factory=list)
+    initial: str | None = None
+    terminal: list[str] = field(default_factory=list)
+    transitions: list[LifecycleTransitionSpec] = field(default_factory=list)
+
+
+@dataclass
+class MonitorSpecIR:
+    """Declarative observation rule in normalized IR form."""
+    id: str
+    observe: list[str] = field(default_factory=list)
+    sampling_kind: str = "event"      # "event" | "periodic"
+    sampling_period_ms: int | None = None
+    rule: str = ""
+    on_match_violation: str | None = None
+    on_match_transition: str | None = None
+    on_match_severity: str | None = None
+
+
 @dataclass
 class ContractSpec:
     """A contract between actors with governance parameters."""
@@ -61,6 +99,9 @@ class ContractSpec:
     governance: GovernanceParams = field(default_factory=GovernanceParams)
     violation_detect: str | None = None
     violation_action: str | None = None
+    # SoS-DSL extension (Appendix E)
+    lifecycle: LifecycleSpecIR | None = None
+    monitors: list[MonitorSpecIR] = field(default_factory=list)
 
 
 @dataclass

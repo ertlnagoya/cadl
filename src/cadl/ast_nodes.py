@@ -218,6 +218,68 @@ class ViolationBlock:
     escalation: str | None = None
 
 
+# === SoS-DSL extension (Appendix E, v0.1-sos-ext) ===
+# These nodes promote per-instance contract execution to first-class
+# language constructs. Core-conforming processors MAY ignore lifecycle:
+# and monitors: but SHOULD preserve them when re-emitting CADL sources.
+
+@dataclass
+class OnViolationSpec:
+    """Effect of a normative violation on the contract lifecycle."""
+    transition: str | None = None      # name of a lifecycle transition to fire
+    severity: str = "Major"            # "Minor" | "Major" | "Critical"
+
+
+@dataclass
+class LifecycleTransition:
+    """A single lifecycle state transition for a contract instance."""
+    id: str
+    from_states: list[str]             # post-normalization always a list
+    to_state: str
+    on: str                            # event expression (raw string)
+    when: str | None = None            # optional guard predicate (raw)
+    deadline_ms: int | None = None     # normalized from "5s" -> 5000
+    on_violation: OnViolationSpec | None = None
+    emit: list[str] = field(default_factory=list)
+    loc: SourceLocation | None = None
+
+
+@dataclass
+class LifecycleSpec:
+    """Per-instance lifecycle of a contract."""
+    states: list[str] = field(default_factory=list)
+    initial: str | None = None
+    terminal: list[str] = field(default_factory=list)
+    transitions: list[LifecycleTransition] = field(default_factory=list)
+    loc: SourceLocation | None = None
+
+
+@dataclass
+class SamplingSpec:
+    """How a monitor samples its observations."""
+    kind: str = "event"                # "event" | "periodic"
+    period_ms: int | None = None       # only for periodic
+
+
+@dataclass
+class OnMatchSpec:
+    """What a monitor emits when its rule matches."""
+    violation: str | None = None       # name of obligation/prohibition
+    transition: str | None = None      # name of lifecycle transition
+    severity: str = "Major"
+
+
+@dataclass
+class MonitorDef:
+    """Declarative observation rule attached to a contract."""
+    id: str
+    observe: list[str] = field(default_factory=list)
+    sampling: SamplingSpec = field(default_factory=SamplingSpec)
+    rule: str = ""
+    on_match: OnMatchSpec | None = None
+    loc: SourceLocation | None = None
+
+
 @dataclass
 class ContractDef:
     id: str
@@ -230,6 +292,9 @@ class ContractDef:
     incentives: IncentivesBlock | None = None
     violation: ViolationBlock | None = None
     duration: str | None = None
+    # SoS-DSL extension (Appendix E)
+    lifecycle: LifecycleSpec | None = None
+    monitors: list[MonitorDef] = field(default_factory=list)
     loc: SourceLocation | None = None
 
 
