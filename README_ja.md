@@ -328,6 +328,34 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 4. **情報共有の整合性** — 共有宣言が有効なアクターを参照していること
 5. **パラメータ値域制約** — `0 <= alpha, beta, lambda <= 1`
 
+## ハンズオン
+
+ロボット配送 System of Systems を題材に、**CADL モデリング → SoS-DSL 契約（lifecycle + monitors） → 可視化 → コード生成 → ライブシミュレーション** までを一気通貫で体験する 90 分の自習ワークショップ（5 回の PBL コースとしても利用可）が用意されています。
+
+教材内容：
+
+- **メイン教材** — 15 分 × 6 ステップ、英日バイリンガル、エンドツーエンド実行スクリプト（`scripts/sos_dsl_handson_e2e.sh`）付き。
+- **演習問題集** — 5 回構成の授業課題セット（縮小 3 回版あり）、★／★★／★★★ の段階的難易度とルーブリック。
+- **学術背景** — Maier の 5 条件、**ISO/IEC/IEEE 21839 / 21840 / 21841** 規格、関連研究領域（ADL、規範的 MAS、実行時検証）、注釈付き参考文献。
+- **PBL コース設計（教員向け）** — 各回に学術的意義と学びの観点を併記、よくあるつまずきと aha ポイント、卒研・修論への接続テーマ。
+
+| 想定読者 | 入口 |
+| --- | --- |
+| 自習で素早く全体像を掴みたい方 | [`docs/handson/sos-dsl-handson-textbook.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-handson-textbook.ja.md) (JA) / [`.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-handson-textbook.en.md) (EN) |
+| 授業で学ぶ学生 | [`docs/handson/sos-dsl-exercises.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-exercises.ja.md) (JA) / [`.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-exercises.en.md) (EN) |
+| 授業を設計する教員 | [`docs/handson/sos-dsl-pbl-course-design.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-pbl-course-design.ja.md) (JA) / [`.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-pbl-course-design.en.md) (EN) |
+| 引用したい研究者 | [`docs/handson/sos-academic-background.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-academic-background.ja.md) (JA) / [`.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-academic-background.en.md) (EN) |
+
+教材本体は [cadl-spec リポジトリ](https://github.com/ertlnagoya/cadl-spec) の `docs/handson/` に置かれており、[仕様サイトの Hands-on セクション](https://ertlnagoya.github.io/cadl-spec/docs/handson/) でレンダリングされます。
+
+ロボット配送のサンプルでパイプライン全体をローカル実行：
+
+```bash
+./scripts/sos_dsl_handson_e2e.sh
+```
+
+IR JSON と Unity C# ツリーが生成され、後者が `raspimouse-swarm-simulator` の Unity プロジェクトに配置されます。続きはハンズオン教材を参照してください。
+
 ## サンプル
 
 ### CADL定義ファイル
