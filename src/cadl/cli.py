@@ -36,8 +36,10 @@ def main(argv: list[str] | None = None) -> int:
     # codegen command
     codegen_cmd = subparsers.add_parser("codegen", help="Generate runtime code from a CADL file")
     codegen_cmd.add_argument("file", type=Path, help="CADL file to generate from")
-    codegen_cmd.add_argument("--target", "-t", choices=["python", "solidity", "opa"],
-                             default="python", help="Code generation target (default: python)")
+    codegen_cmd.add_argument("--target", "-t",
+                             choices=["python", "solidity", "opa", "unity-csharp"],
+                             default="python",
+                             help="Code generation target (default: python)")
     codegen_cmd.add_argument("--output", "-o", type=Path, default=Path("generated"),
                              help="Output directory (default: generated/)")
 
