@@ -142,10 +142,35 @@ mkdir -p "$DEST"
 # Replace Runtime/ and Generated/, but preserve any hand-written
 # files under Demo/ (DeliveryContractDemo.cs / ContractRuntimeHost.cs /
 # PilotContractBridge.cs etc.) — these are project-owned.
-rm -rf "$DEST/Runtime" "$DEST/Generated" 2>/dev/null || true
-cp -r "$CSHARP_DIR/Runtime" "$DEST/Runtime"
-cp -r "$CSHARP_DIR/Generated" "$DEST/Generated"
-cp "$CSHARP_DIR/README.md" "$DEST/README.md"
+#
+# We use Python's shutil for the copy because the naive
+#   rm -rf X && cp -r SRC X
+# pattern misbehaves on filesystems where unlink is restricted (e.g.
+# the cowork sandbox): the rm silently fails, X still exists, then
+# `cp -r SRC X` creates X/SRC nested instead of overwriting X. The
+# Python version overwrites file-by-file via O_TRUNC, which works on
+# both restricted and normal filesystems.
+"$PYTHON" - <<PY
+import shutil, sys
+from pathlib import Path
+src = Path("$CSHARP_DIR")
+dst = Path("$DEST")
+for sub in ("Runtime", "Generated"):
+    sd = src / sub
+    dd = dst / sub
+    dd.mkdir(parents=True, exist_ok=True)
+    # Remove stale .cs files that the new generation no longer emits.
+    keep = {p.name for p in sd.iterdir() if p.is_file()}
+    for old in dd.glob("*.cs"):
+        if old.name not in keep:
+            try: old.unlink()
+            except OSError: pass
+    # Overwrite files one by one.
+    for f in sd.iterdir():
+        if f.is_file():
+            shutil.copyfile(f, dd / f.name)
+shutil.copyfile(src / "README.md", dst / "README.md")
+PY
 echo "  installed: $DEST/Runtime, $DEST/Generated"
 echo "  preserved: $DEST/Demo (if it existed)"
 
