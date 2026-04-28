@@ -1,0 +1,153 @@
+# SoS-DSL Extension Demo (Appendix E, v0.1-sos-ext)
+#
+# This example exercises the lifecycle: and monitors: keys added to the
+# contracts: section by the SoS-DSL extension. The structural part is
+# kept minimal so the file focuses on the per-instance contract
+# execution model rather than on A-SoS / authority / information
+# concerns.
+
+sos:
+  name: "RobotDeliverySoS_DSLDemo"
+  type: Acknowledged
+  version: "0.1.0"
+  description: "Robot-delivery SoS used to demonstrate the SoS-DSL extension."
+  extensions:
+    - sos-dsl: 0.1
+
+  context:
+    environment:
+      grid_size: 30
+      num_robots: 5
+      num_customers: 10
+      time_step_ms: 100
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities:
+        - assign_tasks
+        - reassign_tasks
+        - monitor_fleet
+      interface:
+        input:  [position_report, task_completion, failure_report]
+        output: [route_assignment, task_assignment, replan_command]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities:
+        - follow_path
+        - pick_up
+        - deliver
+      interface:
+        input:  [route_assignment, replan_command]
+        output: [position_report, task_completion, failure_report]
+
+    - id: "CUSTOMER[1..M]"
+      role: "service_requester"
+      autonomy: medium
+      capabilities:
+        - submit_order
+        - confirm_receipt
+      interface:
+        input:  [delivery_notification]
+        output: [delivery_request]
+
+  contracts:
+    - id: DELIVERY_SLA
+      parties:
+        - DISPATCHER
+        - "ROBOT[*]"
+        - "CUSTOMER[*]"
+      assume:
+        - "ROBOT[i].battery > 20"
+      guarantee:
+        - "delivery_time <= 300s"
+      authority:
+        decision_holder: DISPATCHER
+        beta: 0.8
+        mode: "centralized"
+      information:
+        alpha: 0.9
+      incentives:
+        type: task_completion
+        lambda: 0.5
+        rules:
+          - "reward(ROBOT[i], 10) when on_time_delivery"
+          - "penalty(ROBOT[i], -5) when path_deviation"
+      violation:
+        detect: "path_deviation > 2 OR position_report_delay > 5s"
+        action: "notify(DISPATCHER) AND log_violation"
+        escalation: "after 3 violations: reassign_tasks"
+
+      # === SoS-DSL extension: per-instance lifecycle ===
+      lifecycle:
+        states:
+          - Proposed
+          - Assigned
+          - Accepted
+          - Delivering
+          - Completed
+          - Violated
+          - Terminated
+        initial: Proposed
+        terminal: [Completed, Violated, Terminated]
+        transitions:
+          - id: assign
+            from: Proposed
+            to: Assigned
+            on: "DISPATCHER -> ROBOT[i] : route_assignment"
+          - id: accept
+            from: Assigned
+            to: Accepted
+            on: "ROBOT[i] -> DISPATCHER : ack(accepted)"
+            deadline: 5s
+            on_violation:
+              transition: Violated
+              severity: Major
+          - id: start_delivery
+            from: Accepted
+            to: Delivering
+            on: "ROBOT[i].status == InTransit"
+          - id: complete
+            from: Delivering
+            to: Completed
+            on: "ROBOT[i].status == Delivered"
+            when: "now <= request.deadline"
+          - id: late_failure
+            from: [Assigned, Accepted, Delivering]
+            to: Violated
+            on: "now > request.deadline"
+
+      # === SoS-DSL extension: declarative monitors ===
+      monitors:
+        - id: battery_guard
+          observe: "ROBOT[i].battery"
+          sampling: periodic(500ms)
+          rule: "ROBOT[i].battery < 20 AND state == Assigned"
+          on_match:
+            transition: Violated
+            severity: Major
+        - id: collision_watch
+          observe: ["ROBOT[i].position", "OBSTACLES.positions"]
+          sampling: periodic(100ms)
+          rule: "min_dist(ROBOT[i].position, OBSTACLES.positions) < 0.05"
+          on_match:
+            violation: collision
+            severity: Critical
+        - id: deadline_watch
+          observe: time
+          sampling: periodic(1s)
+          rule: "now > request.deadline"
+          on_match:
+            transition: Violated
+            severity: Critical
+
+  metrics:
+    - id: makespan
+      formula: "max(completion_times)"
+      target: "<= 600s"
+    - id: violation_rate
+      formula: "violation_count / contract_instances"
+      target: "<= 0.05"
