@@ -342,12 +342,12 @@ The hands-on materials include:
 
 | Audience | Entry point |
 | --- | --- |
-| Self-learner — quick tour | [`docs/handson/sos-dsl-handson-textbook.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-handson-textbook.en.md) (EN) / [`.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-handson-textbook.ja.md) (JA) |
-| Student in a class | [`docs/handson/sos-dsl-exercises.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-exercises.en.md) (EN) / [`.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-exercises.ja.md) (JA) |
-| Instructor designing a course | [`docs/handson/sos-dsl-pbl-course-design.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-pbl-course-design.en.md) (EN) / [`.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-pbl-course-design.ja.md) (JA) |
-| Researcher needing citations | [`docs/handson/sos-academic-background.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-academic-background.en.md) (EN) / [`.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-academic-background.ja.md) (JA) |
+| Self-learner — quick tour | [Course A — Robot Delivery (main textbook)](https://ertlnagoya.github.io/cadl-spec/docs/handson/main-textbook) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/main-textbook) |
+| Student in a class | [Course A — Exercises](https://ertlnagoya.github.io/cadl-spec/docs/handson/exercises) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/exercises) |
+| Instructor designing a course | [PBL Course Design](https://ertlnagoya.github.io/cadl-spec/docs/handson/pbl-course-design) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/pbl-course-design) |
+| Researcher needing citations | [Why SoS-DSL? (academic background)](https://ertlnagoya.github.io/cadl-spec/docs/handson/academic-background) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/academic-background) |
 
-The materials are hosted in the [cadl-spec repository](https://github.com/ertlnagoya/cadl-spec) under `docs/handson/` and rendered on the [Hands-on section of the spec website](https://ertlnagoya.github.io/cadl-spec/docs/handson/).
+The materials are hosted in the [cadl-spec repository](https://github.com/ertlnagoya/cadl-spec) — English sources under `docs/handson/`, Japanese under `i18n/ja/docusaurus-plugin-content-docs/current/handson/` — and rendered on the [Hands-on section of the spec website](https://ertlnagoya.github.io/cadl-spec/docs/handson/).
 
 To run the full pipeline locally on the bundled robot-delivery example:
 

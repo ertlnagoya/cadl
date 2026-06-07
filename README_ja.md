@@ -341,12 +341,12 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 
 | 想定読者 | 入口 |
 | --- | --- |
-| 自習で素早く全体像を掴みたい方 | [`docs/handson/sos-dsl-handson-textbook.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-handson-textbook.ja.md) (JA) / [`.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-handson-textbook.en.md) (EN) |
-| 授業で学ぶ学生 | [`docs/handson/sos-dsl-exercises.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-exercises.ja.md) (JA) / [`.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-exercises.en.md) (EN) |
-| 授業を設計する教員 | [`docs/handson/sos-dsl-pbl-course-design.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-pbl-course-design.ja.md) (JA) / [`.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-dsl-pbl-course-design.en.md) (EN) |
-| 引用したい研究者 | [`docs/handson/sos-academic-background.ja.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-academic-background.ja.md) (JA) / [`.en.md`](https://github.com/ertlnagoya/cadl-spec/blob/main/docs/handson/sos-academic-background.en.md) (EN) |
+| 自習で素早く全体像を掴みたい方 | [Course A — ロボット配送（メイン教材）](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/main-textbook) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/main-textbook) |
+| 授業で学ぶ学生 | [Course A — 演習問題集](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/exercises) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/exercises) |
+| 授業を設計する教員 | [PBL コース設計](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/pbl-course-design) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/pbl-course-design) |
+| 引用したい研究者 | [Why SoS-DSL?（学術背景）](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/academic-background) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/academic-background) |
 
-教材本体は [cadl-spec リポジトリ](https://github.com/ertlnagoya/cadl-spec) の `docs/handson/` に置かれており、[仕様サイトの Hands-on セクション](https://ertlnagoya.github.io/cadl-spec/docs/handson/) でレンダリングされます。
+教材本体は [cadl-spec リポジトリ](https://github.com/ertlnagoya/cadl-spec) にあり（英語ソースは `docs/handson/`、日本語ソースは `i18n/ja/docusaurus-plugin-content-docs/current/handson/`）、[仕様サイトの Hands-on セクション](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/) でレンダリングされます。
 
 ロボット配送のサンプルでパイプライン全体をローカル実行：
 
