@@ -159,6 +159,14 @@ for sub in ("Runtime", "Generated"):
     sd = src / sub
     dd = dst / sub
     dd.mkdir(parents=True, exist_ok=True)
+    # Self-heal: a prior run with `cp -r SRC dd` (or an older version of
+    # this script) on a restricted-unlink filesystem can leave a nested
+    # dd/<sub> (e.g. Generated/Generated, Runtime/Runtime). Those nested
+    # copies duplicate every type and make Unity fail to compile
+    # (CS0101/CS0111). Remove any such nested directory before copying.
+    nested = dd / sub
+    if nested.is_dir():
+        shutil.rmtree(nested, ignore_errors=True)
     # Remove stale .cs files that the new generation no longer emits.
     keep = {p.name for p in sd.iterdir() if p.is_file()}
     for old in dd.glob("*.cs"):

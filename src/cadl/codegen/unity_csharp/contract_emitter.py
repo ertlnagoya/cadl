@@ -112,9 +112,14 @@ def _emit_contract_class(contract: ContractDef, cls: str, ns: str) -> str:
         ev_lit = _csharp_string(tr.on or "")
         when_block = ""
         if tr.when:
+            # Guard failed → skip this transition. Each transition is an
+            # independent `if (...) { ...; FireTransition(...); return; }`
+            # block (no enclosing loop/switch), so the correct skip is
+            # `return;`. Emitting `break;` here produces invalid C#
+            # (CS0139: no enclosing loop out of which to break).
             when_block = (
                 f"                if (!PredicateEvaluator.Evaluate("
-                f"{_csharp_string(tr.when)}, snap)) break;\n"
+                f"{_csharp_string(tr.when)}, snap)) return;\n"
             )
         from_match = " || ".join(
             f"_state == {cls}State.{_csharp_member(fs)}"
