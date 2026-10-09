@@ -341,7 +341,7 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 
 ## ハンズオン
 
-ロボット配送 System of Systems を題材に、**CADL モデリング → SoS-DSL 契約（lifecycle + monitors） → 可視化 → コード生成 → ライブシミュレーション** までを一気通貫で体験する 90 分の自習ワークショップ（5 回の PBL コースとしても利用可）が用意されています。
+ロボット配送 System of Systems を題材に、**CADL モデリング → SoS-DSL 契約（lifecycle + monitors） → 可視化 → コード生成 → ライブシミュレーション** までを一気通貫で体験する 90 分の自習ワークショップ（5 回の演習コースとしても利用可）が用意されています。
 
 教材内容：
 
