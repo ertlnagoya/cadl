@@ -24,7 +24,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Python 3.9 or later is required; CI runs 3.9 through 3.13.
+Python 3.9 or later is required; CI runs 3.9 through 3.14.
 
 ## Before you open a pull request
 
@@ -42,9 +42,10 @@ formatting AST nodes by hand.
 
 ## Releases
 
-The version lives in `src/cadl/__init__.py` only. A release is a commit that
-sets it, moves the `[Unreleased]` notes under the new version in
-`CHANGELOG.md`, and is tagged `vX.Y.Z`.
+The package version lives in `src/cadl/__init__.py` (`pyproject.toml` reads
+it from there). A release is a commit that sets it, updates `version:` in
+`CITATION.cff` to match, moves the `[Unreleased]` notes under the new version
+in `CHANGELOG.md`, and is tagged `vX.Y.Z`.
 
 Publishing a GitHub Release for that tag runs `.github/workflows/publish.yml`,
 which uploads the distributions to PyPI. The workflow fails if the tag and
