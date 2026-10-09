@@ -156,9 +156,11 @@ class TypeChecker:
         if isinstance(expr, ActorRef):
             if expr.index is not None and expr.name not in bound:
                 self._check_actor_ref(expr, context)
+            self._check_index_expr(expr, context, bound)
         elif isinstance(expr, MemberAccess):
             if expr.obj.name not in bound:
                 self._check_actor_ref(expr.obj, context)
+            self._check_index_expr(expr.obj, context, bound)
         elif isinstance(expr, FunctionCall):
             for arg in expr.args:
                 self._check_actor_ref_in_expr(arg, context, bound)
@@ -179,6 +181,33 @@ class TypeChecker:
                 expr.element, context, bound | {expr.variable}
             )
 
+    def _check_index_expr(self, ref: ActorRef, context: str, bound: frozenset) -> None:
+        """Check actor references inside an index, e.g. ``ROBOT[GHOST.n]``."""
+        index = ref.index
+        if index is None or isinstance(index, (str, int, RangeExpr)):
+            return
+        self._check_actor_ref_in_expr(index, context, bound)
+
+    _SEVERITIES = ("Minor", "Major", "Critical")
+
+    def _check_severities(self, contract: ContractDef, ctx: str) -> None:
+        """A severity outside the three levels has no meaning to the
+        generated runtimes (the C# target would emit an unknown enum member)."""
+        def check(value, where: str) -> None:
+            if value is not None and value not in self._SEVERITIES:
+                self.result.add_error(
+                    f"Unknown severity '{value}' in {ctx} {where}; "
+                    f"expected one of {', '.join(self._SEVERITIES)}",
+                    contract.loc,
+                )
+        if contract.lifecycle:
+            for tr in contract.lifecycle.transitions:
+                if tr.on_violation:
+                    check(tr.on_violation.severity, f"lifecycle transition '{tr.id}'")
+        for mon in contract.monitors:
+            if mon.on_match:
+                check(mon.on_match.severity, f"monitor '{mon.id}'")
+
     def _check_contracts(self, sos: SoSDefinition) -> None:
         """Check contract definitions."""
         for contract in sos.contracts:
@@ -188,15 +217,19 @@ class TypeChecker:
         ctx = f"contract '{contract.id}'"
 
         # Check parties exist and are unique
-        party_names: list[str] = []
+        # Two references are the same party only when name and index agree:
+        # ROBOT[1] and ROBOT[2] are different parties.
+        from .unparse import actor_ref_to_source
+        party_refs: list[str] = []
         for party in contract.parties:
             self._check_actor_ref(party, f"{ctx} parties")
-            if party.name in party_names:
+            ref = actor_ref_to_source(party)
+            if ref in party_refs:
                 self.result.add_error(
-                    f"Duplicate party '{party.name}' in {ctx}",
+                    f"Duplicate party '{ref}' in {ctx}",
                     contract.loc,
                 )
-            party_names.append(party.name)
+            party_refs.append(ref)
 
         if not contract.parties:
             self.result.add_error(
@@ -225,6 +258,8 @@ class TypeChecker:
         # Check incentives
         if contract.incentives:
             self._check_incentives(contract.incentives, ctx)
+
+        self._check_severities(contract, ctx)
 
     def _check_authority(self, auth: AuthorityBlock, context: str) -> None:
         """Check authority block constraints."""

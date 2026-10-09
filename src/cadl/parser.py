@@ -567,11 +567,13 @@ def _build_sampling(value) -> SamplingSpec:
     if value is None:
         return SamplingSpec(kind='event')
     if isinstance(value, dict):
-        # Already-normalized form: {kind: ..., period_ms: ...}
-        return SamplingSpec(
-            kind=str(_get(value, 'kind', 'event')),
-            period_ms=_get(value, 'period_ms'),
-        )
+        # Mapping form: {kind: ..., period_ms: ...}. As with the string
+        # form, anything unrecognised is read as event-driven.
+        kind = str(_get(value, 'kind', 'event'))
+        period = _get(value, 'period_ms')
+        if kind == 'periodic' and isinstance(period, int) and not isinstance(period, bool):
+            return SamplingSpec(kind='periodic', period_ms=period)
+        return SamplingSpec(kind='event')
     s = str(value).strip()
     if s == 'event':
         return SamplingSpec(kind='event')
@@ -850,7 +852,9 @@ def _build_sos(data: dict) -> SoSDefinition:
                     target=_get(v, 'target'),
                     property=_get(v, 'property'),
                     method=str(method) if method is not None else None,
-                    expr=str(expr) if expr is not None else None,
+                    # YAML reads an unquoted true / false as a boolean.
+                    expr=(str(expr).lower() if isinstance(expr, bool) else str(expr))
+                    if expr is not None else None,
                     bound=_parse_bound(_get(v, 'bound')),
                 ))
 

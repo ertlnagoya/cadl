@@ -14,25 +14,25 @@ start: predicate_expr
 ?predicate_expr: or_open
                | or_expr
 
-?or_expr: and_expr ("OR" and_expr)+     -> or_expr
+?or_expr: and_expr (_OR and_expr)+      -> or_expr
         | and_expr
-?and_expr: not_expr ("AND" not_expr)+   -> and_expr
+?and_expr: not_expr (_AND not_expr)+    -> and_expr
          | not_expr
-?not_expr: "NOT" not_expr               -> not_expr
+?not_expr: _NOT not_expr                -> not_expr
          | comparison
 
-?or_open: (and_expr "OR")+ and_open     -> or_expr
+?or_open: (and_expr _OR)+ and_open      -> or_expr
         | and_open
-?and_open: (not_expr "AND")+ not_open   -> and_expr
+?and_open: (not_expr _AND)+ not_open    -> and_expr
          | not_open
-?not_open: "NOT" not_open               -> not_expr
+?not_open: _NOT not_open                -> not_expr
          | quantified_expr
 
 ?comparison: expr COMP_OP expr          -> comparison
            | expr
 
-quantified_expr: QUANTIFIER IDENTIFIER "in" expr ":" predicate_expr
-QUANTIFIER: "for all" | "exists"
+quantified_expr: QUANTIFIER IDENTIFIER _IN expr ":" predicate_expr
+QUANTIFIER: /(?:for\s+all|exists)(?![A-Za-z0-9_])/
 
 // === Arithmetic ===
 // The operators are named terminals so that they survive into the parse
@@ -51,7 +51,7 @@ arg_list: arg ("," arg)*
 ?arg: comprehension | predicate_expr | STRING
 
 // Aggregate over a range or set: sum(ROBOT[i].goal_count for i in 1..5)
-comprehension: predicate_expr "for" IDENTIFIER "in" comp_domain
+comprehension: predicate_expr _FOR IDENTIFIER _IN comp_domain
 ?comp_domain: INT ".." (INT | IDENTIFIER)  -> range_domain
             | expr
 
@@ -82,7 +82,16 @@ MUL_OP: "*" | "/"
 COMP_OP: "==" | "!=" | "<=" | ">=" | "<" | ">"
 
 // === Literals ===
-BOOL: "true" | "false"
+BOOL: /(?:true|false)(?![A-Za-z0-9_])/
+
+// === Keywords ===
+// A keyword ends at a word boundary, so NOT_READY, ORDER or inventory are
+// identifiers and are never split into a keyword plus a remainder.
+_AND: /AND(?![A-Za-z0-9_])/
+_OR: /OR(?![A-Za-z0-9_])/
+_NOT: /NOT(?![A-Za-z0-9_])/
+_IN: /in(?![A-Za-z0-9_])/
+_FOR: /for(?![A-Za-z0-9_])/
 DURATION_LIT: /\d+(ms|s|min|h)/
 STRING: /\"[^\"]*\"/
 

@@ -202,3 +202,40 @@ class TestSmtEntryContent:
         )
         results = {r.check_name: r for r in verify(sos)}
         assert results["verification.v_bad"].status == "failed"
+
+
+class TestEntryEdgeCases:
+
+    def test_target_checked_for_every_method(self):
+        sos = TestSmtEntryContent()._sos()
+        spec = VerificationSpec(id="v", type="safety", method="model_check", target="NOPE")
+        assert dispatch_spec(spec, sos).status == "failed"
+        spec = VerificationSpec(id="v", type="safety", method="model_check", target="C1")
+        assert dispatch_spec(spec, sos).status == "not_supported"
+
+    def test_white_space_around_the_arrow_is_ignored(self):
+        sos = TestSmtEntryContent()._sos()
+        for target in ("NORMAL->DEGRADED", "NORMAL -> DEGRADED", "NORMAL ->DEGRADED"):
+            spec = VerificationSpec(id="v", type="safety", target=target)
+            assert dispatch_spec(spec, sos).status == "passed", target
+        spec = VerificationSpec(id="v", type="safety", target="NORMAL->NORMAL")
+        assert dispatch_spec(spec, sos).status == "failed"
+
+    def test_expr_that_is_not_a_predicate_is_unknown(self):
+        spec = VerificationSpec(id="v", type="safety", expr="this is not ( parseable")
+        r = dispatch_spec(spec)
+        assert r.status == "unknown" and "not checked" in r.message
+
+    def test_unquoted_yaml_false_is_the_boolean(self):
+        from cadl.parser import parse
+        sos = parse(
+            "sos:\n"
+            '  name: "T"\n'
+            "  type: Directed\n"
+            "  verification:\n"
+            "    - id: v\n"
+            "      type: safety\n"
+            "      expr: false\n"
+        )
+        (r,) = [x for x in verify(sos) if x.check_name == "verification.v"]
+        assert r.status == "failed"

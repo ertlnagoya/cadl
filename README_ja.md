@@ -182,14 +182,14 @@ CADL処理系は、一般的なコンパイラと同じパイプライン構成�
   SMT検証    コード生成   モード      IEC 62853
   (Z3)      (codegen/)   マップ     要約
               |
-        +-----+-----+
-        v     v     v
-     Python Solidity OPA/Rego
+        +-----+-----+--------+
+        v     v     v        v
+     Python Solidity OPA/Rego Unity C#
 ```
 
 ### コード生成
 
-`cadl codegen` は検証済みCADL定義から実行可能なコードを生成します。4つのターゲットに対応：
+`cadl codegen` はCADL定義から実行可能なコードを生成します。型検査は行いますが検証器は実行しないので、先に `cadl verify` を実行してください。4つのターゲットに対応：
 
 **Python** (`--target python`, デフォルト):
 
@@ -479,6 +479,9 @@ tests/
   test_method_dispatch.py 検証メソッドの振り分けテスト
   test_codegen_safety.py コード生成の入力安全性テスト
   test_examples_verify.py 全サンプルが `cadl verify` を通ることの確認
+  test_actor_reference_check.py   `cadl check` がアクターとして扱う名前
+  test_codegen_deterministic.py   生成コードが実行ごとに同一であること
+  test_keyword_boundaries.py      キーワードが長い名前から切り出されないこと
 
 examples/
   robot_delivery.cadl        ロボット配送SoS（認知型）
