@@ -9,24 +9,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 - License changed from MIT to Apache License 2.0 (`LICENSE`, `NOTICE`).
   Releases up to and including 0.3.2 remain available under the MIT License.
-
-### Fixed
-- `scripts/sos_dsl_handson_e2e.sh` ran a command quoted in one of its
-  comments on every invocation, leaving a stray `dd/` copy of `src/` in the
-  repository on case-insensitive file systems.
-
-### Added
-- `.github/workflows/publish.yml`: publishing a GitHub Release builds the
-  distributions and uploads them to PyPI through Trusted Publishing.
-
-### Fixed
-- Parser ignored `method:`, `expr:` and `bound:` in `verification:` entries,
-  so `method: model_check` (or `simulation` / `proof`) written in a `.cadl`
-  file was treated as the default `smt` and reported as passed. The fields
-  are now read, and non-SMT methods surface as `not_supported` from
-  `cadl verify`, as the 0.3.0 entry describes.
-
-### Changed
+- The hands-on script and documentation point to the public
+  `cadl-raspimouse-simulator` repository and to Unity 6 (6000.2);
+  `sos_dsl_handson_e2e.sh` now defaults to `../cadl-raspimouse-simulator/unity`.
 - `beta` is documented consistently as decision **centralization**
   (0 = fully distributed, 1 = centralized), which is how the IEC 62853
   report, the simulator IR and most examples already used it. The README
@@ -38,6 +23,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - README: dropped the links to the instructor course-design page (removed
   from the spec site) and marked `raspimouse-swarm-simulator` as not
   publicly available.
+
+### Fixed
+- Parser ignored `method:`, `expr:` and `bound:` in `verification:` entries,
+  so `method: model_check` (or `simulation` / `proof`) written in a `.cadl`
+  file was treated as the default `smt` and reported as passed. The fields
+  are now read, and non-SMT methods surface as `not_supported` from
+  `cadl verify`, as the 0.3.0 entry describes.
+- `scripts/sos_dsl_handson_e2e.sh` ran a command quoted in one of its
+  comments on every invocation, leaving a stray `dd/` copy of `src/` in the
+  repository on case-insensitive file systems.
+
+### Added
+- `.github/workflows/publish.yml`: publishing a GitHub Release builds the
+  distributions and uploads them to PyPI through Trusted Publishing.
 
 ## [0.3.2] — 2026-10-09
 

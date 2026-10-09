@@ -6,7 +6,7 @@ implement the per-instance contract lifecycle and declarative monitors
 described by the SoS-DSL extension.
 
 The semantics of the generated runtime mirror the Python reference
-runtime in ``raspimouse-swarm-simulator/cadl/runtime/engine.py``:
+runtime in ``cadl-raspimouse-simulator/cadl/runtime/engine.py``:
 
   - Lifecycle state machine driven by ``Tick`` (sim time) and
     ``PostEvent`` (port messages).
@@ -122,7 +122,7 @@ Generated/      # one set of files per contract that declares lifecycle:
    render visuals or write logs.
 
 The generator's semantics match the Python runtime in
-`raspimouse-swarm-simulator/cadl/runtime/engine.py` — a generated
+`cadl-raspimouse-simulator/cadl/runtime/engine.py` — a generated
 contract that passes the Python tests behaves the same in Unity.
 
 Reward and sanction *execution* is intentionally out of scope (v0.1):
