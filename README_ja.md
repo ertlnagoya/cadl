@@ -6,6 +6,13 @@ CADL（Contract Architecture Description Language）は、System of Systems（So
 
 名古屋大学 大学院情報学研究科 ERTL にて開発しています。
 
+**ドキュメント**
+
+- [仕様書・言語リファレンス](https://www.ertl.jp/cadl-spec/ja/)（[English](https://www.ertl.jp/cadl-spec/)） — 言語は[第5章](https://www.ertl.jp/cadl-spec/ja/docs/spec/language-spec)、構文の全体は[付録A](https://www.ertl.jp/cadl-spec/ja/docs/spec/appendix-a-syntax)から読むのがおすすめです
+- [ハンズオン講座](https://www.ertl.jp/cadl-spec/ja/docs/handson/) — ツールチェーンを順に体験する教材
+- このREADME — インストール、コマンド、同梱サンプル
+- [CHANGELOG](CHANGELOG.md) · [コントリビュート](CONTRIBUTING.md) · [セキュリティポリシー](SECURITY.md) · [Issues](https://github.com/ertlnagoya/cadl/issues)
+
 ## 動機
 
 SoS環境では、独立に運用される複数のシステムが共通のルールのもとで協調する必要があります。現状、これらのルールは自然言語の契約書や暗黙の合意に依存しており、曖昧性・矛盾・設計意図と実装の乖離が避けられません。
@@ -28,6 +35,9 @@ CADLファイル（`.cadl`）はYAMLライクな宣言的構文を使用しま�
 | `algorithms` | 中央/局所アルゴリズムの参照 |
 | `transitions` | 安全不変条件を伴う、運用モード（regime）間の遷移 |
 | `metrics` | 計算式と目標値を持つ評価指標 |
+| `verification` | 検査する性質と、使用する手法（実装済みは `smt` のみ） |
+
+契約には `lifecycle:` と `monitors:` のブロック（SoS-DSL拡張）も書けます。契約インスタンスがたどる状態と、実行中に監視する条件を記述するものです。キーの一覧は、仕様書の[付録A](https://www.ertl.jp/cadl-spec/ja/docs/spec/appendix-a-syntax)と[付録E](https://www.ertl.jp/cadl-spec/ja/docs/spec/appendix-e-sos-dsl)にあります。
 
 ### 制度パラメータ
 
@@ -142,6 +152,9 @@ cadl codegen examples/robot_delivery.cadl --target solidity -o /tmp/solidity_out
 # OPA/Regoポリシーを生成
 cadl codegen examples/robot_delivery.cadl --target opa -o /tmp/rego_out
 
+# SoS-DSL契約（lifecycle / monitors）からUnity C#を生成
+cadl codegen examples/sos_dsl_robot_delivery.cadl --target unity-csharp -o /tmp/unity_out
+
 # 運用モードの遷移を分析
 cadl regime-map examples/smart_city_traffic.cadl
 cadl regime-map examples/smart_city_traffic.cadl --format dot -o regime.dot
@@ -175,7 +188,7 @@ CADL処理系は、一般的なコンパイラと同じパイプライン構成�
 +---------+---------+
           |
           v
-    [検証済みAST]
+    [型検査済みAST]
           |
     +-----+-----+-----------+-----------+
     v           v           v           v
@@ -300,7 +313,7 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
 |---|---|---|
 | SoSタイプ | 認知型（Acknowledged） | 協調型（Collaborative） |
 | 意思決定権限 | DISPATCHER（中央集権） | TAXI[*]（各タクシーが自律決定） |
-| beta | 0.8（集中型） | 0.1（分散型） |
+| beta（契約ごと） | 0.8, 0.9（集中型） | 0.1, 0.05（分散型） |
 | 中央プランナ | ECBS | aggregation_only |
 | 局所プランナ | tracking_only | LRA* + 局所衝突回避 |
 | 共有方式 | アップリンク + ブロードキャスト | ピアツーピア ブロードキャスト |
@@ -318,6 +331,8 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
 | 局所プランナ | なし | DirectionDijkstra | NaiveDijkstra + OccupancyAware |
 | 通信方式 | NATS req/res | NATS req/res + リソースクエリ | MCPツール |
 | 運用モード | NORMAL ↔ CONGESTED | NORMAL ↔ CONGESTED | NORMAL ↔ COLLISION_RESOLUTION ↔ DEADLOCK |
+
+beta と alpha の行は、各定義の主となる契約の値です。C-SoS と MCP-SoS のファイルには、別の値を持つ2つ目の契約があります。
 
 ```bash
 # 3モードのUnity設定を生成
@@ -339,13 +354,14 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 
 ### 型検査の内容
 
-型検査器は以下の5項目を検証します：
+型検査器（`cadl check`）は以下を検証します：
 
-1. **アクター参照の存在確認** — 参照されるアクターがすべて定義済みであること
-2. **契約当事者の整合性** — 当事者の重複・不在がないこと
+1. **アクター参照の存在確認** — 当事者、権限、情報共有、プロトコルステップ、`assume:` / `guarantee:` の述語で参照されるアクターが定義済みであること。述語の中では、添字付きの名前（`ROBOT[i]`）とメンバー参照の対象（`ROBOT.battery`）をアクターとして扱い、単独の名前は状態変数とみなします
+2. **契約当事者の整合性** — すべての契約に当事者があり、同じ当事者が重複していないこと
 3. **プロトコルステップの妥当性** — 送信者・受信者がアクター定義と一致すること
 4. **情報共有の整合性** — 共有宣言が有効なアクターを参照していること
 5. **パラメータ値域制約** — `0 <= alpha, beta, lambda <= 1`
+6. **idの一意性と深刻度** — アクター・契約・プロトコル・メトリクスのidが重複していないこと、`severity:` が `Minor` / `Major` / `Critical` のいずれかであること
 
 ## ハンズオン
 
@@ -381,14 +397,15 @@ IR JSON と Unity C# ツリーが生成され、後者が [cadl-raspimouse-simul
 |---|---|---|---|
 | `robot_delivery.cadl` | 自律配送ロボット群 | 認知型 | 経路調整、障害時再計画、2つの運用モード |
 | `smart_city_traffic.cadl` | 交通信号制御 | 協調型 | 3つの運用モード（通常/渋滞/緊急）、緊急車両優先 |
-| `supply_chain.cadl` | 製造サプライチェーン | 協調型 | 4アクター連鎖、品質リコール、5つの運用モード |
+| `supply_chain.cadl` | 製造サプライチェーン | 協調型 | 4アクター連鎖、品質リコール、4つの運用モード |
 | `iot_data_sharing.cadl` | IoTセンサデータ共有 | 仮想型 | データ鮮度契約、プライバシーポリシー、異常検知 |
 | `household_chores.cadl` | 家庭内家事分担 | 協調型 | 人間中心設計、金銭的インセンティブ、紛争解決 |
 | `a_sos_robot_delivery.cadl` | MAPF配送ロボット（A-SoS） | 認知型 | 中央ECBSプランナ、3つの運用モード、安全保証 |
-| `c_sos_taxi_fleet.cadl` | 自律タクシー群（C-SoS） | 協調型 | 分散LRA*、ピア衝突解決、5つの運用モード |
+| `c_sos_taxi_fleet.cadl` | 自律タクシー群（C-SoS） | 協調型 | 分散LRA*、ピア衝突解決、3つの運用モード |
 | `raspimouse_d_sos.cadl` | Raspimouse群ロボット（D-SoS） | 指示型 | NATS経由の集中調停、NaiveDijkstra、beta=0.9 |
 | `raspimouse_c_sos.cadl` | Raspimouse群ロボット（C-SoS） | 協調型 | ローカルDirectionDijkstra＋中央検証、離散時間同期 |
 | `raspimouse_mcp_sos.cadl` | Raspimouse群ロボット（MCP-SoS） | 認知型 | MCPツールによるLLM制御、Static/Dynamicパスモード、3つの運用モード |
+| `sos_dsl_robot_delivery.cadl` | SoS-DSL拡張を使ったロボット配送 | 認知型 | 契約ライフサイクル（7状態）、3つのモニタ。ハンズオン講座で使うサンプル |
 
 ### デモスクリプト
 
@@ -403,6 +420,9 @@ python examples/demo_smart_city.py
 
 # Python / Solidity / Rego出力の比較
 python examples/demo_codegen_targets.py
+
+# 3層シミュレータIRと、A-SoS / C-SoSの比較
+python examples/demo_sim_ir.py
 ```
 
 ## プロジェクト構成
@@ -523,6 +543,8 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 
 ## 関連プロジェクト
 
+- [cadl-spec](https://github.com/ertlnagoya/cadl-spec) — 仕様書とハンズオン講座。<https://www.ertl.jp/cadl-spec/ja/> で公開しています。
+- [cadl-explorer](https://github.com/ertlnagoya/cadl-explorer) — `cadl sim-ir` が出力するIRから契約ライフサイクルを描画し、合成モデル上でガバナンス設定を試せるStreamlitアプリケーション。
 - [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator) — ハンズオン講座で使うシミュレータ。C-SoS のロボット配送シナリオ用の Unity プロジェクト、Go アービトレータ、Python 参照ランタイムを収録しています。
 - raspimouse-swarm-simulator（現時点では非公開） — マルチエージェント群ロボットシミュレーションプラットフォーム。`examples/raspimouse_*.cadl` で3つのSoSモードを記述し、Unity設定ジェネレータでシミュレータ用の構成JSONを生成できます。
 

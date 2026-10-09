@@ -6,6 +6,13 @@ CADL is a domain-specific language for formally describing, verifying, and deplo
 
 CADL is developed at ERTL, Graduate School of Informatics, Nagoya University.
 
+**Documentation**
+
+- [Specification and language reference](https://www.ertl.jp/cadl-spec/) ([日本語](https://www.ertl.jp/cadl-spec/ja/)) — start with [Chapter 5](https://www.ertl.jp/cadl-spec/docs/spec/language-spec) for the language and [Appendix A](https://www.ertl.jp/cadl-spec/docs/spec/appendix-a-syntax) for the complete syntax
+- [Hands-on course](https://www.ertl.jp/cadl-spec/docs/handson/) — a guided walkthrough of the toolchain
+- This README — installation, commands, and the bundled examples
+- [CHANGELOG](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md) · [Issues](https://github.com/ertlnagoya/cadl/issues)
+
 ## Motivation
 
 In SoS environments, independently operated systems must coordinate under shared rules. Today, these rules exist mostly as natural-language contracts and tacit agreements, making them prone to ambiguity, contradiction, and drift between design intent and implementation.
@@ -28,6 +35,9 @@ A CADL file (`.cadl`) uses a YAML-like declarative syntax. Each file describes o
 | `algorithms` | References to central/local algorithms |
 | `transitions` | Regime transitions with safety invariants |
 | `metrics` | Performance indicators with formulas and targets |
+| `verification` | Properties to check, with the method to use (only `smt` is implemented) |
+
+A contract may also carry `lifecycle:` and `monitors:` blocks (the SoS-DSL extension), which describe the states a contract instance goes through and the conditions watched while it runs. The complete list of keys is in [Appendix A](https://www.ertl.jp/cadl-spec/docs/spec/appendix-a-syntax) and [Appendix E](https://www.ertl.jp/cadl-spec/docs/spec/appendix-e-sos-dsl) of the specification.
 
 ### Institutional Parameters
 
@@ -142,6 +152,9 @@ cadl codegen examples/robot_delivery.cadl --target solidity -o /tmp/solidity_out
 # Generate OPA/Rego policies
 cadl codegen examples/robot_delivery.cadl --target opa -o /tmp/rego_out
 
+# Generate Unity C# for SoS-DSL contracts (lifecycle / monitors)
+cadl codegen examples/sos_dsl_robot_delivery.cadl --target unity-csharp -o /tmp/unity_out
+
 # Analyze regime transitions
 cadl regime-map examples/smart_city_traffic.cadl
 cadl regime-map examples/smart_city_traffic.cadl --format dot -o regime.dot
@@ -175,7 +188,7 @@ The CADL toolchain follows a standard compiler pipeline:
 +--------+---------+
          |
          v
-   [Verified AST]
+   [Checked AST]
          |
     +----+----+----------+-----------+
     v         v          v           v
@@ -301,7 +314,7 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
 |---|---|---|
 | SoS Type | Acknowledged | Collaborative |
 | Decision Authority | DISPATCHER (central) | TAXI[*] (each taxi) |
-| beta | 0.8 (centralized) | 0.1 (decentralized) |
+| beta (per contract) | 0.8, 0.9 (centralized) | 0.1, 0.05 (decentralized) |
 | Central Planner | ECBS | aggregation_only |
 | Local Planner | tracking_only | LRA* + conflict avoidance |
 | Sharing Mode | uplink + broadcast | peer-to-peer broadcast |
@@ -319,6 +332,8 @@ Three CADL definitions model the same 5-robot swarm on an 11-node graph network 
 | Local Planner | none | DirectionDijkstra | NaiveDijkstra + OccupancyAware |
 | Communication | NATS req/res | NATS req/res + resource query | MCP tools |
 | Regimes | NORMAL ↔ CONGESTED | NORMAL ↔ CONGESTED | NORMAL ↔ COLLISION_RESOLUTION ↔ DEADLOCK |
+
+The beta and alpha rows show the values of the main contract of each definition; the C-SoS and MCP-SoS files contain a second contract with its own values.
 
 ```bash
 # Generate Unity configs for all three modes
@@ -340,13 +355,14 @@ Requires `ANTHROPIC_API_KEY` environment variable and `pip install "cadl-lang[ai
 
 ### Type Checks
 
-The type checker validates:
+The type checker (`cadl check`) validates:
 
-1. **Actor reference existence** — All referenced actors are defined
-2. **Contract party consistency** — No duplicate or missing parties
+1. **Actor reference existence** — Actors referenced in parties, authority, information sharing, protocol steps, and `assume:` / `guarantee:` predicates are defined. In a predicate a name is treated as an actor when it is indexed (`ROBOT[i]`) or is the object of a member access (`ROBOT.battery`); a bare name is taken as a state variable
+2. **Contract party consistency** — Every contract has parties, and no party is listed twice
 3. **Protocol step validity** — Senders and receivers match actor definitions
 4. **Information sharing coherence** — Sharing declarations reference valid actors
 5. **Parameter range constraints** — `0 <= alpha, beta, lambda <= 1`
+6. **Unique ids and known severities** — No duplicate actor, contract, protocol, or metric ids; `severity:` is `Minor`, `Major`, or `Critical`
 
 ## Hands-on
 
@@ -380,16 +396,17 @@ This generates the IR JSON, the Unity C# tree, and drops the latter into the Uni
 
 | File | Description | SoS Type | Key Features |
 |---|---|---|---|
-| `robot_delivery.cadl` | Autonomous delivery fleet | Acknowledged | Route coordination, failure replanning, 2-regime transitions |
-| `smart_city_traffic.cadl` | Traffic signal management | Collaborative | 3-regime transitions (NORMAL/CONGESTED/EMERGENCY), emergency override |
-| `supply_chain.cadl` | Manufacturing supply chain | Collaborative | 4-actor chain, quality recall protocol, 5-regime transitions |
+| `robot_delivery.cadl` | Autonomous delivery fleet | Acknowledged | Route coordination, failure replanning, 2 regimes |
+| `smart_city_traffic.cadl` | Traffic signal management | Collaborative | 3 regimes (NORMAL/CONGESTED/EMERGENCY), emergency override |
+| `supply_chain.cadl` | Manufacturing supply chain | Collaborative | 4-actor chain, quality recall protocol, 4 regimes |
 | `iot_data_sharing.cadl` | IoT sensor aggregation | Virtual | Data freshness contracts, privacy policy, anomaly detection |
 | `household_chores.cadl` | Family chore sharing | Collaborative | Human-centric, monetary incentives, dispute resolution |
-| `a_sos_robot_delivery.cadl` | MAPF robot delivery (A-SoS) | Acknowledged | Central ECBS planner, 3-regime transitions, fleet safety |
-| `c_sos_taxi_fleet.cadl` | Autonomous taxi fleet (C-SoS) | Collaborative | Decentralized LRA*, peer conflict resolution, 5-regime transitions |
+| `a_sos_robot_delivery.cadl` | MAPF robot delivery (A-SoS) | Acknowledged | Central ECBS planner, 3 regimes, fleet safety |
+| `c_sos_taxi_fleet.cadl` | Autonomous taxi fleet (C-SoS) | Collaborative | Decentralized LRA*, peer conflict resolution, 3 regimes |
 | `raspimouse_d_sos.cadl` | Raspimouse swarm (D-SoS) | Directed | Centralized arbitration via NATS, NaiveDijkstra, beta=0.9 |
 | `raspimouse_c_sos.cadl` | Raspimouse swarm (C-SoS) | Collaborative | Local DirectionDijkstra + central verification, discrete-time sync |
 | `raspimouse_mcp_sos.cadl` | Raspimouse swarm (MCP-SoS) | Acknowledged | LLM-controlled via MCP tools, Static/Dynamic path modes, 3 regimes |
+| `sos_dsl_robot_delivery.cadl` | Robot delivery with the SoS-DSL extension | Acknowledged | Contract lifecycle (7 states), 3 monitors; the example used by the hands-on course |
 
 ### Demo Scripts
 
@@ -404,6 +421,9 @@ python examples/demo_smart_city.py
 
 # Side-by-side comparison of Python, Solidity, and Rego output
 python examples/demo_codegen_targets.py
+
+# 3-layer simulator IR and A-SoS / C-SoS comparison
+python examples/demo_sim_ir.py
 ```
 
 ## Project Structure
@@ -524,6 +544,8 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 
 ## Related Projects
 
+- [cadl-spec](https://github.com/ertlnagoya/cadl-spec) — The specification and the hands-on course, published at <https://www.ertl.jp/cadl-spec/>.
+- [cadl-explorer](https://github.com/ertlnagoya/cadl-explorer) — A Streamlit application that draws the contract lifecycle from the IR that `cadl sim-ir` produces and explores governance settings on a synthetic model.
 - [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator) — The simulator used by the hands-on course: Unity project, Go arbitrator and Python reference runtime for the C-SoS robot-delivery scenario.
 - raspimouse-swarm-simulator (not publicly available at present) — Multi-agent swarm robotics simulation platform. CADL files in `examples/raspimouse_*.cadl` describe its three SoS modes, and the Unity config generator produces configuration JSON for the simulator.
 

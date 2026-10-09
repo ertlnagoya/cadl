@@ -6,6 +6,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- README (English and Japanese): links to the specification, hands-on
+  course, changelog, contributing guide and issue tracker at the top; the
+  `verification` block and the SoS-DSL `lifecycle:` / `monitors:` blocks in
+  the language overview; the Unity C# command under Usage; the pipeline
+  diagram says "Checked AST"; the type-check list matches what `cadl check`
+  does; the examples table counts regimes consistently (`supply_chain` has 4,
+  `c_sos_taxi_fleet` 3) and lists `sos_dsl_robot_delivery.cadl`;
+  `demo_sim_ir.py` under demo scripts; `cadl-spec` and `cadl-explorer` under
+  related projects.
+- CONTRIBUTING: CI runs Python 3.9 through 3.14; a release also updates
+  `version:` in `CITATION.cff`.
+
 ## [0.3.8] — 2026-10-09
 
 Python 3.14 is now a tested and declared version.
