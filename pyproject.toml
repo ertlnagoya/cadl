@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "cadl"
+name = "cadl-lang"
 version = "0.1.0"
 description = "Contract Architecture Description Language — a DSL for formally specifying, verifying, and deploying institutional designs in System of Systems"
 readme = "README.md"

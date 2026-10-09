@@ -316,7 +316,7 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 3. 生成されたCADLをパース・型検査
 4. バリデーションエラー時はエラーフィードバック付きでリトライ
 
-`ANTHROPIC_API_KEY`環境変数の設定と `pip install cadl[ai]` が必要です。
+`ANTHROPIC_API_KEY`環境変数の設定と `pip install "cadl-lang[ai]"` が必要です。
 
 ### 型検査の内容（Phase 1）
 

@@ -23,6 +23,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - Integration tests `tests/test_method_dispatch.py` (11 new cases).
 
 ### Changed
+- PyPI distribution renamed from `cadl` to `cadl-lang` (the name `cadl` is
+  taken on PyPI by an unrelated project). The import package (`import cadl`)
+  and the `cadl` CLI command are unchanged.
 - Fixed attribution in `README.md` / `README_ja.md` from "Matsubara
   Laboratory" / "松原研究室" to "ERTL".
 - `CodegenSpec.target` docstring updated to enumerate the canonical

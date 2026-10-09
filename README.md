@@ -317,7 +317,7 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 3. The generated CADL is parsed and type-checked
 4. On validation errors, the system retries with error feedback
 
-Requires `ANTHROPIC_API_KEY` environment variable and `pip install cadl[ai]`.
+Requires `ANTHROPIC_API_KEY` environment variable and `pip install "cadl-lang[ai]"`.
 
 ### Type Checks (Phase 1)
 

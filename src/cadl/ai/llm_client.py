@@ -31,7 +31,7 @@ class ClaudeClient:
             except ImportError:
                 raise ImportError(
                     "The 'anthropic' package is required for AI features. "
-                    "Install it with: pip install cadl[ai]"
+                    "Install it with: pip install 'cadl-lang[ai]'"
                 )
             api_key = self.config.api_key or os.environ.get("ANTHROPIC_API_KEY")
             if not api_key:
