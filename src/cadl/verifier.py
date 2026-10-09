@@ -677,13 +677,22 @@ def _check_regime_safety_invariants(sos: SoSDefinition) -> List[VerificationResu
 
 
 def _declared_targets(sos: SoSDefinition) -> Set[str]:
-    """Names a ``verification:`` entry may give as its ``target:``."""
+    """Names a ``verification:`` entry may give as its ``target:``:
+    a contract id, a protocol id, a regime name, or ``FROM->TO`` for a
+    declared transition."""
     names: Set[str] = {c.id for c in sos.contracts}
     names |= {p.id for p in sos.protocols}
     for t in sos.transitions:
-        names |= {t.from_regime, t.to_regime}
-        names |= {f"{t.from_regime}->{t.to_regime}", f"{t.from_regime} -> {t.to_regime}"}
+        names |= {t.from_regime, t.to_regime, f"{t.from_regime}->{t.to_regime}"}
     return names
+
+
+def _normalise_target(target: str) -> str:
+    """Ignore white space around the arrow of a ``FROM -> TO`` target."""
+    if "->" in target:
+        left, _, right = target.partition("->")
+        return f"{left.strip()}->{right.strip()}"
+    return target.strip()
 
 
 def dispatch_spec(
@@ -698,9 +707,11 @@ def dispatch_spec(
     return a ``failed`` result.
 
     For ``smt`` entries the verifier checks what it can about the entry
-    itself: that ``target:`` names a declared contract, protocol, regime
-    or transition (when ``sos`` is given), and that ``expr:`` is
-    satisfiable. It does not prove ``expr`` against the model; the
+    itself: that ``expr:`` is satisfiable (an ``expr`` that is not a
+    predicate of Appendix A is reported as ``unknown``). It does not prove
+    ``expr`` against the model. For every method, a ``target:`` that names
+    no declared contract, protocol, regime or transition fails (when
+    ``sos`` is given); the
     contract and transition checks of :func:`verify` run regardless of
     the entries.
 
@@ -708,21 +719,39 @@ def dispatch_spec(
     """
     method = (spec.method or "smt").lower()
     check_name = f"verification.{spec.id}"
+    # A target that names nothing is an error whatever the method (A.8).
+    if (
+        sos is not None
+        and spec.target
+        and _normalise_target(spec.target) not in _declared_targets(sos)
+    ):
+        return VerificationResult(
+            check_name=check_name,
+            status="failed",
+            message=(
+                f"target {spec.target!r} is not a declared contract, "
+                f"protocol, regime or transition"
+            ),
+        )
     if method == "smt":
-        if sos is not None and spec.target and spec.target not in _declared_targets(sos):
-            return VerificationResult(
-                check_name=check_name,
-                status="failed",
-                message=(
-                    f"target {spec.target!r} is not a declared contract, "
-                    f"protocol, regime or transition"
-                ),
-            )
         if spec.expr:
+            from .parser import parse_expr
+            try:
+                parsed = parse_expr(spec.expr)
+            except Exception:
+                # An opaque predicate cannot be given to the solver.
+                return VerificationResult(
+                    check_name=check_name,
+                    status="unknown",
+                    message=(
+                        "method=smt; expr is not a predicate of Appendix A "
+                        f"and was not checked: {spec.expr}"
+                    ),
+                )
             ctx = Z3Context()
             solver = z3.Solver()
             solver.set("timeout", 5000)
-            solver.add(_parse_condition(spec.expr, ctx))
+            solver.add(_to_z3_bool(parsed, ctx))
             outcome = solver.check()
             if outcome == z3.unsat:
                 return VerificationResult(
