@@ -676,7 +676,19 @@ def _check_regime_safety_invariants(sos: SoSDefinition) -> List[VerificationResu
     return results
 
 
-def dispatch_spec(spec: VerificationSpec) -> VerificationResult:
+def _declared_targets(sos: SoSDefinition) -> Set[str]:
+    """Names a ``verification:`` entry may give as its ``target:``."""
+    names: Set[str] = {c.id for c in sos.contracts}
+    names |= {p.id for p in sos.protocols}
+    for t in sos.transitions:
+        names |= {t.from_regime, t.to_regime}
+        names |= {f"{t.from_regime}->{t.to_regime}", f"{t.from_regime} -> {t.to_regime}"}
+    return names
+
+
+def dispatch_spec(
+    spec: VerificationSpec, sos: Optional[SoSDefinition] = None
+) -> VerificationResult:
     """Route a user-declared verification spec to the appropriate back-end.
 
     The reference verifier only implements the ``smt`` method. Other
@@ -685,14 +697,57 @@ def dispatch_spec(spec: VerificationSpec) -> VerificationResult:
     see an explicit diagnostic instead of a silent skip. Unknown methods
     return a ``failed`` result.
 
+    For ``smt`` entries the verifier checks what it can about the entry
+    itself: that ``target:`` names a declared contract, protocol, regime
+    or transition (when ``sos`` is given), and that ``expr:`` is
+    satisfiable. It does not prove ``expr`` against the model; the
+    contract and transition checks of :func:`verify` run regardless of
+    the entries.
+
     See Appendix A §A.8 and Appendix D §D.4 for the conformance rule.
     """
     method = (spec.method or "smt").lower()
+    check_name = f"verification.{spec.id}"
     if method == "smt":
+        if sos is not None and spec.target and spec.target not in _declared_targets(sos):
+            return VerificationResult(
+                check_name=check_name,
+                status="failed",
+                message=(
+                    f"target {spec.target!r} is not a declared contract, "
+                    f"protocol, regime or transition"
+                ),
+            )
+        if spec.expr:
+            ctx = Z3Context()
+            solver = z3.Solver()
+            solver.set("timeout", 5000)
+            solver.add(_parse_condition(spec.expr, ctx))
+            outcome = solver.check()
+            if outcome == z3.unsat:
+                return VerificationResult(
+                    check_name=check_name,
+                    status="failed",
+                    message=f"method=smt; expr is unsatisfiable: {spec.expr}",
+                )
+            if outcome != z3.sat:
+                return VerificationResult(
+                    check_name=check_name,
+                    status="unknown",
+                    message="method=smt; could not decide whether expr is satisfiable",
+                )
+            return VerificationResult(
+                check_name=check_name,
+                status="passed",
+                message=(
+                    "method=smt; expr is satisfiable (not proved against the "
+                    "model); built-in contract/transition checks apply"
+                ),
+            )
         # SMT-backed checks are already discharged by the bulk passes in
         # ``verify(sos)``; this per-spec entry records the acknowledgement.
         return VerificationResult(
-            check_name=f"verification.{spec.id}",
+            check_name=check_name,
             status="passed",
             message=f"method=smt; discharged by built-in contract/transition checks",
         )
@@ -758,6 +813,6 @@ def verify(sos: SoSDefinition) -> List[VerificationResult]:
 
     # 5. Per-spec method dispatch (Appendix A §A.8)
     for spec in sos.verifications:
-        results.append(dispatch_spec(spec))
+        results.append(dispatch_spec(spec, sos))
 
     return results

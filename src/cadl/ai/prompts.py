@@ -71,7 +71,7 @@ sos:
 - Virtual: Loosely coupled systems with minimal coordination
 
 ## Autonomy Levels
-- none, low, medium, high, full
+- low, medium, high
 
 ## Institutional Parameters (all in range [0, 1])
 - alpha: Information sharing degree (0=local only, 1=full sharing)

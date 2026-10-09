@@ -235,7 +235,7 @@ class ViolationBlock:
 @dataclass
 class OnViolationSpec:
     """Effect of a normative violation on the contract lifecycle."""
-    transition: str | None = None      # name of a lifecycle transition to fire
+    transition: str | None = None      # lifecycle state to move to (not a transition id)
     severity: str = "Major"            # "Minor" | "Major" | "Critical"
 
 
@@ -274,7 +274,7 @@ class SamplingSpec:
 class OnMatchSpec:
     """What a monitor emits when its rule matches."""
     violation: str | None = None       # name of obligation/prohibition
-    transition: str | None = None      # name of lifecycle transition
+    transition: str | None = None      # lifecycle state to move to (not a transition id)
     severity: str = "Major"
 
 

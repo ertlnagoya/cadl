@@ -157,7 +157,7 @@ class TestIEC62853Report:
         params = report["institutional_parameters"]
         assert len(params) == 1
         p = params[0]
-        assert p["cadl_concept"] == "lambda (incentive alignment)"
+        assert p["cadl_concept"] == "lambda (incentive strength)"
         assert p["value"] == 0.6
         assert p["iec62853_concept"] == "Stakeholder Alignment Metric"
 
@@ -335,20 +335,20 @@ class TestIEC62853Descriptions:
     # --- lambda descriptions ---
 
     def test_lambda_high(self):
-        assert _lambda_description(0.9) == "Strong incentive alignment"
-        assert _lambda_description(0.8) == "Strong incentive alignment"
+        assert _lambda_description(0.9) == "Strong incentives (market mechanism)"
+        assert _lambda_description(0.8) == "Strong incentives (market mechanism)"
 
     def test_lambda_moderate(self):
-        assert _lambda_description(0.6) == "Moderate incentive alignment"
-        assert _lambda_description(0.5) == "Moderate incentive alignment"
+        assert _lambda_description(0.6) == "Moderate incentives"
+        assert _lambda_description(0.5) == "Moderate incentives"
 
     def test_lambda_low(self):
-        assert _lambda_description(0.3) == "Weak incentive alignment"
-        assert _lambda_description(0.2) == "Weak incentive alignment"
+        assert _lambda_description(0.3) == "Weak incentives"
+        assert _lambda_description(0.2) == "Weak incentives"
 
     def test_lambda_very_low(self):
-        assert _lambda_description(0.1) == "Misaligned incentives"
-        assert _lambda_description(0.0) == "Misaligned incentives"
+        assert _lambda_description(0.1) == "Directive-based (little or no incentive)"
+        assert _lambda_description(0.0) == "Directive-based (little or no incentive)"
 
     # --- boundary values ---
 

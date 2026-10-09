@@ -189,7 +189,7 @@ CADL処理系は、一般的なコンパイラと同じパイプライン構成�
 
 ### コード生成
 
-`cadl codegen` は検証済みCADL定義から実行可能なコードを生成します。3つのターゲットに対応：
+`cadl codegen` は検証済みCADL定義から実行可能なコードを生成します。4つのターゲットに対応：
 
 **Python** (`--target python`, デフォルト):
 
@@ -219,6 +219,14 @@ Open Policy Agentポリシー（`.rego`）を生成：
 - 全契約を集約するメインポリシーパッケージ
 - 情報共有・権限ポリシールール
 
+**Unity C#** (`--target unity-csharp`):
+
+SoS-DSL拡張（`lifecycle:` / `monitors:`）を使う契約からC#を生成：
+- 契約ごとの `Generated/<Contract>State.cs`、`<Contract>Contract.cs`、`<Contract>Monitors.cs`
+- `Runtime/` のサポートクラス（契約ランタイム、イベントバス、述語評価器）
+
+[ハンズオン教材](https://www.ertl.jp/cadl-spec/ja/docs/handson/main-textbook)で、このターゲットを一通り実行できます。
+
 ### 運用モード遷移の分析
 
 `cadl regime-map` は運用モード（regime）の遷移グラフを分析します：
@@ -238,7 +246,7 @@ Open Policy Agentポリシー（`.rego`）を生成：
 |---|---|
 | alpha（情報共有度） | 情報透明性レベル |
 | beta（権限集中度） | ガバナンス集中度指標 |
-| lambda（インセンティブ整合度） | ステークホルダ整合性メトリクス |
+| lambda（インセンティブ強度） | ステークホルダ整合性メトリクス |
 | ContractDef | サービスレベル合意（SLA） |
 | ViolationBlock | 障害応答仕様 |
 | TransitionDef | 運用状態機械 |
@@ -429,6 +437,10 @@ src/cadl/
     opa/
       rego_expr.py     式AST → Regoソース変換
       rego_gen.py      OPA/Regoポリシー生成
+    unity_csharp/
+      contract_emitter.py  契約ごとのC#（状態enum・契約・モニタ）
+      runtime_template.py  生成のたびに出力するC#ランタイム
+    safety.py          コード生成前の入力検査
   ai/
     __init__.py        公開generate_cadl() API
     prompts.py         システムプロンプト・few-shot例
@@ -457,6 +469,16 @@ tests/
   test_iec62853.py       IEC 62853要約のテスト
   test_sim_ir.py         シミュレータIR変換・検証のテスト
   test_sim_gen.py        シミュレータ設定ジェネレータのテスト
+  test_sim_ir_sos_dsl.py シミュレータIR内のSoS-DSL（lifecycle / monitors）
+  test_sos_dsl_extension.py       SoS-DSLパーサのテスト
+  test_unity_csharp_codegen.py    Unity C#生成のテスト
+  test_unity_csharp_structural.py 生成C#の構造チェック
+  test_expr_parser.py    式文法のテスト
+  test_unparse.py        式の往復変換テスト
+  test_name_resolution.py 生成コードでのアクター／状態変数の解決
+  test_method_dispatch.py 検証メソッドの振り分けテスト
+  test_codegen_safety.py コード生成の入力安全性テスト
+  test_examples_verify.py 全サンプルが `cadl verify` を通ることの確認
 
 examples/
   robot_delivery.cadl        ロボット配送SoS（認知型）
@@ -473,6 +495,11 @@ examples/
   raspimouse_c_sos.cadl      Raspimouse群ロボット C-SoS（協調型）
   raspimouse_mcp_sos.cadl    Raspimouse群ロボット MCP-SoS（LLM制御）
   test_raspimouse.sh         Raspimouse用パース・検証・Unity設定生成テスト
+  sos_dsl_robot_delivery.cadl  SoS-DSL（lifecycle / monitors）付きロボット配送
+  demo_sim_ir.py             3層シミュレータIRとA-SoS / C-SoS比較のデモ
+
+scripts/
+  sos_dsl_handson_e2e.sh     ハンズオン用パイプライン：check → Sim-IR → Unity C# → Unityプロジェクト
 ```
 
 ## 開発状況

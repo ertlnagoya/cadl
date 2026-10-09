@@ -190,7 +190,7 @@ The CADL toolchain follows a standard compiler pipeline:
 
 ### Code Generation
 
-`cadl codegen` generates executable code from a verified CADL definition. Three targets are supported:
+`cadl codegen` generates executable code from a verified CADL definition. Four targets are supported:
 
 **Python** (`--target python`, default):
 
@@ -220,6 +220,14 @@ Generates Open Policy Agent policies (`.rego`):
 - Main policy package aggregating all contracts
 - Information sharing and authority policy rules
 
+**Unity C#** (`--target unity-csharp`):
+
+Generates C# for contracts that use the SoS-DSL extension (`lifecycle:` / `monitors:`):
+- `Generated/<Contract>State.cs`, `<Contract>Contract.cs`, `<Contract>Monitors.cs` per contract
+- `Runtime/` support classes (contract runtime, event bus, predicate evaluator)
+
+The [hands-on textbook](https://www.ertl.jp/cadl-spec/docs/handson/main-textbook) runs this target end to end.
+
 ### Regime Transitions
 
 `cadl regime-map` analyzes the regime transition graph:
@@ -239,7 +247,7 @@ Generates Open Policy Agent policies (`.rego`):
 |---|---|
 | alpha (information sharing) | Information Transparency Level |
 | beta (authority centralization) | Governance Centralization Index |
-| lambda (incentive alignment) | Stakeholder Alignment Metric |
+| lambda (incentive strength) | Stakeholder Alignment Metric |
 | ContractDef | Service Level Agreement (SLA) |
 | ViolationBlock | Failure Response Specification |
 | TransitionDef | Operational State Machine |
@@ -430,6 +438,10 @@ src/cadl/
     opa/
       rego_expr.py     Expression AST -> Rego source
       rego_gen.py      OPA/Rego policy generation
+    unity_csharp/
+      contract_emitter.py  Per-contract C# (state enum, contract, monitors)
+      runtime_template.py  C# runtime support emitted with every generation
+    safety.py          Input checks applied before code generation
   ai/
     __init__.py        Public generate_cadl() API
     prompts.py         System prompts and few-shot examples
@@ -458,6 +470,16 @@ tests/
   test_iec62853.py       IEC 62853-oriented summary tests
   test_sim_ir.py         Simulator IR lowering and validation tests
   test_sim_gen.py        Simulator config generator tests
+  test_sim_ir_sos_dsl.py SoS-DSL lifecycle / monitors in the simulator IR
+  test_sos_dsl_extension.py       SoS-DSL parser tests
+  test_unity_csharp_codegen.py    Unity C# generation tests
+  test_unity_csharp_structural.py Structural checks on the generated C#
+  test_expr_parser.py    Expression grammar tests
+  test_unparse.py        Expression round-trip tests
+  test_name_resolution.py Actor vs state-variable resolution in generated code
+  test_method_dispatch.py Verification method dispatch tests
+  test_codegen_safety.py Code generation input-safety tests
+  test_examples_verify.py Every example passes `cadl verify`
 
 examples/
   robot_delivery.cadl        Robot delivery SoS (Acknowledged type)
@@ -474,6 +496,11 @@ examples/
   raspimouse_c_sos.cadl      Raspimouse swarm C-SoS (Collaborative)
   raspimouse_mcp_sos.cadl    Raspimouse swarm MCP-SoS (LLM-controlled)
   test_raspimouse.sh         Parse, validate, and generate Unity configs for Raspimouse
+  sos_dsl_robot_delivery.cadl  Robot delivery with SoS-DSL lifecycle and monitors
+  demo_sim_ir.py             3-layer simulator IR and A-SoS / C-SoS comparison demo
+
+scripts/
+  sos_dsl_handson_e2e.sh     Hands-on pipeline: check -> Sim-IR -> Unity C# -> Unity project
 ```
 
 ## Status

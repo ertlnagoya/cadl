@@ -4,7 +4,8 @@ Checks performed (per spec §6.2.2):
 1. Actor reference existence - all referenced actors are defined
 2. Contract party validation - no duplicates, all parties exist
 3. Protocol step sender/receiver match actor definitions
-4. Information sharing declarations match message exchanges
+4. Information sharing declarations name declared actors (comparing
+   them with the actual message exchanges is planned, not implemented)
 5. Institutional parameter range constraints (0 <= alpha, beta, lambda <= 1)
 """
 
@@ -17,6 +18,8 @@ from .ast_nodes import (
     ActorRef,
     AuthorityBlock,
     BarrierStep,
+    BinaryOp,
+    Comprehension,
     ComputeStep,
     ConditionalStep,
     ContractDef,
@@ -27,6 +30,7 @@ from .ast_nodes import (
     MemberAccess,
     MessageStep,
     ParallelStep,
+    QuantifiedExpr,
     ProtocolDef,
     RangeExpr,
     ResponsibilityGroup,
@@ -34,6 +38,7 @@ from .ast_nodes import (
     SoSDefinition,
     SourceLocation,
     Step,
+    UnaryOp,
     ViewDef,
 )
 
@@ -135,15 +140,44 @@ class TypeChecker:
                 ref.loc,
             )
 
-    def _check_actor_ref_in_expr(self, expr: Expression, context: str) -> None:
-        """Recursively check actor references in expressions."""
+    def _check_actor_ref_in_expr(
+        self, expr: Expression, context: str, bound: frozenset = frozenset()
+    ) -> None:
+        """Recursively check actor references in expressions.
+
+        The expression grammar reads every bare name as an actor
+        reference, so a name standing alone (``system_ready``,
+        ``delivery_time``) cannot be told from a state variable and is
+        not reported. A name is treated as an actor, and must be
+        declared, when it is indexed (``ROBOT[i]``) or is the object of
+        a member access (``ROBOT.battery``). Variables bound by a
+        quantifier or a comprehension are exempt.
+        """
         if isinstance(expr, ActorRef):
-            self._check_actor_ref(expr, context)
+            if expr.index is not None and expr.name not in bound:
+                self._check_actor_ref(expr, context)
         elif isinstance(expr, MemberAccess):
-            self._check_actor_ref(expr.obj, context)
+            if expr.obj.name not in bound:
+                self._check_actor_ref(expr.obj, context)
         elif isinstance(expr, FunctionCall):
             for arg in expr.args:
-                self._check_actor_ref_in_expr(arg, context)
+                self._check_actor_ref_in_expr(arg, context, bound)
+        elif isinstance(expr, BinaryOp):
+            self._check_actor_ref_in_expr(expr.left, context, bound)
+            self._check_actor_ref_in_expr(expr.right, context, bound)
+        elif isinstance(expr, UnaryOp):
+            self._check_actor_ref_in_expr(expr.operand, context, bound)
+        elif isinstance(expr, QuantifiedExpr):
+            self._check_actor_ref_in_expr(expr.domain, context, bound)
+            self._check_actor_ref_in_expr(
+                expr.predicate, context, bound | {expr.variable}
+            )
+        elif isinstance(expr, Comprehension):
+            if not isinstance(expr.domain, RangeExpr):
+                self._check_actor_ref_in_expr(expr.domain, context, bound)
+            self._check_actor_ref_in_expr(
+                expr.element, context, bound | {expr.variable}
+            )
 
     def _check_contracts(self, sos: SoSDefinition) -> None:
         """Check contract definitions."""

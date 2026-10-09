@@ -6,6 +6,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-10-09
+
+Aligns the implementation with the specification (Appendix A / E) where a
+cross-check found them apart.
+
+### Fixed
+- `cadl check` reported a predicate that is a single name (`"system_ready"`)
+  as an undefined actor, and did not look for undeclared actors inside
+  comparisons or `AND` / `OR` / `NOT`. A name is now treated as an actor,
+  and must be declared, when it is indexed (`ROBOT[i]`) or is the object of a
+  member access (`GHOST.x > 5`); a bare name is taken as a state variable.
+  Variables bound by a quantifier or a comprehension are exempt.
+- A quantifier could only start an expression. It may now follow `AND`,
+  `OR` and `NOT` as in spec A.10 (`a AND for all x in X: p(x)`), and scopes
+  over everything to its right.
+- `in`, `exists` and `IN` were accepted as identifiers although the spec
+  reserves them.
+- A `verification:` entry with `method: smt` passed whatever it contained.
+  It now fails when `target:` does not name a declared contract, protocol,
+  regime or transition, or when `expr:` is unsatisfiable. `expr` is still
+  not proved against the model; the message says so.
+- `scripts/sos_dsl_handson_e2e.sh` pointed to a runbook file that does not
+  exist; it now points to the hands-on textbook.
+- The NL-to-CADL prompt listed autonomy levels `none` and `full`, which the
+  language does not have.
+
+### Changed
+- IEC 62853 summary: `lambda` is labelled "incentive strength" and described
+  on the scale the specification defines (0 = directive-based, 1 = market
+  mechanism) instead of as "incentive alignment" / "misaligned incentives".
+- README: lists `unity-csharp` as the fourth code generation target and
+  completes the project structure listing.
+
 ## [0.3.3] — 2026-10-09
 
 ### Security
@@ -206,7 +239,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/ertlnagoya/cadl/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/ertlnagoya/cadl/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ertlnagoya/cadl/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ertlnagoya/cadl/compare/v0.3.0...v0.3.1
