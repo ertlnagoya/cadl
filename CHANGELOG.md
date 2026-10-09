@@ -6,6 +6,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-10-09
+
+### Fixed
+- `cadl codegen --target unity-csharp` emitted the `case` lines of
+  `IsTerminal` in an order that changed from run to run (the terminal states
+  were iterated as a set), so regenerating from an unchanged file produced a
+  different `*Contract.cs` each time. They now follow the order in which
+  `terminal:` declares them. A test regenerates every code target under
+  several hash seeds and requires identical output.
+
 ## [0.3.4] — 2026-10-09
 
 Aligns the implementation with the specification (Appendix A / E) where a
@@ -239,7 +249,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/ertlnagoya/cadl/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/ertlnagoya/cadl/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/ertlnagoya/cadl/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ertlnagoya/cadl/compare/v0.3.1...v0.3.2

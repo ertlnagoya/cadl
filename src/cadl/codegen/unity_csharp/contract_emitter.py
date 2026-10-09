@@ -99,10 +99,13 @@ def _emit_contract_class(contract: ContractDef, cls: str, ns: str) -> str:
     lc = contract.lifecycle or LifecycleSpec()
     initial = lc.initial or (lc.states[0] if lc.states else "Initial")
     initial_member = _csharp_member(initial)
-    terminal_set = set(lc.terminal)
+    # Declaration order with duplicates removed. A set here made the order of
+    # the emitted `case` lines vary from run to run (string hashing is
+    # randomised per process), so regenerating produced spurious diffs.
+    terminal_states = list(dict.fromkeys(lc.terminal))
 
     is_terminal_body = ",\n            ".join(
-        f"{cls}State.{_csharp_member(s)}" for s in terminal_set
+        f"{cls}State.{_csharp_member(s)}" for s in terminal_states
     ) or "/* none */"
 
     # Build a transition table: per-(from-state) list of edges sorted
@@ -169,7 +172,7 @@ def _emit_contract_class(contract: ContractDef, cls: str, ns: str) -> str:
         "            switch (s) {\n"
         + ''.join(
             f"                case {cls}State.{_csharp_member(s)}: return true;\n"
-            for s in terminal_set
+            for s in terminal_states
         )
         + "                default: return false;\n"
         "            }\n"
