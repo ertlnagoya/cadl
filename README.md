@@ -34,7 +34,7 @@ A CADL file (`.cadl`) uses a YAML-like declarative syntax. Each file describes o
 CADL quantifies institutional characteristics using three continuous parameters in [0, 1]:
 
 - **alpha** — Information sharing degree (0 = local only, 1 = full sharing)
-- **beta** — Decision decentralization (0 = centralized, 1 = fully distributed)
+- **beta** — Decision centralization (0 = fully distributed, 1 = centralized)
 - **lambda** — Incentive strength (0 = directive-based, 1 = market mechanism)
 
 ### Example
@@ -66,7 +66,7 @@ sos:
         - "delivery_time <= promised_time * 1.2"
       authority:
         decision_holder: DISPATCHER
-        beta: 0.2
+        beta: 0.8
       information:
         alpha: 0.8
       incentives:

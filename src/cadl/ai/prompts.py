@@ -36,7 +36,7 @@ sos:
         - "guarantee_expression"
       authority:
         decision_holder: ACTOR1
-        beta: 0.2
+        beta: 0.8
       information:
         alpha: 0.8
       incentives:
@@ -75,7 +75,7 @@ sos:
 
 ## Institutional Parameters (all in range [0, 1])
 - alpha: Information sharing degree (0=local only, 1=full sharing)
-- beta: Decision decentralization (0=centralized, 1=fully distributed)
+- beta: Decision centralization (0=fully distributed, 1=centralized)
 - lambda: Incentive strength (0=directive-based, 1=market mechanism)
 
 ## Actor References
@@ -145,7 +145,7 @@ sos:
       authority:
         decision_scope: "route_assignment"
         decision_holder: DISPATCHER
-        beta: 0.2
+        beta: 0.8
       information:
         alpha: 0.8
         views:
@@ -225,7 +225,7 @@ sos:
         - "all_chores_assigned_weekly()"
       authority:
         decision_holder: "PARENT[1]"
-        beta: 0.3
+        beta: 0.7
       information:
         alpha: 1.0
       responsibilities:

@@ -37,7 +37,7 @@ sos:
       authority:
         decision_scope: "route_assignment"
         decision_holder: DISPATCHER
-        beta: 0.2
+        beta: 0.8
       information:
         alpha: 0.8
         views:

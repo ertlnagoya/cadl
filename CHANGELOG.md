@@ -14,6 +14,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `cadl verify`, as the 0.3.0 entry describes.
 
 ### Changed
+- `beta` is documented consistently as decision **centralization**
+  (0 = fully distributed, 1 = centralized), which is how the IEC 62853
+  report, the simulator IR and most examples already used it. The README
+  definition and the NL-to-CADL prompt said the opposite. Values written
+  under the old wording were mirrored (`1 - beta`):
+  `examples/robot_delivery.cadl` 0.2 → 0.8,
+  `examples/household_chores.cadl` 0.3 → 0.7, and the README / prompt
+  samples.
 - README: dropped the links to the instructor course-design page (removed
   from the spec site) and marked `raspimouse-swarm-simulator` as not
   publicly available.
