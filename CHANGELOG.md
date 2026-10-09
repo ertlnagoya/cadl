@@ -6,6 +6,36 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.7] — 2026-10-09
+
+Second round of fixes from the cross-check against the specification.
+
+### Fixed
+- A name that begins with a keyword was split into the keyword and the
+  rest: `NOT_READY` was read as `NOT _READY`, `NOTIFIED == true` as
+  `NOT IFIED == true`, and a declared actor `NOTIFIER` was reported as
+  undefined actor `IFIER`. `a ORb` and `for all x inventory: ...` were split
+  the same way. Keywords now end at a word boundary.
+- `cadl check` reported `parties: ["ROBOT[1]", "ROBOT[2]"]` as a duplicate
+  party; two references are the same party only when name and index agree.
+- `cadl check` did not look for undeclared actors inside an index
+  (`ROBOT[GHOST.n].x`).
+- A `severity:` other than `Minor`, `Major`, `Critical` passed `cadl check`
+  and reached the generated C# as an enum member that does not exist; it is
+  now an error.
+- `sampling:` written as a mapping with an unknown `kind` or a non-integer
+  `period_ms` was carried into the IR as written; it is now read as `event`,
+  like an unrecognised string form.
+- `verification:` entries: an `expr:` that is not a predicate of Appendix A
+  was reported as satisfiable (now `unknown`, not checked); an unquoted
+  `expr: false` was read as the name `False`; `target:` is checked for every
+  method, and white space around the arrow of `FROM -> TO` is ignored.
+
+### Changed
+- README: the pipeline diagram shows Unity C# among the code targets, and
+  the code generation section says that `cadl codegen` does not run the
+  verifier.
+
 ## [0.3.6] — 2026-10-09
 
 ### Changed
@@ -261,7 +291,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/ertlnagoya/cadl/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/ertlnagoya/cadl/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/ertlnagoya/cadl/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/ertlnagoya/cadl/compare/v0.3.3...v0.3.4

@@ -139,3 +139,12 @@ sos:
         assert c.id == "PLAIN"
         assert c.lifecycle is None
         assert c.monitors == []
+
+
+def test_mapping_sampling_with_unknown_kind_is_event():
+    from cadl.parser import _build_sampling
+
+    assert _build_sampling({"kind": "weird", "period_ms": "x"}).kind == "event"
+    assert _build_sampling({"kind": "periodic", "period_ms": "x"}).kind == "event"
+    good = _build_sampling({"kind": "periodic", "period_ms": 250})
+    assert (good.kind, good.period_ms) == ("periodic", 250)

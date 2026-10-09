@@ -183,14 +183,14 @@ The CADL toolchain follows a standard compiler pipeline:
   Verify    Generate   Map         Summary
   (Z3)      (codegen/) (regime_map) (iec62853)
               |
-        +-----+-----+
-        v     v     v
-     Python Solidity OPA/Rego
+        +-----+-----+--------+
+        v     v     v        v
+     Python Solidity OPA/Rego Unity C#
 ```
 
 ### Code Generation
 
-`cadl codegen` generates executable code from a verified CADL definition. Four targets are supported:
+`cadl codegen` generates executable code from a CADL definition. It runs the type check but not the verifier, so run `cadl verify` first. Four targets are supported:
 
 **Python** (`--target python`, default):
 
@@ -480,6 +480,9 @@ tests/
   test_method_dispatch.py Verification method dispatch tests
   test_codegen_safety.py Code generation input-safety tests
   test_examples_verify.py Every example passes `cadl verify`
+  test_actor_reference_check.py   Which names `cadl check` treats as actors
+  test_codegen_deterministic.py   Generated code is identical across runs
+  test_keyword_boundaries.py      Keywords are not split out of longer names
 
 examples/
   robot_delivery.cadl        Robot delivery SoS (Acknowledged type)

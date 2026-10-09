@@ -66,3 +66,49 @@ def test_comprehension_variable_and_domain():
     assert _errors(guarantee=["sum(ROBOT[i].load for i in 1..5) < 10"]) == []
     (err,) = _errors(guarantee=["sum(g.load for g in GHOST[*]) < 10"])
     assert "Undefined actor 'GHOST'" in err
+
+
+def test_actor_inside_an_index_is_checked():
+    (err,) = _errors(assume=["ROBOT[GHOST.n].battery > 20"])
+    assert "Undefined actor 'GHOST'" in err
+    assert _errors(assume=["ROBOT[DISPATCHER.current].battery > 20"]) == []
+
+
+def _check(body):
+    source = (
+        "sos:\n"
+        '  name: "T"\n'
+        "  type: Directed\n"
+        "  actors:\n"
+        "    - id: DISPATCHER\n"
+        "      role: coordinator\n"
+        "    - id: ROBOT[1..3]\n"
+        "      role: agent\n"
+        "  contracts:\n"
+        "    - id: C1\n" + body
+    )
+    return [str(e) for e in type_check(parse(source)).errors]
+
+
+def test_differently_indexed_parties_are_distinct():
+    assert _check('      parties: ["ROBOT[1]", "ROBOT[2]", DISPATCHER]\n') == []
+
+
+def test_same_reference_twice_is_a_duplicate():
+    (err,) = _check('      parties: ["ROBOT[*]", "ROBOT[*]"]\n')
+    assert "Duplicate party 'ROBOT[*]'" in err
+
+
+def test_unknown_severity_is_an_error():
+    body = (
+        '      parties: [DISPATCHER, "ROBOT[*]"]\n'
+        "      monitors:\n"
+        "        - id: m1\n"
+        '          observe: "ROBOT[i].battery"\n'
+        '          rule: "ROBOT[i].battery < 20"\n'
+        "          on_match:\n"
+        "            severity: Catastrophic\n"
+    )
+    (err,) = _check(body)
+    assert "Unknown severity 'Catastrophic'" in err and "monitor 'm1'" in err
+    assert _check(body.replace("Catastrophic", "Critical")) == []
