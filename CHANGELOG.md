@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-10-09
+
 ### Changed
 - Generated Solidity files carry `SPDX-License-Identifier: Apache-2.0`
   (was `MIT`), matching the license of the toolchain. Edit the line if you
@@ -259,7 +261,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/ertlnagoya/cadl/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/ertlnagoya/cadl/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/ertlnagoya/cadl/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/ertlnagoya/cadl/compare/v0.3.2...v0.3.3
