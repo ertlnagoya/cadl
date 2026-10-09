@@ -6,6 +6,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.8] — 2026-10-09
+
+Python 3.14 is now a tested and declared version.
+
 ### Fixed
 - The event-loop tests used `asyncio.get_event_loop()`, which raises on
   Python 3.14 when no loop is running. They use `asyncio.run()` now, and
@@ -296,7 +300,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/ertlnagoya/cadl/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/ertlnagoya/cadl/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/ertlnagoya/cadl/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/ertlnagoya/cadl/compare/v0.3.4...v0.3.5
