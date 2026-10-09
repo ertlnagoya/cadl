@@ -159,7 +159,7 @@ for sub in ("Runtime", "Generated"):
     sd = src / sub
     dd = dst / sub
     dd.mkdir(parents=True, exist_ok=True)
-    # Self-heal: a prior run with `cp -r SRC dd` (or an older version of
+    # Self-heal: a prior run with 'cp -r SRC dd' (or an older version of
     # this script) on a restricted-unlink filesystem can leave a nested
     # dd/<sub> (e.g. Generated/Generated, Runtime/Runtime). Those nested
     # copies duplicate every type and make Unity fail to compile

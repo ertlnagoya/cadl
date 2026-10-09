@@ -10,6 +10,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - License changed from MIT to Apache License 2.0 (`LICENSE`, `NOTICE`).
   Releases up to and including 0.3.2 remain available under the MIT License.
 
+### Fixed
+- `scripts/sos_dsl_handson_e2e.sh` ran a command quoted in one of its
+  comments on every invocation, leaving a stray `dd/` copy of `src/` in the
+  repository on case-insensitive file systems.
+
 ### Added
 - `.github/workflows/publish.yml`: publishing a GitHub Release builds the
   distributions and uploads them to PyPI through Trusted Publishing.
