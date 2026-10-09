@@ -6,6 +6,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- The event-loop tests used `asyncio.get_event_loop()`, which raises on
+  Python 3.14 when no loop is running. They use `asyncio.run()` now, and
+  Python 3.14 is part of the CI matrix. The library itself needed no change.
+
 ## [0.3.6] — 2026-10-09
 
 ### Changed

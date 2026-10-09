@@ -84,7 +84,7 @@ class TestEventLoop:
         loop = EventLoop(runtime)
         loop.post_event(Event(name="test_event", source="test"))
 
-        asyncio.get_event_loop().run_until_complete(loop.run(max_cycles=1))
+        asyncio.run(loop.run(max_cycles=1))
 
         assert proto.executed
         assert proto.received_event is not None
@@ -98,7 +98,7 @@ class TestEventLoop:
         loop = EventLoop(runtime)
         loop.post_event(Event(name="other_event", source="test"))
 
-        asyncio.get_event_loop().run_until_complete(loop.run(max_cycles=1))
+        asyncio.run(loop.run(max_cycles=1))
 
         assert not proto.executed
 
@@ -114,14 +114,14 @@ class TestEventLoop:
             asyncio.ensure_future(stopper())
             await loop.run()
 
-        asyncio.get_event_loop().run_until_complete(run_and_stop())
+        asyncio.run(run_and_stop())
         assert not loop._running
 
     def test_max_cycles(self):
         runtime = DummyRuntime()
         loop = EventLoop(runtime)
 
-        asyncio.get_event_loop().run_until_complete(loop.run(max_cycles=3))
+        asyncio.run(loop.run(max_cycles=3))
         # Should complete without hanging
 
     def test_monitor_cycle_runs(self):
@@ -130,7 +130,7 @@ class TestEventLoop:
         runtime.add_monitor(monitor)
 
         loop = EventLoop(runtime)
-        asyncio.get_event_loop().run_until_complete(loop.run(max_cycles=1))
+        asyncio.run(loop.run(max_cycles=1))
         # No violations from DummyMonitor, but cycle ran without error
 
     def test_multiple_events_single_cycle(self):
@@ -142,7 +142,7 @@ class TestEventLoop:
         loop.post_event(Event(name="test_event", source="a"))
         loop.post_event(Event(name="test_event", source="b"))
 
-        asyncio.get_event_loop().run_until_complete(loop.run(max_cycles=1))
+        asyncio.run(loop.run(max_cycles=1))
 
         assert proto.executed
         # Protocol executed for both events; last event captured
