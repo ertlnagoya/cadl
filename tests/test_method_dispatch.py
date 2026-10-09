@@ -145,3 +145,60 @@ class TestMotivationExtension:
         # Should run without raising; core verifier ignores the block.
         results = verify(sos)
         assert isinstance(results, list)
+
+
+class TestSmtEntryContent:
+    """An smt entry is checked for what the verifier can check about it."""
+
+    def _sos(self):
+        from cadl.parser import parse
+        return parse(
+            "sos:\n"
+            '  name: "T"\n'
+            "  type: Directed\n"
+            "  actors:\n"
+            "    - id: A\n"
+            "      role: r\n"
+            "  contracts:\n"
+            "    - id: C1\n"
+            "      parties: [A]\n"
+            "  transitions:\n"
+            "    - from: NORMAL\n"
+            "      to: DEGRADED\n"
+            '      condition: "load > 0.8"\n'
+            "    - from: DEGRADED\n"
+            "      to: NORMAL\n"
+            '      condition: "load <= 0.8"\n'
+        )
+
+    def test_unknown_target_fails(self):
+        spec = VerificationSpec(id="v", type="safety", target="DOES_NOT_EXIST")
+        r = dispatch_spec(spec, self._sos())
+        assert r.status == "failed" and "DOES_NOT_EXIST" in r.message
+
+    def test_declared_targets_pass(self):
+        for target in ("C1", "NORMAL", "NORMAL->DEGRADED"):
+            spec = VerificationSpec(id="v", type="safety", target=target)
+            assert dispatch_spec(spec, self._sos()).status == "passed", target
+
+    def test_target_is_not_checked_without_a_definition(self):
+        spec = VerificationSpec(id="v", type="safety", target="ANYTHING")
+        assert dispatch_spec(spec).status == "passed"
+
+    def test_unsatisfiable_expr_fails(self):
+        for expr in ("false", "x > 5 AND x < 3"):
+            spec = VerificationSpec(id="v", type="safety", expr=expr)
+            assert dispatch_spec(spec).status == "failed", expr
+
+    def test_satisfiable_expr_passes_and_says_it_is_not_a_proof(self):
+        spec = VerificationSpec(id="v", type="safety", expr="x > 5")
+        r = dispatch_spec(spec)
+        assert r.status == "passed" and "not proved" in r.message
+
+    def test_verify_passes_the_definition_through(self):
+        sos = self._sos()
+        sos.verifications.append(
+            VerificationSpec(id="v_bad", type="safety", target="NOPE")
+        )
+        results = {r.check_name: r for r in verify(sos)}
+        assert results["verification.v_bad"].status == "failed"

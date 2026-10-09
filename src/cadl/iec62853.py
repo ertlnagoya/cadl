@@ -81,7 +81,7 @@ def generate_iec62853_report(sos: SoSDefinition) -> dict:
             lambdas.append(contract.incentives.lambda_)
             params.append({
                 "contract_id": contract.id,
-                "cadl_concept": f"lambda (incentive alignment)",
+                "cadl_concept": "lambda (incentive strength)",
                 "value": contract.incentives.lambda_,
                 "iec62853_concept": "Stakeholder Alignment Metric",
                 "description": _lambda_description(contract.incentives.lambda_),
@@ -163,13 +163,14 @@ def _alpha_description(alpha: float) -> str:
 
 
 def _lambda_description(lambda_: float) -> str:
+    # lambda is incentive strength: 0 = directive-based, 1 = market mechanism.
     if lambda_ >= 0.8:
-        return "Strong incentive alignment"
+        return "Strong incentives (market mechanism)"
     if lambda_ >= 0.5:
-        return "Moderate incentive alignment"
+        return "Moderate incentives"
     if lambda_ >= 0.2:
-        return "Weak incentive alignment"
-    return "Misaligned incentives"
+        return "Weak incentives"
+    return "Directive-based (little or no incentive)"
 
 
 def _party_str(party) -> str:

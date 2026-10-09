@@ -157,3 +157,40 @@ class TestComprehension:
             variable="r",
             domain=ActorRef("ROBOT", index="*"),
         )
+
+
+class TestQuantifierPosition:
+    """A quantifier may follow AND / OR / NOT (spec A.10)."""
+
+    def test_after_and(self):
+        expr = parse_expr("a AND for all x in X: p(x)")
+        assert expr.op == "AND" and isinstance(expr.right, QuantifiedExpr)
+
+    def test_after_not(self):
+        expr = parse_expr("NOT exists x in X: p(x)")
+        assert expr.op == "NOT" and isinstance(expr.operand, QuantifiedExpr)
+        assert expr.operand.quantifier == "exists"
+
+    def test_scope_extends_to_the_right_after_and(self):
+        expr = parse_expr("a AND for all x in X: p(x) OR q")
+        assert expr.op == "AND"
+        assert expr.right.predicate == BinaryOp(
+            "OR", FunctionCall("p", [_name("x")]), _name("q")
+        )
+
+    def test_parenthesised_quantifier_can_be_followed(self):
+        expr = parse_expr("(for all x in X: p(x)) AND q")
+        assert expr.op == "AND" and isinstance(expr.left, QuantifiedExpr)
+        assert expr.right == _name("q")
+
+
+class TestReservedKeywords:
+
+    @pytest.mark.parametrize("word", ["in", "exists", "IN", "AND", "OR", "NOT"])
+    def test_keyword_is_not_an_identifier(self, word):
+        with pytest.raises(Exception):
+            parse_expr(f"{word} > 3")
+
+    @pytest.mark.parametrize("word", ["inside", "existsx", "INDEX", "all", "format"])
+    def test_words_containing_a_keyword_are_identifiers(self, word):
+        assert parse_expr(f"{word} > 3") == BinaryOp(">", _name(word), IntLiteral(3))

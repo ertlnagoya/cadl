@@ -12,7 +12,7 @@ Open an issue at <https://github.com/ertlnagoya/cadl/issues> with:
 - `cadl --version` and your Python version.
 
 For questions about the language itself, see the
-[specification](https://ertlnagoya.github.io/cadl-spec/).
+[specification](https://www.ertl.jp/cadl-spec/).
 
 ## Development setup
 

@@ -45,7 +45,7 @@ class GovernanceParams:
     """Institutional parameters for a contract."""
     alpha: float | None = None      # information transparency [0, 1]
     beta: float | None = None       # authority centralization [0, 1]
-    lambda_: float | None = None    # incentive alignment [0, 1]
+    lambda_: float | None = None    # incentive strength [0, 1]
     decision_holder: str | None = None
     sharing_mode: str | None = None  # e.g. "uplink + broadcast"
     incentive_type: str | None = None

@@ -6,8 +6,12 @@ start: predicate_expr
 
 // === Predicates ===
 // Precedence, loosest to tightest: OR, AND, NOT, comparison, + -, * /
-// A quantifier scopes over everything to its right.
-?predicate_expr: quantified_expr
+// A quantifier may stand wherever a comparison may (after AND / OR / NOT)
+// and scopes over everything to its right, so it is always the last
+// operand of the chain it appears in. The "_open" rules are the forms
+// that end in a quantifier; keeping them apart makes the grammar
+// unambiguous.
+?predicate_expr: or_open
                | or_expr
 
 ?or_expr: and_expr ("OR" and_expr)+     -> or_expr
@@ -16,6 +20,13 @@ start: predicate_expr
          | not_expr
 ?not_expr: "NOT" not_expr               -> not_expr
          | comparison
+
+?or_open: (and_expr "OR")+ and_open     -> or_expr
+        | and_open
+?and_open: (not_expr "AND")+ not_open   -> and_expr
+         | not_open
+?not_open: "NOT" not_open               -> not_expr
+         | quantified_expr
 
 ?comparison: expr COMP_OP expr          -> comparison
            | expr
@@ -78,7 +89,8 @@ STRING: /\"[^\"]*\"/
 %import common.INT
 %import common.FLOAT
 %import common.WS
-// Keywords are not identifiers, so "NOT (a)" is never read as a call.
-IDENTIFIER: /(?!(?:AND|OR|NOT|true|false)\b)[a-zA-Z_][a-zA-Z0-9_]*/
+// Reserved keywords (spec A.11, E.3) are not identifiers, so "NOT (a)" is
+// never read as a call. "for all" is matched as a phrase by QUANTIFIER.
+IDENTIFIER: /(?!(?:AND|OR|NOT|IN|true|false|in|exists)\b)[a-zA-Z_][a-zA-Z0-9_]*/
 
 %ignore WS
