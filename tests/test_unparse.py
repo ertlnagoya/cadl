@@ -24,6 +24,11 @@ from cadl.unparse import expr_to_source
     "DISPATCHER.is_operational == true",
     "response_time <= 200ms",
     'mode == "auto"',
+    "ROBOT[i].battery > 20",
+    "all(ROBOT[*].status != Collision)",
+    "sum(ROBOT[i].goal_count for i in 1..5)",
+    "min(ROBOT[i].goal_count for i in 1..N)",
+    "sum(r.load for r in ROBOT[*]) / count(ROBOT[*])",
     "for all r in ROBOT[*]: r.status != Collision",
     "x > 30s AND NOT (for all r in ROBOT[*]: r.status != Collision)",
 ])

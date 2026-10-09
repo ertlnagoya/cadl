@@ -17,7 +17,18 @@ def sanitize_id(name: str) -> str:
         ROBOT -> Robot
     """
     parts = name.split("_")
-    return "".join(part.capitalize() for part in parts)
+    return "".join(_capitalize_part(part) for part in parts)
+
+
+def _capitalize_part(part: str) -> str:
+    """Capitalize one ``_``-separated part, keeping existing camel case.
+
+    ``SLA`` -> ``Sla`` and ``robot`` -> ``Robot``, but a mixed-case part such
+    as ``RobotDeliverySystem`` is already a class name and is kept as is.
+    """
+    if part.isupper() or part.islower():
+        return part.capitalize()
+    return part[:1].upper() + part[1:]
 
 
 def snake_case(name: str) -> str:

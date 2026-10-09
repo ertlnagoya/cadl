@@ -6,13 +6,16 @@ instead of Z3 objects.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Dict, Set
+from typing import Any, Dict, FrozenSet, Iterable, Iterator, Optional, Set
 
 from ..ast_nodes import (
     ActorRef,
     BinaryOp,
     BoolLiteral,
+    Comprehension,
     DurationLiteral,
     Expression,
     FloatLiteral,
@@ -27,6 +30,34 @@ from ..ast_nodes import (
 )
 
 
+# Actor names declared by the SoS being generated. The expression grammar
+# reads every bare name as an actor reference; generators use this set to
+# tell a declared actor (``DISPATCHER``) from a state variable
+# (``delivery_time``). ``None`` means "unknown": treat every name as an actor.
+_DECLARED_ACTORS: ContextVar[Optional[FrozenSet[str]]] = ContextVar(
+    "cadl_declared_actors", default=None
+)
+
+
+@contextmanager
+def declared_actors(names: Iterable[str]) -> Iterator[None]:
+    """Compile expressions knowing which names are actors."""
+    token = _DECLARED_ACTORS.set(frozenset(names))
+    try:
+        yield
+    finally:
+        _DECLARED_ACTORS.reset(token)
+
+
+def is_state_variable(ref: ActorRef, actor_names: Optional[FrozenSet[str]]) -> bool:
+    """True if a bare name is known not to be a declared actor."""
+    return (
+        ref.index is None
+        and actor_names is not None
+        and ref.name not in actor_names
+    )
+
+
 @dataclass
 class CompilerContext:
     """Tracks compilation context for expression translation."""
@@ -37,6 +68,10 @@ class CompilerContext:
     needs_timedelta: bool = False
     # Local variables (e.g., quantifier variables)
     locals: Set[str] = field(default_factory=set)
+    # Declared actor names, or None if unknown
+    actor_names: Optional[FrozenSet[str]] = field(
+        default_factory=_DECLARED_ACTORS.get
+    )
 
 
 def expr_to_python(expr: Expression, ctx: CompilerContext = None) -> str:
@@ -116,6 +151,21 @@ def expr_to_python(expr: Expression, ctx: CompilerContext = None) -> str:
         operand = expr_to_python(expr.operand, ctx)
         return f"({expr.op} {operand})"
 
+    if isinstance(expr, Comprehension):
+        prev_locals = ctx.locals.copy()
+        ctx.locals.add(expr.variable)
+        element = expr_to_python(expr.element, ctx)
+        ctx.locals = prev_locals
+
+        if isinstance(expr.domain, RangeExpr):
+            end = expr.domain.end
+            if isinstance(end, str):
+                end = f"{ctx.state_prefix}['{end}']"
+            domain = f"range({expr.domain.start}, {end} + 1)"
+        else:
+            domain = expr_to_python(expr.domain, ctx)
+        return f"{element} for {expr.variable} in {domain}"
+
     if isinstance(expr, QuantifiedExpr):
         # Save and extend locals
         prev_locals = ctx.locals.copy()
@@ -143,6 +193,8 @@ def _actor_ref_str(ref: ActorRef, ctx: CompilerContext) -> str:
         # is the element itself, not an entry of the actor table.
         if name in ctx.locals:
             return name
+        if is_state_variable(ref, ctx.actor_names):
+            return f"{ctx.state_prefix}['{name}']"
         return f"{ctx.actor_prefix}['{name}']"
     if ref.index == "*" or isinstance(ref.index, RangeExpr):
         return f"{ctx.actor_prefix}['{name}']"

@@ -66,10 +66,14 @@ def expr_to_rego(expr: Expression, ctx: RegoContext | None = None) -> str:
         name = expr.name.lower()
         if expr.index == "*":
             return f"{ctx.input_prefix}.{name}"
+        if isinstance(expr.index, RangeExpr):
+            return f"{ctx.input_prefix}.{name}"
         if expr.index is not None:
             idx = expr.index
-            if isinstance(idx, str) and idx in ctx.locals:
-                return f"{ctx.input_prefix}.{name}[{idx}]"
+            if isinstance(idx, (ActorRef, Identifier)) and getattr(idx, "index", None) is None:
+                idx = idx.name
+            elif not isinstance(idx, (str, int)):
+                idx = expr_to_rego(idx, ctx)
             return f"{ctx.input_prefix}.{name}[{idx}]"
         return f"{ctx.input_prefix}.{name}"
 

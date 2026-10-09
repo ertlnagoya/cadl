@@ -22,6 +22,7 @@ from .ast_nodes import (
     ActorRef,
     BinaryOp,
     BoolLiteral,
+    Comprehension,
     ContractDef,
     DurationLiteral,
     Expression,
@@ -163,6 +164,12 @@ def _expr_key(expr: Any) -> str:
         return f"({_expr_key(expr.left)} {expr.op} {_expr_key(expr.right)})"
     if isinstance(expr, UnaryOp):
         return f"({expr.op} {_expr_key(expr.operand)})"
+    if isinstance(expr, Comprehension):
+        if isinstance(expr.domain, RangeExpr):
+            domain = f"{expr.domain.start}..{expr.domain.end}"
+        else:
+            domain = _expr_key(expr.domain)
+        return f"{_expr_key(expr.element)} for {expr.variable} in {domain}"
     if isinstance(expr, QuantifiedExpr):
         return (f"({expr.quantifier} {expr.variable} in "
                 f"{_expr_key(expr.domain)}: {_expr_key(expr.predicate)})")

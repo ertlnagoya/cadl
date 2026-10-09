@@ -413,6 +413,7 @@ src/cadl/
   deadlock.py          Protocol deadlock detection
   regime_map.py        Regime transition graph analysis
   iec62853.py          IEC 62853 compliance mapping
+  unparse.py           Expression AST back to CADL source text
   cli.py               Command-line interface
   codegen/
     __init__.py        Public generate() API (multi-target dispatch)

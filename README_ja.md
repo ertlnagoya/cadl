@@ -412,6 +412,7 @@ src/cadl/
   deadlock.py          プロトコルデッドロック検出
   regime_map.py        運用モードの遷移グラフ分析
   iec62853.py          IEC 62853準拠マッピング
+  unparse.py           式ASTをCADLのソーステキストに戻す
   cli.py               コマンドラインインタフェース
   codegen/
     __init__.py        公開generate() API（マルチターゲット対応）

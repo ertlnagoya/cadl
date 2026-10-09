@@ -6,11 +6,13 @@ from cadl.ast_nodes import (
     ActorRef,
     BinaryOp,
     BoolLiteral,
+    Comprehension,
     FloatLiteral,
     FunctionCall,
     IntLiteral,
     MemberAccess,
     QuantifiedExpr,
+    RangeExpr,
     UnaryOp,
 )
 from cadl.parser import parse_expr
@@ -103,4 +105,55 @@ class TestQuantifier:
             "AND",
             BinaryOp(">", MemberAccess(_name("r"), "battery"), IntLiteral(20)),
             _name("ok"),
+        )
+
+
+class TestMemberAccess:
+
+    def test_plain(self):
+        assert parse_expr("DISPATCHER.is_operational") == MemberAccess(
+            _name("DISPATCHER"), "is_operational"
+        )
+
+    def test_indexed_object(self):
+        assert parse_expr("ROBOT[i].battery > 20") == BinaryOp(
+            ">",
+            MemberAccess(ActorRef("ROBOT", index=_name("i")), "battery"),
+            IntLiteral(20),
+        )
+
+    def test_wildcard_object(self):
+        assert parse_expr("ROBOT[*].status") == MemberAccess(
+            ActorRef("ROBOT", index="*"), "status"
+        )
+
+    def test_inside_call(self):
+        expr = parse_expr("all(ROBOT[*].status != Collision)")
+        assert expr == FunctionCall("all", [BinaryOp(
+            "!=", MemberAccess(ActorRef("ROBOT", index="*"), "status"), _name("Collision"),
+        )])
+
+
+class TestComprehension:
+
+    def test_numeric_range(self):
+        assert parse_expr("sum(ROBOT[i].goal_count for i in 1..5)") == FunctionCall(
+            "sum",
+            [Comprehension(
+                element=MemberAccess(ActorRef("ROBOT", index=_name("i")), "goal_count"),
+                variable="i",
+                domain=RangeExpr(start=1, end=5),
+            )],
+        )
+
+    def test_symbolic_range_end(self):
+        expr = parse_expr("min(ROBOT[i].goal_count for i in 1..N)")
+        assert expr.args[0].domain == RangeExpr(start=1, end="N")
+
+    def test_over_a_set(self):
+        expr = parse_expr("sum(r.load for r in ROBOT[*])")
+        assert expr.args[0] == Comprehension(
+            element=MemberAccess(_name("r"), "load"),
+            variable="r",
+            domain=ActorRef("ROBOT", index="*"),
         )

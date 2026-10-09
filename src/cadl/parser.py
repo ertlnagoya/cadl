@@ -22,6 +22,7 @@ from .ast_nodes import (
     AutonomyLevel,
     BarrierStep,
     BinaryOp,
+    Comprehension,
     BoolLiteral,
     CodegenSpec,
     ComputeStep,
@@ -121,9 +122,19 @@ class ExprTransformer(Transformer):
         return items[0]
 
     def member_access(self, items):
-        parts = [str(i) for i in items]
-        obj = ActorRef(name=parts[0])
-        return MemberAccess(obj=obj, member=".".join(parts[1:]))
+        obj = items[0]
+        if not isinstance(obj, ActorRef):
+            obj = ActorRef(name=str(obj))
+        return MemberAccess(obj=obj, member=".".join(str(i) for i in items[1:]))
+
+    def range_domain(self, items):
+        end = int(items[1]) if str(items[1]).isdigit() else str(items[1])
+        return RangeExpr(start=int(items[0]), end=end)
+
+    def comprehension(self, items):
+        return Comprehension(
+            element=items[0], variable=str(items[1]), domain=items[2]
+        )
 
     def function_call(self, items):
         name = str(items[0])

@@ -37,9 +37,15 @@ QUANTIFIER: "for all" | "exists"
 
 function_call: IDENTIFIER "(" [arg_list] ")"
 arg_list: arg ("," arg)*
-?arg: predicate_expr | STRING
+?arg: comprehension | predicate_expr | STRING
 
-member_access: IDENTIFIER ("." IDENTIFIER)+
+// Aggregate over a range or set: sum(ROBOT[i].goal_count for i in 1..5)
+comprehension: predicate_expr "for" IDENTIFIER "in" comp_domain
+?comp_domain: INT ".." (INT | IDENTIFIER)  -> range_domain
+            | expr
+
+// The object may be indexed: ROBOT[i].battery, ROBOT[*].status
+member_access: actor_ref ("." IDENTIFIER)+
 
 // === Atoms ===
 ?atom: FLOAT                            -> float_lit

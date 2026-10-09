@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-10-09
+
 ### Fixed
 - Expression parser dropped the arithmetic operators, so every expression
   containing `+`, `-`, `*` or `/` failed to parse and fell back to an opaque
@@ -26,6 +28,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   expressions; they now show the CADL source text.
 - Python codegen resolved a quantifier's bound variable through the actor
   table (`ctx.actors['r']`).
+- Generated Python and Solidity read every bare name from the actor table
+  (`ctx.actors['delivery_time']`, `actors_delivery_time`). Names that are not
+  declared actors are now state variables: `ctx.state['delivery_time']` in
+  Python, `stateUint["..."]` / `stateBool["..."]` in Solidity.
+- Generated class and file names lower-cased the inside of camel-case names
+  (`Robotdeliverysystem.sol`); they now keep it (`RobotDeliverySystem.sol`).
 
 ### Changed
 - "Assumes do not entail guarantees" is reported as `[INFO]`, not `[FAIL]`:
@@ -39,8 +47,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   example uses `for all` / `exists` in place of `all(...)` / `any(...)`.
   Every example now passes `cadl verify`, and CI enforces it.
 
+- **Generated names changed**: the runtime class and the Solidity
+  orchestrator of an SoS with a camel-case name are now spelled as in the
+  source, e.g. `RobotDeliverySystemRuntime` (was `RobotdeliverysystemRuntime`).
+
 ### Added
+- Member access on an indexed actor: `ROBOT[i].battery`, `ROBOT[*].status`.
+- Aggregate comprehensions as call arguments:
+  `sum(ROBOT[i].goal_count for i in 1..5)`, `sum(r.load for r in ROBOT[*])`.
 - `cadl.unparse.expr_to_source()` renders an expression back to CADL text.
+- `CONTRIBUTING.md`, `SECURITY.md` and `CITATION.cff`.
 
 ## [0.3.1] — 2026-10-09
 
@@ -141,7 +157,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/ertlnagoya/cadl/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ertlnagoya/cadl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ertlnagoya/cadl/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/ertlnagoya/cadl/compare/v0.2.1...v0.2.2

@@ -48,6 +48,12 @@ class TestEmitter:
         assert sanitize_id("ROBOT") == "Robot"
         assert sanitize_id("FAILURE_REPLAN") == "FailureReplan"
 
+    def test_sanitize_id_keeps_camel_case(self):
+        assert sanitize_id("RobotDeliverySystem") == "RobotDeliverySystem"
+        assert sanitize_id("MAPFRobotDelivery") == "MAPFRobotDelivery"
+        assert sanitize_id("smartCity") == "SmartCity"
+        assert sanitize_id("robot") == "Robot"
+
     def test_snake_case(self):
         assert snake_case("DELIVERY_SLA") == "delivery_sla"
         assert snake_case("ROBOT") == "robot"

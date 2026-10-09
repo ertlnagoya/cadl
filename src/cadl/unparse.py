@@ -13,6 +13,7 @@ from .ast_nodes import (
     ActorRef,
     BinaryOp,
     BoolLiteral,
+    Comprehension,
     DurationLiteral,
     FloatLiteral,
     FunctionCall,
@@ -109,6 +110,13 @@ def _render(expr: Any, nested: bool) -> str:
         return f"{left} {expr.op} {right}"
     if isinstance(expr, UnaryOp):
         return f"{expr.op} {_child(expr.operand, _PREC_NOT)}"
+    if isinstance(expr, Comprehension):
+        if isinstance(expr.domain, RangeExpr):
+            domain = f"{expr.domain.start}..{expr.domain.end}"
+        else:
+            domain = _child(expr.domain, _PREC_ADD)
+        element = _child(expr.element, _PREC_OR)
+        return f"{element} for {expr.variable} in {domain}"
     if isinstance(expr, QuantifiedExpr):
         keyword = "for all" if expr.quantifier == "for_all" else "exists"
         domain = _render(expr.domain, nested=True)

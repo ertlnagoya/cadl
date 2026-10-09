@@ -137,11 +137,20 @@ class QuantifiedExpr:
     loc: SourceLocation | None = None
 
 
+@dataclass
+class Comprehension:
+    """Aggregate argument: ``element for variable in domain``."""
+    element: Expression
+    variable: str
+    domain: Union[RangeExpr, Expression]
+    loc: SourceLocation | None = None
+
+
 Expression = Union[
     IntLiteral, FloatLiteral, BoolLiteral, StringLiteral,
     DurationLiteral, DistLiteral, ListLiteral,
     ActorRef, MemberAccess, FunctionCall,
-    BinaryOp, UnaryOp, QuantifiedExpr, Identifier,
+    BinaryOp, UnaryOp, QuantifiedExpr, Identifier, Comprehension,
 ]
 
 

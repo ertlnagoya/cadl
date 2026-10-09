@@ -54,6 +54,7 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
       - __init__.py        Package exports
     """
     from .actor_gen import generate_actors_module
+    from .expr_compiler import declared_actors
     from .contract_gen import generate_contracts_module
     from .metric_gen import generate_metrics_module
     from .protocol_gen import generate_protocols_module
@@ -63,18 +64,19 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate each module
-    if sos.actors:
-        _write(output_dir / "actors.py", generate_actors_module(sos.actors))
+    with declared_actors(a.id.name for a in sos.actors):
+        if sos.actors:
+            _write(output_dir / "actors.py", generate_actors_module(sos.actors))
 
-    if sos.contracts:
-        _write(output_dir / "contracts.py", generate_contracts_module(sos.contracts))
+        if sos.contracts:
+            _write(output_dir / "contracts.py", generate_contracts_module(sos.contracts))
 
-    if sos.protocols:
-        _write(output_dir / "protocols.py", generate_protocols_module(sos.protocols))
+        if sos.protocols:
+            _write(output_dir / "protocols.py", generate_protocols_module(sos.protocols))
 
-    _write(output_dir / "transitions.py", generate_transitions_module(sos.transitions))
-    _write(output_dir / "metrics.py", generate_metrics_module(sos.metrics))
-    _write(output_dir / "runtime.py", generate_runtime_module(sos))
+        _write(output_dir / "transitions.py", generate_transitions_module(sos.transitions))
+        _write(output_dir / "metrics.py", generate_metrics_module(sos.metrics))
+        _write(output_dir / "runtime.py", generate_runtime_module(sos))
 
     # Generate __init__.py
     _write(output_dir / "__init__.py", _generate_init(sos))

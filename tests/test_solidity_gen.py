@@ -493,7 +493,7 @@ class TestSolidityGen:
         sos = _minimal_sos(name="TestSystem", contracts=[contract])
         code = generate_main_sol(sos)
         assert "pragma solidity ^0.8.20;" in code
-        assert "contract Testsystem {" in code
+        assert "contract TestSystem {" in code
 
     def test_main_sol_imports_contracts(self):
         c1 = _minimal_contract(cid="ALPHA")
@@ -545,6 +545,11 @@ class TestSolidityGen:
 # TestSolidityIntegration
 # ===========================================================================
 
+def _names(directory):
+    """File names as written; Path.exists() ignores case on some systems."""
+    return {p.name for p in directory.iterdir()}
+
+
 class TestSolidityIntegration:
     """End-to-end tests using generate_solidity()."""
 
@@ -561,7 +566,7 @@ class TestSolidityIntegration:
         # Contract file
         assert (output / "TestSla.sol").exists()
         # Main orchestrator
-        assert (output / "Minimalsos.sol").exists()
+        assert "MinimalSoS.sol" in _names(output)
         # No regime controller without transitions
         assert not (output / "RegimeController.sol").exists()
 
@@ -578,7 +583,7 @@ class TestSolidityIntegration:
         generate_solidity(sos, output)
 
         assert (output / "TestSla.sol").exists()
-        assert (output / "Transsos.sol").exists()
+        assert "TransSoS.sol" in _names(output)
         assert (output / "RegimeController.sol").exists()
 
     def test_generate_solidity_creates_output_dir(self, tmp_path):
@@ -588,7 +593,7 @@ class TestSolidityIntegration:
         generate_solidity(sos, output)
 
         assert output.exists()
-        assert (output / "Dirtest.sol").exists()
+        assert "DirTest.sol" in _names(output)
 
     def test_generate_solidity_multiple_contracts(self, tmp_path):
         c1 = _minimal_contract(cid="ALPHA_SLA")
@@ -600,7 +605,7 @@ class TestSolidityIntegration:
 
         assert (output / "AlphaSla.sol").exists()
         assert (output / "BetaSla.sol").exists()
-        assert (output / "Multisos.sol").exists()
+        assert "MultiSoS.sol" in _names(output)
 
     def test_robot_delivery_solidity(self, tmp_path):
         """Parse robot_delivery.cadl and generate Solidity files."""
@@ -616,8 +621,8 @@ class TestSolidityIntegration:
         generate_solidity(sos, output)
 
         # Should have at least the main orchestrator
-        main_file = output / "Robotdeliverysystem.sol"
-        assert main_file.exists(), f"Expected main file; got: {list(output.iterdir())}"
+        main_file = output / "RobotDeliverySystem.sol"
+        assert main_file.name in _names(output), f"Expected main file; got: {list(output.iterdir())}"
 
         # All .sol files should contain valid Solidity pragma
         for f in output.glob("*.sol"):

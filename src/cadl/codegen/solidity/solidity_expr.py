@@ -6,8 +6,9 @@ Analogous to expr_compiler.py (Python) but emits Solidity source strings.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Set
+from typing import FrozenSet, Optional, Set
 
+from ..expr_compiler import _DECLARED_ACTORS, is_state_variable
 from ...ast_nodes import (
     ActorRef,
     BinaryOp,
@@ -32,6 +33,40 @@ class SolidityContext:
     state_prefix: str = "state"
     actor_prefix: str = "actors"
     locals: Set[str] = field(default_factory=set)
+    # Declared actor names, or None if unknown (see expr_compiler)
+    actor_names: Optional[FrozenSet[str]] = field(
+        default_factory=_DECLARED_ACTORS.get
+    )
+
+
+def _index_str(index, ctx: "SolidityContext") -> str:
+    """Render an actor index; a bare name is an index variable."""
+    if isinstance(index, (str, int)):
+        return str(index)
+    if isinstance(index, (ActorRef, Identifier)) and getattr(index, "index", None) is None:
+        return index.name
+    return expr_to_solidity(index, ctx)
+
+
+def _is_state_name(expr, ctx: "SolidityContext") -> bool:
+    return (
+        isinstance(expr, ActorRef)
+        and expr.name not in ctx.locals
+        and is_state_variable(expr, ctx.actor_names)
+    )
+
+
+def predicate_to_solidity(expr: Expression, ctx: "SolidityContext | None" = None) -> str:
+    """Compile an expression used as a truth value.
+
+    The generated contracts keep state in ``stateUint`` and ``stateBool``;
+    a state variable standing alone as a condition is read from the latter.
+    """
+    if ctx is None:
+        ctx = SolidityContext()
+    if _is_state_name(expr, ctx):
+        return f'stateBool["{expr.name}"]'
+    return expr_to_solidity(expr, ctx)
 
 
 def expr_to_solidity(expr: Expression, ctx: SolidityContext | None = None) -> str:
@@ -67,14 +102,13 @@ def expr_to_solidity(expr: Expression, ctx: SolidityContext | None = None) -> st
         return f"{ctx.state_prefix}.{expr.name}"
 
     if isinstance(expr, ActorRef):
+        if _is_state_name(expr, ctx):
+            return f'stateUint["{expr.name}"]'
         name = expr.name.lower()
-        if expr.index == "*":
+        if expr.index == "*" or isinstance(expr.index, RangeExpr):
             return f"{ctx.actor_prefix}_{name}"
         if expr.index is not None:
-            idx = expr.index
-            if isinstance(idx, str) and idx in ctx.locals:
-                return f"{ctx.actor_prefix}_{name}[{idx}]"
-            return f"{ctx.actor_prefix}_{name}[{idx}]"
+            return f"{ctx.actor_prefix}_{name}[{_index_str(expr.index, ctx)}]"
         return f"{ctx.actor_prefix}_{name}"
 
     if isinstance(expr, MemberAccess):
@@ -86,8 +120,13 @@ def expr_to_solidity(expr: Expression, ctx: SolidityContext | None = None) -> st
         return f"{expr.name}({args})"
 
     if isinstance(expr, BinaryOp):
-        left = expr_to_solidity(expr.left, ctx)
-        right = expr_to_solidity(expr.right, ctx)
+        boolean_operands = expr.op in ("AND", "OR") or (
+            expr.op in ("==", "!=")
+            and (isinstance(expr.left, BoolLiteral) or isinstance(expr.right, BoolLiteral))
+        )
+        compile_operand = predicate_to_solidity if boolean_operands else expr_to_solidity
+        left = compile_operand(expr.left, ctx)
+        right = compile_operand(expr.right, ctx)
 
         op_map = {
             "AND": "&&",
@@ -108,7 +147,7 @@ def expr_to_solidity(expr: Expression, ctx: SolidityContext | None = None) -> st
 
     if isinstance(expr, UnaryOp):
         if expr.op == "NOT":
-            operand = expr_to_solidity(expr.operand, ctx)
+            operand = predicate_to_solidity(expr.operand, ctx)
             return f"(!{operand})"
         operand = expr_to_solidity(expr.operand, ctx)
         return f"({expr.op} {operand})"

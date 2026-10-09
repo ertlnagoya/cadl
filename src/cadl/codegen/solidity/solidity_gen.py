@@ -18,7 +18,8 @@ from ...ast_nodes import (
     TransitionDef,
 )
 from ..emitter import sanitize_id, snake_case
-from .solidity_expr import SolidityContext, expr_to_solidity
+from ..expr_compiler import declared_actors
+from .solidity_expr import SolidityContext, expr_to_solidity, predicate_to_solidity
 
 
 def generate_solidity(sos: SoSDefinition, output_dir: Path) -> None:
@@ -28,20 +29,21 @@ def generate_solidity(sos: SoSDefinition, output_dir: Path) -> None:
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate a contract for each ContractDef
-    for contract in sos.contracts:
-        code = generate_contract_sol(contract, sos)
-        filename = f"{sanitize_id(contract.id)}.sol"
-        (output_dir / filename).write_text(code, encoding="utf-8")
+    with declared_actors(a.id.name for a in sos.actors):
+        # Generate a contract for each ContractDef
+        for contract in sos.contracts:
+            code = generate_contract_sol(contract, sos)
+            filename = f"{sanitize_id(contract.id)}.sol"
+            (output_dir / filename).write_text(code, encoding="utf-8")
 
-    # Generate regime controller if transitions exist
-    if sos.transitions:
-        code = generate_regime_sol(sos)
-        (output_dir / "RegimeController.sol").write_text(code, encoding="utf-8")
+        # Generate regime controller if transitions exist
+        if sos.transitions:
+            code = generate_regime_sol(sos)
+            (output_dir / "RegimeController.sol").write_text(code, encoding="utf-8")
 
-    # Generate main orchestrator
-    code = generate_main_sol(sos)
-    (output_dir / f"{sanitize_id(sos.name)}.sol").write_text(code, encoding="utf-8")
+        # Generate main orchestrator
+        code = generate_main_sol(sos)
+        (output_dir / f"{sanitize_id(sos.name)}.sol").write_text(code, encoding="utf-8")
 
 
 def generate_contract_sol(contract: ContractDef, sos: SoSDefinition) -> str:
@@ -271,7 +273,7 @@ def generate_main_sol(sos: SoSDefinition) -> str:
 
 def _compile_predicate(expr: Expression, ctx: SolidityContext) -> str:
     """Compile a predicate expression to Solidity."""
-    return expr_to_solidity(expr, ctx)
+    return predicate_to_solidity(expr, ctx)
 
 
 def _compile_condition(cond_str: str, ctx: SolidityContext) -> str:
@@ -279,7 +281,7 @@ def _compile_condition(cond_str: str, ctx: SolidityContext) -> str:
     from ...parser import parse_expr
     try:
         expr = parse_expr(cond_str)
-        return expr_to_solidity(expr, ctx)
+        return predicate_to_solidity(expr, ctx)
     except Exception:
         # Fallback: use as boolean state variable
         sanitized = cond_str.replace(" ", "_").replace(".", "_")[:40]
