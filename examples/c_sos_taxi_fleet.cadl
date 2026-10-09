@@ -176,11 +176,11 @@ sos:
   transitions:
     - from: NORMAL
       to: PEAK_DEMAND
-      condition: "pending_requests > available_taxis * 1.5"
+      condition: "pending_requests > available_taxis * 1.5 AND active_incidents == 0"
       protocol: RIDE_MATCHING
     - from: PEAK_DEMAND
       to: NORMAL
-      condition: "pending_requests <= available_taxis"
+      condition: "pending_requests <= available_taxis AND active_incidents == 0"
     - from: NORMAL
       to: INCIDENT_RESPONSE
       condition: "active_incidents > 0"

@@ -136,12 +136,16 @@ class ExprTransformer(Transformer):
     def comparison(self, items):
         return BinaryOp(op=str(items[1]), left=items[0], right=items[2])
 
-    def or_expr_inner(self, items):
-        if len(items) == 1:
-            return items[0]
+    def or_expr(self, items):
         result = items[0]
-        for i in range(1, len(items)):
-            result = BinaryOp(op="OR", left=result, right=items[i])
+        for item in items[1:]:
+            result = BinaryOp(op="OR", left=result, right=item)
+        return result
+
+    def and_expr(self, items):
+        result = items[0]
+        for item in items[1:]:
+            result = BinaryOp(op="AND", left=result, right=item)
         return result
 
     def not_expr(self, items):

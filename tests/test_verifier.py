@@ -28,7 +28,9 @@ from cadl.verifier import (
     verify,
     _check_contract_consistency,
     _check_cross_contract_consistency,
+    _check_assumption_satisfiability,
     _check_guarantee_entailment,
+    _check_transition_exclusivity,
 )
 
 
@@ -233,12 +235,12 @@ class TestVerify:
         assert results == []
 
     def test_single_consistent_contract(self):
-        """Single satisfiable contract produces consistency + entailment results."""
+        """Single satisfiable contract produces consistency, assumption and entailment results."""
         c = _make_contract("C1", ["A"], guarantee=[BoolLiteral(True)])
         sos = _make_sos(contracts=[c])
         results = verify(sos)
-        # 1 consistency + 1 entailment
-        assert len(results) == 2
+        # 1 consistency + 1 assumptions + 1 entailment
+        assert len(results) == 3
         assert all(r.status == "passed" for r in results)
 
     def test_cross_contract_with_shared_parties(self):
@@ -247,8 +249,8 @@ class TestVerify:
         c2 = _make_contract("C2", ["A", "C"], guarantee=[BoolLiteral(True)])
         sos = _make_sos(contracts=[c1, c2])
         results = verify(sos)
-        # 2 consistency + 2 entailment + 1 cross-contract (A is shared)
-        assert len(results) == 5
+        # 2 consistency + 2 assumptions + 2 entailment + 1 cross-contract (A is shared)
+        assert len(results) == 7
         assert all(r.status == "passed" for r in results)
 
     def test_no_cross_check_without_shared_parties(self):
@@ -257,8 +259,8 @@ class TestVerify:
         c2 = _make_contract("C2", ["C", "D"], guarantee=[BoolLiteral(True)])
         sos = _make_sos(contracts=[c1, c2])
         results = verify(sos)
-        # 2 consistency + 2 entailment, no cross-contract
-        assert len(results) == 4
+        # 2 consistency + 2 assumptions + 2 entailment, no cross-contract
+        assert len(results) == 6
 
     def test_verification_result_str(self):
         """VerificationResult __str__ formatting."""
@@ -300,12 +302,9 @@ class TestRobotDeliveryVerification:
         sos = parse_file(cadl_file)
         results = verify(sos)
 
-        # Consistency checks should pass (no contradictions in the example).
-        # Entailment checks may fail since assumes don't logically entail
-        # guarantees in the example — that's expected and informational.
+        # Guarantees are obligations, not consequences of the assumes, so
+        # entailment is reported as "info" and nothing may fail.
         for r in results:
-            if "entailment" in r.check_name:
-                continue  # Entailment failures are expected
             assert r.status != "failed", f"Unexpected failure: {r}"
 
 
@@ -324,15 +323,15 @@ class TestGuaranteeEntailment:
         result = _check_guarantee_entailment(contract)
         assert result.status == "passed"
 
-    def test_entailment_fails_when_not_implied(self):
-        """If assume x > 0, guarantee x > 100 is NOT entailed."""
+    def test_entailment_is_informational_when_not_implied(self):
+        """If assume x > 0, guarantee x > 100 is NOT entailed: info, not failure."""
         contract = _make_contract(
             "C1", ["A"],
             assume=[BinaryOp(">", Identifier("x"), IntLiteral(0))],
             guarantee=[BinaryOp(">", Identifier("x"), IntLiteral(100))],
         )
         result = _check_guarantee_entailment(contract)
-        assert result.status == "failed"
+        assert result.status == "info"
         assert result.counterexample is not None
 
     def test_entailment_empty_assumes(self):
@@ -377,3 +376,107 @@ class TestGuaranteeEntailment:
         )
         result = _check_guarantee_entailment(contract)
         assert result.status == "passed"
+
+
+# === Assumption satisfiability tests ===
+
+class TestAssumptionSatisfiability:
+    """A contract whose assumes cannot hold together never applies."""
+
+    def test_satisfiable_assumptions(self):
+        contract = _make_contract(
+            "C1", ["A"],
+            assume=[BinaryOp(">", Identifier("x"), IntLiteral(0))],
+        )
+        assert _check_assumption_satisfiability(contract).status == "passed"
+
+    def test_contradictory_assumptions(self):
+        contract = _make_contract(
+            "C1", ["A"],
+            assume=[
+                BinaryOp(">", Identifier("x"), IntLiteral(10)),
+                BinaryOp("<", Identifier("x"), IntLiteral(5)),
+            ],
+        )
+        assert _check_assumption_satisfiability(contract).status == "failed"
+
+    def test_no_assumptions(self):
+        contract = _make_contract("C1", ["A"], guarantee=[BoolLiteral(True)])
+        assert _check_assumption_satisfiability(contract).status == "passed"
+
+
+# === Numeric encoding tests ===
+
+class TestNumericEncoding:
+    """Names used in comparisons are quantities, not 0/1 truth values."""
+
+    def _sat(self, *exprs):
+        import z3
+        from cadl.parser import parse_expr
+        from cadl.verifier import _to_z3_bool
+        ctx = Z3Context()
+        solver = z3.Solver()
+        for e in exprs:
+            solver.add(_to_z3_bool(parse_expr(e), ctx))
+        return solver.check() == z3.sat
+
+    def test_threshold_above_one_is_satisfiable(self):
+        assert self._sat("battery > 20")
+
+    def test_contradictory_bounds_are_unsatisfiable(self):
+        assert not self._sat("battery > 20", "battery < 10")
+
+    def test_arithmetic_on_both_sides(self):
+        assert self._sat("active_tasks > capacity * 0.8")
+        assert not self._sat(
+            "active_tasks > capacity * 0.8", "active_tasks <= capacity * 0.5",
+            "capacity > 0",
+        )
+
+    def test_boolean_equality(self):
+        assert not self._sat("emergency_active == true", "emergency_active == false")
+
+    def test_same_call_is_same_symbol(self):
+        assert not self._sat("count(late) > 3", "count(late) < 2")
+
+    def test_distinct_strings_differ(self):
+        assert not self._sat('mode == "auto"', 'mode == "manual"')
+
+    def test_conjunction_and_negation(self):
+        assert not self._sat("a AND NOT a")
+        assert self._sat("a OR NOT a")
+
+
+# === Transition exclusivity tests ===
+
+class TestTransitionExclusivity:
+
+    def _results(self, *conds):
+        transitions = [
+            TransitionDef(from_regime="S", to_regime=f"T{i}", condition=c)
+            for i, c in enumerate(conds)
+        ]
+        return _check_transition_exclusivity(_make_sos(transitions=transitions))
+
+    def test_disjoint_thresholds_are_exclusive(self):
+        (r,) = self._results("level > 0.7", "level <= 0.4")
+        assert r.status == "passed"
+
+    def test_independent_conditions_overlap(self):
+        (r,) = self._results("level > 0.7", "emergency_active == true")
+        assert r.status == "failed"
+        assert r.counterexample is not None
+
+    def test_explicit_priority_makes_them_exclusive(self):
+        (r,) = self._results(
+            "level > 0.7 AND emergency_active == false",
+            "emergency_active == true",
+        )
+        assert r.status == "passed"
+
+    def test_conjunctions_with_complementary_bounds(self):
+        (r,) = self._results(
+            "emergency_active == false AND level <= 0.4",
+            "emergency_active == false AND level > 0.4",
+        )
+        assert r.status == "passed"

@@ -2,8 +2,12 @@
 
 Performs:
 1. Single contract consistency: assume + guarantee are satisfiable together
-2. Cross-contract consistency: contracts sharing parties don't contradict
-3. Transition condition mutual exclusivity
+2. Assumption satisfiability: a contract's assumes can hold together
+3. Cross-contract consistency: contracts sharing parties don't contradict
+4. Transition condition mutual exclusivity
+5. Regime reachability, dead states and safety invariants
+
+Whether guarantees follow from assumes is reported as information only.
 """
 
 from __future__ import annotations
@@ -45,12 +49,20 @@ _SUPPORTED_METHODS = {"smt"}
 class VerificationResult:
     """Result of a single verification check."""
     check_name: str
-    status: str  # "passed", "failed", "unknown"
+    # "passed", "failed", "unknown", "info" (a finding that is not a
+    # defect) or "not_supported". Only "failed" fails verification.
+    status: str
     message: str
     counterexample: Optional[Dict[str, Any]] = None
 
     def __str__(self) -> str:
-        icon = {"passed": "PASS", "failed": "FAIL", "unknown": "UNKNOWN"}[self.status]
+        icon = {
+            "passed": "PASS",
+            "failed": "FAIL",
+            "unknown": "UNKNOWN",
+            "info": "INFO",
+            "not_supported": "SKIP",
+        }.get(self.status, self.status.upper())
         s = f"[{icon}] {self.check_name}: {self.message}"
         if self.counterexample:
             s += f"\n        Counterexample: {self.counterexample}"
@@ -65,6 +77,7 @@ class Z3Context:
         self.int_vars: Dict[str, z3.ArithRef] = {}
         self.real_vars: Dict[str, z3.ArithRef] = {}
         self.func_decls: Dict[str, z3.FuncDeclRef] = {}
+        self.string_codes: Dict[str, int] = {}
 
     def get_bool(self, name: str) -> z3.BoolRef:
         if name not in self.bool_vars:
@@ -81,6 +94,12 @@ class Z3Context:
             self.real_vars[name] = z3.Real(name)
         return self.real_vars[name]
 
+    def get_string_code(self, value: str) -> z3.ArithRef:
+        """Distinct numeric constant per string, so "a" == "b" is false."""
+        if value not in self.string_codes:
+            self.string_codes[value] = len(self.string_codes)
+        return z3.RealVal(self.string_codes[value])
+
     def get_uninterpreted_bool_func(self, name: str, arity: int = 0) -> Any:
         """Get or create an uninterpreted boolean function."""
         key = f"{name}/{arity}"
@@ -92,23 +111,128 @@ class Z3Context:
         return self.func_decls[key]
 
 
+def _index_to_name(index: Any) -> str:
+    """Render an actor index (``*``, a range, a name or a number)."""
+    if index == "*":
+        return "ALL"
+    if isinstance(index, RangeExpr):
+        return "range"
+    if isinstance(index, ActorRef) and index.index is None:
+        return index.name
+    if isinstance(index, Identifier):
+        return index.name
+    if isinstance(index, IntLiteral):
+        return str(index.value)
+    if isinstance(index, (str, int)):
+        return str(index)
+    return _expr_key(index)
+
+
 def _actor_ref_to_name(ref: ActorRef) -> str:
     """Convert an ActorRef to a string name for Z3 variables."""
-    name = ref.name
-    if ref.index == "*":
-        return f"{name}_ALL"
-    if isinstance(ref.index, RangeExpr):
-        return f"{name}_range"
-    if ref.index is not None:
-        return f"{name}_{ref.index}"
-    return name
+    if ref.index is None:
+        return ref.name
+    return f"{ref.name}_{_index_to_name(ref.index)}"
+
+
+def _expr_key(expr: Any) -> str:
+    """Canonical text for an expression, used to name opaque symbols.
+
+    Two occurrences of the same call (``count(late_orders)``) must map to
+    the same Z3 variable, so the name is derived from the expression text.
+    """
+    if isinstance(expr, BoolLiteral):
+        return "true" if expr.value else "false"
+    if isinstance(expr, (IntLiteral, FloatLiteral)):
+        return str(expr.value)
+    if isinstance(expr, DurationLiteral):
+        return f"{expr.value}{expr.unit}"
+    if isinstance(expr, StringLiteral):
+        return f'"{expr.value}"'
+    if isinstance(expr, Identifier):
+        return expr.name
+    if isinstance(expr, ActorRef):
+        return _actor_ref_to_name(expr)
+    if isinstance(expr, MemberAccess):
+        return f"{_actor_ref_to_name(expr.obj)}_{expr.member}"
+    if isinstance(expr, FunctionCall):
+        if not expr.args:
+            return expr.name
+        return f"{expr.name}({', '.join(_expr_key(a) for a in expr.args)})"
+    if isinstance(expr, BinaryOp):
+        return f"({_expr_key(expr.left)} {expr.op} {_expr_key(expr.right)})"
+    if isinstance(expr, UnaryOp):
+        return f"({expr.op} {_expr_key(expr.operand)})"
+    if isinstance(expr, QuantifiedExpr):
+        return (f"({expr.quantifier} {expr.variable} in "
+                f"{_expr_key(expr.domain)}: {_expr_key(expr.predicate)})")
+    return f"unknown_{type(expr).__name__}"
+
+
+_LOGICAL_OPS = {"AND", "OR"}
+_ORDER_OPS = {"<", "<=", ">", ">="}
+_EQUALITY_OPS = {"==", "!="}
+_ARITH_OPS = {"+", "-", "*", "/"}
+_SYMBOLS = (Identifier, ActorRef, MemberAccess, FunctionCall)
+
+
+def _is_boolean_expr(expr: Any) -> bool:
+    """True if the expression is boolean by its own shape."""
+    if isinstance(expr, (BoolLiteral, QuantifiedExpr)):
+        return True
+    if isinstance(expr, UnaryOp):
+        return expr.op == "NOT"
+    if isinstance(expr, BinaryOp):
+        return expr.op not in _ARITH_OPS
+    return False
+
+
+def _symbol_name(expr: Any) -> str:
+    if isinstance(expr, StringLiteral):
+        sanitized = expr.value.replace(" ", "_").replace(".", "_")
+        sanitized = "".join(c for c in sanitized if c.isalnum() or c == "_")
+        return f"pred_{sanitized or 'str_pred'}"
+    return _expr_key(expr)
+
+
+def _as_bool(val: Any) -> Any:
+    return val if z3.is_bool(val) else val != 0
+
+
+def _as_num(val: Any) -> Any:
+    if z3.is_bool(val):
+        return z3.If(val, z3.RealVal(1), z3.RealVal(0))
+    if z3.is_int(val):
+        return z3.ToReal(val)
+    return val
+
+
+def _to_z3_bool(expr: Any, ctx: Z3Context) -> Any:
+    """Translate an expression used as a truth value."""
+    if isinstance(expr, _SYMBOLS) or isinstance(expr, StringLiteral):
+        # A name or call standing alone is an opaque proposition.
+        return ctx.get_bool(_symbol_name(expr))
+    return _as_bool(expr_to_z3(expr, ctx))
+
+
+def _to_z3_num(expr: Any, ctx: Z3Context) -> Any:
+    """Translate an expression used as a number."""
+    if isinstance(expr, _SYMBOLS):
+        # A name or call compared or combined arithmetically is a quantity.
+        return ctx.get_real(_symbol_name(expr))
+    if isinstance(expr, StringLiteral):
+        return ctx.get_string_code(expr.value)
+    return _as_num(expr_to_z3(expr, ctx))
 
 
 def expr_to_z3(expr: Expression, ctx: Z3Context) -> Any:
     """Convert a CADL Expression AST node to a Z3 expression.
 
-    Uses a best-effort approach: expressions that can't be fully encoded
-    are represented as opaque boolean variables or uninterpreted functions.
+    Names carry no declared type in CADL, so the sort of a symbol follows
+    from how it is used: operands of ``<``, ``+`` etc. become real-valued
+    variables, operands of ``AND`` / ``OR`` / ``NOT`` become propositions.
+    Function calls are opaque symbols named after their text. A name used
+    both ways in one check yields two unrelated variables.
     """
     if isinstance(expr, BoolLiteral):
         return z3.BoolVal(expr.value)
@@ -119,108 +243,74 @@ def expr_to_z3(expr: Expression, ctx: Z3Context) -> Any:
     if isinstance(expr, FloatLiteral):
         return z3.RealVal(expr.value)
 
-    if isinstance(expr, StringLiteral):
-        # Treat string predicates as opaque boolean variables
-        sanitized = expr.value.replace(" ", "_").replace(".", "_")
-        sanitized = "".join(c for c in sanitized if c.isalnum() or c == "_")
-        if not sanitized:
-            sanitized = "str_pred"
-        return ctx.get_bool(f"pred_{sanitized}")
-
-    if isinstance(expr, Identifier):
-        # Unknown identifier → boolean variable
-        return ctx.get_bool(expr.name)
-
     if isinstance(expr, DurationLiteral):
         # Convert to milliseconds as integer
         multipliers = {"ms": 1, "s": 1000, "min": 60000, "h": 3600000}
         ms = expr.value * multipliers.get(expr.unit, 1)
         return z3.IntVal(ms)
 
-    if isinstance(expr, ActorRef):
-        return ctx.get_bool(_actor_ref_to_name(expr))
-
-    if isinstance(expr, MemberAccess):
-        # e.g. DISPATCHER.is_operational → uninterpreted bool
-        name = f"{expr.obj.name}_{expr.member}"
-        return ctx.get_bool(name)
-
-    if isinstance(expr, FunctionCall):
-        # Encode function calls as uninterpreted functions
-        if not expr.args:
-            return ctx.get_bool(expr.name)
-        # With args: create uninterpreted function
-        z3_args = [expr_to_z3(a, ctx) for a in expr.args]
-        func = ctx.get_uninterpreted_bool_func(expr.name, len(z3_args))
-        if callable(func) and not isinstance(func, z3.BoolRef):
-            return func(*z3_args)
-        return func
+    if isinstance(expr, StringLiteral) or isinstance(expr, _SYMBOLS):
+        return ctx.get_bool(_symbol_name(expr))
 
     if isinstance(expr, BinaryOp):
-        left = expr_to_z3(expr.left, ctx)
-        right = expr_to_z3(expr.right, ctx)
+        if expr.op in _LOGICAL_OPS:
+            left = _to_z3_bool(expr.left, ctx)
+            right = _to_z3_bool(expr.right, ctx)
+            return z3.And(left, right) if expr.op == "AND" else z3.Or(left, right)
 
-        # Logical operators
-        if expr.op == "AND":
-            return z3.And(left, right)
-        if expr.op == "OR":
-            return z3.Or(left, right)
+        if expr.op in _EQUALITY_OPS and (
+            _is_boolean_expr(expr.left) or _is_boolean_expr(expr.right)
+        ):
+            left = _to_z3_bool(expr.left, ctx)
+            right = _to_z3_bool(expr.right, ctx)
+            return left == right if expr.op == "==" else left != right
 
-        # Comparison operators — need arithmetic sorts
-        left_arith = _to_arith(left, ctx)
-        right_arith = _to_arith(right, ctx)
-
+        left = _to_z3_num(expr.left, ctx)
+        right = _to_z3_num(expr.right, ctx)
         if expr.op == "==":
-            return left_arith == right_arith
+            return left == right
         if expr.op == "!=":
-            return left_arith != right_arith
+            return left != right
         if expr.op == "<":
-            return left_arith < right_arith
+            return left < right
         if expr.op == "<=":
-            return left_arith <= right_arith
+            return left <= right
         if expr.op == ">":
-            return left_arith > right_arith
+            return left > right
         if expr.op == ">=":
-            return left_arith >= right_arith
-
-        # Arithmetic operators
+            return left >= right
         if expr.op == "+":
-            return left_arith + right_arith
+            return left + right
         if expr.op == "-":
-            return left_arith - right_arith
+            return left - right
         if expr.op == "*":
-            return left_arith * right_arith
+            return left * right
         if expr.op == "/":
-            return left_arith / right_arith
+            return left / right
 
         # Fallback
         return ctx.get_bool(f"binop_{expr.op}")
 
     if isinstance(expr, UnaryOp):
         if expr.op == "NOT":
-            operand = expr_to_z3(expr.operand, ctx)
-            return z3.Not(operand)
+            return z3.Not(_to_z3_bool(expr.operand, ctx))
         return ctx.get_bool(f"unary_{expr.op}")
 
     if isinstance(expr, QuantifiedExpr):
-        # Create a Z3 integer variable for the quantified variable
-        qvar = z3.Int(expr.variable)
-        body = expr_to_z3(expr.predicate, ctx)
-        if expr.quantifier == "for_all":
-            return z3.ForAll([qvar], body)
-        else:  # exists
-            return z3.Exists([qvar], body)
+        # The body's symbols are opaque and do not mention the bound
+        # variable as a Z3 term, so the quantifier reduces to its body.
+        return _to_z3_bool(expr.predicate, ctx)
 
     # Fallback: opaque boolean
-    return ctx.get_bool(f"unknown_{id(expr)}")
+    return ctx.get_bool(_expr_key(expr))
 
 
-def _to_arith(val: Any, ctx: Z3Context) -> Any:
-    """Coerce a Z3 value to arithmetic sort if it's boolean."""
-    if z3.is_bool(val):
-        # Convert bool to int (0/1) for arithmetic
-        return z3.If(val, z3.IntVal(1), z3.IntVal(0))
-    return val
+def _add_predicates(solver: z3.Solver, preds: List[Expression], ctx: Z3Context) -> None:
+    for pred in preds:
+        try:
+            solver.add(_to_z3_bool(pred, ctx))
+        except Exception:
+            pass  # Skip expressions that cannot be encoded
 
 
 def _check_contract_consistency(contract: ContractDef) -> VerificationResult:
@@ -233,21 +323,8 @@ def _check_contract_consistency(contract: ContractDef) -> VerificationResult:
     solver = z3.Solver()
     solver.set("timeout", 5000)  # 5 second timeout
 
-    # Add assume constraints
-    for pred in contract.assume:
-        try:
-            z3_expr = expr_to_z3(pred, ctx)
-            solver.add(z3_expr)
-        except Exception:
-            pass  # Skip unparseable expressions
-
-    # Add guarantee constraints
-    for pred in contract.guarantee:
-        try:
-            z3_expr = expr_to_z3(pred, ctx)
-            solver.add(z3_expr)
-        except Exception:
-            pass
+    _add_predicates(solver, contract.assume, ctx)
+    _add_predicates(solver, contract.guarantee, ctx)
 
     result = solver.check()
 
@@ -280,12 +357,9 @@ def _check_cross_contract_consistency(
     solver.set("timeout", 5000)
 
     # Add all constraints from both contracts
-    for pred in c1.assume + c1.guarantee + c2.assume + c2.guarantee:
-        try:
-            z3_expr = expr_to_z3(pred, ctx)
-            solver.add(z3_expr)
-        except Exception:
-            pass
+    _add_predicates(
+        solver, c1.assume + c1.guarantee + c2.assume + c2.guarantee, ctx
+    )
 
     result = solver.check()
 
@@ -373,7 +447,7 @@ def _parse_condition(cond_str: str, ctx: Z3Context) -> Any:
     from .parser import parse_expr
     try:
         expr = parse_expr(cond_str)
-        return expr_to_z3(expr, ctx)
+        return _to_z3_bool(expr, ctx)
     except Exception:
         # Fallback: treat as opaque boolean
         sanitized = cond_str.replace(" ", "_")[:40]
@@ -381,12 +455,54 @@ def _parse_condition(cond_str: str, ctx: Z3Context) -> Any:
         return ctx.get_bool(f"cond_{sanitized}")
 
 
-def _check_guarantee_entailment(contract: ContractDef) -> VerificationResult:
-    """Check that assumes entail guarantees: assume => guarantee.
+def _check_assumption_satisfiability(contract: ContractDef) -> VerificationResult:
+    """Check that a contract's assumptions can hold together.
 
-    For each guarantee, we check if assuming all 'assume' predicates
-    makes the guarantee necessarily true. If not, the assumptions
-    alone are insufficient to ensure the guarantee.
+    A contract C = (A, G) only binds its parties in environments that
+    satisfy A. If A is unsatisfiable the contract never applies, and its
+    guarantees are vacuous.
+    """
+    check_name = f"Contract '{contract.id}' assumptions"
+
+    if not contract.assume:
+        return VerificationResult(
+            check_name=check_name,
+            status="passed",
+            message="No assumptions (the contract applies unconditionally)",
+        )
+
+    ctx = Z3Context()
+    solver = z3.Solver()
+    solver.set("timeout", 5000)
+    _add_predicates(solver, contract.assume, ctx)
+
+    result = solver.check()
+    if result == z3.sat:
+        return VerificationResult(
+            check_name=check_name,
+            status="passed",
+            message="Assumptions are satisfiable",
+        )
+    if result == z3.unsat:
+        return VerificationResult(
+            check_name=check_name,
+            status="failed",
+            message="Assumptions contradict each other; the contract can never apply",
+        )
+    return VerificationResult(
+        check_name=check_name,
+        status="unknown",
+        message="Solver could not determine satisfiability (timeout or undecidable)",
+    )
+
+
+def _check_guarantee_entailment(contract: ContractDef) -> VerificationResult:
+    """Report whether the guarantees already follow from the assumptions.
+
+    In an assume-guarantee contract the guarantees are obligations the
+    parties take on, not consequences of the assumptions, so "not
+    entailed" is the normal case and is reported as ``info``. It is not a
+    defect and does not fail verification.
     """
     check_name = f"Contract '{contract.id}' entailment"
 
@@ -401,7 +517,7 @@ def _check_guarantee_entailment(contract: ContractDef) -> VerificationResult:
     assume_exprs = []
     for pred in contract.assume:
         try:
-            assume_exprs.append(expr_to_z3(pred, ctx))
+            assume_exprs.append(_to_z3_bool(pred, ctx))
         except Exception:
             pass
 
@@ -414,7 +530,7 @@ def _check_guarantee_entailment(contract: ContractDef) -> VerificationResult:
 
     for pred in contract.guarantee:
         try:
-            g = expr_to_z3(pred, ctx)
+            g = _to_z3_bool(pred, ctx)
         except Exception:
             continue
 
@@ -430,8 +546,11 @@ def _check_guarantee_entailment(contract: ContractDef) -> VerificationResult:
             ce = {str(d): str(model[d]) for d in model.decls()}
             return VerificationResult(
                 check_name=check_name,
-                status="failed",
-                message="Assumes do not entail all guarantees",
+                status="info",
+                message=(
+                    "Guarantees do not follow from the assumptions alone; "
+                    "they are obligations the parties must meet"
+                ),
                 counterexample=ce,
             )
 
@@ -606,7 +725,11 @@ def verify(sos: SoSDefinition) -> List[VerificationResult]:
     for contract in sos.contracts:
         results.append(_check_contract_consistency(contract))
 
-    # 1b. Check guarantee entailment
+    # 1b. Check that each contract's assumptions can hold at all
+    for contract in sos.contracts:
+        results.append(_check_assumption_satisfiability(contract))
+
+    # 1c. Report (informationally) whether guarantees follow from assumes
     for contract in sos.contracts:
         results.append(_check_guarantee_entailment(contract))
 

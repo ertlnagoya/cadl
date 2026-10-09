@@ -68,19 +68,23 @@ def _sos(protocols: list[ProtocolDef] = None) -> SoSDefinition:
 class TestWaitForGraph:
     """Test dependency graph construction."""
 
-    def test_simple_message(self):
-        """A -> B means B waits for A."""
-        steps = [_msg("A", "B")]
-        graph = _build_wait_for_graph(steps)
-        assert "B" in graph
-        assert "A" in graph["B"]
+    def test_sequential_message_adds_no_wait(self):
+        """Sequential steps are ordered; a single send blocks nobody."""
+        graph = _build_wait_for_graph([_msg("A", "B")])
+        assert graph == {}
 
-    def test_chain(self):
-        """A -> B -> C: B waits for A, C waits for B."""
-        steps = [_msg("A", "B"), _msg("B", "C")]
-        graph = _build_wait_for_graph(steps)
+    def test_request_reply_is_not_a_cycle(self):
+        """A -> B then B -> A in sequence is an exchange, not a circular wait."""
+        graph = _build_wait_for_graph([_msg("A", "B"), _msg("B", "A")])
+        assert _find_cycles(graph) == []
+
+    def test_parallel_mutual_sends_wait_on_each_other(self):
+        """Parallel A -> B and B -> A: each may wait for the other."""
+        graph = _build_wait_for_graph([
+            ParallelStep(steps=[_msg("A", "B"), _msg("B", "A")])
+        ])
         assert "A" in graph.get("B", set())
-        assert "B" in graph.get("C", set())
+        assert "B" in graph.get("A", set())
 
     def test_compute_no_dependency(self):
         """Compute steps don't create inter-actor dependencies."""
@@ -129,6 +133,20 @@ class TestProtocolDeadlock:
     def test_linear_protocol_no_deadlock(self):
         """Linear A -> B -> C has no circular dependency."""
         proto = _protocol("P1", [_msg("A", "B"), _msg("B", "C")])
+        result = _check_protocol_deadlock(proto)
+        assert result.status == "passed"
+
+    def test_request_reply_no_deadlock(self):
+        """A request followed by its reply must not be reported."""
+        proto = _protocol("P1", [
+            _msg("A", "B"), _compute("B"), _msg("B", "A"),
+        ])
+        result = _check_protocol_deadlock(proto)
+        assert result.status == "passed"
+
+    def test_sequential_ring_no_deadlock(self):
+        """A -> B -> C -> A in sequence is a relay, not a circular wait."""
+        proto = _protocol("P1", [_msg("A", "B"), _msg("B", "C"), _msg("C", "A")])
         result = _check_protocol_deadlock(proto)
         assert result.status == "passed"
 

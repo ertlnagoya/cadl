@@ -6,6 +6,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Expression parser dropped the arithmetic operators, so every expression
+  containing `+`, `-`, `*` or `/` failed to parse and fell back to an opaque
+  string (reported as "not a valid expression").
+- Expressions containing `AND` were returned as a raw parse tree instead of
+  an AST node, and `OR` bound tighter than `AND`. Precedence is now, loosest
+  to tightest: `OR`, `AND`, `NOT`, comparison, `+ -`, `* /`. A quantifier
+  scopes over everything to its right.
+- Verifier encoded every name as a boolean coerced to 0/1, so thresholds
+  such as `battery > 20` were unsatisfiable. Names used in comparisons or
+  arithmetic are now real-valued; the same call text maps to the same symbol.
+- Deadlock detector reported any request followed by its reply as a circular
+  dependency. Sequential steps are ordered and no longer count as waits;
+  only mutual sends between `parallel` branches do.
+- `cadl verify` crashed when printing a `not_supported` result.
+- Generated labels and simulator IR text showed AST class names
+  (`FunctionCall`, `ActorRef <= DurationLiteral`) or lost indices for parsed
+  expressions; they now show the CADL source text.
+- Python codegen resolved a quantifier's bound variable through the actor
+  table (`ctx.actors['r']`).
+
+### Changed
+- "Assumes do not entail guarantees" is reported as `[INFO]`, not `[FAIL]`:
+  guarantees are obligations, not consequences of the assumptions. `verify`
+  instead fails a contract whose assumptions contradict each other
+  (`Contract '<id>' assumptions`), per the spec's `all_assumes_satisfiable`.
+- `[INFO]` and `[SKIP]` results are excluded from the pass/fail totals.
+- Examples: transitions leaving the same regime now have mutually exclusive
+  conditions (`a_sos_robot_delivery`, `c_sos_taxi_fleet`,
+  `smart_city_traffic`, `supply_chain`, `raspimouse_mcp_sos`); the MCP
+  example uses `for all` / `exists` in place of `all(...)` / `any(...)`.
+  Every example now passes `cadl verify`, and CI enforces it.
+
+### Added
+- `cadl.unparse.expr_to_source()` renders an expression back to CADL text.
+
 ## [0.3.1] — 2026-10-09
 
 ### Changed

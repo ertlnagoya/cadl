@@ -168,7 +168,7 @@ sos:
       protocol: TASK_DISPATCH
     - from: CONGESTED
       to: NORMAL
-      condition: "active_tasks <= capacity * 0.5"
+      condition: "active_tasks <= capacity * 0.5 AND collision_risk <= 0.3"
     - from: CONGESTED
       to: EMERGENCY
       condition: "collision_risk > 0.3"

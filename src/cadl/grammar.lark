@@ -5,23 +5,31 @@
 start: predicate_expr
 
 // === Predicates ===
-?predicate_expr: or_expr
+// Precedence, loosest to tightest: OR, AND, NOT, comparison, + -, * /
+// A quantifier scopes over everything to its right.
+?predicate_expr: quantified_expr
+               | or_expr
 
-?or_expr: and_expr ("AND" and_expr)*
-?and_expr: not_expr ("OR" not_expr)*    -> or_expr_inner
-?not_expr: "NOT" comparison             -> not_expr
+?or_expr: and_expr ("OR" and_expr)+     -> or_expr
+        | and_expr
+?and_expr: not_expr ("AND" not_expr)+   -> and_expr
+         | not_expr
+?not_expr: "NOT" not_expr               -> not_expr
          | comparison
 
 ?comparison: expr COMP_OP expr          -> comparison
-           | quantified_expr
            | expr
 
 quantified_expr: QUANTIFIER IDENTIFIER "in" expr ":" predicate_expr
 QUANTIFIER: "for all" | "exists"
 
 // === Arithmetic ===
-?expr: term (("+"|"-") term)*           -> arith_expr
-?term: factor (("*"|"/") factor)*       -> term_expr
+// The operators are named terminals so that they survive into the parse
+// tree; anonymous string tokens are filtered out by Lark.
+?expr: term (ADD_OP term)+              -> arith_expr
+     | term
+?term: factor (MUL_OP factor)+          -> term_expr
+     | factor
 ?factor: "(" predicate_expr ")"         -> grouped
        | function_call
        | member_access
@@ -49,6 +57,10 @@ actor_ref: IDENTIFIER "[" WILDCARD "]"  -> actor_ref_wild
 
 WILDCARD: "*"
 
+// === Arithmetic operators ===
+ADD_OP: "+" | "-"
+MUL_OP: "*" | "/"
+
 // === Comparison operators ===
 COMP_OP: "==" | "!=" | "<=" | ">=" | "<" | ">"
 
@@ -60,6 +72,7 @@ STRING: /\"[^\"]*\"/
 %import common.INT
 %import common.FLOAT
 %import common.WS
-IDENTIFIER: /[a-zA-Z_][a-zA-Z0-9_]*/
+// Keywords are not identifiers, so "NOT (a)" is never read as a call.
+IDENTIFIER: /(?!(?:AND|OR|NOT|true|false)\b)[a-zA-Z_][a-zA-Z0-9_]*/
 
 %ignore WS

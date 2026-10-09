@@ -158,9 +158,8 @@ def _actor_ref_str(ref) -> str:
     if isinstance(ref, ActorRef):
         if ref.index == "*":
             return f"{ref.name}[*]"
-        if ref.index is not None:
-            return f"{ref.name}[{ref.index}]"
-        return ref.name
+        from ..unparse import actor_ref_to_source
+        return actor_ref_to_source(ref)
     return str(ref)
 
 
@@ -173,7 +172,8 @@ def _message_str(expr) -> str:
         return expr.name
     if isinstance(expr, ActorRef):
         return expr.name
-    return str(type(expr).__name__)
+    from ..unparse import expr_to_source
+    return expr_to_source(expr)
 
 
 def _expr_label(expr) -> str:
@@ -183,7 +183,8 @@ def _expr_label(expr) -> str:
         return expr.value
     if isinstance(expr, Identifier):
         return expr.name
-    return type(expr).__name__
+    from ..unparse import expr_to_source
+    return expr_to_source(expr)
 
 
 def generate_protocols_module(protocols: List[ProtocolDef]) -> str:

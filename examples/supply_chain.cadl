@@ -146,7 +146,7 @@ sos:
       safety_invariant: "order_fulfillment_rate >= 0.90"
     - from: NORMAL
       to: SURGE
-      condition: "demand_spike_detected == true"
+      condition: "demand_spike_detected == true AND supply_disruption_detected == false"
       safety_invariant: "warehouse_capacity_available == true"
     - from: SURGE
       to: NORMAL

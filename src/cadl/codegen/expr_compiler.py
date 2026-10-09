@@ -78,17 +78,7 @@ def expr_to_python(expr: Expression, ctx: CompilerContext = None) -> str:
         return f"{ctx.state_prefix}['{expr.name}']"
 
     if isinstance(expr, ActorRef):
-        name = expr.name
-        if expr.index == "*":
-            return f"{ctx.actor_prefix}['{name}']"
-        if isinstance(expr.index, RangeExpr):
-            return f"{ctx.actor_prefix}['{name}']"
-        if expr.index is not None:
-            idx = expr.index
-            if isinstance(idx, str) and idx in ctx.locals:
-                return f"{ctx.actor_prefix}['{name}'][{idx}]"
-            return f"{ctx.actor_prefix}['{name}'][{idx}]"
-        return f"{ctx.actor_prefix}['{name}']"
+        return _actor_ref_str(expr, ctx)
 
     if isinstance(expr, MemberAccess):
         obj = _actor_ref_str(expr.obj, ctx)
@@ -148,11 +138,21 @@ def expr_to_python(expr: Expression, ctx: CompilerContext = None) -> str:
 def _actor_ref_str(ref: ActorRef, ctx: CompilerContext) -> str:
     """Convert an ActorRef to a Python accessor string."""
     name = ref.name
-    if ref.index == "*":
+    if ref.index is None:
+        # A bound variable (e.g. the ``r`` of ``for all r in ROBOT[*]``)
+        # is the element itself, not an entry of the actor table.
+        if name in ctx.locals:
+            return name
         return f"{ctx.actor_prefix}['{name}']"
-    if ref.index is not None:
-        idx = ref.index
-        if isinstance(idx, str) and idx in ctx.locals:
-            return f"{ctx.actor_prefix}['{name}'][{idx}]"
-        return f"{ctx.actor_prefix}['{name}'][{idx}]"
-    return f"{ctx.actor_prefix}['{name}']"
+    if ref.index == "*" or isinstance(ref.index, RangeExpr):
+        return f"{ctx.actor_prefix}['{name}']"
+    return f"{ctx.actor_prefix}['{name}'][{_index_str(ref.index, ctx)}]"
+
+
+def _index_str(index: Any, ctx: CompilerContext) -> str:
+    """Render an actor index; a bare name is an index variable."""
+    if isinstance(index, (str, int)):
+        return str(index)
+    if isinstance(index, (ActorRef, Identifier)) and getattr(index, "index", None) is None:
+        return index.name
+    return expr_to_python(index, ctx)

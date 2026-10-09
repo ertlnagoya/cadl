@@ -323,35 +323,5 @@ def _actor_ref_str(ref: ActorRef) -> str:
 
 def _expr_to_str(expr: Expression) -> str:
     """Convert an AST expression node back to a readable string."""
-    if isinstance(expr, Identifier):
-        return expr.name
-    if isinstance(expr, IntLiteral):
-        return str(expr.value)
-    if isinstance(expr, FloatLiteral):
-        return str(expr.value)
-    if isinstance(expr, BoolLiteral):
-        return str(expr.value).lower()
-    if isinstance(expr, StringLiteral):
-        return expr.value
-    if isinstance(expr, DurationLiteral):
-        return f"{expr.value}{expr.unit}"
-    if isinstance(expr, ActorRef):
-        return _actor_ref_str(expr)
-    if isinstance(expr, MemberAccess):
-        return f"{_actor_ref_str(expr.obj)}.{expr.member}"
-    if isinstance(expr, FunctionCall):
-        args = ", ".join(_expr_to_str(a) for a in expr.args)
-        return f"{expr.name}({args})"
-    if isinstance(expr, BinaryOp):
-        left = _expr_to_str(expr.left)
-        right = _expr_to_str(expr.right)
-        return f"{left} {expr.op} {right}"
-    if isinstance(expr, UnaryOp):
-        return f"{expr.op} {_expr_to_str(expr.operand)}"
-    if isinstance(expr, QuantifiedExpr):
-        domain = _expr_to_str(expr.domain)
-        pred = _expr_to_str(expr.predicate)
-        q = "for_all" if expr.quantifier == "for_all" else "exists"
-        return f"{q} {expr.variable} in {domain}: {pred}"
-    # Fallback
-    return str(expr)
+    from ..unparse import expr_to_source
+    return expr_to_source(expr)

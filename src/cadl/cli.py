@@ -214,11 +214,18 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         any(r.status == "failed" for r in v_results) or \
         any(r.status == "failed" for r in d_results)
 
-    total_checks = len(v_results) + len(d_results) + 1  # +1 for type check
+    # "info" and "not_supported" results are findings, not checks with a
+    # verdict, so they are left out of the pass/fail totals.
+    judged = ("passed", "failed", "unknown", "warning")
+    total_checks = sum(1 for r in v_results if r.status in judged) + \
+                   sum(1 for r in d_results if r.status in judged) + \
+                   1  # +1 for type check
     passed = sum(1 for r in v_results if r.status == "passed") + \
              sum(1 for r in d_results if r.status == "passed") + \
              (1 if tc_result.ok else 0)
-    failed = total_checks - passed
+    failed = sum(1 for r in v_results if r.status == "failed") + \
+             sum(1 for r in d_results if r.status == "failed") + \
+             (0 if tc_result.ok else 1)
 
     # JSON output
     if args.format == "json":

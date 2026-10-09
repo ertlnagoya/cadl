@@ -198,18 +198,18 @@ sos:
   transitions:
     - from: NORMAL
       to: COLLISION_RESOLUTION
-      condition: "any(ROBOT[*].status == Collision)"
+      condition: "exists r in ROBOT[*]: r.status == Collision"
       protocol: COLLISION_RESOLUTION
     - from: COLLISION_RESOLUTION
       to: NORMAL
-      condition: "all(ROBOT[*].status != Collision)"
+      condition: "for all r in ROBOT[*]: r.status != Collision"
     - from: COLLISION_RESOLUTION
       to: DEADLOCK
-      condition: "collision_unresolved_for > 30s"
+      condition: "collision_unresolved_for > 30s AND NOT (for all r in ROBOT[*]: r.status != Collision)"
       protocol: DEADLOCK_RESOLUTION
     - from: DEADLOCK
       to: NORMAL
-      condition: "all(ROBOT[*].status != Collision)"
+      condition: "for all r in ROBOT[*]: r.status != Collision"
 
   metrics:
     - id: goal_sum

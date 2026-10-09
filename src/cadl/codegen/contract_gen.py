@@ -132,15 +132,10 @@ def _predicate_label(expr: Expression) -> str:
         return expr.value
     if isinstance(expr, Identifier):
         return expr.name
-    if isinstance(expr, FunctionCall):
+    if isinstance(expr, FunctionCall) and not expr.args:
         return f"{expr.name}()"
-    if isinstance(expr, MemberAccess):
-        return f"{expr.obj.name}.{expr.member}"
-    if isinstance(expr, BinaryOp):
-        left = _predicate_label(expr.left)
-        right = _predicate_label(expr.right)
-        return f"{left} {expr.op} {right}"
-    return str(type(expr).__name__)
+    from ..unparse import expr_to_source
+    return expr_to_source(expr)
 
 
 def _party_str(party) -> str:

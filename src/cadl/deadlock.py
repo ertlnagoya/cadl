@@ -1,7 +1,7 @@
 """CADL Deadlock Detector - analyzes protocols for potential deadlocks.
 
 Checks:
-1. Circular message dependencies within a protocol
+1. Circular waits between the parallel branches of a protocol
 2. Barrier reachability (all required actors can reach the barrier)
 3. Circular fallback chains across protocols
 """
@@ -80,41 +80,37 @@ def _collect_actors_in_steps(steps: List[Step]) -> Set[str]:
 def _build_wait_for_graph(steps: List[Step]) -> Dict[str, Set[str]]:
     """Build a wait-for graph from protocol steps.
 
-    An edge A -> B means "A waits for B" (B must act before A can proceed).
-    In a message step `sender -> receiver : msg`, the receiver waits for the sender.
+    An edge A -> B means "A is blocked until B acts". Steps listed in
+    sequence are totally ordered, so a request followed by its reply
+    (A -> B, then B -> A) is an exchange, not a circular wait, and adds no
+    edge. Waits can only become circular between the branches of a
+    ``parallel`` block, which run without a fixed order.
     """
     graph: Dict[str, Set[str]] = defaultdict(set)
 
-    flat_steps = _collect_steps_flat(steps)
-
-    # Track sequential dependencies: each step depends on the previous
-    prev_actors: Set[str] = set()
-    for step in flat_steps:
-        if isinstance(step, MessageStep):
-            sender = _actor_name(step.sender)
-            receiver = _actor_name(step.receiver)
-            # Receiver waits for sender to send
-            graph[receiver].add(sender)
-        elif isinstance(step, ComputeStep):
-            pass  # Local computation, no inter-actor dependency
-        elif isinstance(step, ParallelStep):
-            # Analyze parallel branches for cross-dependencies
+    for step in _collect_steps_flat(steps):
+        if isinstance(step, ParallelStep):
             _analyze_parallel(step, graph)
 
     return dict(graph)
 
 
+def _branch_sends(step: Step) -> Set[Tuple[str, str]]:
+    """Collect the (sender, receiver) pairs of one parallel branch."""
+    return {
+        (_actor_name(s.sender), _actor_name(s.receiver))
+        for s in _collect_steps_flat([step])
+        if isinstance(s, MessageStep)
+    }
+
+
 def _analyze_parallel(parallel: ParallelStep, graph: Dict[str, Set[str]]) -> None:
     """Analyze parallel branches for potential deadlocks.
 
-    If branch 1 has A->B and branch 2 has B->A, this is a potential deadlock.
+    If branch 1 has A->B and branch 2 has B->A, each side may be waiting
+    to receive before it sends: a potential deadlock.
     """
-    branch_sends: List[Set[Tuple[str, str]]] = []
-    for step in parallel.steps:
-        sends = set()
-        if isinstance(step, MessageStep):
-            sends.add((_actor_name(step.sender), _actor_name(step.receiver)))
-        branch_sends.append(sends)
+    branch_sends = [_branch_sends(step) for step in parallel.steps]
 
     # Check for cross-branch circular dependencies
     for i, sends_i in enumerate(branch_sends):
@@ -162,7 +158,7 @@ def _find_cycles(graph: Dict[str, Set[str]]) -> List[List[str]]:
 
 
 def _check_protocol_deadlock(protocol: ProtocolDef) -> DeadlockResult:
-    """Check a single protocol for circular message dependencies."""
+    """Check a single protocol for circular waits between parallel branches."""
     graph = _build_wait_for_graph(protocol.steps)
     cycles = _find_cycles(graph)
 

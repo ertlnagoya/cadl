@@ -47,9 +47,7 @@ jobs:
             for t in python unity go; do
               cadl sim-gen "$f" --target "$t" -o "/tmp/cadl-smoke/$name/sim.$t"
             done
-            # verify reports findings on several examples (exit 1); it must
-            # run to completion but its verdict does not gate CI.
-            cadl verify "$f" || [ $? -eq 1 ]
+            cadl verify "$f"
             echo "::endgroup::"
           done
 

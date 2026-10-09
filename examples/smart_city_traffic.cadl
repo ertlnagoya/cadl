@@ -108,12 +108,12 @@ sos:
   transitions:
     - from: NORMAL
       to: CONGESTED
-      condition: "congestion_level > 0.7"
+      condition: "congestion_level > 0.7 AND emergency_active == false"
       protocol: CONGESTION_RESPONSE
       safety_invariant: "avg_wait_time <= 300s"
     - from: CONGESTED
       to: NORMAL
-      condition: "congestion_level <= 0.4"
+      condition: "congestion_level <= 0.4 AND emergency_active == false"
       safety_invariant: "throughput >= min_throughput"
     - from: NORMAL
       to: EMERGENCY
