@@ -361,10 +361,10 @@ The materials are hosted in the [cadl-spec repository](https://github.com/ertlna
 To run the full pipeline locally on the bundled robot-delivery example:
 
 ```bash
-./scripts/sos_dsl_handson_e2e.sh --unity ""
+./scripts/sos_dsl_handson_e2e.sh
 ```
 
-This generates the IR JSON and the Unity C# tree. Without `--unity ""` the script also copies the tree into the `raspimouse-swarm-simulator` Unity project, which is not publicly available at present. See the hands-on textbook for the rest of the walkthrough.
+This generates the IR JSON, the Unity C# tree, and drops the latter into the Unity project of [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator) when it is cloned next to this repository (otherwise pass `--unity ""` to stop after code generation). See the hands-on textbook for the rest of the walkthrough.
 
 ## Examples
 
@@ -494,6 +494,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 
 ## Related Projects
 
+- [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator) — The simulator used by the hands-on course: Unity project, Go arbitrator and Python reference runtime for the C-SoS robot-delivery scenario.
 - raspimouse-swarm-simulator (not publicly available at present) — Multi-agent swarm robotics simulation platform. CADL files in `examples/raspimouse_*.cadl` describe its three SoS modes, and the Unity config generator produces configuration JSON for the simulator.
 
 ## References

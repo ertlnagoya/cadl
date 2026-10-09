@@ -16,12 +16,12 @@
 #   ./scripts/sos_dsl_handson_e2e.sh examples/sos_dsl_robot_delivery.cadl
 #   ./scripts/sos_dsl_handson_e2e.sh \
 #       examples/my_delivery.cadl \
-#       --unity ../raspimouse-swarm-simulator/unity \
+#       --unity ../cadl-raspimouse-simulator/unity \
 #       --output output/my_delivery
 #
 # Flags:
 #   --unity <dir>    Unity project root to drop generated C# into.
-#                    Default: ../raspimouse-swarm-simulator/unity
+#                    Default: ../cadl-raspimouse-simulator/unity
 #                    (relative to the cadl_repo root). Pass "" to skip
 #                    Unity drop.
 #   --output <dir>   Where to put intermediate artefacts (IR JSON +
@@ -56,7 +56,7 @@ fi
 
 INPUT="${REPO_DIR}/examples/sos_dsl_robot_delivery.cadl"
 OUTPUT_DIR="${REPO_DIR}/output/sos_dsl_handson"
-UNITY_DIR="${REPO_DIR}/../raspimouse-swarm-simulator/unity"
+UNITY_DIR="${REPO_DIR}/../cadl-raspimouse-simulator/unity"
 
 # Parse args
 positional=()
@@ -184,7 +184,7 @@ echo "  preserved: $DEST/Demo (if it existed)"
 
 label "DONE"
 echo "Next steps for the student:"
-echo "  1. Open the Unity project at $UNITY_DIR in Unity 2022.3.x"
+echo "  1. Open the Unity project at $UNITY_DIR in Unity 6 (6000.2)"
 echo "  2. Open Assets/Scenes/C-SoS.unity"
 echo "  3. Add a ContractRuntimeHost GameObject (Demo/ContractRuntimeHost)"
 echo "  4. Attach PilotContractBridge to each robot that has Pilot_CSoS"

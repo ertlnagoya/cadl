@@ -360,10 +360,10 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 ロボット配送のサンプルでパイプライン全体をローカル実行：
 
 ```bash
-./scripts/sos_dsl_handson_e2e.sh --unity ""
+./scripts/sos_dsl_handson_e2e.sh
 ```
 
-IR JSON と Unity C# ツリーが生成されます。`--unity ""` を付けない場合は、生成したツリーを `raspimouse-swarm-simulator` の Unity プロジェクト（現時点では非公開）にもコピーします。続きはハンズオン教材を参照してください。
+IR JSON と Unity C# ツリーが生成され、後者が [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator) の Unity プロジェクトに配置されます（このリポジトリの隣にクローンしてある場合。無い場合は `--unity ""` を付けるとコード生成までで終了します）。続きはハンズオン教材を参照してください。
 
 ## サンプル
 
@@ -493,6 +493,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 
 ## 関連プロジェクト
 
+- [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator) — ハンズオン講座で使うシミュレータ。C-SoS のロボット配送シナリオ用の Unity プロジェクト、Go アービトレータ、Python 参照ランタイムを収録しています。
 - raspimouse-swarm-simulator（現時点では非公開） — マルチエージェント群ロボットシミュレーションプラットフォーム。`examples/raspimouse_*.cadl` で3つのSoSモードを記述し、Unity設定ジェネレータでシミュレータ用の構成JSONを生成できます。
 
 ## 参考文献
