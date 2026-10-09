@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cadl-lang"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Contract Architecture Description Language — a DSL for formally specifying, verifying, and deploying institutional designs in System of Systems"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -30,6 +30,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",
     "Topic :: Software Development :: Compilers",
 ]
@@ -58,6 +59,9 @@ Repository = "https://github.com/ertlnagoya/cadl"
 [project.scripts]
 cadl = "cadl.cli:main"
 
+[tool.hatch.version]
+path = "src/cadl/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/cadl"]
 
@@ -69,6 +73,7 @@ include = [
     "README.md",
     "README_ja.md",
     "LICENSE",
+    "CHANGELOG.md",
     "pyproject.toml",
 ]
 

@@ -104,10 +104,21 @@ sos:
 Requires Python 3.9+.
 
 ```bash
-pip install -e ".[dev]"
+pip install cadl-lang
 
 # With AI features (requires Anthropic API key)
-pip install -e ".[ai]"
+pip install "cadl-lang[ai]"
+```
+
+The distribution is named `cadl-lang` on PyPI; the import package and the command are both `cadl`.
+
+To work on CADL itself, install from source:
+
+```bash
+git clone https://github.com/ertlnagoya/cadl
+cd cadl
+pip install -e ".[dev]"
+pytest
 ```
 
 ## Usage
@@ -177,7 +188,7 @@ The CADL toolchain follows a standard compiler pipeline:
      Python Solidity OPA/Rego
 ```
 
-### Code Generation (Phase 3 + Phase 6)
+### Code Generation
 
 `cadl codegen` generates executable code from a verified CADL definition. Three targets are supported:
 
@@ -209,7 +220,7 @@ Generates Open Policy Agent policies (`.rego`):
 - Main policy package aggregating all contracts
 - Information sharing and authority policy rules
 
-### Regime Transitions (Phase 5)
+### Regime Transitions
 
 `cadl regime-map` analyzes the regime transition graph:
 
@@ -220,7 +231,7 @@ Generates Open Policy Agent policies (`.rego`):
 - **Shortest path** — BFS-based shortest path between any two regimes
 - **Export formats**: text summary, Graphviz DOT, JSON
 
-### IEC 62853 Compliance (Phase 6)
+### IEC 62853 Compliance
 
 `cadl iec62853` maps CADL constructs to IEC 62853 Open Systems Dependability concepts:
 
@@ -234,7 +245,7 @@ Generates Open Policy Agent policies (`.rego`):
 | TransitionDef | Operational State Machine |
 | SoS type (D/A/C/V) | System Integration Level |
 
-### Simulator Config Generation (Phase 7)
+### Simulator Config Generation
 
 `cadl sim-*` commands lower a CADL definition to a **3-layer Intermediate Representation (IR)** and generate simulator-specific configuration files:
 
@@ -308,7 +319,7 @@ cadl sim-gen examples/raspimouse_c_sos.cadl --target unity -o output/raspimouse_
 cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimouse_mcp_sos_unity.json
 ```
 
-### AI Integration (Phase 4)
+### AI Integration
 
 `cadl ai` generates CADL from natural language descriptions via Claude API:
 
@@ -319,7 +330,7 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 
 Requires `ANTHROPIC_API_KEY` environment variable and `pip install "cadl-lang[ai]"`.
 
-### Type Checks (Phase 1)
+### Type Checks
 
 The type checker validates:
 
@@ -466,17 +477,21 @@ examples/
   test_raspimouse.sh         Parse, validate, and generate Unity configs for Raspimouse
 ```
 
-## Roadmap
+## Status
 
-| Phase | Goal | Status |
-|---|---|---|
-| 1 | Core language design, parser, type checker | Done |
-| 2 | Verification engine (SMT-based consistency, deadlock detection) | Done |
-| 3 | Runtime code generation (Python) | Done |
-| 4 | AI integration (NL-to-CADL via Claude API) | Done |
-| 5 | Regime transitions and regime map construction | Done |
-| 6 | IEC 62853 integration, smart contract generation (Solidity, OPA/Rego) | Done |
-| 7 | Simulator IR & config generation (Python, Unity, Go) | Done |
+CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the generated output may change between releases.
+
+| Feature | Status |
+|---|---|
+| Core language, parser, type checker | Available |
+| Verification (SMT-based consistency, deadlock detection) | Available |
+| Python runtime code generation | Available |
+| Natural language to CADL via Claude API | Available |
+| Regime transitions and regime map | Available |
+| IEC 62853 report, Solidity and OPA/Rego generation | Available |
+| Simulator IR and config generation (Python, Unity, Go) | Available |
+| SoS-DSL extension (`lifecycle:` / `monitors:`) and Unity C# generation | Available |
+| `model_check` / `simulation` / `proof` verification methods | Not supported yet (reported explicitly) |
 
 ## Related Projects
 

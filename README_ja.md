@@ -104,10 +104,21 @@ sos:
 Python 3.9以上が必要です。
 
 ```bash
-pip install -e ".[dev]"
+pip install cadl-lang
 
 # AI機能を使う場合（Anthropic APIキーが必要）
-pip install -e ".[ai]"
+pip install "cadl-lang[ai]"
+```
+
+PyPI上の配布名は `cadl-lang` です。importするパッケージ名とコマンド名はどちらも `cadl` です。
+
+CADL自体を開発する場合は、ソースからインストールします。
+
+```bash
+git clone https://github.com/ertlnagoya/cadl
+cd cadl
+pip install -e ".[dev]"
+pytest
 ```
 
 ## 使い方
@@ -176,7 +187,7 @@ CADL処理系は、一般的なコンパイラと同じパイプライン構成�
      Python Solidity OPA/Rego
 ```
 
-### コード生成（Phase 3 + Phase 6）
+### コード生成
 
 `cadl codegen` は検証済みCADL定義から実行可能なコードを生成します。3つのターゲットに対応：
 
@@ -208,7 +219,7 @@ Open Policy Agentポリシー（`.rego`）を生成：
 - 全契約を集約するメインポリシーパッケージ
 - 情報共有・権限ポリシールール
 
-### 運用モード遷移の分析（Phase 5）
+### 運用モード遷移の分析
 
 `cadl regime-map` は運用モード（regime）の遷移グラフを分析します：
 
@@ -219,7 +230,7 @@ Open Policy Agentポリシー（`.rego`）を生成：
 - **最短経路** — 任意の2つのモード間の最短経路をBFSで算出
 - **出力形式**: テキスト要約、Graphviz DOT、JSON
 
-### IEC 62853準拠検査（Phase 6）
+### IEC 62853準拠検査
 
 `cadl iec62853` はCADL構成要素をIEC 62853オープンシステムディペンダビリティの概念にマッピングします：
 
@@ -233,7 +244,7 @@ Open Policy Agentポリシー（`.rego`）を生成：
 | TransitionDef | 運用状態機械 |
 | SoSタイプ（D/A/C/V） | システム統合レベル |
 
-### シミュレータ設定生成（Phase 7）
+### シミュレータ設定生成
 
 `cadl sim-*` コマンドはCADL定義を**3層の中間表現（IR）**に変換（lowering）し、シミュレータ固有の設定ファイルを生成します：
 
@@ -307,7 +318,7 @@ cadl sim-gen examples/raspimouse_c_sos.cadl --target unity -o output/raspimouse_
 cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimouse_mcp_sos_unity.json
 ```
 
-### AI統合（Phase 4）
+### AI統合
 
 `cadl ai` は自然言語の記述からClaude APIを用いてCADL定義を生成します：
 
@@ -318,7 +329,7 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 
 `ANTHROPIC_API_KEY`環境変数の設定と `pip install "cadl-lang[ai]"` が必要です。
 
-### 型検査の内容（Phase 1）
+### 型検査の内容
 
 型検査器は以下の5項目を検証します：
 
@@ -465,17 +476,21 @@ examples/
   test_raspimouse.sh         Raspimouse用パース・検証・Unity設定生成テスト
 ```
 
-## 実装ロードマップ
+## 開発状況
 
-| フェーズ | 目標 | 状態 |
-|---|---|---|
-| Phase 1 | 言語コア設計・パーサ・型検査器 | 完了 |
-| Phase 2 | 検証エンジン（SMTベース無矛盾性検証、デッドロック検出） | 完了 |
-| Phase 3 | ランタイム・コード生成（Python） | 完了 |
-| Phase 4 | AI統合（Claude APIによる自然言語→CADL変換） | 完了 |
-| Phase 5 | 運用モード遷移・モードマップ構築 | 完了 |
-| Phase 6 | IEC 62853連携・スマートコントラクト生成（Solidity, OPA/Rego） | 完了 |
-| Phase 7 | シミュレータIR・設定生成（Python, Unity, Go） | 完了 |
+CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語仕様と生成物はリリース間で変わる可能性があります。
+
+| 機能 | 状態 |
+|---|---|
+| 言語コア・パーサ・型検査器 | 利用可能 |
+| 検証（SMTベース無矛盾性検証、デッドロック検出） | 利用可能 |
+| Pythonランタイムのコード生成 | 利用可能 |
+| Claude APIによる自然言語→CADL変換 | 利用可能 |
+| 運用モード遷移・モードマップ | 利用可能 |
+| IEC 62853レポート、Solidity・OPA/Rego生成 | 利用可能 |
+| シミュレータIR・設定生成（Python, Unity, Go） | 利用可能 |
+| SoS-DSL拡張（`lifecycle:` / `monitors:`）とUnity C#生成 | 利用可能 |
+| 検証メソッド `model_check` / `simulation` / `proof` | 未対応（未対応である旨を明示的に報告） |
 
 ## 関連プロジェクト
 

@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
@@ -34,12 +34,24 @@ jobs:
 
       - name: Smoke-test examples
         run: |
-          cadl verify examples/robot_delivery.cadl || true
-          cadl verify examples/household_chores.cadl || true
-          cadl verify examples/iot_data_sharing.cadl || true
-          cadl codegen examples/robot_delivery.cadl -o /tmp/robot_delivery
-          cadl codegen examples/household_chores.cadl -o /tmp/household
-          cadl codegen examples/iot_data_sharing.cadl -o /tmp/iot
+          set -e
+          for f in examples/*.cadl; do
+            name=$(basename "$f" .cadl)
+            echo "::group::$name"
+            cadl parse "$f"
+            cadl check "$f"
+            cadl sim-validate "$f"
+            for t in python solidity opa; do
+              cadl codegen "$f" --target "$t" -o "/tmp/cadl-smoke/$name/$t"
+            done
+            for t in python unity go; do
+              cadl sim-gen "$f" --target "$t" -o "/tmp/cadl-smoke/$name/sim.$t"
+            done
+            # verify reports findings on several examples (exit 1); it must
+            # run to completion but its verdict does not gate CI.
+            cadl verify "$f" || [ $? -eq 1 ]
+            echo "::endgroup::"
+          done
 
   build:
     name: Build sdist and wheel

@@ -561,7 +561,7 @@ class TestSolidityIntegration:
         # Contract file
         assert (output / "TestSla.sol").exists()
         # Main orchestrator
-        assert (output / "MinimalSoS.sol").exists()
+        assert (output / "Minimalsos.sol").exists()
         # No regime controller without transitions
         assert not (output / "RegimeController.sol").exists()
 
@@ -578,7 +578,7 @@ class TestSolidityIntegration:
         generate_solidity(sos, output)
 
         assert (output / "TestSla.sol").exists()
-        assert (output / "TransSoS.sol").exists()
+        assert (output / "Transsos.sol").exists()
         assert (output / "RegimeController.sol").exists()
 
     def test_generate_solidity_creates_output_dir(self, tmp_path):
@@ -588,7 +588,7 @@ class TestSolidityIntegration:
         generate_solidity(sos, output)
 
         assert output.exists()
-        assert (output / "DirTest.sol").exists()
+        assert (output / "Dirtest.sol").exists()
 
     def test_generate_solidity_multiple_contracts(self, tmp_path):
         c1 = _minimal_contract(cid="ALPHA_SLA")
@@ -600,7 +600,7 @@ class TestSolidityIntegration:
 
         assert (output / "AlphaSla.sol").exists()
         assert (output / "BetaSla.sol").exists()
-        assert (output / "MultiSoS.sol").exists()
+        assert (output / "Multisos.sol").exists()
 
     def test_robot_delivery_solidity(self, tmp_path):
         """Parse robot_delivery.cadl and generate Solidity files."""
@@ -616,7 +616,7 @@ class TestSolidityIntegration:
         generate_solidity(sos, output)
 
         # Should have at least the main orchestrator
-        main_file = output / "RobotDeliverySystem.sol"
+        main_file = output / "Robotdeliverysystem.sol"
         assert main_file.exists(), f"Expected main file; got: {list(output.iterdir())}"
 
         # All .sol files should contain valid Solidity pragma
