@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Contract Architecture Description Language — a DSL for formally specifying, verifying, and deploying institutional designs in System of Systems"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MIT"
+license = "Apache-2.0"
 authors = [
     {name = "ERTL, Nagoya University"},
 ]
@@ -24,7 +24,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -73,6 +73,7 @@ include = [
     "README.md",
     "README_ja.md",
     "LICENSE",
+    "NOTICE",
     "CHANGELOG.md",
     "CITATION.cff",
     "pyproject.toml",

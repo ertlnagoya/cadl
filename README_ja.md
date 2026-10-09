@@ -505,4 +505,4 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 
 ## ライセンス
 
-MIT
+[Apache License 2.0](LICENSE)。0.3.2 までのリリースは MIT License で公開されています。

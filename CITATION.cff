@@ -6,7 +6,7 @@ authors:
   - name: "ERTL, Graduate School of Informatics, Nagoya University"
 version: 0.3.2
 date-released: 2026-10-09
-license: MIT
+license: Apache-2.0
 repository-code: "https://github.com/ertlnagoya/cadl"
 url: "https://ertlnagoya.github.io/cadl-spec/"
 keywords:

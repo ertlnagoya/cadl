@@ -505,4 +505,4 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE). Releases up to and including 0.3.2 were published under the MIT License.

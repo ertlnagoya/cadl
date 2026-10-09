@@ -52,5 +52,5 @@ the package version differ.
 
 ## License
 
-By contributing you agree that your contribution is licensed under the MIT
-License (see `LICENSE`).
+By contributing you agree that your contribution is licensed under the
+Apache License, Version 2.0 (see `LICENSE`).

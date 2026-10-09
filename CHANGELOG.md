@@ -6,6 +6,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- License changed from MIT to Apache License 2.0 (`LICENSE`, `NOTICE`).
+  Releases up to and including 0.3.2 remain available under the MIT License.
+
 ### Added
 - `.github/workflows/publish.yml`: publishing a GitHub Release builds the
   distributions and uploads them to PyPI through Trusted Publishing.
