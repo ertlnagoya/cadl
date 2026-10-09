@@ -723,6 +723,18 @@ def _build_protocol(data: dict) -> ProtocolDef:
     return proto
 
 
+def _parse_bound(value) -> Optional[int]:
+    """Read a verification `bound:` (a step count). Non-integers are dropped."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return None
+
+
 def _build_sos(data: dict) -> SoSDefinition:
     """Build a SoSDefinition from the top-level YAML dict."""
     sos_data = _get(data, 'sos')
@@ -830,11 +842,16 @@ def _build_sos(data: dict) -> SoSDefinition:
     if isinstance(verify_data, list):
         for v in verify_data:
             if isinstance(v, dict):
+                method = _get(v, 'method')
+                expr = _get(v, 'expr')
                 sos.verifications.append(VerificationSpec(
                     id=str(_get(v, 'id', '')),
                     type=str(_get(v, 'type', '')),
                     target=_get(v, 'target'),
                     property=_get(v, 'property'),
+                    method=str(method) if method is not None else None,
+                    expr=str(expr) if expr is not None else None,
+                    bound=_parse_bound(_get(v, 'bound')),
                 ))
 
     # Codegen

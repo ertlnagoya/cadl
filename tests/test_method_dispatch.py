@@ -67,6 +67,55 @@ class TestVerifyIntegratesDispatch:
         assert "verification.v_smt" in check_names
 
 
+_SOURCE_WITH_METHODS = """
+sos:
+  name: "MethodFromSource"
+  type: Collaborative
+  actors:
+    - id: A
+      role: "worker"
+  verification:
+    - id: v_default
+      type: consistency
+    - id: v_smt
+      type: consistency
+      method: SMT
+    - id: v_mc
+      type: safety
+      method: model_check
+      expr: "x > 0"
+      bound: 100
+    - id: v_bad_bound
+      type: safety
+      method: simulation
+      bound: "1000_steps"
+"""
+
+
+class TestMethodReadFromSource:
+    """`method` / `expr` / `bound` written in a .cadl file reach the verifier."""
+
+    def test_parser_reads_method_expr_bound(self):
+        from cadl.parser import parse
+
+        specs = {v.id: v for v in parse(_SOURCE_WITH_METHODS).verifications}
+        assert specs["v_default"].method is None
+        assert specs["v_smt"].method == "SMT"
+        assert specs["v_mc"].method == "model_check"
+        assert specs["v_mc"].expr == "x > 0"
+        assert specs["v_mc"].bound == 100
+        assert specs["v_bad_bound"].bound is None
+
+    def test_non_smt_method_in_source_is_reported_not_supported(self):
+        from cadl.parser import parse
+
+        results = {r.check_name: r for r in verify(parse(_SOURCE_WITH_METHODS))}
+        assert results["verification.v_default"].status == "passed"
+        assert results["verification.v_smt"].status == "passed"
+        assert results["verification.v_mc"].status == "not_supported"
+        assert results["verification.v_bad_bound"].status == "not_supported"
+
+
 class TestMotivationExtension:
     def test_sos_definition_has_optional_motivation_field(self):
         sos = SoSDefinition(name="t")

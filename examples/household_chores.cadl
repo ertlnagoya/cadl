@@ -23,7 +23,7 @@ sos:
         - "all_chores_assigned_weekly()"
       authority:
         decision_holder: "PARENT[1]"
-        beta: 0.3
+        beta: 0.7
       information:
         alpha: 1.0
       responsibilities:
