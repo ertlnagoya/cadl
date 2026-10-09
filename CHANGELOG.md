@@ -6,6 +6,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `.github/workflows/publish.yml`: publishing a GitHub Release builds the
+  distributions and uploads them to PyPI through Trusted Publishing.
+
 ### Fixed
 - Parser ignored `method:`, `expr:` and `bound:` in `verification:` entries,
   so `method: model_check` (or `simulation` / `proof`) written in a `.cadl`

@@ -1,0 +1,57 @@
+name: Publish to PyPI
+
+# Runs when a GitHub Release is published. Uploads with PyPI Trusted
+# Publishing: no API token is stored; PyPI accepts the upload because it
+# comes from this workflow in the "pypi" environment of this repository.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build sdist and wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check that the tag matches the package version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(python -c "import re; print(re.search(r'__version__ = \"(.+?)\"', open('src/cadl/__init__.py').read()).group(1))")
+          echo "package version: $version, release tag: $TAG"
+          test "v$version" = "$TAG"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+          python -m build
+          python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Upload to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/cadl-lang/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
