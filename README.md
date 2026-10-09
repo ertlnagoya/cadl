@@ -300,7 +300,7 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
 
 #### Raspimouse Swarm Simulator — D-SoS / C-SoS / MCP-SoS Comparison
 
-Three CADL definitions model the same 5-robot swarm on an 11-node graph network under different SoS paradigms. These connect to the [raspimouse-swarm-simulator](https://github.com/ertlnagoya/raspimouse-swarm-simulator) via the Unity config generator (`cadl sim-gen --target unity`).
+Three CADL definitions model the same 5-robot swarm on an 11-node graph network under different SoS paradigms. These connect to the raspimouse-swarm-simulator (not publicly available at present) via the Unity config generator (`cadl sim-gen --target unity`).
 
 | Property | D-SoS (Directed) | C-SoS (Collaborative) | MCP-SoS (Acknowledged) |
 |---|---|---|---|
@@ -342,20 +342,18 @@ The type checker validates:
 
 ## Hands-on
 
-A 90-minute self-paced workshop (or a 5-session PBL course) walks you through the complete CADL toolchain end-to-end on a robot delivery System of Systems: **CADL modelling → SoS-DSL contracts (lifecycle + monitors) → visualisation → code generation → live simulation**.
+A 90-minute self-paced workshop (or a 5-session exercise course) walks you through the complete CADL toolchain end-to-end on a robot delivery System of Systems: **CADL modelling → SoS-DSL contracts (lifecycle + monitors) → visualisation → code generation → live simulation**.
 
 The hands-on materials include:
 
 - **Main textbook** — six 15-minute steps, with full bilingual EN / JA pages and a runnable end-to-end script (`scripts/sos_dsl_handson_e2e.sh`).
 - **Exercises booklet** — a 5-session structured course (compact 3-session version available) with graded ★ / ★★ / ★★★ tasks and a rubric.
 - **Academic background** — Maier's five SoS criteria, the **ISO/IEC/IEEE 21839 / 21840 / 21841** standards, related research (ADLs, Normative MAS, Runtime Verification), and an annotated bibliography.
-- **PBL course design (instructor-facing)** — full lesson plans with academic significance and learning perspective annotated per session, common student pitfalls, "aha moment" engineering, and links to graduation-thesis research themes.
 
 | Audience | Entry point |
 | --- | --- |
 | Self-learner — quick tour | [Course A — Robot Delivery (main textbook)](https://ertlnagoya.github.io/cadl-spec/docs/handson/main-textbook) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/main-textbook) |
 | Student in a class | [Course A — Exercises](https://ertlnagoya.github.io/cadl-spec/docs/handson/exercises) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/exercises) |
-| Instructor designing a course | [PBL Course Design](https://ertlnagoya.github.io/cadl-spec/docs/handson/pbl-course-design) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/pbl-course-design) |
 | Researcher needing citations | [Why SoS-DSL? (academic background)](https://ertlnagoya.github.io/cadl-spec/docs/handson/academic-background) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/academic-background) |
 
 The materials are hosted in the [cadl-spec repository](https://github.com/ertlnagoya/cadl-spec) — English sources under `docs/handson/`, Japanese under `i18n/ja/docusaurus-plugin-content-docs/current/handson/` — and rendered on the [Hands-on section of the spec website](https://ertlnagoya.github.io/cadl-spec/docs/handson/).
@@ -496,7 +494,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 
 ## Related Projects
 
-- [raspimouse-swarm-simulator](https://github.com/ertlnagoya/raspimouse-swarm-simulator) — Multi-agent swarm robotics simulation platform. CADL files in `examples/raspimouse_*.cadl` describe its three SoS modes, and the Unity config generator produces configuration JSON for the simulator.
+- raspimouse-swarm-simulator (not publicly available at present) — Multi-agent swarm robotics simulation platform. CADL files in `examples/raspimouse_*.cadl` describe its three SoS modes, and the Unity config generator produces configuration JSON for the simulator.
 
 ## References
 

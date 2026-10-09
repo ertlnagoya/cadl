@@ -6,6 +6,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Parser ignored `method:`, `expr:` and `bound:` in `verification:` entries,
+  so `method: model_check` (or `simulation` / `proof`) written in a `.cadl`
+  file was treated as the default `smt` and reported as passed. The fields
+  are now read, and non-SMT methods surface as `not_supported` from
+  `cadl verify`, as the 0.3.0 entry describes.
+
+### Changed
+- README: dropped the links to the instructor course-design page (removed
+  from the spec site) and marked `raspimouse-swarm-simulator` as not
+  publicly available.
+
 ## [0.3.2] — 2026-10-09
 
 ### Fixed

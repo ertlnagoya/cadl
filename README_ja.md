@@ -299,7 +299,7 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
 
 #### Raspimouse群ロボットシミュレータ — D-SoS / C-SoS / MCP-SoS の比較
 
-同一の5台ロボット・11ノードグラフネットワーク上で、異なるSoSパラダイムを記述する3つのCADL定義です。`cadl sim-gen --target unity` により、[raspimouse-swarm-simulator](https://github.com/ertlnagoya/raspimouse-swarm-simulator) のUnity設定JSONを自動生成できます。
+同一の5台ロボット・11ノードグラフネットワーク上で、異なるSoSパラダイムを記述する3つのCADL定義です。`cadl sim-gen --target unity` により、raspimouse-swarm-simulator（現時点では非公開） のUnity設定JSONを自動生成できます。
 
 | 特性 | D-SoS（指示型） | C-SoS（協調型） | MCP-SoS（認知型） |
 |---|---|---|---|
@@ -348,13 +348,11 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 - **メイン教材** — 15 分 × 6 ステップ、英日バイリンガル、エンドツーエンド実行スクリプト（`scripts/sos_dsl_handson_e2e.sh`）付き。
 - **演習問題集** — 5 回構成の授業課題セット（縮小 3 回版あり）、★／★★／★★★ の段階的難易度とルーブリック。
 - **学術背景** — Maier の 5 条件、**ISO/IEC/IEEE 21839 / 21840 / 21841** 規格、関連研究領域（ADL、規範的 MAS、実行時検証）、注釈付き参考文献。
-- **PBL コース設計（教員向け）** — 各回に学術的意義と学びの観点を併記。よくあるつまずき、「なるほど」と思わせる工夫、卒研・修論につながるテーマも収録。
 
 | 想定読者 | 入口 |
 | --- | --- |
 | 自習で素早く全体像を掴みたい方 | [Course A — ロボット配送（メイン教材）](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/main-textbook) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/main-textbook) |
 | 授業で学ぶ学生 | [Course A — 演習問題集](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/exercises) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/exercises) |
-| 授業を設計する教員 | [PBL コース設計](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/pbl-course-design) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/pbl-course-design) |
 | 引用したい研究者 | [Why SoS-DSL?（学術背景）](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/academic-background) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/academic-background) |
 
 教材本体は [cadl-spec リポジトリ](https://github.com/ertlnagoya/cadl-spec) にあり（英語ソースは `docs/handson/`、日本語ソースは `i18n/ja/docusaurus-plugin-content-docs/current/handson/`）、[仕様サイトの Hands-on セクション](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/) でレンダリングされます。
@@ -495,7 +493,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 
 ## 関連プロジェクト
 
-- [raspimouse-swarm-simulator](https://github.com/ertlnagoya/raspimouse-swarm-simulator) — マルチエージェント群ロボットシミュレーションプラットフォーム。`examples/raspimouse_*.cadl` で3つのSoSモードを記述し、Unity設定ジェネレータでシミュレータ用の構成JSONを生成できます。
+- raspimouse-swarm-simulator（現時点では非公開） — マルチエージェント群ロボットシミュレーションプラットフォーム。`examples/raspimouse_*.cadl` で3つのSoSモードを記述し、Unity設定ジェネレータでシミュレータ用の構成JSONを生成できます。
 
 ## 参考文献
 
