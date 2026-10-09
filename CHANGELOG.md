@@ -6,6 +6,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Generated Solidity files carry `SPDX-License-Identifier: Apache-2.0`
+  (was `MIT`), matching the license of the toolchain. Edit the line if you
+  release generated contracts under another license.
+- The default model of `cadl ai` is `claude-sonnet-5-5` (was
+  `claude-sonnet-4-20250514`). Set `CADL_LLM_MODEL` or pass `--model` to
+  use another one.
+- The CI and publish workflows declare `permissions: contents: read`; the
+  publish job keeps `id-token: write` for Trusted Publishing.
+
 ## [0.3.5] — 2026-10-09
 
 ### Fixed

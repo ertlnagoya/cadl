@@ -7,10 +7,18 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 
+DEFAULT_MODEL = "claude-sonnet-5-5"
+
+
+def default_model() -> str:
+    """Model used when none is given: ``CADL_LLM_MODEL`` if set, else DEFAULT_MODEL."""
+    return os.environ.get("CADL_LLM_MODEL") or DEFAULT_MODEL
+
+
 @dataclass
 class ClientConfig:
     """Configuration for the Claude API client."""
-    model: str = "claude-sonnet-4-20250514"
+    model: str = field(default_factory=default_model)
     max_tokens: int = 4096
     temperature: float = 0.0
     api_key: Optional[str] = None

@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     ai_cmd.add_argument("--verify", action="store_true",
                         help="Run SMT verification and deadlock detection on generated CADL")
     ai_cmd.add_argument("--model", type=str, default=None,
-                        help="Override LLM model (default: claude-sonnet-4-20250514)")
+                        help="Override LLM model (default: $CADL_LLM_MODEL, else claude-sonnet-5-5)")
 
     args = parser.parse_args(argv)
 

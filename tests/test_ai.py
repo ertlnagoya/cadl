@@ -107,11 +107,16 @@ class TestExtractCadl:
 # ---------------------------------------------------------------------------
 
 class TestClientConfig:
-    def test_default_config(self):
+    def test_default_config(self, monkeypatch):
+        monkeypatch.delenv("CADL_LLM_MODEL", raising=False)
         config = ClientConfig()
-        assert config.model == "claude-sonnet-4-20250514"
+        assert config.model == "claude-sonnet-5-5"
         assert config.max_tokens == 4096
         assert config.temperature == 0.0
+
+    def test_model_from_environment(self, monkeypatch):
+        monkeypatch.setenv("CADL_LLM_MODEL", "claude-haiku-5-5")
+        assert ClientConfig().model == "claude-haiku-5-5"
 
     def test_custom_config(self):
         config = ClientConfig(model="claude-opus-4-20250514", max_tokens=8192)
