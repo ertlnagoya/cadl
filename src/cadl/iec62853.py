@@ -1,9 +1,11 @@
-"""IEC 62853 Open Systems Dependability — compliance mapping from CADL.
+"""Dependability summary of a CADL definition, organised around the themes
+of IEC 62853 (Open Systems Dependability).
 
-Maps CADL institutional parameters and constructs to IEC 62853 dependability
-concepts, generating structured compliance reports.
+The indicator names below are defined by CADL. They are not terms of
+IEC 62853, and the report is informative: it does not assess conformance
+to the standard.
 
-IEC 62853 Mapping:
+CADL-defined indicators:
     alpha (information sharing)  → Information Transparency Level
     beta (authority)             → Governance Centralization Index
     lambda (incentives)          → Stakeholder Alignment Metric
@@ -18,7 +20,13 @@ from __future__ import annotations
 from .ast_nodes import SoSDefinition, SoSType
 
 
-# IEC 62853 System Integration Level mapping from SoS types
+DISCLAIMER = (
+    "Indicator names are defined by CADL, not by IEC 62853; this report "
+    "is informative and does not assess conformance to the standard."
+)
+
+
+# CADL-defined integration level per SoS type (not an IEC 62853 scale)
 _SOS_TYPE_TO_INTEGRATION = {
     SoSType.DIRECTED: "Level 4 — Centrally Managed",
     SoSType.ACKNOWLEDGED: "Level 3 — Acknowledged Integration",
@@ -28,11 +36,15 @@ _SOS_TYPE_TO_INTEGRATION = {
 
 
 def generate_iec62853_report(sos: SoSDefinition) -> dict:
-    """Generate an IEC 62853 compliance report from a CADL SoS definition.
+    """Generate an IEC 62853-oriented dependability summary of a CADL SoS.
+
+    The ``iec62853_concept`` keys hold CADL-defined indicator names; the key
+    name is kept for backward compatibility.
 
     Returns a dict suitable for JSON serialization or text formatting.
     """
     report: dict = {
+        "disclaimer": DISCLAIMER,
         "sos_name": sos.name,
         "sos_type": sos.type.value if sos.type else "Unspecified",
         "system_integration_level": _SOS_TYPE_TO_INTEGRATION.get(

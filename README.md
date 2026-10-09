@@ -146,7 +146,7 @@ cadl codegen examples/robot_delivery.cadl --target opa -o /tmp/rego_out
 cadl regime-map examples/smart_city_traffic.cadl
 cadl regime-map examples/smart_city_traffic.cadl --format dot -o regime.dot
 
-# IEC 62853 compliance report
+# IEC 62853-oriented dependability summary
 cadl iec62853 examples/robot_delivery.cadl
 cadl iec62853 examples/smart_city_traffic.cadl --format json
 
@@ -180,7 +180,7 @@ The CADL toolchain follows a standard compiler pipeline:
     +----+----+----------+-----------+
     v         v          v           v
   SMT       Code       Regime      IEC 62853
-  Verify    Generate   Map         Compliance
+  Verify    Generate   Map         Summary
   (Z3)      (codegen/) (regime_map) (iec62853)
               |
         +-----+-----+
@@ -231,11 +231,11 @@ Generates Open Policy Agent policies (`.rego`):
 - **Shortest path** — BFS-based shortest path between any two regimes
 - **Export formats**: text summary, Graphviz DOT, JSON
 
-### IEC 62853 Compliance
+### IEC 62853-oriented Summary
 
-`cadl iec62853` maps CADL constructs to IEC 62853 Open Systems Dependability concepts:
+`cadl iec62853` summarises a CADL definition around the themes of IEC 62853 (Open Systems Dependability). The indicator names are defined by CADL, not by the standard, and the report does not assess conformance to IEC 62853.
 
-| CADL Concept | IEC 62853 Concept |
+| CADL Concept | CADL-defined indicator |
 |---|---|
 | alpha (information sharing) | Information Transparency Level |
 | beta (authority centralization) | Governance Centralization Index |
@@ -352,11 +352,11 @@ The hands-on materials include:
 
 | Audience | Entry point |
 | --- | --- |
-| Self-learner — quick tour | [Course A — Robot Delivery (main textbook)](https://ertlnagoya.github.io/cadl-spec/docs/handson/main-textbook) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/main-textbook) |
-| Student in a class | [Course A — Exercises](https://ertlnagoya.github.io/cadl-spec/docs/handson/exercises) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/exercises) |
-| Researcher needing citations | [Why SoS-DSL? (academic background)](https://ertlnagoya.github.io/cadl-spec/docs/handson/academic-background) (EN) / [JA](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/academic-background) |
+| Self-learner — quick tour | [Course A — Robot Delivery (main textbook)](https://www.ertl.jp/cadl-spec/docs/handson/main-textbook) (EN) / [JA](https://www.ertl.jp/cadl-spec/ja/docs/handson/main-textbook) |
+| Student in a class | [Course A — Exercises](https://www.ertl.jp/cadl-spec/docs/handson/exercises) (EN) / [JA](https://www.ertl.jp/cadl-spec/ja/docs/handson/exercises) |
+| Researcher needing citations | [Why SoS-DSL? (academic background)](https://www.ertl.jp/cadl-spec/docs/handson/academic-background) (EN) / [JA](https://www.ertl.jp/cadl-spec/ja/docs/handson/academic-background) |
 
-The materials are hosted in the [cadl-spec repository](https://github.com/ertlnagoya/cadl-spec) — English sources under `docs/handson/`, Japanese under `i18n/ja/docusaurus-plugin-content-docs/current/handson/` — and rendered on the [Hands-on section of the spec website](https://ertlnagoya.github.io/cadl-spec/docs/handson/).
+The materials are hosted in the [cadl-spec repository](https://github.com/ertlnagoya/cadl-spec) — English sources under `docs/handson/`, Japanese under `i18n/ja/docusaurus-plugin-content-docs/current/handson/` — and rendered on the [Hands-on section of the spec website](https://www.ertl.jp/cadl-spec/docs/handson/).
 
 To run the full pipeline locally on the bundled robot-delivery example:
 
@@ -391,7 +391,7 @@ Run the demo scripts to see the full toolchain in action:
 # End-to-end workflow: parse -> verify -> codegen (Python/Solidity/Rego) -> regime map -> IEC 62853
 python examples/demo_robot_delivery.py
 
-# Regime transitions, compliance analysis, and multi-target generation
+# Regime transitions, dependability summary, and multi-target generation
 python examples/demo_smart_city.py
 
 # Side-by-side comparison of Python, Solidity, and Rego output
@@ -410,7 +410,7 @@ src/cadl/
   verifier.py          SMT-based contract verification (Z3)
   deadlock.py          Protocol deadlock detection
   regime_map.py        Regime transition graph analysis
-  iec62853.py          IEC 62853 compliance mapping
+  iec62853.py          IEC 62853-oriented dependability summary
   unparse.py           Expression AST back to CADL source text
   cli.py               Command-line interface
   codegen/
@@ -455,7 +455,7 @@ tests/
   test_regime_map.py     Regime map graph analysis tests
   test_solidity_gen.py   Solidity code generation tests
   test_opa_gen.py        OPA/Rego code generation tests
-  test_iec62853.py       IEC 62853 compliance mapping tests
+  test_iec62853.py       IEC 62853-oriented summary tests
   test_sim_ir.py         Simulator IR lowering and validation tests
   test_sim_gen.py        Simulator config generator tests
 

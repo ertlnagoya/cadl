@@ -146,7 +146,7 @@ cadl codegen examples/robot_delivery.cadl --target opa -o /tmp/rego_out
 cadl regime-map examples/smart_city_traffic.cadl
 cadl regime-map examples/smart_city_traffic.cadl --format dot -o regime.dot
 
-# IEC 62853準拠レポートを生成
+# IEC 62853を参考にしたディペンダビリティ要約を生成
 cadl iec62853 examples/robot_delivery.cadl
 cadl iec62853 examples/smart_city_traffic.cadl --format json
 
@@ -180,7 +180,7 @@ CADL処理系は、一般的なコンパイラと同じパイプライン構成�
     +-----+-----+-----------+-----------+
     v           v           v           v
   SMT検証    コード生成   モード      IEC 62853
-  (Z3)      (codegen/)   マップ     準拠検査
+  (Z3)      (codegen/)   マップ     要約
               |
         +-----+-----+
         v     v     v
@@ -230,11 +230,11 @@ Open Policy Agentポリシー（`.rego`）を生成：
 - **最短経路** — 任意の2つのモード間の最短経路をBFSで算出
 - **出力形式**: テキスト要約、Graphviz DOT、JSON
 
-### IEC 62853準拠検査
+### IEC 62853を参考にした要約
 
-`cadl iec62853` はCADL構成要素をIEC 62853オープンシステムディペンダビリティの概念にマッピングします：
+`cadl iec62853` は、CADL定義をIEC 62853（オープンシステムディペンダビリティ）の主題に沿って要約します。指標名はCADL独自のものであり、規格の用語ではありません。また、このレポートはIEC 62853への適合性を評価するものではありません。
 
-| CADL概念 | IEC 62853概念 |
+| CADL概念 | CADL独自指標 |
 |---|---|
 | alpha（情報共有度） | 情報透明性レベル |
 | beta（権限集中度） | ガバナンス集中度指標 |
@@ -351,11 +351,11 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 
 | 想定読者 | 入口 |
 | --- | --- |
-| 自習で素早く全体像を掴みたい方 | [Course A — ロボット配送（メイン教材）](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/main-textbook) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/main-textbook) |
-| 授業で学ぶ学生 | [Course A — 演習問題集](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/exercises) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/exercises) |
-| 引用したい研究者 | [Why SoS-DSL?（学術背景）](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/academic-background) (JA) / [EN](https://ertlnagoya.github.io/cadl-spec/docs/handson/academic-background) |
+| 自習で素早く全体像を掴みたい方 | [Course A — ロボット配送（メイン教材）](https://www.ertl.jp/cadl-spec/ja/docs/handson/main-textbook) (JA) / [EN](https://www.ertl.jp/cadl-spec/docs/handson/main-textbook) |
+| 授業で学ぶ学生 | [Course A — 演習問題集](https://www.ertl.jp/cadl-spec/ja/docs/handson/exercises) (JA) / [EN](https://www.ertl.jp/cadl-spec/docs/handson/exercises) |
+| 引用したい研究者 | [Why SoS-DSL?（学術背景）](https://www.ertl.jp/cadl-spec/ja/docs/handson/academic-background) (JA) / [EN](https://www.ertl.jp/cadl-spec/docs/handson/academic-background) |
 
-教材本体は [cadl-spec リポジトリ](https://github.com/ertlnagoya/cadl-spec) にあり（英語ソースは `docs/handson/`、日本語ソースは `i18n/ja/docusaurus-plugin-content-docs/current/handson/`）、[仕様サイトの Hands-on セクション](https://ertlnagoya.github.io/cadl-spec/ja/docs/handson/) でレンダリングされます。
+教材本体は [cadl-spec リポジトリ](https://github.com/ertlnagoya/cadl-spec) にあり（英語ソースは `docs/handson/`、日本語ソースは `i18n/ja/docusaurus-plugin-content-docs/current/handson/`）、[仕様サイトの Hands-on セクション](https://www.ertl.jp/cadl-spec/ja/docs/handson/) でレンダリングされます。
 
 ロボット配送のサンプルでパイプライン全体をローカル実行：
 
@@ -390,7 +390,7 @@ IR JSON と Unity C# ツリーが生成され、後者が [cadl-raspimouse-simul
 # 一連のワークフロー: パース -> 検証 -> コード生成(Python/Solidity/Rego) -> モードマップ -> IEC 62853
 python examples/demo_robot_delivery.py
 
-# 運用モード遷移の分析、準拠検査、マルチターゲット生成
+# 運用モード遷移の分析、ディペンダビリティ要約、マルチターゲット生成
 python examples/demo_smart_city.py
 
 # Python / Solidity / Rego出力の比較
@@ -409,7 +409,7 @@ src/cadl/
   verifier.py          SMTベース契約検証（Z3）
   deadlock.py          プロトコルデッドロック検出
   regime_map.py        運用モードの遷移グラフ分析
-  iec62853.py          IEC 62853準拠マッピング
+  iec62853.py          IEC 62853を参考にした要約
   unparse.py           式ASTをCADLのソーステキストに戻す
   cli.py               コマンドラインインタフェース
   codegen/
@@ -454,7 +454,7 @@ tests/
   test_regime_map.py     モードマップ分析のテスト
   test_solidity_gen.py   Solidityコード生成のテスト
   test_opa_gen.py        OPA/Regoコード生成のテスト
-  test_iec62853.py       IEC 62853準拠マッピングのテスト
+  test_iec62853.py       IEC 62853要約のテスト
   test_sim_ir.py         シミュレータIR変換・検証のテスト
   test_sim_gen.py        シミュレータ設定ジェネレータのテスト
 
@@ -502,7 +502,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 - ISO/IEC/IEEE 21841:2019, Taxonomy of Systems of Systems.
 - Saoud et al., "Assume-guarantee contracts for continuous-time systems," Automatica, 2021.
 - IEC 62853:2018, Open Systems Dependability.
-- 下山・松原, "Governance as a Structural Design Variable," submitted, 2026.
+- C. Shimoyama and Y. Matsubara, "Governance as a Structural Design Variable: An Empirical Study of Performance-Autonomy Value Spaces in Systems of Systems," in Proc. 21st International Conference on System of Systems Engineering (SoSE), 2026.
 
 ## ライセンス
 

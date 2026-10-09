@@ -28,6 +28,10 @@ def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> No
     if target not in SUPPORTED_TARGETS:
         raise ValueError(f"Unsupported target: {target!r}. Choose from: {sorted(SUPPORTED_TARGETS)}")
 
+    if target != "unity-csharp":
+        from .safety import check_codegen_input
+        check_codegen_input(sos)
+
     if target == "python":
         _generate_python(sos, output_dir)
     elif target == "solidity":

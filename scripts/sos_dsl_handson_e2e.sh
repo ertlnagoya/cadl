@@ -145,8 +145,8 @@ mkdir -p "$DEST"
 #
 # We use Python's shutil for the copy because the naive
 #   rm -rf X && cp -r SRC X
-# pattern misbehaves on filesystems where unlink is restricted (e.g.
-# the cowork sandbox): the rm silently fails, X still exists, then
+# pattern misbehaves on filesystems where unlink is restricted:
+# the rm silently fails, X still exists, then
 # `cp -r SRC X` creates X/SRC nested instead of overwriting X. The
 # Python version overwrites file-by-file via O_TRUNC, which works on
 # both restricted and normal filesystems.

@@ -142,8 +142,8 @@ def main() -> None:
     for line in rm.to_text().splitlines():
         print(f"      {line}")
 
-    # --- Step 8: IEC 62853 Compliance ---
-    print("\n[9] IEC 62853 compliance report...")
+    # --- Step 8: IEC 62853-oriented summary ---
+    print("\n[9] IEC 62853-oriented dependability summary...")
     report = generate_iec62853_report(sos)
     print(f"    System Integration Level: {report['system_integration_level']}")
     for param in report["institutional_parameters"]:
