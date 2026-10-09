@@ -1,4 +1,4 @@
-"""Tests for CADL IEC 62853 compliance mapping module."""
+"""Tests for the IEC 62853-oriented dependability summary module."""
 
 from __future__ import annotations
 
@@ -485,6 +485,7 @@ class TestIEC62853Integration:
         report = generate_iec62853_report(sos)
 
         expected_keys = {
+            "disclaimer",
             "sos_name",
             "sos_type",
             "system_integration_level",

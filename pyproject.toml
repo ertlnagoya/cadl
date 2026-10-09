@@ -52,8 +52,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://ertlnagoya.github.io/cadl-spec/"
-Documentation = "https://ertlnagoya.github.io/cadl-spec/"
+Homepage = "https://www.ertl.jp/cadl-spec/"
+Documentation = "https://www.ertl.jp/cadl-spec/"
 Repository = "https://github.com/ertlnagoya/cadl"
 
 [project.scripts]

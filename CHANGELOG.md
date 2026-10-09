@@ -6,9 +6,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-10-09
+
+### Security
+- `cadl codegen` for the `python`, `solidity` and `opa` targets wrote ids and
+  text from the `.cadl` file into generated source verbatim. A crafted
+  string could add code to the generated module, and a contract id such as
+  `../../x` wrote a file outside the output directory. Code generation now
+  checks the definition first and refuses ids that are not identifiers and
+  text containing quotes, backslashes, backticks, `*/` or control
+  characters (`cadl.codegen.safety`). The Unity C# target already sanitised
+  names and escaped literals.
+
 ### Changed
 - License changed from MIT to Apache License 2.0 (`LICENSE`, `NOTICE`).
   Releases up to and including 0.3.2 remain available under the MIT License.
+- `cadl iec62853` is described as an IEC 62853-oriented dependability
+  summary instead of a "compliance report". The indicator names are defined
+  by CADL, not by the standard, and the report does not assess conformance;
+  the text output and a new `disclaimer` key in the JSON say so. JSON keys
+  are otherwise unchanged.
 
 ### Fixed
 - `scripts/sos_dsl_handson_e2e.sh` ran a command quoted in one of its
@@ -190,7 +207,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/ertlnagoya/cadl/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ertlnagoya/cadl/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ertlnagoya/cadl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ertlnagoya/cadl/compare/v0.2.2...v0.3.0

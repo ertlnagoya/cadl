@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
                              help="Save output to file")
 
     # iec62853 command
-    iec_cmd = subparsers.add_parser("iec62853", help="Generate IEC 62853 compliance report")
+    iec_cmd = subparsers.add_parser("iec62853", help="Generate an IEC 62853-oriented dependability summary (informative; not a conformance assessment)")
     iec_cmd.add_argument("file", type=Path, help="CADL file to analyze")
     iec_cmd.add_argument("--format", choices=["text", "json"], default="text",
                          help="Output format (default: text)")
@@ -411,18 +411,20 @@ def _cmd_iec62853(args: argparse.Namespace) -> int:
 
 def _format_iec62853_text(report: dict) -> str:
     lines = []
-    lines.append(f"IEC 62853 Compliance Report: {report['sos_name']}")
+    lines.append(f"Dependability Summary (IEC 62853-oriented): {report['sos_name']}")
     lines.append("=" * 60)
+    if report.get("disclaimer"):
+        lines.append(f"Note: {report['disclaimer']}")
     lines.append("")
 
-    lines.append(f"System Integration Level: {report['system_integration_level']}")
+    lines.append(f"Integration Level (CADL-defined): {report['system_integration_level']}")
     lines.append(f"SoS Type: {report['sos_type']}")
     lines.append("")
 
     lines.append("--- Institutional Parameters ---")
     for param in report.get("institutional_parameters", []):
         lines.append(f"  {param['cadl_concept']}: {param['value']}")
-        lines.append(f"    IEC 62853: {param['iec62853_concept']}")
+        lines.append(f"    Indicator (CADL-defined): {param['iec62853_concept']}")
     lines.append("")
 
     lines.append("--- Service Level Agreements ---")

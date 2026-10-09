@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""CADL Demo: Smart City Traffic — Regime Map & Compliance Analysis
+"""CADL Demo: Smart City Traffic — Regime Map & Dependability Summary
 
 Demonstrates Phase 5-6 features:
   1. Multi-regime transition analysis (NORMAL / CONGESTED / EMERGENCY)
   2. Regime map graph export (DOT format for Graphviz)
-  3. IEC 62853 Open Systems Dependability compliance report
+  3. IEC 62853-oriented dependability summary (informative)
   4. Multi-target code generation comparison
 
 Run:
@@ -80,9 +80,9 @@ def main() -> None:
     for line in dot.splitlines():
         print(f"  {line}")
 
-    # --- IEC 62853 Compliance Report ---
+    # --- IEC 62853-oriented summary ---
     print("\n" + "-" * 60)
-    print("IEC 62853 Compliance Report")
+    print("Dependability Summary (IEC 62853-oriented)")
     print("-" * 60)
 
     report = generate_iec62853_report(sos)
@@ -93,7 +93,7 @@ def main() -> None:
     print("\nInstitutional Parameters:")
     for p in report["institutional_parameters"]:
         print(f"  [{p['contract_id']}] {p['cadl_concept']} = {p['value']}")
-        print(f"    IEC 62853: {p['iec62853_concept']} ({p['description']})")
+        print(f"    Indicator: {p['iec62853_concept']} ({p['description']})")
 
     print("\nService Level Agreements:")
     for sla in report["service_level_agreements"]:
