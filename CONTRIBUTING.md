@@ -46,6 +46,10 @@ The version lives in `src/cadl/__init__.py` only. A release is a commit that
 sets it, moves the `[Unreleased]` notes under the new version in
 `CHANGELOG.md`, and is tagged `vX.Y.Z`.
 
+Publishing a GitHub Release for that tag runs `.github/workflows/publish.yml`,
+which uploads the distributions to PyPI. The workflow fails if the tag and
+the package version differ.
+
 ## License
 
 By contributing you agree that your contribution is licensed under the MIT

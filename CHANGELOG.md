@@ -6,6 +6,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `.github/workflows/publish.yml`: publishing a GitHub Release builds the
+  distributions and uploads them to PyPI through Trusted Publishing.
+
 ## [0.3.2] — 2026-10-09
 
 ### Fixed
