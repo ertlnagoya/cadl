@@ -52,7 +52,7 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition) -> str:
     ctx = SolidityContext()
 
     lines: list[str] = []
-    lines.append("// SPDX-License-Identifier: MIT")
+    lines.append("// SPDX-License-Identifier: Apache-2.0")
     lines.append(f"// Generated from CADL contract: {contract.id}")
     lines.append("pragma solidity ^0.8.20;")
     lines.append("")
@@ -161,7 +161,7 @@ def generate_regime_sol(sos: SoSDefinition) -> str:
     ctx = SolidityContext()
 
     lines: list[str] = []
-    lines.append("// SPDX-License-Identifier: MIT")
+    lines.append("// SPDX-License-Identifier: Apache-2.0")
     lines.append("// Generated CADL regime controller")
     lines.append("pragma solidity ^0.8.20;")
     lines.append("")
@@ -220,7 +220,7 @@ def generate_main_sol(sos: SoSDefinition) -> str:
     name = sanitize_id(sos.name)
 
     lines: list[str] = []
-    lines.append("// SPDX-License-Identifier: MIT")
+    lines.append("// SPDX-License-Identifier: Apache-2.0")
     lines.append(f"// Generated CADL orchestrator: {sos.name}")
     lines.append("pragma solidity ^0.8.20;")
     lines.append("")

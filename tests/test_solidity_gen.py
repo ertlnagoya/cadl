@@ -328,7 +328,7 @@ class TestSolidityGen:
         contract = _minimal_contract()
         sos = _minimal_sos(contracts=[contract])
         code = generate_contract_sol(contract, sos)
-        assert "SPDX-License-Identifier: MIT" in code
+        assert "SPDX-License-Identifier: Apache-2.0" in code
 
     def test_contract_sol_party_addresses(self):
         contract = _minimal_contract(
