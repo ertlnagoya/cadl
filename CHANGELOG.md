@@ -22,6 +22,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   related projects.
 - CONTRIBUTING: CI runs Python 3.9 through 3.14; a release also updates
   `version:` in `CITATION.cff`.
+- README (English and Japanese): the workshop takes about 95 minutes (was
+  "90-minute"); the simulator entries point to the public export,
+  `cadl-raspimouse-simulator`; the SoSE 2026 paper is in the English
+  reference list as well.
+- `.gitignore`: the files written by the README commands (`regime.dot`,
+  `sim_config.json`, `sim_config.yaml`).
 
 ## [0.3.8] — 2026-10-09
 
