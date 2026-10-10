@@ -67,4 +67,4 @@ done
 echo "========================================"
 echo "完了！生成されたファイル:"
 echo "========================================"
-ls -la "$SCRIPT_DIR/../output/raspimouse_*"
+ls -la "$SCRIPT_DIR/../output/"raspimouse_*

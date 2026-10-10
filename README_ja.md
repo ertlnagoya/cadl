@@ -320,7 +320,7 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
 
 #### Raspimouse群ロボットシミュレータ — D-SoS / C-SoS / MCP-SoS の比較
 
-同一の5台ロボット・11ノードグラフネットワーク上で、異なるSoSパラダイムを記述する3つのCADL定義です。`cadl sim-gen --target unity` により、raspimouse-swarm-simulator（現時点では非公開） のUnity設定JSONを自動生成できます。
+同一の5台ロボット・11ノードグラフネットワーク上で、異なるSoSパラダイムを記述する3つのCADL定義です。`cadl sim-gen --target unity` により、raspimouse-swarm-simulator（研究用リポジトリで非公開。ハンズオンに必要な部分は [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator) として公開）のUnity設定JSONを自動生成できます。
 
 | 特性 | D-SoS（指示型） | C-SoS（協調型） | MCP-SoS（認知型） |
 |---|---|---|---|
@@ -365,7 +365,7 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 
 ## ハンズオン
 
-ロボット配送 System of Systems を題材に、**CADL モデリング → SoS-DSL 契約（lifecycle + monitors） → 可視化 → コード生成 → ライブシミュレーション** までを一気通貫で体験する 90 分の自習ワークショップ（5 回の演習コースとしても利用可）が用意されています。
+ロボット配送 System of Systems を題材に、**CADL モデリング → SoS-DSL 契約（lifecycle + monitors） → 可視化 → コード生成 → ライブシミュレーション** までを一気通貫で体験する 約 95 分の自習ワークショップ（5 回の演習コースとしても利用可）が用意されています。
 
 教材内容：
 
@@ -546,7 +546,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 - [cadl-spec](https://github.com/ertlnagoya/cadl-spec) — 仕様書とハンズオン講座。<https://www.ertl.jp/cadl-spec/ja/> で公開しています。
 - [cadl-explorer](https://github.com/ertlnagoya/cadl-explorer) — `cadl sim-ir` が出力するIRから契約ライフサイクルを描画し、合成モデル上でガバナンス設定を試せるStreamlitアプリケーション。
 - [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator) — ハンズオン講座で使うシミュレータ。C-SoS のロボット配送シナリオ用の Unity プロジェクト、Go アービトレータ、Python 参照ランタイムを収録しています。
-- raspimouse-swarm-simulator（現時点では非公開） — マルチエージェント群ロボットシミュレーションプラットフォーム。`examples/raspimouse_*.cadl` で3つのSoSモードを記述し、Unity設定ジェネレータでシミュレータ用の構成JSONを生成できます。
+- raspimouse-swarm-simulator（研究用リポジトリで非公開。公開版は [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator)） — マルチエージェント群ロボットシミュレーションプラットフォーム。`examples/raspimouse_*.cadl` で3つのSoSモードを記述し、Unity設定ジェネレータでシミュレータ用の構成JSONを生成できます。
 
 ## 参考文献
 

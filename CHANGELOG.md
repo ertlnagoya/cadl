@@ -6,6 +6,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- `examples/test_raspimouse.sh` no longer exits with status 1 after
+  generating the configs (the final `ls` quoted its glob).
+
 ### Changed
 - README (English and Japanese): links to the specification, hands-on
   course, changelog, contributing guide and issue tracker at the top; the
