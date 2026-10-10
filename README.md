@@ -321,7 +321,7 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
 
 #### Raspimouse Swarm Simulator — D-SoS / C-SoS / MCP-SoS Comparison
 
-Three CADL definitions model the same 5-robot swarm on an 11-node graph network under different SoS paradigms. These connect to the raspimouse-swarm-simulator (not publicly available at present) via the Unity config generator (`cadl sim-gen --target unity`).
+Three CADL definitions model the same 5-robot swarm on an 11-node graph network under different SoS paradigms. These connect to the raspimouse-swarm-simulator (a research repository that is not public; the part needed for the hands-on course is published as [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator)) via the Unity config generator (`cadl sim-gen --target unity`).
 
 | Property | D-SoS (Directed) | C-SoS (Collaborative) | MCP-SoS (Acknowledged) |
 |---|---|---|---|
@@ -366,7 +366,7 @@ The type checker (`cadl check`) validates:
 
 ## Hands-on
 
-A 90-minute self-paced workshop (or a 5-session exercise course) walks you through the complete CADL toolchain end-to-end on a robot delivery System of Systems: **CADL modelling → SoS-DSL contracts (lifecycle + monitors) → visualisation → code generation → live simulation**.
+A self-paced workshop of about 95 minutes (or a 5-session exercise course) walks you through the complete CADL toolchain end-to-end on a robot delivery System of Systems: **CADL modelling → SoS-DSL contracts (lifecycle + monitors) → visualisation → code generation → live simulation**.
 
 The hands-on materials include:
 
@@ -547,7 +547,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 - [cadl-spec](https://github.com/ertlnagoya/cadl-spec) — The specification and the hands-on course, published at <https://www.ertl.jp/cadl-spec/>.
 - [cadl-explorer](https://github.com/ertlnagoya/cadl-explorer) — A Streamlit application that draws the contract lifecycle from the IR that `cadl sim-ir` produces and explores governance settings on a synthetic model.
 - [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator) — The simulator used by the hands-on course: Unity project, Go arbitrator and Python reference runtime for the C-SoS robot-delivery scenario.
-- raspimouse-swarm-simulator (not publicly available at present) — Multi-agent swarm robotics simulation platform. CADL files in `examples/raspimouse_*.cadl` describe its three SoS modes, and the Unity config generator produces configuration JSON for the simulator.
+- raspimouse-swarm-simulator (research repository, not public; public export: [cadl-raspimouse-simulator](https://github.com/ertlnagoya/cadl-raspimouse-simulator)) — Multi-agent swarm robotics simulation platform. CADL files in `examples/raspimouse_*.cadl` describe its three SoS modes, and the Unity config generator produces configuration JSON for the simulator.
 
 ## References
 
@@ -555,6 +555,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 - ISO/IEC/IEEE 21841:2019, Taxonomy of Systems of Systems.
 - Saoud et al., "Assume-guarantee contracts for continuous-time systems," Automatica, 2021.
 - IEC 62853:2018, Open Systems Dependability.
+- C. Shimoyama and Y. Matsubara, "Governance as a Structural Design Variable: An Empirical Study of Performance-Autonomy Value Spaces in Systems of Systems," in Proc. 21st International Conference on System of Systems Engineering (SoSE), 2026.
 
 ## License
 

@@ -8,3 +8,7 @@ build/
 .venv/
 .DS_Store
 output/
+# Files written by the commands in the README
+/regime.dot
+/sim_config.json
+/sim_config.yaml
