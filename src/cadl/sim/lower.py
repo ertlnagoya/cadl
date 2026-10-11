@@ -68,6 +68,7 @@ def lower_to_ir(sos: SoSDefinition) -> SimIR:
             )
             for t in sos.transitions
         ],
+        motivation_block=sos.motivation.raw if sos.motivation else None,
     )
 
 

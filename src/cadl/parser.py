@@ -7,6 +7,7 @@ Uses a hybrid approach:
 
 from __future__ import annotations
 
+import contextvars
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -17,6 +18,7 @@ from lark import Lark, Token, Transformer, v_args
 from .ast_nodes import (
     ActorDef,
     ActorRef,
+    AgentMotivationBlock,
     AlgorithmDef,
     AuthorityBlock,
     AutonomyLevel,
@@ -35,6 +37,7 @@ from .ast_nodes import (
     FallbackBlock,
     FloatLiteral,
     FunctionCall,
+    GovernanceMotivationBlock,
     Identifier,
     IncentiveRule,
     IncentivesBlock,
@@ -47,6 +50,7 @@ from .ast_nodes import (
     MessageStep,
     MetricDef,
     MonitorDef,
+    MotivationBlock,
     OnMatchSpec,
     OnViolationSpec,
     ParallelStep,
@@ -218,7 +222,33 @@ def parse_expr(text: str) -> Expression:
     return ExprTransformer().transform(tree)
 
 
+def parse_rule(text: str) -> Expression:
+    """Parse a SoS-DSL ``rule`` (Appendix E §E.3): a predicate that may
+    also use set membership, ``x IN [a, b]``.
+
+    The membership is read as ``x == IN(a, b)``, so the result can be
+    used to check the syntax and the names of a rule; it is not an input
+    for the code generators, which translate the rule text themselves.
+    """
+    return parse_expr(_MEMBERSHIP_RE.sub(r" == __in__(\1)", text))
+
+
+_MEMBERSHIP_RE = re.compile(r"\s+IN\s*\[([^\[\]]*)\]")
+
+
 # === YAML-based structural parser ===
+
+# Findings that do not stop parsing (an entry that is dropped, a value
+# replaced by its default). `_build_sos` hands them to the AST, and
+# `cadl check` reports them.
+_diagnostics: contextvars.ContextVar = contextvars.ContextVar("cadl_diagnostics")
+
+
+def _note(severity: str, message: str) -> None:
+    notes = _diagnostics.get(None)
+    if notes is not None:
+        notes.append((severity, message))
+
 
 def _get(data: dict, key: str, default=None):
     """Safely get a value from a dict."""
@@ -287,6 +317,9 @@ def _build_actor(data: dict) -> ActorDef:
         autonomy = AutonomyLevel(autonomy_str)
     except ValueError:
         autonomy = AutonomyLevel.MEDIUM
+        _note("error",
+              f"Unknown autonomy '{autonomy_str}' for actor '{actor_ref.name}'; "
+              f"expected one of low, medium, high")
 
     capabilities = _get(data, 'capabilities', []) or []
 
@@ -345,6 +378,19 @@ def _build_information(data: dict) -> InformationBlock:
                         target=_parse_actor_ref_str(m.group(2).strip()),
                         data=m.group(3).strip(),
                     ))
+                else:
+                    _note("error",
+                          f"Malformed sharing entry '{item}'; "
+                          f"expected \"SOURCE -> TARGET : data\"")
+            else:
+                # Unquoted, YAML reads "A -> B : data" as a one-entry mapping.
+                written = (
+                    " : ".join(f"{k}: {v}" for k, v in item.items())
+                    if isinstance(item, dict) else str(item)
+                )
+                _note("error",
+                      f"sharing entry '{written}' must be a quoted string, "
+                      f"e.g. \"A -> B : data\" (Appendix A.4)")
 
     return info
 
@@ -662,7 +708,13 @@ def _build_step(data) -> Optional[Any]:
                 then_steps = []
                 if isinstance(v, list):
                     then_steps = [s for s in (_build_step(item) for item in v) if s is not None]
-                return ConditionalStep(condition=condition, then_steps=then_steps)
+                else_steps = []
+                else_data = data.get('else')
+                if isinstance(else_data, list):
+                    else_steps = [s for s in (_build_step(item) for item in else_data) if s is not None]
+                return ConditionalStep(
+                    condition=condition, then_steps=then_steps, else_steps=else_steps
+                )
 
             if k_str == 'parallel':
                 steps = []
@@ -671,9 +723,11 @@ def _build_step(data) -> Optional[Any]:
                 return ParallelStep(steps=steps)
 
             if k_str.startswith('barrier'):
-                cond_str = k_str.replace('barrier:', '').strip()
-                if not cond_str and isinstance(v, str):
-                    cond_str = v
+                # "barrier: <predicate>"; an unquoted true / false arrives
+                # from YAML as a boolean.
+                cond_str = k_str[len('barrier'):].lstrip(':').strip()
+                if not cond_str and v is not None:
+                    cond_str = str(v).lower() if isinstance(v, bool) else str(v).strip()
                 try:
                     condition = parse_expr(cond_str)
                 except Exception:
@@ -737,8 +791,85 @@ def _parse_bound(value) -> Optional[int]:
         return None
 
 
+_NUMBER = (int, float)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, _NUMBER) and not isinstance(value, bool)
+
+
+def _build_motivation(data: dict) -> MotivationBlock:
+    """Build the `motivation:` block of Appendix C.
+
+    A value of the wrong kind keeps the default of its field and is
+    reported; the block as written is kept in ``raw``.
+    """
+    block = MotivationBlock(raw=data)
+
+    def number(section: dict, key: str, default):
+        value = _get(section, key)
+        if value is None:
+            return default
+        if not _is_number(value):
+            _note("error", f"motivation: '{key}' must be a number, got '{value}'")
+            return default
+        return value
+
+    agent_data = _get(data, 'agent')
+    if isinstance(agent_data, dict):
+        agent = AgentMotivationBlock(profile=str(_get(agent_data, 'profile', 'uniform')))
+        values = _get(agent_data, 'values')
+        if isinstance(values, list):
+            if all(_is_number(v) for v in values):
+                agent.values = [float(v) for v in values]
+            else:
+                _note("error", "motivation: 'values' must be a list of numbers")
+        elif values is not None:
+            _note("error", "motivation: 'values' must be a list of numbers")
+        block.agent = agent
+
+    gov_data = _get(data, 'governance')
+    if isinstance(gov_data, dict):
+        gov = GovernanceMotivationBlock(model=str(_get(gov_data, 'model', 'none')))
+        gov.rho = float(number(gov_data, 'rho', gov.rho))
+        gov.kappa = float(number(gov_data, 'kappa', gov.kappa))
+        gov.wait_scale = float(number(gov_data, 'wait_scale', gov.wait_scale))
+        budget = _get(gov_data, 'budget_base')
+        if isinstance(budget, int) and not isinstance(budget, bool):
+            gov.budget_base = budget
+        elif budget is not None:
+            _note("error", f"motivation: 'budget_base' must be an integer, got '{budget}'")
+        block.governance = gov
+
+    return block
+
+
+def _build_extensions(data) -> Dict[str, str]:
+    """Read `extensions:` (A.2): a sequence of one-entry mappings name: version."""
+    extensions: Dict[str, str] = {}
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                for name, version in item.items():
+                    extensions[str(name)] = str(version)
+            elif item is not None:
+                extensions[str(item)] = ""
+    return extensions
+
+
 def _build_sos(data: dict) -> SoSDefinition:
     """Build a SoSDefinition from the top-level YAML dict."""
+    notes: list = []
+    token = _diagnostics.set(notes)
+    try:
+        sos = _build_sos_body(data)
+    finally:
+        _diagnostics.reset(token)
+    sos.diagnostics = notes
+    return sos
+
+
+def _build_sos_body(data: dict) -> SoSDefinition:
     sos_data = _get(data, 'sos')
     if sos_data is None:
         raise CADLParseError("Missing 'sos:' top-level key")
@@ -868,6 +999,12 @@ def _build_sos(data: dict) -> SoSDefinition:
                     output=_get(cg, 'output'),
                     mappings=_get(cg, 'mappings', {}) or {},
                 ))
+
+    # Extensions (A.2) and the motivation block (Appendix C)
+    sos.extensions = _build_extensions(_get(sos_data, 'extensions'))
+    motivation_data = _get(sos_data, 'motivation')
+    if isinstance(motivation_data, dict):
+        sos.motivation = _build_motivation(motivation_data)
 
     return sos
 

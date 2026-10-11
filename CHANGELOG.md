@@ -6,7 +6,55 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Checks that the specification requires and `cadl` 0.3.8 did not make
+(Appendix A.12 and Appendix E.4 list them as deviations). **A file that
+`cadl check` accepted can now be rejected**; the cases are listed under
+"Changed".
+
+### Added
+- `cadl check` applies the static semantics of the SoS-DSL extension
+  (Appendix E.4). Errors: an initial or terminal state that is not listed in
+  `states` (L-1); a `from` or `to` that is not listed (L-2); no terminal
+  state, or none reachable from the initial state (L-3); an
+  `on_violation.transition` or `on_match.transition` that is not a state
+  (L-5, M-3); a duplicate transition or monitor id; a monitor without a
+  `rule`; an undeclared actor in a message event of `on:`. Warnings: a
+  `deadline:` without `on_violation:` (L-4); an `observe:` entry whose object
+  is not a declared actor (M-1); an `on:`, `when:` or `rule:` that is not a
+  rule of Appendix E.3. M-1 is a warning and not an error because the
+  shipped example `sos_dsl_robot_delivery.cadl` observes
+  `OBSTACLES.positions`.
+- `cadl.parser.parse_rule` parses a rule, including `x IN [a, b]`.
+- The `motivation:` block (Appendix C) is read into the AST. `cadl check`
+  validates `profile`, `model` and the ranges of `rho`, `kappa`,
+  `budget_base`, `wait_scale` and `values`, and prints an `[INFO]` line
+  saying that verification and code generation do not use the block.
+  `cadl sim-ir` carries the block as written in the new key
+  `motivation_block` (it was dropped before).
+- `extensions:` is read. An extension other than `sos-dsl`, or a version of
+  it other than `0.1`, is a warning.
+- A `codegen:` entry whose `target:` cannot be emitted (for example `ros2`)
+  is a warning of `cadl check` and is printed by `cadl codegen` (Appendix
+  D.4). Generation is still selected on the command line.
+- `TypeCheckResult.infos` and the key `type_check.infos` in
+  `cadl verify --format json`.
+
+### Changed
+- `cadl check` rejects an identifier that is not ASCII
+  (`[A-Za-z_][A-Za-z0-9_]*`) or is a reserved word (`AND`, `OR`, `NOT`,
+  `true`, `false`, `exists`, `in`), for actors, contracts, protocols,
+  metrics, regimes, lifecycle states, lifecycle transitions and monitors
+  (Appendix A.1, A.11). Text in strings and comments may still be Unicode.
+- An unquoted or malformed `sharing:` entry is an error; it was dropped
+  without a diagnostic (Appendix A.4).
+- An `autonomy:` other than `low`, `medium`, `high` is an error; it was read
+  as `medium`.
+
 ### Fixed
+- The `else:` branch of a conditional step was discarded, and the condition
+  of `barrier: <predicate>` was replaced by the name `barrier`. Both are
+  kept now, so actors in an `else:` branch are checked and the simulator IR
+  contains the branch and the condition.
 - `examples/test_raspimouse.sh` no longer exits with status 1 after
   generating the configs (the final `ls` quoted its glob).
 
