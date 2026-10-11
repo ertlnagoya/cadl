@@ -7,6 +7,7 @@ Uses a hybrid approach:
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -281,7 +282,7 @@ def _parse_predicate(item) -> Expression:
 
 def _build_actor(data: dict) -> ActorDef:
     """Build an ActorDef from a YAML dict."""
-    id_str = str(_get(data, 'id', ''))
+    id_str = _id_str(_get(data, 'id', ''))
     actor_ref = _parse_actor_ref_str(id_str)
 
     role = str(_get(data, 'role', ''))
@@ -344,11 +345,11 @@ def _build_information(data: dict) -> InformationBlock:
             # text for the type checker to report.
             m = None
             if isinstance(item, str):
-                m = re.fullmatch(r'\s*(.+?)\s*->\s*(.+?)\s*:\s*([A-Za-z_]\w*)\s*', item)
+                m = re.fullmatch(r'\s*(.+?)\s*->\s*(.+?)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*', item)
                 if m is None:
                     # Lenient form: the item carries arguments or other text
                     # after its name. Keep the name and let the checker warn.
-                    m = re.match(r'\s*(.+?)\s*->\s*(.+?)\s*:\s*([A-Za-z_]\w*)', item)
+                    m = re.match(r'\s*(.+?)\s*->\s*(.+?)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])', item)
                     if m:
                         info.lenient_sharing.append(item)
             if m:
@@ -403,7 +404,7 @@ def _build_violation(data: dict) -> ViolationBlock:
 def _build_contract(data: dict) -> ContractDef:
     """Build a ContractDef from a YAML dict."""
     contract = ContractDef(
-        id=str(_get(data, 'id', '')),
+        id=_id_str(_get(data, 'id', '')),
         parties=_parse_actor_ref_list(_get(data, 'parties', [])),
     )
 
@@ -543,7 +544,7 @@ def _build_lifecycle_transition(data: dict) -> LifecycleTransition:
     )
     emit = _as_str_list(_get(data, 'emit', []))
     return LifecycleTransition(
-        id=str(_get(data, 'id', '')),
+        id=_id_str(_get(data, 'id', '')),
         from_states=from_states,
         to_state=str(_get(data, 'to', '')),
         on=str(_yaml_on_key(data, '')),
@@ -610,7 +611,7 @@ def _build_monitor(data: dict) -> MonitorDef:
         else None
     )
     return MonitorDef(
-        id=str(_get(data, 'id', '')),
+        id=_id_str(_get(data, 'id', '')),
         observe=_as_str_list(_get(data, 'observe', [])),
         sampling=_build_sampling(_get(data, 'sampling')),
         rule=str(_get(data, 'rule', '')),
@@ -709,7 +710,7 @@ def _build_step(data) -> Optional[Any]:
 def _build_protocol(data: dict) -> ProtocolDef:
     """Build a ProtocolDef from a YAML dict."""
     proto = ProtocolDef(
-        id=str(_get(data, 'id', '')),
+        id=_id_str(_get(data, 'id', '')),
         trigger=str(_get(data, 'trigger', '')),
     )
 
@@ -751,6 +752,13 @@ def _parse_bound(value) -> Optional[int]:
         return None
 
 
+def _id_str(value) -> str:
+    """An id as written. YAML reads an unquoted true / false as a boolean."""
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
 def _entry_as_text(item) -> str:
     """Render a YAML value roughly as it was written, for diagnostics."""
     if isinstance(item, dict) and len(item) == 1:
@@ -775,10 +783,16 @@ def _build_extensions(data) -> list:
 
 
 def _build_motivation(data) -> MotivationBlock | None:
-    """Read the `motivation:` block of Appendix C, keeping it verbatim."""
-    if not isinstance(data, dict):
+    """Read the `motivation:` block of Appendix C, keeping it verbatim.
+
+    The block must never make a file invalid (Appendix C), so a value that
+    cannot be interpreted is left at its default; it stays in ``raw``.
+    """
+    if data is None:
         return None
     block = MotivationBlock(raw=data)
+    if not isinstance(data, dict):
+        return block
     agent = _get(data, 'agent')
     if isinstance(agent, dict):
         a = AgentMotivationBlock()
@@ -786,7 +800,7 @@ def _build_motivation(data) -> MotivationBlock | None:
             a.profile = str(_get(agent, 'profile'))
         values = _get(agent, 'values')
         if isinstance(values, list):
-            a.values = [float(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            a.values = [float(v) for v in values if _is_finite_number(v)]
         block.agent = a
     gov = _get(data, 'governance')
     if isinstance(gov, dict):
@@ -795,10 +809,22 @@ def _build_motivation(data) -> MotivationBlock | None:
             g.model = str(_get(gov, 'model'))
         for key, cast in (('rho', float), ('kappa', float), ('budget_base', int), ('wait_scale', float)):
             v = _get(gov, key)
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                setattr(g, key, cast(v))
+            if _is_finite_number(v):
+                try:
+                    setattr(g, key, cast(v))
+                except (ValueError, OverflowError):
+                    pass
         block.governance = g
     return block
+
+
+def _is_finite_number(v) -> bool:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        return False
 
 
 def _build_sos(data: dict) -> SoSDefinition:
@@ -898,7 +924,7 @@ def _build_sos(data: dict) -> SoSDefinition:
         for m in metrics_data:
             if isinstance(m, dict):
                 sos.metrics.append(MetricDef(
-                    id=str(_get(m, 'id', '')),
+                    id=_id_str(_get(m, 'id', '')),
                     formula=_get(m, 'formula'),
                     target=_get(m, 'target'),
                 ))
@@ -928,7 +954,8 @@ def _build_sos(data: dict) -> SoSDefinition:
         for cg in codegen_data:
             if isinstance(cg, dict):
                 sos.codegen.append(CodegenSpec(
-                    target=str(_get(cg, 'target', 'python')),
+                    # `target:` defaults to python (Appendix A §A.9)
+                    target=str(_get(cg, 'target') or 'python'),
                     output=_get(cg, 'output'),
                     mappings=_get(cg, 'mappings', {}) or {},
                 ))

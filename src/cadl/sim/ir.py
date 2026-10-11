@@ -254,4 +254,4 @@ class SimIR:
     motivation: MotivationSpec | None = None
     # The source's `motivation:` block of Appendix C, verbatim (§C.6).
     # Absent from the serialized IR when the source has no such block.
-    motivation_block: dict[str, Any] | None = None
+    motivation_block: Any = None

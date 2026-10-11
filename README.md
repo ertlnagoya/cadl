@@ -363,7 +363,7 @@ The type checker (`cadl check`) validates:
 4. **Information sharing coherence** — Sharing declarations reference valid actors
 5. **Parameter range constraints** — `0 <= alpha, beta, lambda <= 1`
 6. **Unique ids and known severities** — No duplicate actor, contract, protocol, or metric ids; `severity:` is `Minor`, `Major`, or `Critical`
-7. **Identifiers** — Actor, contract, and protocol ids are ASCII identifiers and are not reserved words (`AND`, `OR`, `NOT`, `IN`, `in`, `exists`, `true`, `false`)
+7. **Identifiers** — Actor, contract, protocol, and metric ids and regime names are ASCII identifiers and are not reserved words (`AND`, `OR`, `NOT`, `IN`, `in`, `exists`, `true`, `false`)
 8. **Sharing entries** — Each `sharing:` entry is a quoted string `"SOURCE -> TARGET : item"`; an unquoted or malformed entry is an error, and an item with arguments is accepted with a warning
 
 It also reports, without failing the check, a `codegen:` target that `cadl codegen` cannot emit (warning), an extension name it does not know, and a `motivation:` block, which it keeps and passes on in `cadl sim-ir` but does not interpret (informational).

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Union
+from typing import Any, Union
 
 
 # === Enums ===
@@ -487,7 +487,7 @@ class MotivationBlock:
     agent: AgentMotivationBlock | None = None
     governance: GovernanceMotivationBlock | None = None
     # The block as written in the source, for verbatim re-emission (§C.6).
-    raw: dict | None = None
+    raw: Any = None
     loc: SourceLocation | None = None
 
 

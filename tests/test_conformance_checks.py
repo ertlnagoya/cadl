@@ -6,6 +6,8 @@ diagnostic.
 """
 
 import json
+import subprocess
+import sys
 
 import pytest
 
@@ -66,7 +68,7 @@ def test_actor_id_must_be_an_ascii_identifier(name):
     assert any("Actor ID" in e and "not a valid identifier" in e for e in errors), errors
 
 
-@pytest.mark.parametrize("name", ["AND", "OR", "NOT", "IN", "in", "exists", "true"])
+@pytest.mark.parametrize("name", ["AND", "OR", "NOT", "IN", "in", "exists", "true", "false"])
 def test_reserved_word_is_not_an_actor_id(name):
     errors = _messages(_check(_source(actor_id=name)).errors)
     assert any("Actor ID" in e and "reserved word" in e for e in errors), errors
@@ -160,7 +162,7 @@ def test_unknown_extension_gets_an_informational_diagnostic():
 
 def test_other_version_of_a_known_extension_is_noted():
     result = _check(_source(extra="  extensions:\n    - sos-dsl: 0.9\n"))
-    assert any("version 0.9" in i for i in _messages(result.infos))
+    assert any("version '0.9'" in i for i in _messages(result.infos))
 
 
 def test_motivation_block_is_never_an_error_and_is_noted():
@@ -188,3 +190,126 @@ def test_motivation_block_is_passed_on_verbatim_by_sim_ir():
 def test_sim_ir_of_a_file_without_motivation_is_unchanged():
     ir = _ir_to_dict(lower_to_ir(parse(_source())))
     assert "motivation_block" not in ir
+
+
+# --- review follow-ups -------------------------------------------------------
+
+@pytest.mark.parametrize("word", ["true", "false"])
+def test_unquoted_boolean_id_is_reported_as_a_reserved_word(word):
+    source = _source().replace('- id: "DISPATCHER"', f"- id: {word}")
+    errors = _messages(_check(source).errors)
+    assert any(f"Actor ID '{word}' is a reserved word" in e for e in errors), errors
+
+
+def test_metric_ids_and_regime_names_are_identifiers():
+    extra = (
+        "  transitions:\n"
+        '    - from: "通常"\n'
+        "      to: BUSY\n"
+        '      condition: "load > 3"\n'
+        "  metrics:\n"
+        '    - id: "AND"\n'
+        '      formula: "load"\n'
+    )
+    errors = _messages(_check(_source(extra=extra)).errors)
+    assert any("Regime name '通常'" in e for e in errors), errors
+    assert any("Metric ID 'AND' is a reserved word" in e for e in errors), errors
+
+
+def test_codegen_entry_without_target_defaults_to_python():
+    sos = parse(_source(extra="  codegen:\n    - target:\n    - output: out\n"))
+    assert [c.target for c in sos.codegen] == ["python", "python"]
+    assert not type_check(sos).warnings
+
+
+def test_non_ascii_or_reserved_sharing_item_is_an_error():
+    for item in ("位置", "2pos"):
+        result = _check(_source(sharing=[f'"ROBOT[*] -> DISPATCHER : {item}"']))
+        assert any("Invalid sharing entry" in e for e in _messages(result.errors)), item
+
+
+@pytest.mark.parametrize("shape", [
+    "  extensions:\n    sos-dsl: 0.1\n",          # mapping
+    "  extensions:\n    - sos-dsl\n",             # plain string
+    "  extensions:\n",                            # null
+    "  extensions: []\n",                         # empty
+])
+def test_extension_declaration_shapes_are_accepted(shape):
+    result = _check(_source(extra=shape))
+    assert result.ok and not result.infos
+
+
+@pytest.mark.parametrize("block", [
+    "  motivation:\n    governance:\n      budget_base: .inf\n",
+    "  motivation:\n    governance:\n      rho: .nan\n      kappa: " + "9" * 400 + "\n",
+    "  motivation:\n    agent:\n      values: [0.1, x, .inf]\n",
+    "  motivation: just some text\n",
+    "  motivation: {}\n",
+    "  motivation:\n    since: 2026-01-01\n",
+])
+def test_no_motivation_block_can_invalidate_a_file(block):
+    sos = parse(_source(extra=block))          # must not raise
+    result = type_check(sos)
+    assert result.ok
+    assert any("motivation: block" in i for i in _messages(result.infos))
+    assert _ir_to_dict(lower_to_ir(sos))["motivation_block"] is not None
+
+
+def test_motivation_block_keeps_key_order_and_nested_values():
+    block = (
+        "  motivation:\n"
+        "    zeta: 1\n"
+        "    agent:\n"
+        "      values: [0.2, 0.9]\n"
+        "      profile: custom\n"
+        "    alpha_note: {nested: [1, {deep: true}]}\n"
+    )
+    ir = _ir_to_dict(lower_to_ir(parse(_source(extra=block))))
+    kept = ir["motivation_block"]
+    assert list(kept) == ["zeta", "agent", "alpha_note"]
+    assert list(kept["agent"]) == ["values", "profile"]
+    assert kept["alpha_note"] == {"nested": [1, {"deep": True}]}
+
+
+# --- command line ------------------------------------------------------------
+
+def _run(tmp_path, source, *args):
+    path = tmp_path / "t.cadl"
+    path.write_text(source, encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, "-m", "cadl.cli", args[0], str(path), *args[1:]],
+        capture_output=True, text=True,
+    )
+
+
+def test_cli_check_reports_infos_and_warnings_without_failing(tmp_path):
+    extra = MOTIVATION + "  codegen:\n    - target: ros2\n"
+    proc = _run(tmp_path, _source(extra=extra), "check")
+    assert proc.returncode == 0
+    assert "Type check passed" in proc.stdout and "(1 warning(s))" in proc.stdout
+    assert "[INFO]" in proc.stderr and "[WARNING]" in proc.stderr
+
+
+def test_cli_check_fails_on_a_bad_identifier(tmp_path):
+    proc = _run(tmp_path, _source(actor_id="my-actor"), "check")
+    assert proc.returncode == 1
+    assert "not a valid identifier" in proc.stderr
+
+
+def test_cli_verify_json_lists_infos(tmp_path):
+    proc = _run(tmp_path, _source(extra=MOTIVATION), "verify", "--format", "json")
+    report = json.loads(proc.stdout)
+    assert len(report["type_check"]["infos"]) == 1
+
+
+def test_cli_sim_ir_json_is_strict_json_for_odd_motivation_values(tmp_path):
+    block = "  motivation:\n    since: 2026-01-01\n    governance:\n      kappa: .inf\n"
+    proc = _run(tmp_path, _source(extra=block), "sim-ir", "--format", "json")
+    assert proc.returncode == 0, proc.stderr
+    ir = json.loads(proc.stdout, parse_constant=lambda c: pytest.fail(f"non-strict JSON: {c}"))
+    assert ir["motivation_block"] == {"since": "2026-01-01", "governance": {"kappa": "inf"}}
+
+
+def test_cli_sim_ir_without_motivation_has_no_extra_key(tmp_path):
+    proc = _run(tmp_path, _source(), "sim-ir", "--format", "json")
+    assert "motivation_block" not in json.loads(proc.stdout)

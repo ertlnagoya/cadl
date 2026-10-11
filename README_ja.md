@@ -362,7 +362,7 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 4. **情報共有の整合性** — 共有宣言が有効なアクターを参照していること
 5. **パラメータ値域制約** — `0 <= alpha, beta, lambda <= 1`
 6. **idの一意性と深刻度** — アクター・契約・プロトコル・メトリクスのidが重複していないこと、`severity:` が `Minor` / `Major` / `Critical` のいずれかであること
-7. **識別子** — アクター・契約・プロトコルのidがASCIIの識別子であり、予約語（`AND`、`OR`、`NOT`、`IN`、`in`、`exists`、`true`、`false`）でないこと
+7. **識別子** — アクター・契約・プロトコル・メトリクスのidと運用モードの名前がASCIIの識別子であり、予約語（`AND`、`OR`、`NOT`、`IN`、`in`、`exists`、`true`、`false`）でないこと
 8. **共有の項目** — `sharing:` の各項目が引用符付きの文字列 `"SOURCE -> TARGET : item"` であること。引用符のない項目や形式に合わない項目はエラーとし、引数付きの item は警告を出して受け付けます
 
 このほか、検査を失敗させずに次を報告します。`cadl codegen` が出力できない `codegen:` のターゲット（警告）、未知の拡張名、`motivation:` ブロック（情報）。`motivation:` ブロックは解釈しませんが、保持して `cadl sim-ir` の出力に引き渡します。

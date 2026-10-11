@@ -517,7 +517,10 @@ def _cmd_sim_ir(args: argparse.Namespace) -> int:
 
     if args.format == "json":
         import json
-        print(json.dumps(_ir_to_dict(ir), indent=2, ensure_ascii=False))
+        d = _ir_to_dict(ir)
+        if "motivation_block" in d:
+            d["motivation_block"] = _jsonable(d["motivation_block"])
+        print(json.dumps(d, indent=2, ensure_ascii=False))
     else:
         import yaml
         print(yaml.dump(_ir_to_dict(ir), default_flow_style=False,
@@ -540,6 +543,20 @@ def _ir_to_dict(ir) -> dict:
     if d.get("motivation_block") is None:
         d.pop("motivation_block", None)
     return d
+
+
+def _jsonable(value):
+    """Make a YAML value safe for strict JSON (dates, sets, inf, nan → text)."""
+    import math
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, bool) or value is None or isinstance(value, (str, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    return str(value)
 
 
 def _cmd_sim_gen(args: argparse.Namespace) -> int:

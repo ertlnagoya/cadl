@@ -10,34 +10,40 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 `cadl check` now reports the cases in which the reference implementation
 accepted a file silently although the specification (Appendix A, C, D)
-asks for a diagnostic. A file that used a non-ASCII or reserved id, or an
-unquoted `sharing:` entry, was accepted before and is an error now.
+asks for a diagnostic. Some files that 0.3.8 accepted are errors now: a
+file with a non-ASCII or reserved id, and a file with a `sharing:` entry
+that is unquoted or whose item is not an ASCII identifier.
 
 ### Added
-- `cadl check` reports an actor, contract, or protocol id that is not an
-  ASCII identifier, or that is a reserved word (`AND`, `OR`, `NOT`, `IN`,
-  `in`, `exists`, `true`, `false`), as an error (Appendix A, A.1 and A.11).
-- A `sharing:` entry that is not a quoted string of the form
-  `"SOURCE -> TARGET : item"` is an error; it used to be dropped without
-  a diagnostic. An item with arguments (`"A -> B : report(period: 5s)"`)
-  is still accepted, now with a warning that only the name is kept
-  (Appendix A, A.4).
+- `cadl check` reports an actor, contract, protocol, or metric id, or a
+  regime name, that is not an ASCII identifier, or that is a reserved
+  word (`AND`, `OR`, `NOT`, `IN`, `in`, `exists`, `true`, `false`), as an
+  error (Appendix A, A.1 and A.11). An id written as an unquoted `true`
+  or `false` is reported as the reserved word it is.
+- A `sharing:` entry that is not a string of the form
+  `"SOURCE -> TARGET : item"` with an ASCII identifier as item is an
+  error (Appendix A, A.4). An unquoted entry used to be dropped without
+  a diagnostic. An entry whose item began with a digit or contained
+  non-ASCII letters used to be kept; it is an error now and no longer
+  reaches the IR. An item followed by arguments
+  (`"A -> B : report(period: 5s)"`) is still accepted, now with a
+  warning that only the name is kept.
 - A `codegen:` entry whose target `cadl codegen` cannot emit gets a
   warning from `cadl check`, `cadl verify`, and `cadl codegen`
-  (Appendix D, D.4).
+  (Appendix D, D.4). `cadl codegen` now prints every type-check warning,
+  not only this one. An entry without `target:` means `python`, as A.9
+  says.
 - Informational diagnostics (`[INFO]`, never a failure) for an
   `extensions:` name the implementation does not know, for a version of
   `sos-dsl` other than `0.1`, and for a `motivation:` block
   (Appendix C). `cadl verify --format json` lists them under
   `type_check.infos`.
-- The `motivation:` block is parsed and passed on verbatim by
+- The `motivation:` block is read and passed on as written by
   `cadl sim-ir` as `motivation_block` (Appendix C, C.6). The key is
   present only when the source has the block, so the IR of other files
-  is unchanged.
-
-### Fixed
-- `examples/test_raspimouse.sh` no longer exits with status 1 after
-  generating the configs (the final `ls` quoted its glob).
+  is unchanged. No content of the block can make a file invalid; in
+  JSON output, values that JSON cannot express (dates, infinities) are
+  written as text.
 
 ### Changed
 - `examples/raspimouse_c_sos.cadl`: the four `sharing:` entries of the

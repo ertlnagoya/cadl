@@ -363,8 +363,10 @@ class TypeChecker:
         """Check transition definitions."""
         regime_names: set[str] = set()
         for trans in sos.transitions:
-            regime_names.add(trans.from_regime)
-            regime_names.add(trans.to_regime)
+            for regime in (trans.from_regime, trans.to_regime):
+                if regime not in regime_names:
+                    self._check_identifier(regime, "Regime name", trans.loc)
+                regime_names.add(regime)
 
             if trans.protocol and trans.protocol not in self.protocol_ids:
                 self.result.add_warning(
@@ -420,6 +422,8 @@ class TypeChecker:
         """Check metric definitions."""
         seen: set[str] = set()
         for metric in sos.metrics:
+            if metric.id not in seen:
+                self._check_identifier(metric.id, "Metric ID", metric.loc)
             if metric.id in seen:
                 self.result.add_error(
                     f"Duplicate metric ID: '{metric.id}'",
@@ -484,7 +488,7 @@ class TypeChecker:
                 )
             elif version and version not in KNOWN_EXTENSIONS[name]:
                 self.result.add_info(
-                    f"extension '{name}' is declared with version {version}; this "
+                    f"extension '{name}' is declared with version '{version}'; this "
                     f"processor implements {', '.join(KNOWN_EXTENSIONS[name])}",
                     sos.loc,
                 )
