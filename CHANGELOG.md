@@ -6,11 +6,45 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.9] — 2026-10-11
+
+`cadl check` now reports the cases in which the reference implementation
+accepted a file silently although the specification (Appendix A, C, D)
+asks for a diagnostic. A file that used a non-ASCII or reserved id, or an
+unquoted `sharing:` entry, was accepted before and is an error now.
+
+### Added
+- `cadl check` reports an actor, contract, or protocol id that is not an
+  ASCII identifier, or that is a reserved word (`AND`, `OR`, `NOT`, `IN`,
+  `in`, `exists`, `true`, `false`), as an error (Appendix A, A.1 and A.11).
+- A `sharing:` entry that is not a quoted string of the form
+  `"SOURCE -> TARGET : item"` is an error; it used to be dropped without
+  a diagnostic. An item with arguments (`"A -> B : report(period: 5s)"`)
+  is still accepted, now with a warning that only the name is kept
+  (Appendix A, A.4).
+- A `codegen:` entry whose target `cadl codegen` cannot emit gets a
+  warning from `cadl check`, `cadl verify`, and `cadl codegen`
+  (Appendix D, D.4).
+- Informational diagnostics (`[INFO]`, never a failure) for an
+  `extensions:` name the implementation does not know, for a version of
+  `sos-dsl` other than `0.1`, and for a `motivation:` block
+  (Appendix C). `cadl verify --format json` lists them under
+  `type_check.infos`.
+- The `motivation:` block is parsed and passed on verbatim by
+  `cadl sim-ir` as `motivation_block` (Appendix C, C.6). The key is
+  present only when the source has the block, so the IR of other files
+  is unchanged.
+
 ### Fixed
 - `examples/test_raspimouse.sh` no longer exits with status 1 after
   generating the configs (the final `ls` quoted its glob).
 
 ### Changed
+- `examples/raspimouse_c_sos.cadl`: the four `sharing:` entries of the
+  delivery-assignment contract no longer carry arguments. The generated
+  IR and simulator configs are byte-identical.
+- README (English and Japanese): the type-check list covers the new
+  checks and diagnostics.
 - README (English and Japanese): links to the specification, hands-on
   course, changelog, contributing guide and issue tracker at the top; the
   `verification` block and the SoS-DSL `lifecycle:` / `monitors:` blocks in
@@ -323,7 +357,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.8...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.9...HEAD
+[0.3.9]: https://github.com/ertlnagoya/cadl/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/ertlnagoya/cadl/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/ertlnagoya/cadl/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/ertlnagoya/cadl/compare/v0.3.5...v0.3.6

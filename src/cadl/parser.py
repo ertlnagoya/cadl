@@ -17,14 +17,15 @@ from lark import Lark, Token, Transformer, v_args
 from .ast_nodes import (
     ActorDef,
     ActorRef,
+    AgentMotivationBlock,
     AlgorithmDef,
     AuthorityBlock,
     AutonomyLevel,
     BarrierStep,
     BinaryOp,
-    Comprehension,
     BoolLiteral,
     CodegenSpec,
+    Comprehension,
     ComputeStep,
     ConditionalStep,
     ContextBlock,
@@ -35,18 +36,20 @@ from .ast_nodes import (
     FallbackBlock,
     FloatLiteral,
     FunctionCall,
+    GovernanceMotivationBlock,
     Identifier,
     IncentiveRule,
     IncentivesBlock,
     InformationBlock,
-    InterfaceDef,
     IntLiteral,
+    InterfaceDef,
     LifecycleSpec,
     LifecycleTransition,
     MemberAccess,
     MessageStep,
     MetricDef,
     MonitorDef,
+    MotivationBlock,
     OnMatchSpec,
     OnViolationSpec,
     ParallelStep,
@@ -336,15 +339,26 @@ def _build_information(data: dict) -> InformationBlock:
     sharing_data = _get(data, 'sharing', [])
     if isinstance(sharing_data, list):
         for item in sharing_data:
+            # A sharing entry is a quoted string "A -> B : item" whose item
+            # is an identifier (Appendix A §A.4). Anything else is kept as
+            # text for the type checker to report.
+            m = None
             if isinstance(item, str):
-                # Parse "A -> B : data" format
-                m = re.match(r'(.+?)\s*->\s*(.+?)\s*:\s*(\w+)', item)
-                if m:
-                    info.sharing.append(SharingDef(
-                        source=_parse_actor_ref_str(m.group(1).strip()),
-                        target=_parse_actor_ref_str(m.group(2).strip()),
-                        data=m.group(3).strip(),
-                    ))
+                m = re.fullmatch(r'\s*(.+?)\s*->\s*(.+?)\s*:\s*([A-Za-z_]\w*)\s*', item)
+                if m is None:
+                    # Lenient form: the item carries arguments or other text
+                    # after its name. Keep the name and let the checker warn.
+                    m = re.match(r'\s*(.+?)\s*->\s*(.+?)\s*:\s*([A-Za-z_]\w*)', item)
+                    if m:
+                        info.lenient_sharing.append(item)
+            if m:
+                info.sharing.append(SharingDef(
+                    source=_parse_actor_ref_str(m.group(1).strip()),
+                    target=_parse_actor_ref_str(m.group(2).strip()),
+                    data=m.group(3).strip(),
+                ))
+            else:
+                info.invalid_sharing.append(_entry_as_text(item))
 
     return info
 
@@ -737,6 +751,56 @@ def _parse_bound(value) -> Optional[int]:
         return None
 
 
+def _entry_as_text(item) -> str:
+    """Render a YAML value roughly as it was written, for diagnostics."""
+    if isinstance(item, dict) and len(item) == 1:
+        (k, v), = item.items()
+        return f"{k}: {v}"
+    return str(item)
+
+
+def _build_extensions(data) -> list:
+    """Read `extensions:` as (name, version) pairs (Appendix A §A.2)."""
+    out = []
+    if isinstance(data, dict):
+        data = [{k: v} for k, v in data.items()]
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    out.append((str(k), "" if v is None else str(v)))
+            elif item is not None:
+                out.append((str(item), ""))
+    return out
+
+
+def _build_motivation(data) -> MotivationBlock | None:
+    """Read the `motivation:` block of Appendix C, keeping it verbatim."""
+    if not isinstance(data, dict):
+        return None
+    block = MotivationBlock(raw=data)
+    agent = _get(data, 'agent')
+    if isinstance(agent, dict):
+        a = AgentMotivationBlock()
+        if _get(agent, 'profile') is not None:
+            a.profile = str(_get(agent, 'profile'))
+        values = _get(agent, 'values')
+        if isinstance(values, list):
+            a.values = [float(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        block.agent = a
+    gov = _get(data, 'governance')
+    if isinstance(gov, dict):
+        g = GovernanceMotivationBlock()
+        if _get(gov, 'model') is not None:
+            g.model = str(_get(gov, 'model'))
+        for key, cast in (('rho', float), ('kappa', float), ('budget_base', int), ('wait_scale', float)):
+            v = _get(gov, key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                setattr(g, key, cast(v))
+        block.governance = g
+    return block
+
+
 def _build_sos(data: dict) -> SoSDefinition:
     """Build a SoSDefinition from the top-level YAML dict."""
     sos_data = _get(data, 'sos')
@@ -868,6 +932,10 @@ def _build_sos(data: dict) -> SoSDefinition:
                     output=_get(cg, 'output'),
                     mappings=_get(cg, 'mappings', {}) or {},
                 ))
+
+    # Extension declarations and the motivation block (Appendices A.2, C)
+    sos.extensions = _build_extensions(_get(sos_data, 'extensions'))
+    sos.motivation = _build_motivation(_get(sos_data, 'motivation'))
 
     return sos
 

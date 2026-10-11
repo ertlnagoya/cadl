@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 from typing import Any
 
 from ..ast_nodes import (
@@ -68,6 +70,11 @@ def lower_to_ir(sos: SoSDefinition) -> SimIR:
             )
             for t in sos.transitions
         ],
+        motivation_block=(
+            copy.deepcopy(sos.motivation.raw)
+            if sos.motivation is not None and sos.motivation.raw is not None
+            else None
+        ),
     )
 
 

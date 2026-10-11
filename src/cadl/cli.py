@@ -172,6 +172,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
     result = type_check(sos)
 
+    for info in result.infos:
+        print(f"  {info}", file=sys.stderr)
     for warning in result.warnings:
         print(f"  {warning}", file=sys.stderr)
     for error in result.errors:
@@ -237,6 +239,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                 "ok": tc_result.ok,
                 "errors": [str(e) for e in tc_result.errors],
                 "warnings": [str(w) for w in tc_result.warnings],
+                "infos": [str(i) for i in tc_result.infos],
             },
             "verification": [
                 {"name": r.check_name, "status": r.status, "message": r.message,
@@ -263,6 +266,8 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     print()
 
     print("--- Type Check ---")
+    for i in tc_result.infos:
+        print(f"  {i}")
     for w in tc_result.warnings:
         print(f"  {w}")
     for e in tc_result.errors:
@@ -314,6 +319,8 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
 
     # Type check
     tc_result = type_check(sos)
+    for w in tc_result.warnings:
+        print(f"  {w}", file=sys.stderr)
     if not tc_result.ok:
         for e in tc_result.errors:
             print(f"  {e}", file=sys.stderr)
@@ -528,6 +535,10 @@ def _ir_to_dict(ir) -> dict:
         gov = c.get("governance", {})
         if "lambda_" in gov:
             gov["lambda"] = gov.pop("lambda_")
+    # The verbatim motivation block is an optional key: present only when
+    # the source has a `motivation:` block.
+    if d.get("motivation_block") is None:
+        d.pop("motivation_block", None)
     return d
 
 

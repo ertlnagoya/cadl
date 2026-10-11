@@ -239,6 +239,7 @@ class SimIR:
         transitions: cross-cutting regime transitions.
         task_arbitration: optional FCFS task arbitration config (→ Unity taskArbitration).
         motivation: optional agent motivation / wandering-goal config (→ Unity motivationConfig).
+        motivation_block: the `motivation:` block of the source, kept verbatim (Appendix C).
     """
     name: str
     sos_type: str = ""
@@ -251,3 +252,6 @@ class SimIR:
     transitions: list[TransitionSpec] = field(default_factory=list)
     task_arbitration: TaskArbitrationSpec | None = None
     motivation: MotivationSpec | None = None
+    # The source's `motivation:` block of Appendix C, verbatim (§C.6).
+    # Absent from the serialized IR when the source has no such block.
+    motivation_block: dict[str, Any] | None = None

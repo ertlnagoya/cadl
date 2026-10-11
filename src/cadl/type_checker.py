@@ -11,6 +11,8 @@ Checks performed (per spec §6.2.2):
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 
 from .ast_nodes import (
@@ -43,6 +45,17 @@ from .ast_nodes import (
 )
 
 
+# Appendix A §A.1: identifier = ( letter | "_" ) , { letter | digit | "_" }
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Appendix A §A.11 and Appendix E §E.3 (the same set as the expression grammar)
+RESERVED_WORDS = frozenset({"AND", "OR", "NOT", "IN", "true", "false", "in", "exists"})
+# Targets `cadl codegen` emits, and the simulator configs of `cadl sim-gen`
+CODEGEN_TARGETS = ("python", "solidity", "opa", "unity-csharp")
+SIM_TARGETS = ("unity", "go")
+# Extensions this processor implements, with the versions it knows
+KNOWN_EXTENSIONS = {"sos-dsl": ("0.1",)}
+
+
 @dataclass
 class TypeError:
     """A type checking error."""
@@ -62,6 +75,8 @@ class TypeCheckResult:
     """Result of type checking."""
     errors: list[TypeError] = field(default_factory=list)
     warnings: list[TypeError] = field(default_factory=list)
+    # Informational diagnostics: they never make a file invalid.
+    infos: list[TypeError] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -72,6 +87,9 @@ class TypeCheckResult:
 
     def add_warning(self, message: str, loc: SourceLocation | None = None) -> None:
         self.warnings.append(TypeError(message=message, loc=loc, severity="warning"))
+
+    def add_info(self, message: str, loc: SourceLocation | None = None) -> None:
+        self.infos.append(TypeError(message=message, loc=loc, severity="info"))
 
 
 class TypeChecker:
@@ -93,13 +111,17 @@ class TypeChecker:
         self._check_transitions(sos)
         self._check_algorithms(sos)
         self._check_metrics(sos)
+        self._check_codegen(sos)
+        self._check_extensions(sos)
         return self.result
 
     def _collect_definitions(self, sos: SoSDefinition) -> None:
         """Collect all defined names for reference checking."""
         for actor in sos.actors:
             self.actor_names.add(actor.id.name)
+            self._check_identifier(actor.id.name, "Actor ID", actor.loc)
         for contract in sos.contracts:
+            self._check_identifier(contract.id, "Contract ID", contract.loc)
             if contract.id in self.contract_ids:
                 self.result.add_error(
                     f"Duplicate contract ID: '{contract.id}'",
@@ -107,6 +129,7 @@ class TypeChecker:
                 )
             self.contract_ids.add(contract.id)
         for protocol in sos.protocols:
+            self._check_identifier(protocol.id, "Protocol ID", protocol.loc)
             if protocol.id in self.protocol_ids:
                 self.result.add_error(
                     f"Duplicate protocol ID: '{protocol.id}'",
@@ -287,6 +310,19 @@ class TypeChecker:
             self._check_actor_ref(sharing.source, f"{context} information sharing")
             self._check_actor_ref(sharing.target, f"{context} information sharing")
 
+        for entry in info.lenient_sharing:
+            self.result.add_warning(
+                f"Sharing entry in {context} has an item that is not an identifier: "
+                f"{entry!r}. Only the item name is kept; the rest is ignored",
+            )
+
+        for entry in info.invalid_sharing:
+            self.result.add_error(
+                f"Invalid sharing entry in {context}: {entry!r}. A sharing entry "
+                f"must be a quoted string of the form \"SOURCE -> TARGET : item\", "
+                f"where item is an identifier",
+            )
+
     def _check_incentives(self, inc: IncentivesBlock, context: str) -> None:
         """Check incentives block constraints."""
         if inc.lambda_ is not None:
@@ -400,6 +436,64 @@ class TypeChecker:
                         f"Metric '{metric.id}' formula is not a valid expression: {metric.formula}",
                         metric.loc,
                     )
+
+
+    def _check_identifier(self, name: str, what: str, loc: SourceLocation | None = None) -> None:
+        """Identifiers are ASCII and are not reserved words (Appendix A §A.1, §A.11)."""
+        if not name:
+            return  # a missing id is reported elsewhere
+        if name in RESERVED_WORDS:
+            self.result.add_error(
+                f"{what} '{name}' is a reserved word and cannot be used as an identifier",
+                loc,
+            )
+        elif not _IDENTIFIER_RE.fullmatch(name):
+            self.result.add_error(
+                f"{what} '{name}' is not a valid identifier: use ASCII letters, "
+                f"digits and '_' only, not starting with a digit",
+                loc,
+            )
+
+    def _check_codegen(self, sos: SoSDefinition) -> None:
+        """A target that cannot be emitted gets a diagnostic (Appendix D §D.4)."""
+        for spec in sos.codegen:
+            target = spec.target
+            if target in CODEGEN_TARGETS:
+                continue
+            if target in SIM_TARGETS:
+                self.result.add_warning(
+                    f"codegen target '{target}' is a simulator config; it is not "
+                    f"emitted by `cadl codegen`, use `cadl sim-gen -t {target}`",
+                    spec.loc,
+                )
+            else:
+                self.result.add_warning(
+                    f"codegen target '{target}' is not supported by this processor "
+                    f"(supported: {', '.join(CODEGEN_TARGETS)})",
+                    spec.loc,
+                )
+
+    def _check_extensions(self, sos: SoSDefinition) -> None:
+        """Informational diagnostics for extensions this processor does not implement."""
+        for name, version in sos.extensions:
+            if name not in KNOWN_EXTENSIONS:
+                self.result.add_info(
+                    f"extension '{name}' is not known to this processor; "
+                    f"its declaration is ignored",
+                    sos.loc,
+                )
+            elif version and version not in KNOWN_EXTENSIONS[name]:
+                self.result.add_info(
+                    f"extension '{name}' is declared with version {version}; this "
+                    f"processor implements {', '.join(KNOWN_EXTENSIONS[name])}",
+                    sos.loc,
+                )
+        if sos.motivation is not None:
+            self.result.add_info(
+                "the motivation: block (Appendix C) is not interpreted by this "
+                "processor; it is kept as written and passed on by `cadl sim-ir`",
+                sos.loc,
+            )
 
 
 def type_check(sos: SoSDefinition) -> TypeCheckResult:

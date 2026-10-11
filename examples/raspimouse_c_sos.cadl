@@ -163,10 +163,10 @@ sos:
           TASK_OWNER: "goal_sequence + active_robot_list + claim_timestamps"
           "ROBOT[*]": "assigned_goal + own_delivery_count"
         sharing:
-          - "ROBOT[*] -> TASK_OWNER : claim_request(id, delay=agentMotivation[i])"
-          - "TASK_OWNER -> ROBOT[winner] : delivery_assignment(goal)"
-          - "ROBOT[winner] -> TASK_OWNER : delivery_complete(id)"
-          - "ROBOT[i] -> TASK_OWNER : retirement_notification(id)"
+          - "ROBOT[*] -> TASK_OWNER : claim_request"
+          - "TASK_OWNER -> ROBOT[winner] : delivery_assignment"
+          - "ROBOT[winner] -> TASK_OWNER : delivery_complete"
+          - "ROBOT[i] -> TASK_OWNER : retirement_notification"
       responsibilities:
         "ROBOT[*]":
           - "wait_motivation_delay(agentMotivation[i])"
