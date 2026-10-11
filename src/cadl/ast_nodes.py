@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Union
+from typing import Any, Union
 
 
 # === Enums ===
@@ -200,6 +200,12 @@ class InformationBlock:
     alpha: float | None = None
     views: list[ViewDef] = field(default_factory=list)
     sharing: list[SharingDef] = field(default_factory=list)
+    # Entries of `sharing:` that are not a quoted "A -> B : item" string
+    # (Appendix A §A.4), kept as text so that `cadl check` can report them.
+    invalid_sharing: list[str] = field(default_factory=list)
+    # Entries accepted leniently although their item is not an identifier
+    # (for example "A -> B : report(period: 5s)"); only the name is kept.
+    lenient_sharing: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -480,6 +486,8 @@ class MotivationBlock:
     """
     agent: AgentMotivationBlock | None = None
     governance: GovernanceMotivationBlock | None = None
+    # The block as written in the source, for verbatim re-emission (§C.6).
+    raw: Any = None
     loc: SourceLocation | None = None
 
 
@@ -500,5 +508,7 @@ class SoSDefinition:
     metrics: list[MetricDef] = field(default_factory=list)
     verifications: list[VerificationSpec] = field(default_factory=list)
     codegen: list[CodegenSpec] = field(default_factory=list)
+    # `extensions:` declarations as (name, version) pairs (Appendix A §A.2).
+    extensions: list[tuple[str, str]] = field(default_factory=list)
     motivation: MotivationBlock | None = None  # Appendix C (v0.1-ext)
     loc: SourceLocation | None = None

@@ -172,6 +172,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
     result = type_check(sos)
 
+    for info in result.infos:
+        print(f"  {info}", file=sys.stderr)
     for warning in result.warnings:
         print(f"  {warning}", file=sys.stderr)
     for error in result.errors:
@@ -237,6 +239,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                 "ok": tc_result.ok,
                 "errors": [str(e) for e in tc_result.errors],
                 "warnings": [str(w) for w in tc_result.warnings],
+                "infos": [str(i) for i in tc_result.infos],
             },
             "verification": [
                 {"name": r.check_name, "status": r.status, "message": r.message,
@@ -263,6 +266,8 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     print()
 
     print("--- Type Check ---")
+    for i in tc_result.infos:
+        print(f"  {i}")
     for w in tc_result.warnings:
         print(f"  {w}")
     for e in tc_result.errors:
@@ -314,6 +319,8 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
 
     # Type check
     tc_result = type_check(sos)
+    for w in tc_result.warnings:
+        print(f"  {w}", file=sys.stderr)
     if not tc_result.ok:
         for e in tc_result.errors:
             print(f"  {e}", file=sys.stderr)
@@ -510,7 +517,10 @@ def _cmd_sim_ir(args: argparse.Namespace) -> int:
 
     if args.format == "json":
         import json
-        print(json.dumps(_ir_to_dict(ir), indent=2, ensure_ascii=False))
+        d = _ir_to_dict(ir)
+        if "motivation_block" in d:
+            d["motivation_block"] = _jsonable(d["motivation_block"])
+        print(json.dumps(d, indent=2, ensure_ascii=False))
     else:
         import yaml
         print(yaml.dump(_ir_to_dict(ir), default_flow_style=False,
@@ -528,7 +538,25 @@ def _ir_to_dict(ir) -> dict:
         gov = c.get("governance", {})
         if "lambda_" in gov:
             gov["lambda"] = gov.pop("lambda_")
+    # The verbatim motivation block is an optional key: present only when
+    # the source has a `motivation:` block.
+    if d.get("motivation_block") is None:
+        d.pop("motivation_block", None)
     return d
+
+
+def _jsonable(value):
+    """Make a YAML value safe for strict JSON (dates, sets, inf, nan → text)."""
+    import math
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, bool) or value is None or isinstance(value, (str, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    return str(value)
 
 
 def _cmd_sim_gen(args: argparse.Namespace) -> int:
