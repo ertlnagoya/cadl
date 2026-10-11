@@ -481,6 +481,7 @@ class MotivationBlock:
     agent: AgentMotivationBlock | None = None
     governance: GovernanceMotivationBlock | None = None
     loc: SourceLocation | None = None
+    raw: dict | None = None            # the block as written (Appendix C §C.6)
 
 
 # === Top-level SoS ===
@@ -502,3 +503,6 @@ class SoSDefinition:
     codegen: list[CodegenSpec] = field(default_factory=list)
     motivation: MotivationBlock | None = None  # Appendix C (v0.1-ext)
     loc: SourceLocation | None = None
+    extensions: dict[str, str] = field(default_factory=dict)  # name -> version (A.2)
+    # Findings of the parser that `cadl check` reports: (severity, message).
+    diagnostics: list[tuple[str, str]] = field(default_factory=list)

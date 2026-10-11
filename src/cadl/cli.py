@@ -172,6 +172,8 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
     result = type_check(sos)
 
+    for info in result.infos:
+        print(f"  {info}", file=sys.stderr)
     for warning in result.warnings:
         print(f"  {warning}", file=sys.stderr)
     for error in result.errors:
@@ -237,6 +239,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                 "ok": tc_result.ok,
                 "errors": [str(e) for e in tc_result.errors],
                 "warnings": [str(w) for w in tc_result.warnings],
+                "infos": [str(i) for i in tc_result.infos],
             },
             "verification": [
                 {"name": r.check_name, "status": r.status, "message": r.message,
@@ -263,6 +266,8 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     print()
 
     print("--- Type Check ---")
+    for i in tc_result.infos:
+        print(f"  {i}")
     for w in tc_result.warnings:
         print(f"  {w}")
     for e in tc_result.errors:
@@ -319,6 +324,11 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
             print(f"  {e}", file=sys.stderr)
         print(f"Type check failed: cannot generate code", file=sys.stderr)
         return 1
+    # A target the file asks for and this processor cannot emit is
+    # reported, not skipped silently (Appendix D, D.4).
+    for w in tc_result.warnings:
+        if "codegen target" in w.message:
+            print(f"  {w}", file=sys.stderr)
 
     # Generate
     target = args.target
