@@ -170,6 +170,9 @@ class ActorDef:
     capabilities: list[str] = field(default_factory=list)
     interface: InterfaceDef | None = None
     loc: SourceLocation | None = None
+    # An `autonomy:` value outside low / medium / high, kept as text so
+    # that `cadl check` can report it; `autonomy` is then the default.
+    invalid_autonomy: str | None = None
 
 
 # === Contract definition ===

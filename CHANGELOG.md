@@ -6,6 +6,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+`cadl check` applies the static semantics of the SoS-DSL extension. Some
+files that 0.3.9 accepted are errors now: a file whose lifecycle or
+monitors break rules L-1, L-2, L-3, L-5 or M-3 of Appendix E, and a file
+with an `autonomy:` other than `low`, `medium`, `high`.
+
+### Added
+- `cadl check` applies Appendix E, E.4. Errors: an initial or terminal
+  state that is not listed in `states` (L-1); a `from` or `to` that is not
+  listed (L-2); no terminal state, or none reachable from the initial state
+  (L-3); an `on_violation.transition` or `on_match.transition` that is not
+  a state (L-5, M-3); a lifecycle state, transition id, monitor id or
+  violation label that is not an ASCII identifier or is a reserved word; a
+  duplicate transition or monitor id; a monitor without a `rule`; an
+  undeclared actor in a message event of `on:`. Warnings: a `deadline:`
+  without `on_violation:` (L-4); an `observe:` entry whose object is not a
+  declared actor (M-1); an `on:`, `when:` or `rule:` that is not a rule of
+  E.3. M-1 is a warning and not an error because the shipped example
+  `sos_dsl_robot_delivery.cadl` observes `OBSTACLES.positions`; `cadl check`
+  prints that warning for it.
+- `cadl.parser.parse_rule` parses a rule, including `x IN [a, b]`.
+
+### Changed
+- An `autonomy:` other than `low`, `medium`, `high` is an error of
+  `cadl check`; it was read as `medium` without a diagnostic (Appendix A,
+  A.3).
+
+### Fixed
+- The `else:` branch of a conditional step was discarded, and the condition
+  of `barrier: <predicate>` was replaced by the name `barrier`. Both are
+  kept now, so actors in an `else:` branch are checked and the simulator IR
+  contains the branch and the condition (Appendix A, A.5). No example uses
+  either form, so the IR of every example is unchanged.
+
 ## [0.3.9] — 2026-10-11
 
 `cadl check` now reports the cases in which the reference implementation
