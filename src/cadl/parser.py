@@ -222,6 +222,20 @@ def parse_expr(text: str) -> Expression:
     return ExprTransformer().transform(tree)
 
 
+_MEMBERSHIP_RE = re.compile(r"\s+IN\s*\[([^\[\]]*)\]")
+
+
+def parse_rule(text: str) -> Expression:
+    """Parse a SoS-DSL ``rule`` (Appendix E §E.3): a predicate that may
+    also use set membership, ``x IN [a, b]``.
+
+    The membership is read as ``x == __in__(a, b)``, so the result serves
+    to check the syntax of a rule; it is not an input for the code
+    generators, which translate the rule text themselves.
+    """
+    return parse_expr(_MEMBERSHIP_RE.sub(r" == __in__(\1)", text))
+
+
 # === YAML-based structural parser ===
 
 def _get(data: dict, key: str, default=None):
@@ -287,10 +301,12 @@ def _build_actor(data: dict) -> ActorDef:
 
     role = str(_get(data, 'role', ''))
     autonomy_str = str(_get(data, 'autonomy', 'medium'))
+    invalid_autonomy = None
     try:
         autonomy = AutonomyLevel(autonomy_str)
     except ValueError:
         autonomy = AutonomyLevel.MEDIUM
+        invalid_autonomy = autonomy_str
 
     capabilities = _get(data, 'capabilities', []) or []
 
@@ -308,6 +324,7 @@ def _build_actor(data: dict) -> ActorDef:
         autonomy=autonomy,
         capabilities=[str(c) for c in capabilities],
         interface=interface,
+        invalid_autonomy=invalid_autonomy,
     )
 
 
@@ -677,7 +694,13 @@ def _build_step(data) -> Optional[Any]:
                 then_steps = []
                 if isinstance(v, list):
                     then_steps = [s for s in (_build_step(item) for item in v) if s is not None]
-                return ConditionalStep(condition=condition, then_steps=then_steps)
+                else_steps = []
+                else_data = data.get('else')
+                if isinstance(else_data, list):
+                    else_steps = [s for s in (_build_step(item) for item in else_data) if s is not None]
+                return ConditionalStep(
+                    condition=condition, then_steps=then_steps, else_steps=else_steps
+                )
 
             if k_str == 'parallel':
                 steps = []
@@ -686,9 +709,11 @@ def _build_step(data) -> Optional[Any]:
                 return ParallelStep(steps=steps)
 
             if k_str.startswith('barrier'):
-                cond_str = k_str.replace('barrier:', '').strip()
-                if not cond_str and isinstance(v, str):
-                    cond_str = v
+                # "barrier: <predicate>"; an unquoted true / false arrives
+                # from YAML as a boolean.
+                cond_str = k_str[len('barrier'):].lstrip(':').strip()
+                if not cond_str and v is not None:
+                    cond_str = str(v).lower() if isinstance(v, bool) else str(v).strip()
                 try:
                     condition = parse_expr(cond_str)
                 except Exception:

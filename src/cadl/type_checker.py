@@ -7,6 +7,7 @@ Checks performed (per spec §6.2.2):
 4. Information sharing declarations name declared actors (comparing
    them with the actual message exchanges is planned, not implemented)
 5. Institutional parameter range constraints (0 <= alpha, beta, lambda <= 1)
+6. SoS-DSL static semantics, rules L-1 to M-3 (Appendix E §E.4)
 """
 
 from __future__ import annotations
@@ -149,11 +150,219 @@ class TypeChecker:
                 )
             seen_names.add(name)
 
+            if actor.invalid_autonomy is not None:
+                self.result.add_error(
+                    f"Unknown autonomy '{actor.invalid_autonomy}' for actor "
+                    f"'{name}'; expected one of low, medium, high",
+                    actor.loc,
+                )
+
             if not actor.role:
                 self.result.add_warning(
                     f"Actor '{name}' has no role defined",
                     actor.loc,
                 )
+
+    # --- SoS-DSL extension (Appendix E, E.4) ---
+
+    _MESSAGE_EVENT_RE = re.compile(r"^(.+?)\s*->\s*(.+?)\s*:\s*(.+)$")
+
+    def _check_rule(self, text: str, where: str, loc) -> None:
+        """A rule that is not a predicate of Appendix A / E.3 is kept as
+        text by the generators; say so instead of passing it silently."""
+        from .parser import parse_rule
+        try:
+            parse_rule(text)
+        except Exception:
+            self.result.add_warning(
+                f"{where} is not a valid rule (Appendix E.3) and is kept as "
+                f"text: {text}",
+                loc,
+            )
+
+    def _check_event(self, text: str, where: str, loc) -> None:
+        """`on:` holds a message event (A -> B : msg) or a rule."""
+        from .parser import _parse_actor_ref_str, parse_expr
+        m = self._MESSAGE_EVENT_RE.match(text.strip())
+        if "->" in text and m:
+            for part, role in ((m.group(1), "sender"), (m.group(2), "receiver")):
+                self._check_actor_ref(
+                    _parse_actor_ref_str(part.strip()), f"{where} ({role})"
+                )
+            try:
+                parse_expr(m.group(3).strip())
+            except Exception:
+                self.result.add_warning(
+                    f"{where} names a message that is not a function call or "
+                    f"an identifier: {m.group(3).strip()}",
+                    loc,
+                )
+        else:
+            self._check_rule(text, where, loc)
+
+    def _check_lifecycle(self, contract: ContractDef, ctx: str) -> None:
+        lc = contract.lifecycle
+        if lc is None:
+            return
+        states = set(lc.states)
+        for state in lc.states:
+            self._check_identifier(state, f"Lifecycle state of {ctx}", lc.loc)
+
+        # L-1: initial and terminal states are declared states.
+        if lc.initial is None:
+            self.result.add_error(f"Lifecycle of {ctx} has no initial state", lc.loc)
+        elif lc.initial not in states:
+            self.result.add_error(
+                f"Lifecycle initial state '{lc.initial}' of {ctx} is not listed "
+                f"in states (L-1)", lc.loc,
+            )
+        for state in lc.terminal:
+            if state not in states:
+                self.result.add_error(
+                    f"Lifecycle terminal state '{state}' of {ctx} is not listed "
+                    f"in states (L-1)", lc.loc,
+                )
+
+        seen_ids: set[str] = set()
+        for tr in lc.transitions:
+            where = f"lifecycle transition '{tr.id}' of {ctx}"
+            self._check_identifier(tr.id, f"Lifecycle transition ID of {ctx}", tr.loc)
+            if tr.id and tr.id in seen_ids:
+                self.result.add_error(f"Duplicate {where}", tr.loc)
+            seen_ids.add(tr.id)
+
+            # L-2: from and to are declared states.
+            if not tr.from_states:
+                self.result.add_error(f"The {where} has no 'from' state (L-2)", tr.loc)
+            for state in tr.from_states:
+                if state not in states:
+                    self.result.add_error(
+                        f"The {where} leaves '{state}', which is not listed in "
+                        f"states (L-2)", tr.loc,
+                    )
+            if tr.to_state not in states:
+                self.result.add_error(
+                    f"The {where} enters '{tr.to_state}', which is not listed in "
+                    f"states (L-2)", tr.loc,
+                )
+
+            # L-4: a deadline should say what happens when it is missed.
+            if tr.deadline_ms is not None and tr.on_violation is None:
+                self.result.add_warning(
+                    f"The {where} has a deadline but no on_violation block (L-4)",
+                    tr.loc,
+                )
+
+            # L-5: on_violation.transition names a declared state.
+            target = tr.on_violation.transition if tr.on_violation else None
+            if target is not None and target not in states:
+                self.result.add_error(
+                    f"on_violation.transition '{target}' of the {where} is not a "
+                    f"state listed in states (L-5); it names the target state, "
+                    f"not a transition id", tr.loc,
+                )
+
+            if tr.on:
+                self._check_event(tr.on, f"'on' of the {where}", tr.loc)
+            if tr.when:
+                self._check_rule(tr.when, f"'when' of the {where}", tr.loc)
+
+        # L-3: a terminal state exists and one can be reached.
+        if not lc.terminal:
+            self.result.add_error(
+                f"Lifecycle of {ctx} lists no terminal state (L-3)", lc.loc
+            )
+        elif lc.initial in states and not (
+            self._reachable_states(contract) & set(lc.terminal)
+        ):
+            self.result.add_error(
+                f"No terminal state of the lifecycle of {ctx} is reachable from "
+                f"the initial state '{lc.initial}' (L-3)", lc.loc,
+            )
+
+    @staticmethod
+    def _reachable_states(contract: ContractDef) -> set[str]:
+        """States an instance can be in: those reached by transitions and
+        deadline violations, and the targets of monitors, which force a
+        move from whatever state the instance is in."""
+        lc = contract.lifecycle
+        edges: dict[str, set[str]] = {}
+        for tr in lc.transitions:
+            targets = {tr.to_state}
+            if tr.on_violation and tr.on_violation.transition:
+                targets.add(tr.on_violation.transition)
+            for state in tr.from_states:
+                edges.setdefault(state, set()).update(targets)
+        forced = {
+            mon.on_match.transition for mon in contract.monitors
+            if mon.on_match and mon.on_match.transition
+        }
+        reached = {lc.initial} | forced
+        frontier = list(reached)
+        while frontier:
+            for nxt in edges.get(frontier.pop(), ()):
+                if nxt not in reached:
+                    reached.add(nxt)
+                    frontier.append(nxt)
+        return reached
+
+    _OBSERVE_RESERVED = ("time", "state")
+
+    def _check_monitors(self, contract: ContractDef, ctx: str) -> None:
+        from .parser import parse_expr
+        states = set(contract.lifecycle.states) if contract.lifecycle else set()
+        seen_ids: set[str] = set()
+        for mon in contract.monitors:
+            where = f"monitor '{mon.id}' of {ctx}"
+            self._check_identifier(mon.id, f"Monitor ID of {ctx}", mon.loc)
+            if mon.id and mon.id in seen_ids:
+                self.result.add_error(f"Duplicate {where}", mon.loc)
+            seen_ids.add(mon.id)
+
+            # M-1: an observation is an attribute of a declared actor, a
+            # message name, or one of the reserved identifiers. A bare
+            # identifier cannot be told from a message name and is accepted.
+            for entry in mon.observe:
+                if entry in self._OBSERVE_RESERVED:
+                    continue
+                try:
+                    expr = parse_expr(entry)
+                except Exception:
+                    expr = None
+                if isinstance(expr, MemberAccess):
+                    if expr.obj.name not in self.actor_names:
+                        self.result.add_warning(
+                            f"The {where} observes '{entry}', but "
+                            f"'{expr.obj.name}' is not a declared actor (M-1)",
+                            mon.loc,
+                        )
+                elif not (isinstance(expr, ActorRef) and expr.index is None):
+                    self.result.add_warning(
+                        f"The {where} observes '{entry}', which is neither an "
+                        f"attribute of an actor nor a name (M-1)",
+                        mon.loc,
+                    )
+
+            if mon.rule:
+                self._check_rule(mon.rule, f"'rule' of the {where}", mon.loc)
+            else:
+                self.result.add_error(f"The {where} has no rule", mon.loc)
+
+            if mon.on_match:
+                # M-2: the label is an identifier; it need not be declared.
+                if mon.on_match.violation:
+                    self._check_identifier(
+                        str(mon.on_match.violation),
+                        f"Violation label of the {where}", mon.loc,
+                    )
+                # M-3: on_match.transition names a state of this contract.
+                target = mon.on_match.transition
+                if target is not None and target not in states:
+                    self.result.add_error(
+                        f"on_match.transition '{target}' of the {where} is not a "
+                        f"state of the lifecycle of this contract (M-3); it names "
+                        f"the target state, not a transition id", mon.loc,
+                    )
 
     def _check_actor_ref(self, ref: ActorRef, context: str) -> None:
         """Check that an actor reference refers to a defined actor."""
@@ -283,6 +492,8 @@ class TypeChecker:
             self._check_incentives(contract.incentives, ctx)
 
         self._check_severities(contract, ctx)
+        self._check_lifecycle(contract, ctx)
+        self._check_monitors(contract, ctx)
 
     def _check_authority(self, auth: AuthorityBlock, context: str) -> None:
         """Check authority block constraints."""
