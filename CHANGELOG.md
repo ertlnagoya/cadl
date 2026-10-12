@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.10] — 2026-10-12
+
 `cadl check` applies the static semantics of the SoS-DSL extension. Some
 files that 0.3.9 accepted are errors now: a file whose lifecycle or
 monitors break rules L-1, L-2, L-3, L-5 or M-3 of Appendix E, and a file
@@ -38,6 +40,8 @@ with an `autonomy:` other than `low`, `medium`, `high`.
   kept now, so actors in an `else:` branch are checked and the simulator IR
   contains the branch and the condition (Appendix A, A.5). No example uses
   either form, so the IR of every example is unchanged.
+- README (English and Japanese): the type-check list covers the SoS-DSL
+  rules and the `autonomy:` check.
 
 ## [0.3.9] — 2026-10-11
 
