@@ -331,13 +331,13 @@ class TypeChecker:
                     expr = None
                 if isinstance(expr, MemberAccess):
                     if expr.obj.name not in self.actor_names:
-                        self.result.add_warning(
+                        self.result.add_error(
                             f"The {where} observes '{entry}', but "
                             f"'{expr.obj.name}' is not a declared actor (M-1)",
                             mon.loc,
                         )
                 elif not (isinstance(expr, ActorRef) and expr.index is None):
-                    self.result.add_warning(
+                    self.result.add_error(
                         f"The {where} observes '{entry}', which is neither an "
                         f"attribute of an actor nor a name (M-1)",
                         mon.loc,

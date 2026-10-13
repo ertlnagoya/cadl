@@ -6,6 +6,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Rule M-1 of Appendix E is an error of `cadl check`; 0.3.10 reported it
+  as a warning. An `observe:` entry whose object is not a declared actor
+  (`OBSTACLES.positions` without an actor `OBSTACLES`), or that is neither
+  an attribute of an actor nor a name, now makes the file invalid.
+- `examples/sos_dsl_robot_delivery.cadl`: the monitor `collision_watch`
+  observes `DISPATCHER.obstacle_positions` (was `OBSTACLES.positions`,
+  which named no declared actor), so the file conforms to M-1 and
+  `cadl check` prints no warning for it. The lifecycle, the monitor ids and
+  the generated C# file names are unchanged.
+
 ## [0.3.10] — 2026-10-12
 
 `cadl check` applies the static semantics of the SoS-DSL extension. Some
