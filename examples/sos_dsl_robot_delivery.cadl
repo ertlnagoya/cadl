@@ -130,9 +130,9 @@ sos:
             transition: Violated
             severity: Major
         - id: collision_watch
-          observe: ["ROBOT[i].position", "OBSTACLES.positions"]
+          observe: ["ROBOT[i].position", "DISPATCHER.obstacle_positions"]
           sampling: periodic(100ms)
-          rule: "min_dist(ROBOT[i].position, OBSTACLES.positions) < 0.05"
+          rule: "min_dist(ROBOT[i].position, DISPATCHER.obstacle_positions) < 0.05"
           on_match:
             violation: collision
             severity: Critical

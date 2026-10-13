@@ -173,10 +173,23 @@ class TestMonitorRules:
             observe: ["R[i].battery", "OBSTACLES.positions", time, state, position_report]
             rule: "R[i].battery < 20"
             """))
-        assert result.ok
-        text = messages(result.warnings)
+        assert not result.ok
+        text = messages(result.errors)
         assert "'OBSTACLES' is not a declared actor (M-1)" in text
         assert text.count("(M-1)") == 1
+
+    def test_m1_observe_is_an_attribute_or_a_name(self):
+        result = check(self.monitor("""
+            observe: ["R[i].battery < 20"]
+            rule: "R[i].battery < 20"
+            """))
+        assert "neither an attribute of an actor nor a name (M-1)" in messages(result.errors)
+
+    def test_bundled_example_has_no_diagnostic(self):
+        from pathlib import Path
+        path = Path(__file__).parent.parent / "examples" / "sos_dsl_robot_delivery.cadl"
+        result = type_check(parse(path.read_text(encoding="utf-8")))
+        assert result.ok and not result.warnings
 
     def test_m3_on_match_names_a_state(self):
         result = check(self.monitor("""
