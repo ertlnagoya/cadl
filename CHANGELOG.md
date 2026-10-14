@@ -438,7 +438,10 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.9...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.12...HEAD
+[0.3.12]: https://github.com/ertlnagoya/cadl/compare/v0.3.11...v0.3.12
+[0.3.11]: https://github.com/ertlnagoya/cadl/compare/v0.3.10...v0.3.11
+[0.3.10]: https://github.com/ertlnagoya/cadl/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/ertlnagoya/cadl/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/ertlnagoya/cadl/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/ertlnagoya/cadl/compare/v0.3.6...v0.3.7
