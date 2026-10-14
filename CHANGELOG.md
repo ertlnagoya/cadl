@@ -6,6 +6,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.13] — 2026-10-15
+
+### Fixed
+- An unquoted `true` or `false` used as a lifecycle state, a `from` / `to`
+  / `initial` state, an `on_violation` or `on_match` transition, a
+  violation label, or a regime name is reported as a reserved word, as it
+  already was for ids. Up to 0.3.12 YAML read it as a boolean, the name
+  became `True` / `False`, and `cadl check` accepted it. The IR keeps it as
+  written (`true`).
+- README (English and Japanese): the type-check list names the lenient
+  forms of `deadline:` and `sampling:` that 0.3.12 accepts.
+- CHANGELOG: the 0.3.9 section lists the `examples/test_raspimouse.sh` fix
+  that was part of that release.
+
 ## [0.3.12] — 2026-10-15
 
 A `deadline:` or `sampling:` value that cannot be read is an error. Such a
@@ -120,6 +134,10 @@ that is unquoted or whose item is not an ASCII identifier.
   is unchanged. No content of the block can make a file invalid; in
   JSON output, values that JSON cannot express (dates, infinities) are
   written as text.
+
+### Fixed
+- `examples/test_raspimouse.sh` exited with status 1 after generating the
+  configs, because its final `ls` quoted the glob.
 
 ### Changed
 - `examples/raspimouse_c_sos.cadl`: the four `sharing:` entries of the
@@ -439,7 +457,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.12...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.13...HEAD
+[0.3.13]: https://github.com/ertlnagoya/cadl/compare/v0.3.12...v0.3.13
 [0.3.12]: https://github.com/ertlnagoya/cadl/compare/v0.3.11...v0.3.12
 [0.3.11]: https://github.com/ertlnagoya/cadl/compare/v0.3.10...v0.3.11
 [0.3.10]: https://github.com/ertlnagoya/cadl/compare/v0.3.9...v0.3.10

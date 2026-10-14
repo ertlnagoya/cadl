@@ -308,3 +308,42 @@ class TestDurationValues:
             sos = parse(source)
             assert type_check(sos).ok
             assert lower_to_ir(sos).institution.contracts[0].lifecycle.transitions[0].deadline_ms == expected
+
+
+# --- Unquoted true / false as names (YAML booleans) ---
+
+class TestBooleanNames:
+    SOURCE = """
+        lifecycle:
+          states: [S0, {state}, Done, Bad]
+          initial: S0
+          terminal: [Done, Bad]
+          transitions:
+            - id: t1
+              from: S0
+              to: Done
+              on: "A -> R[i] : go"
+        monitors:
+          - id: m
+            rule: "x > 1"
+            on_match:
+              violation: {label}
+              transition: Bad
+        """
+
+    def test_unquoted_true_state_is_a_reserved_word(self):
+        result = check(contract(self.SOURCE.format(state="true", label="late")))
+        assert "Lifecycle state of contract 'C' 'true' is a reserved word" in messages(result.errors)
+
+    def test_unquoted_false_violation_label_is_a_reserved_word(self):
+        result = check(contract(self.SOURCE.format(state="Mid", label="false")))
+        assert "'false' is a reserved word" in messages(result.errors)
+
+    def test_boolean_state_is_kept_as_written_in_the_ir(self):
+        sos = parse("sos:\n  name: T\n" + textwrap.indent(textwrap.dedent(
+            contract(self.SOURCE.format(state="true", label="late"))), "  "))
+        assert "true" in lower_to_ir(sos).institution.contracts[0].lifecycle.states
+
+    def test_plain_names_still_pass(self):
+        result = check(contract(self.SOURCE.format(state="Mid", label="late")))
+        assert result.ok, messages(result.errors)

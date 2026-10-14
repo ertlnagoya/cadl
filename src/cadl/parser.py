@@ -517,22 +517,30 @@ def _as_str_list(value) -> list[str]:
     """Coerce a YAML scalar / list to a list of stripped strings."""
     if value is None:
         return []
+    # YAML reads an unquoted true / false as a boolean; keep it as written.
     if isinstance(value, list):
-        return [str(v).strip() for v in value]
-    return [str(value).strip()]
+        return [_id_str(v).strip() for v in value]
+    return [_id_str(value).strip()]
+
+
+def _opt_name(value) -> str | None:
+    """An optional name (state, label) as written, or None when absent."""
+    if value is None or value == '':
+        return None
+    return _id_str(value)
 
 
 def _build_on_violation(data: dict) -> OnViolationSpec:
     return OnViolationSpec(
-        transition=(_get(data, 'transition') or None),
+        transition=_opt_name(_get(data, 'transition')),
         severity=str(_get(data, 'severity', 'Major')),
     )
 
 
 def _build_on_match(data: dict) -> OnMatchSpec:
     return OnMatchSpec(
-        violation=(_get(data, 'violation') or None),
-        transition=(_get(data, 'transition') or None),
+        violation=_opt_name(_get(data, 'violation')),
+        transition=_opt_name(_get(data, 'transition')),
         severity=str(_get(data, 'severity', 'Major')),
     )
 
@@ -569,7 +577,7 @@ def _build_lifecycle_transition(data: dict) -> LifecycleTransition:
     return LifecycleTransition(
         id=_id_str(_get(data, 'id', '')),
         from_states=from_states,
-        to_state=str(_get(data, 'to', '')),
+        to_state=_id_str(_get(data, 'to', '')),
         on=str(_yaml_on_key(data, '')),
         when=(_get(data, 'when') or None),
         deadline_ms=deadline_ms,
@@ -587,7 +595,7 @@ def _build_lifecycle(data: dict) -> LifecycleSpec:
     """Build a LifecycleSpec from a YAML mapping."""
     spec = LifecycleSpec(
         states=_as_str_list(_get(data, 'states', [])),
-        initial=(_get(data, 'initial') or None),
+        initial=_opt_name(_get(data, 'initial')),
         terminal=_as_str_list(_get(data, 'terminal', [])),
     )
     trans_data = _get(data, 'transitions')
@@ -962,8 +970,8 @@ def _build_sos(data: dict) -> SoSDefinition:
         for t in trans_data:
             if isinstance(t, dict):
                 sos.transitions.append(TransitionDef(
-                    from_regime=str(_get(t, 'from', '')),
-                    to_regime=str(_get(t, 'to', '')),
+                    from_regime=_id_str(_get(t, 'from', '')),
+                    to_regime=_id_str(_get(t, 'to', '')),
                     condition=_get(t, 'condition'),
                     protocol=_get(t, 'protocol'),
                     safety_invariant=_get(t, 'safety_invariant'),
