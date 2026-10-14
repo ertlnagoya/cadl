@@ -237,3 +237,56 @@ class TestMonitorRules:
         text = messages(result.errors)
         assert "'IN' is a reserved word" in text
         assert "'battery-guard' is not a valid identifier" in text
+
+
+# --- Duration values (E.3): a value that cannot be read is an error ---
+
+class TestDurationValues:
+    @pytest.mark.parametrize("value", ["5s", "500ms", "2min", "1h", "0s", "10"])
+    def test_readable_deadline_is_accepted(self, value):
+        result = check(contract(transition_keys(
+            f"deadline: {value}\non_violation: {{transition: Failed}}\n")))
+        assert result.ok, messages(result.errors)
+
+    @pytest.mark.parametrize("value, shown", [
+        ("soon", "soon"), ("5sec", "5sec"), ("1.5s", "1.5s"),
+        ("-5s", "-5s"), ("-5", "-5"), ("yes", "true"),
+    ])
+    def test_unreadable_deadline_is_an_error(self, value, shown):
+        result = check(contract(transition_keys(
+            f"deadline: {value}\non_violation: {{transition: Failed}}\n")))
+        assert f"has deadline '{shown}', which is not a duration" in messages(result.errors)
+
+    def test_unreadable_deadline_is_not_also_an_l4_warning(self):
+        result = check(contract(transition_keys("deadline: soon\n")))
+        assert "not a duration" in messages(result.errors)
+        assert "(L-4)" not in messages(result.warnings)
+
+    def test_ir_of_a_valid_deadline_is_unchanged(self):
+        source = "sos:\n  name: T\n" + textwrap.indent(textwrap.dedent(contract(transition_keys(
+            "deadline: 5s\non_violation: {transition: Failed}\n"))), "  ")
+        transition = lower_to_ir(parse(source)).institution.contracts[0].lifecycle.transitions[0]
+        assert transition.deadline_ms == 5000
+
+    def _monitor(self, sampling: str):
+        return check(contract(
+            LIFECYCLE,
+            "monitors:\n  - id: m\n    rule: \"x > 1\"\n"
+            f"    sampling: {sampling}\n",
+        ))
+
+    @pytest.mark.parametrize("value", [
+        "event", "periodic(500ms)", '"periodic(2s)"', "{kind: periodic, period_ms: 500}",
+        "{kind: event}",
+    ])
+    def test_readable_sampling_is_accepted(self, value):
+        result = self._monitor(value)
+        assert "sampling" not in messages(result.errors), messages(result.errors)
+
+    @pytest.mark.parametrize("value", [
+        "periodic(soon)", '"every 500ms"', "sometimes",
+        "{kind: periodic, period_ms: fast}", "{kind: sometimes}",
+    ])
+    def test_unreadable_sampling_is_an_error(self, value):
+        result = self._monitor(value)
+        assert "which is neither 'event' nor 'periodic(<duration>)'" in messages(result.errors)

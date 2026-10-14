@@ -257,6 +257,9 @@ class LifecycleTransition:
     on: str                            # event expression (raw string)
     when: str | None = None            # optional guard predicate (raw)
     deadline_ms: int | None = None     # normalized from "5s" -> 5000
+    # A `deadline:` that is not a duration ("soon"), kept as written so that
+    # `cadl check` can report it; deadline_ms is then None.
+    invalid_deadline: str | None = None
     on_violation: OnViolationSpec | None = None
     emit: list[str] = field(default_factory=list)
     loc: SourceLocation | None = None
@@ -277,6 +280,9 @@ class SamplingSpec:
     """How a monitor samples its observations."""
     kind: str = "event"                # "event" | "periodic"
     period_ms: int | None = None       # only for periodic
+    # A `sampling:` that is neither `event` nor `periodic(<duration>)`, kept
+    # as written so that `cadl check` can report it; kind is then "event".
+    invalid: str | None = None
 
 
 @dataclass

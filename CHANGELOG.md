@@ -6,6 +6,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.12] — 2026-10-15
+
+A `deadline:` or `sampling:` value that cannot be read is an error. Such a
+file passed `cadl check` before, and the value was lost: the deadline
+became `null` in the IR, and the monitor was sampled on events.
+
+### Fixed
+- `cadl check` reports a `deadline:` that is not a duration as an error
+  (Appendix E, E.3: an integer followed by `ms`, `s`, `min`, or `h`), for
+  example `deadline: soon`, `5sec`, `1.5s`, a negative value, or `yes`.
+  Up to 0.3.11 the file passed and the IR had `"deadline_ms": null`. A plain
+  number is still read as seconds (a lenient form).
+- `cadl check` reports a `sampling:` that is neither `event` nor
+  `periodic(<duration>)` as an error, for example `periodic(soon)` or
+  `every 500ms`; the mapping form `{kind: periodic, period_ms: <int>}` is
+  still accepted. Up to 0.3.11 such a monitor was read as event-driven
+  without a diagnostic.
+- README (English and Japanese): the type-check list includes both checks.
+
 ## [0.3.11] — 2026-10-13
 
 Rule M-1 of the SoS-DSL extension is an error. A file with an `observe:`

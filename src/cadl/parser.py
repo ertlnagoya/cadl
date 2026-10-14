@@ -560,13 +560,25 @@ def _build_lifecycle_transition(data: dict) -> LifecycleTransition:
         else None
     )
     emit = _as_str_list(_get(data, 'emit', []))
+    raw_deadline = _get(data, 'deadline')
+    # YAML reads `deadline: yes` as a boolean; it is not a duration. A
+    # negative number of seconds is not one either.
+    deadline_ms = None if isinstance(raw_deadline, bool) else _duration_to_ms(raw_deadline)
+    if deadline_ms is not None and deadline_ms < 0:
+        deadline_ms = None
     return LifecycleTransition(
         id=_id_str(_get(data, 'id', '')),
         from_states=from_states,
         to_state=str(_get(data, 'to', '')),
         on=str(_yaml_on_key(data, '')),
         when=(_get(data, 'when') or None),
-        deadline_ms=_duration_to_ms(_get(data, 'deadline')),
+        deadline_ms=deadline_ms,
+        invalid_deadline=(
+            (str(raw_deadline).lower() if isinstance(raw_deadline, bool)
+             else _entry_as_text(raw_deadline))
+            if raw_deadline is not None and deadline_ms is None
+            else None
+        ),
         on_violation=on_viol,
         emit=emit,
     )
@@ -605,7 +617,9 @@ def _build_sampling(value) -> SamplingSpec:
         period = _get(value, 'period_ms')
         if kind == 'periodic' and isinstance(period, int) and not isinstance(period, bool):
             return SamplingSpec(kind='periodic', period_ms=period)
-        return SamplingSpec(kind='event')
+        if kind == 'event' and period is None:
+            return SamplingSpec(kind='event')
+        return SamplingSpec(kind='event', invalid=_entry_as_text(value))
     s = str(value).strip()
     if s == 'event':
         return SamplingSpec(kind='event')
@@ -615,8 +629,8 @@ def _build_sampling(value) -> SamplingSpec:
         unit = m.group(2)
         period_ms = _duration_to_ms(f"{period}{unit}")
         return SamplingSpec(kind='periodic', period_ms=period_ms)
-    # Unknown form -> treat as event-driven, preserve raw on rule via sampling.kind
-    return SamplingSpec(kind='event')
+    # Unknown form: read as event-driven and keep the text for `cadl check`.
+    return SamplingSpec(kind='event', invalid=s)
 
 
 def _build_monitor(data: dict) -> MonitorDef:
