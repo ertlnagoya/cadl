@@ -560,13 +560,24 @@ def _build_lifecycle_transition(data: dict) -> LifecycleTransition:
         else None
     )
     emit = _as_str_list(_get(data, 'emit', []))
+    raw_deadline = _get(data, 'deadline')
+    # YAML reads `deadline: yes` as a boolean; it is not a duration. A
+    # negative number of seconds is not one either.
+    deadline_ms = None if isinstance(raw_deadline, bool) else _duration_to_ms(raw_deadline)
+    if deadline_ms is not None and deadline_ms < 0:
+        deadline_ms = None
     return LifecycleTransition(
         id=_id_str(_get(data, 'id', '')),
         from_states=from_states,
         to_state=str(_get(data, 'to', '')),
         on=str(_yaml_on_key(data, '')),
         when=(_get(data, 'when') or None),
-        deadline_ms=_duration_to_ms(_get(data, 'deadline')),
+        deadline_ms=deadline_ms,
+        invalid_deadline=(
+            _value_as_text(raw_deadline)
+            if raw_deadline is not None and deadline_ms is None
+            else None
+        ),
         on_violation=on_viol,
         emit=emit,
     )
@@ -599,13 +610,17 @@ def _build_sampling(value) -> SamplingSpec:
     if value is None:
         return SamplingSpec(kind='event')
     if isinstance(value, dict):
-        # Mapping form: {kind: ..., period_ms: ...}. As with the string
-        # form, anything unrecognised is read as event-driven.
+        # Mapping form (lenient, Appendix A §A.12): {kind: periodic,
+        # period_ms: <non-negative integer>} or {kind: event}. Anything else
+        # is read as event-driven and kept as text for `cadl check`.
         kind = str(_get(value, 'kind', 'event'))
         period = _get(value, 'period_ms')
-        if kind == 'periodic' and isinstance(period, int) and not isinstance(period, bool):
+        if (kind == 'periodic' and isinstance(period, int)
+                and not isinstance(period, bool) and period >= 0):
             return SamplingSpec(kind='periodic', period_ms=period)
-        return SamplingSpec(kind='event')
+        if kind == 'event' and period is None:
+            return SamplingSpec(kind='event')
+        return SamplingSpec(kind='event', invalid=_value_as_text(value))
     s = str(value).strip()
     if s == 'event':
         return SamplingSpec(kind='event')
@@ -615,8 +630,8 @@ def _build_sampling(value) -> SamplingSpec:
         unit = m.group(2)
         period_ms = _duration_to_ms(f"{period}{unit}")
         return SamplingSpec(kind='periodic', period_ms=period_ms)
-    # Unknown form -> treat as event-driven, preserve raw on rule via sampling.kind
-    return SamplingSpec(kind='event')
+    # Unknown form: read as event-driven and keep the text for `cadl check`.
+    return SamplingSpec(kind='event', invalid=_value_as_text(value))
 
 
 def _build_monitor(data: dict) -> MonitorDef:
@@ -781,6 +796,17 @@ def _id_str(value) -> str:
     """An id as written. YAML reads an unquoted true / false as a boolean."""
     if isinstance(value, bool):
         return str(value).lower()
+    return str(value)
+
+
+def _value_as_text(value) -> str:
+    """A YAML value rendered roughly as the user wrote it, for diagnostics."""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, (dict, list)):
+        text = yaml.safe_dump(value, default_flow_style=True, sort_keys=False,
+                              allow_unicode=True, width=1000).strip()
+        return text[:-4].strip() if text.endswith("\n...") else text
     return str(value)
 
 

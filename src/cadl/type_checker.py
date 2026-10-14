@@ -246,6 +246,16 @@ class TypeChecker:
                     f"states (L-2)", tr.loc,
                 )
 
+            # E.3: a deadline is a duration literal (an integer with ms, s,
+            # min or h). One that cannot be read would be lost from the IR.
+            if tr.invalid_deadline is not None:
+                self.result.add_error(
+                    f"The {where} has deadline '{tr.invalid_deadline}', which is "
+                    f"not a duration: write an integer followed by ms, s, min or h "
+                    f"(for example 5s)",
+                    tr.loc,
+                )
+
             # L-4: a deadline should say what happens when it is missed.
             if tr.deadline_ms is not None and tr.on_violation is None:
                 self.result.add_warning(
@@ -318,6 +328,16 @@ class TypeChecker:
             if mon.id and mon.id in seen_ids:
                 self.result.add_error(f"Duplicate {where}", mon.loc)
             seen_ids.add(mon.id)
+
+            # E.3: sampling is `event` or `periodic(<duration>)`.
+            if mon.sampling is not None and mon.sampling.invalid is not None:
+                self.result.add_error(
+                    f"The {where} has sampling '{mon.sampling.invalid}', which is "
+                    f"neither 'event' nor 'periodic(<duration>)' (for example "
+                    f"periodic(500ms)); the mapping form needs "
+                    f"{{kind: periodic, period_ms: <non-negative integer>}}",
+                    mon.loc,
+                )
 
             # M-1: an observation is an attribute of a declared actor, a
             # message name, or one of the reserved identifiers. A bare
