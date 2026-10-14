@@ -334,7 +334,8 @@ class TypeChecker:
                 self.result.add_error(
                     f"The {where} has sampling '{mon.sampling.invalid}', which is "
                     f"neither 'event' nor 'periodic(<duration>)' (for example "
-                    f"periodic(500ms))",
+                    f"periodic(500ms)); the mapping form needs "
+                    f"{{kind: periodic, period_ms: <non-negative integer>}}",
                     mon.loc,
                 )
 

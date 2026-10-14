@@ -574,8 +574,7 @@ def _build_lifecycle_transition(data: dict) -> LifecycleTransition:
         when=(_get(data, 'when') or None),
         deadline_ms=deadline_ms,
         invalid_deadline=(
-            (str(raw_deadline).lower() if isinstance(raw_deadline, bool)
-             else _entry_as_text(raw_deadline))
+            _value_as_text(raw_deadline)
             if raw_deadline is not None and deadline_ms is None
             else None
         ),
@@ -611,15 +610,17 @@ def _build_sampling(value) -> SamplingSpec:
     if value is None:
         return SamplingSpec(kind='event')
     if isinstance(value, dict):
-        # Mapping form: {kind: ..., period_ms: ...}. As with the string
-        # form, anything unrecognised is read as event-driven.
+        # Mapping form (lenient, Appendix A §A.12): {kind: periodic,
+        # period_ms: <non-negative integer>} or {kind: event}. Anything else
+        # is read as event-driven and kept as text for `cadl check`.
         kind = str(_get(value, 'kind', 'event'))
         period = _get(value, 'period_ms')
-        if kind == 'periodic' and isinstance(period, int) and not isinstance(period, bool):
+        if (kind == 'periodic' and isinstance(period, int)
+                and not isinstance(period, bool) and period >= 0):
             return SamplingSpec(kind='periodic', period_ms=period)
         if kind == 'event' and period is None:
             return SamplingSpec(kind='event')
-        return SamplingSpec(kind='event', invalid=_entry_as_text(value))
+        return SamplingSpec(kind='event', invalid=_value_as_text(value))
     s = str(value).strip()
     if s == 'event':
         return SamplingSpec(kind='event')
@@ -630,7 +631,7 @@ def _build_sampling(value) -> SamplingSpec:
         period_ms = _duration_to_ms(f"{period}{unit}")
         return SamplingSpec(kind='periodic', period_ms=period_ms)
     # Unknown form: read as event-driven and keep the text for `cadl check`.
-    return SamplingSpec(kind='event', invalid=s)
+    return SamplingSpec(kind='event', invalid=_value_as_text(value))
 
 
 def _build_monitor(data: dict) -> MonitorDef:
@@ -795,6 +796,17 @@ def _id_str(value) -> str:
     """An id as written. YAML reads an unquoted true / false as a boolean."""
     if isinstance(value, bool):
         return str(value).lower()
+    return str(value)
+
+
+def _value_as_text(value) -> str:
+    """A YAML value rendered roughly as the user wrote it, for diagnostics."""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, (dict, list)):
+        text = yaml.safe_dump(value, default_flow_style=True, sort_keys=False,
+                              allow_unicode=True, width=1000).strip()
+        return text[:-4].strip() if text.endswith("\n...") else text
     return str(value)
 
 

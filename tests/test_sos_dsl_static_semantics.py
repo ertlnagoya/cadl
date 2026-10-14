@@ -290,3 +290,21 @@ class TestDurationValues:
     def test_unreadable_sampling_is_an_error(self, value):
         result = self._monitor(value)
         assert "which is neither 'event' nor 'periodic(<duration>)'" in messages(result.errors)
+
+    @pytest.mark.parametrize("value, shown", [
+        ("{kind: periodic, period_ms: -5}", "{kind: periodic, period_ms: -5}"),
+        ("{kind: event, period_ms: 5}", "{kind: event, period_ms: 5}"),
+        ("[5s]", "[5s]"),
+        ("yes", "true"),
+    ])
+    def test_unreadable_sampling_is_shown_as_written(self, value, shown):
+        result = self._monitor(value)
+        assert f"has sampling '{shown}'" in messages(result.errors), messages(result.errors)
+
+    def test_float_seconds_and_missing_deadline_are_unchanged(self):
+        for keys, expected in (("deadline: 2.5\n", 2500), ("deadline:\n", None)):
+            source = "sos:\n  name: T\n" + textwrap.indent(textwrap.dedent(contract(transition_keys(
+                keys + "on_violation: {transition: Failed}\n"))), "  ")
+            sos = parse(source)
+            assert type_check(sos).ok
+            assert lower_to_ir(sos).institution.contracts[0].lifecycle.transitions[0].deadline_ms == expected
