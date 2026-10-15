@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.14] — 2026-10-15
+
 ### Fixed
 - Unity C# runtime: `ContractRuntime.PostEvent` takes an optional
   `instanceId` and, when it is given, delivers the event to that instance
@@ -466,7 +468,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.13...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.14...HEAD
+[0.3.14]: https://github.com/ertlnagoya/cadl/compare/v0.3.13...v0.3.14
 [0.3.13]: https://github.com/ertlnagoya/cadl/compare/v0.3.12...v0.3.13
 [0.3.12]: https://github.com/ertlnagoya/cadl/compare/v0.3.11...v0.3.12
 [0.3.11]: https://github.com/ertlnagoya/cadl/compare/v0.3.10...v0.3.11
