@@ -6,6 +6,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Unity C# runtime: `ContractRuntime.PostEvent` takes an optional
+  `instanceId` and, when it is given, delivers the event to that instance
+  only, as `post_event(instance_id=...)` does in the Python reference
+  runtime. Before, every event went to every open instance, so a host that
+  drives one contract instance per robot (such as the simulator's
+  `PilotContractBridge`) advanced all robots' contracts on one robot's
+  event. Calls without `instanceId` behave as before.
+
 ## [0.3.13] — 2026-10-15
 
 ### Fixed
