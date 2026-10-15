@@ -437,9 +437,22 @@ namespace {ns} {{
             foreach (var kv in snapshot) _world[kv.Key] = kv.Value;
         }}
 
+        /// <summary>
+        /// Post an event. With <paramref name="instanceId"/> null the event
+        /// goes to every open instance; otherwise only to that instance.
+        /// This is the rule of post_event(instance_id=...) in the Python
+        /// reference runtime: a host that drives one instance per robot
+        /// must name the instance, or one robot's event advances them all.
+        /// </summary>
         public void PostEvent(string name, long tMs,
-                              IDictionary<string, object> payload = null) {{
+                              IDictionary<string, object> payload = null,
+                              string instanceId = null) {{
             var ev = new PortEvent {{ Name = name, TMs = tMs, Payload = AsRO(payload) }};
+            if (instanceId != null) {{
+                if (_instances.TryGetValue(instanceId, out var target) && !target.Closed)
+                    target.HandleEvent(ev, this);
+                return;
+            }}
             foreach (var inst in _instances.Values) {{
                 if (inst.Closed) continue;
                 inst.HandleEvent(ev, this);

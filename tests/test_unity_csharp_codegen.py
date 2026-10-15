@@ -215,3 +215,22 @@ sos:
         # Runtime files still emit, but no per-contract files.
         assert (target / "Runtime" / "ContractRuntime.cs").is_file()
         assert not list((target / "Generated").glob("*.cs"))
+
+
+class TestTargetedPost:
+    """PostEvent can address one instance, like post_event(instance_id=...)
+    in the Python reference runtime. Without it, a host that drives one
+    instance per robot advances every robot's contract on one robot's event."""
+
+    def test_post_event_takes_an_instance_id(self, out_dir):
+        src = (out_dir / "Runtime" / "ContractRuntime.cs").read_text(encoding="utf-8")
+        assert "string instanceId = null)" in src
+
+    def test_targeted_post_reaches_only_that_instance(self, out_dir):
+        src = (out_dir / "Runtime" / "ContractRuntime.cs").read_text(encoding="utf-8")
+        body = src[src.index("public void PostEvent"):src.index("public void Tick")]
+        assert "_instances.TryGetValue(instanceId, out var target)" in body
+        targeted = body.index("if (instanceId != null)")
+        broadcast = body.index("foreach (var inst in _instances.Values)")
+        assert targeted < broadcast
+        assert "return;" in body[targeted:broadcast]
