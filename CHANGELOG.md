@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.15] — 2026-10-17
+
 ### Changed
 - README (English and Japanese) and `scripts/sos_dsl_handson_e2e.sh`: the
   hands-on links point to the textbook (`/docs/textbook/`) of the
@@ -474,7 +476,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.14...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.15...HEAD
+[0.3.15]: https://github.com/ertlnagoya/cadl/compare/v0.3.14...v0.3.15
 [0.3.14]: https://github.com/ertlnagoya/cadl/compare/v0.3.13...v0.3.14
 [0.3.13]: https://github.com/ertlnagoya/cadl/compare/v0.3.12...v0.3.13
 [0.3.12]: https://github.com/ertlnagoya/cadl/compare/v0.3.11...v0.3.12
