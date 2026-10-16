@@ -6,6 +6,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- README (English and Japanese) and `scripts/sos_dsl_handson_e2e.sh`: the
+  hands-on links point to the textbook (`/docs/textbook/`) of the
+  specification site, which replaced the Course A pages
+  `handson/main-textbook` and `handson/exercises`.
+
 ## [0.3.14] — 2026-10-15
 
 ### Fixed

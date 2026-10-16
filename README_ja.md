@@ -238,7 +238,7 @@ SoS-DSL拡張（`lifecycle:` / `monitors:`）を使う契約からC#を生成：
 - 契約ごとの `Generated/<Contract>State.cs`、`<Contract>Contract.cs`、`<Contract>Monitors.cs`
 - `Runtime/` のサポートクラス（契約ランタイム、イベントバス、述語評価器）
 
-[ハンズオン教材](https://www.ertl.jp/cadl-spec/ja/docs/handson/main-textbook)で、このターゲットを一通り実行できます。
+[テキストブックの第 7 章](https://www.ertl.jp/cadl-spec/ja/docs/textbook/codegen-runtime/)で、このターゲットを一通り実行できます。
 
 ### 運用モード遷移の分析
 
@@ -371,18 +371,18 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 
 ## ハンズオン
 
-ロボット配送 System of Systems を題材に、**CADL モデリング → SoS-DSL 契約（lifecycle + monitors） → 可視化 → コード生成 → ライブシミュレーション** までを一気通貫で体験する 約 95 分の自習ワークショップ（5 回の演習コースとしても利用可）が用意されています。
+ロボット配送 System of Systems を題材に、**CADL モデリング → SoS-DSL 契約（lifecycle + monitors） → 可視化 → コード生成 → ライブシミュレーション** までを一気通貫で体験する、単独で読めるテキストブックが用意されています。自習なら約 95 分で進められ、5 回の授業としても使えます。
 
 教材内容：
 
-- **メイン教材** — 15 分 × 6 ステップ、英日バイリンガル、エンドツーエンド実行スクリプト（`scripts/sos_dsl_handson_e2e.sh`）付き。
-- **演習問題集** — 5 回構成の授業課題セット（縮小 3 回版あり）、★／★★／★★★ の段階的難易度とルーブリック。
+- **テキストブック（コース A）** — 英日バイリンガルの全 11 章と付録 4 つ。SoS の背景と CADL の要点から始め、エンドツーエンド実行スクリプト（`scripts/sos_dsl_handson_e2e.sh`）を使う 15 分 × 6 の手順に進む。第 4〜9 章の終わりに、5 回の授業向けの ★／★★／★★★ の演習（縮小 3 回版とルーブリックは付録 C）。
+- **そのほかのコース** — コース B（SUMO による都市モビリティ）、コース D（規則を自分たちで直す街）、コース C（自分の SoS）。
 - **学術背景** — Maier の 5 条件、**ISO/IEC/IEEE 21839 / 21840 / 21841** 規格、関連研究領域（ADL、規範的 MAS、実行時検証）、注釈付き参考文献。
 
 | 想定読者 | 入口 |
 | --- | --- |
-| 自習で素早く全体像を掴みたい方 | [Course A — ロボット配送（メイン教材）](https://www.ertl.jp/cadl-spec/ja/docs/handson/main-textbook) (JA) / [EN](https://www.ertl.jp/cadl-spec/docs/handson/main-textbook) |
-| 授業で学ぶ学生 | [Course A — 演習問題集](https://www.ertl.jp/cadl-spec/ja/docs/handson/exercises) (JA) / [EN](https://www.ertl.jp/cadl-spec/docs/handson/exercises) |
+| 自習で素早く全体像を掴みたい方 | [テキストブック — コース A：ロボット配送](https://www.ertl.jp/cadl-spec/ja/docs/textbook/) (JA) / [EN](https://www.ertl.jp/cadl-spec/docs/textbook/) |
+| 授業で学ぶ学生 | [テキストブック 付録 C — 授業での使い方](https://www.ertl.jp/cadl-spec/ja/docs/textbook/appendix-c-teaching/) (JA) / [EN](https://www.ertl.jp/cadl-spec/docs/textbook/appendix-c-teaching/) |
 | 引用したい研究者 | [Why SoS-DSL?（学術背景）](https://www.ertl.jp/cadl-spec/ja/docs/handson/academic-background) (JA) / [EN](https://www.ertl.jp/cadl-spec/docs/handson/academic-background) |
 
 教材本体は [cadl-spec リポジトリ](https://github.com/ertlnagoya/cadl-spec) にあり（英語ソースは `docs/handson/`、日本語ソースは `i18n/ja/docusaurus-plugin-content-docs/current/handson/`）、[仕様サイトの Hands-on セクション](https://www.ertl.jp/cadl-spec/ja/docs/handson/) でレンダリングされます。
