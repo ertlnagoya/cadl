@@ -239,7 +239,7 @@ Generates C# for contracts that use the SoS-DSL extension (`lifecycle:` / `monit
 - `Generated/<Contract>State.cs`, `<Contract>Contract.cs`, `<Contract>Monitors.cs` per contract
 - `Runtime/` support classes (contract runtime, event bus, predicate evaluator)
 
-The [hands-on textbook](https://www.ertl.jp/cadl-spec/docs/handson/main-textbook) runs this target end to end.
+[Chapter 7 of the textbook](https://www.ertl.jp/cadl-spec/docs/textbook/codegen-runtime/) runs this target end to end.
 
 ### Regime Transitions
 
@@ -372,18 +372,18 @@ It also reports, without failing the check, a `codegen:` target that `cadl codeg
 
 ## Hands-on
 
-A self-paced workshop of about 95 minutes (or a 5-session exercise course) walks you through the complete CADL toolchain end-to-end on a robot delivery System of Systems: **CADL modelling → SoS-DSL contracts (lifecycle + monitors) → visualisation → code generation → live simulation**.
+A self-contained textbook, followed in about 95 minutes on your own or as a 5-session class, walks you through the complete CADL toolchain end-to-end on a robot delivery System of Systems: **CADL modelling → SoS-DSL contracts (lifecycle + monitors) → visualisation → code generation → live simulation**.
 
 The hands-on materials include:
 
-- **Main textbook** — six 15-minute steps, with full bilingual EN / JA pages and a runnable end-to-end script (`scripts/sos_dsl_handson_e2e.sh`).
-- **Exercises booklet** — a 5-session structured course (compact 3-session version available) with graded ★ / ★★ / ★★★ tasks and a rubric.
+- **Textbook (Course A)** — eleven chapters and four appendices in English and Japanese: the SoS background and the essentials of CADL, then six 15-minute procedures using a runnable end-to-end script (`scripts/sos_dsl_handson_e2e.sh`). Chapters 4–9 end with graded ★ / ★★ / ★★★ exercises for a 5-session class (a compact 3-session plan and a rubric are in Appendix C).
+- **Further courses** — Course B (urban mobility with SUMO), Course D (a town that amends its own rules) and Course C (your own SoS).
 - **Academic background** — Maier's five SoS criteria, the **ISO/IEC/IEEE 21839 / 21840 / 21841** standards, related research (ADLs, Normative MAS, Runtime Verification), and an annotated bibliography.
 
 | Audience | Entry point |
 | --- | --- |
-| Self-learner — quick tour | [Course A — Robot Delivery (main textbook)](https://www.ertl.jp/cadl-spec/docs/handson/main-textbook) (EN) / [JA](https://www.ertl.jp/cadl-spec/ja/docs/handson/main-textbook) |
-| Student in a class | [Course A — Exercises](https://www.ertl.jp/cadl-spec/docs/handson/exercises) (EN) / [JA](https://www.ertl.jp/cadl-spec/ja/docs/handson/exercises) |
+| Self-learner — quick tour | [Textbook — Course A: Robot Delivery](https://www.ertl.jp/cadl-spec/docs/textbook/) (EN) / [JA](https://www.ertl.jp/cadl-spec/ja/docs/textbook/) |
+| Student in a class | [Textbook, Appendix C — Using this textbook in a class](https://www.ertl.jp/cadl-spec/docs/textbook/appendix-c-teaching/) (EN) / [JA](https://www.ertl.jp/cadl-spec/ja/docs/textbook/appendix-c-teaching/) |
 | Researcher needing citations | [Why SoS-DSL? (academic background)](https://www.ertl.jp/cadl-spec/docs/handson/academic-background) (EN) / [JA](https://www.ertl.jp/cadl-spec/ja/docs/handson/academic-background) |
 
 The materials are hosted in the [cadl-spec repository](https://github.com/ertlnagoya/cadl-spec) — English sources under `docs/handson/`, Japanese under `i18n/ja/docusaurus-plugin-content-docs/current/handson/` — and rendered on the [Hands-on section of the spec website](https://www.ertl.jp/cadl-spec/docs/handson/).
