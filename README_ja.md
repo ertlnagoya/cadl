@@ -348,7 +348,8 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 1. ユーザが自然言語（日本語・英語対応）でSoSを記述
 2. Claudeがfew-shot例を参考にCADL定義を生成
 3. 生成されたCADLをパース・型検査
-4. バリデーションエラー時はエラーフィードバック付きでリトライ
+4. `--verify` を指定すると、`cadl verify` と同じSMT検証とデッドロック検出も行い、失敗した検査をバリデーションエラーとして扱う
+5. バリデーションエラー時はエラーフィードバック付きでリトライ
 
 `ANTHROPIC_API_KEY`環境変数の設定と `pip install "cadl-lang[ai]"` が必要です。
 
