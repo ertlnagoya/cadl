@@ -323,6 +323,95 @@ sos:
         client.generate_with_history.assert_not_called()
 
 
+VERIFY_CADL = """sos:
+  name: VerifyCheck
+  type: Directed
+  actors:
+    - id: A
+      type: system
+    - id: B
+      type: system
+  contracts:
+    - id: C1
+      parties: [A, B]
+      assume:
+        - "x > 10"
+      guarantee:
+        - "x < {bound}"
+  protocols:
+    - id: P1
+      trigger: "start"
+      steps:
+        - "A -> B : msg"
+{fallback1}
+    - id: P2
+      trigger: "start"
+      steps:
+        - "A -> B : msg"
+{fallback2}
+"""
+
+
+def _verify_cadl(bound="20", circular=False):
+    fallback1 = fallback2 = ""
+    if circular:
+        fallback1 = '      fallback:\n        on_failure: "switch_to_protocol(P2)"'
+        fallback2 = '      fallback:\n        on_failure: "switch_to_protocol(P1)"'
+    return VERIFY_CADL.format(bound=bound, fallback1=fallback1, fallback2=fallback2)
+
+
+class TestGenerateCadlVerify:
+    """verify=True runs the same checks as `cadl verify`."""
+
+    def _make_mock_client(self, response: str) -> ClaudeClient:
+        client = ClaudeClient()
+        client.generate = MagicMock(return_value=response)
+        client.generate_with_history = MagicMock(return_value=response)
+        return client
+
+    def test_consistent_definition_passes(self):
+        client = self._make_mock_client(_verify_cadl())
+        result = generate_cadl("test", client=client, verify=True)
+        assert result.errors == []
+        assert result.sos is not None
+        client.generate_with_history.assert_not_called()
+
+    def test_mock_response_passes(self):
+        client = self._make_mock_client(MOCK_CADL_RESPONSE)
+        result = generate_cadl("test", client=client, verify=True)
+        assert result.errors == []
+
+    def test_contradictory_contract_is_reported(self):
+        client = self._make_mock_client(_verify_cadl(bound="5"))
+        result = generate_cadl("test", client=client, verify=True, max_retries=0)
+        assert len(result.errors) == 1
+        assert result.errors[0].startswith("Verification: Contract 'C1' consistency")
+
+    def test_fallback_cycle_is_reported(self):
+        client = self._make_mock_client(_verify_cadl(circular=True))
+        result = generate_cadl("test", client=client, verify=True, max_retries=0)
+        assert len(result.errors) == 1
+        assert result.errors[0].startswith("Deadlock: Fallback chain cycle")
+
+    def test_checks_skipped_without_verify(self):
+        client = self._make_mock_client(_verify_cadl(bound="5", circular=True))
+        result = generate_cadl("test", client=client, max_retries=0)
+        assert result.errors == []
+
+    @pytest.mark.parametrize("name", [
+        "a_sos_robot_delivery", "c_sos_taxi_fleet", "household_chores",
+        "iot_data_sharing", "raspimouse_c_sos", "raspimouse_d_sos",
+        "raspimouse_mcp_sos", "robot_delivery", "smart_city_traffic",
+        "sos_dsl_robot_delivery", "supply_chain",
+    ])
+    def test_examples_pass(self, name):
+        from pathlib import Path
+        path = Path(__file__).resolve().parent.parent / "examples" / f"{name}.cadl"
+        client = self._make_mock_client(path.read_text(encoding="utf-8"))
+        result = generate_cadl("test", client=client, verify=True)
+        assert result.errors == []
+
+
 # ---------------------------------------------------------------------------
 # NlToCadlResult tests
 # ---------------------------------------------------------------------------

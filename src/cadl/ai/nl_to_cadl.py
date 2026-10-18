@@ -119,23 +119,22 @@ def _validate_cadl(cadl_source: str, *, verify: bool = False) -> NlToCadlResult:
     except Exception as e:
         errors.append(f"Type check error: {e}")
 
-    # Optional verification
+    # Optional verification. As in `cadl verify`, only a "failed" result
+    # is an error; "unknown", "warning", "info" and "not_supported" are not.
     if verify and not errors:
         try:
             from ..verifier import verify as smt_verify
-            vresult = smt_verify(sos)
-            if not vresult.consistent:
-                for issue in vresult.issues:
-                    errors.append(f"Verification: {issue}")
+            for r in smt_verify(sos):
+                if r.status == "failed":
+                    errors.append(f"Verification: {r.check_name}: {r.message}")
         except Exception as e:
             errors.append(f"Verification error: {e}")
 
         try:
-            from ..deadlock import check_deadlocks
-            deadlocks = check_deadlocks(sos)
-            if deadlocks:
-                for dl in deadlocks:
-                    errors.append(f"Deadlock: {dl}")
+            from ..deadlock import detect_deadlocks
+            for r in detect_deadlocks(sos):
+                if r.status == "failed":
+                    errors.append(f"Deadlock: {r.check_name}: {r.message}")
         except Exception as e:
             errors.append(f"Deadlock check error: {e}")
 
