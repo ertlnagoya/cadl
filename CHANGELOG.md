@@ -6,6 +6,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.16] — 2026-10-18
+
+### Fixed
+- `cadl ai --verify` (`generate_cadl(..., verify=True)`) reported a
+  failure for every generated definition: it read a `consistent` attribute
+  that the list returned by `verify()` does not have, and imported
+  `check_deadlocks`, which does not exist (the function is
+  `detect_deadlocks`). It now runs the same SMT and deadlock checks as
+  `cadl verify` and reports only the checks whose status is `failed`, so a
+  definition that `cadl verify` passes is accepted without a retry.
+
 ## [0.3.15] — 2026-10-17
 
 ### Changed
@@ -476,7 +487,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.15...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.16...HEAD
+[0.3.16]: https://github.com/ertlnagoya/cadl/compare/v0.3.15...v0.3.16
 [0.3.15]: https://github.com/ertlnagoya/cadl/compare/v0.3.14...v0.3.15
 [0.3.14]: https://github.com/ertlnagoya/cadl/compare/v0.3.13...v0.3.14
 [0.3.13]: https://github.com/ertlnagoya/cadl/compare/v0.3.12...v0.3.13
