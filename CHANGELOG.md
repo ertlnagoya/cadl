@@ -6,6 +6,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- README (English and Japanese): the `cadl ai` steps describe `--verify`.
+
 ## [0.3.16] — 2026-10-18
 
 ### Fixed

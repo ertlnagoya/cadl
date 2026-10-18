@@ -349,7 +349,8 @@ cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimous
 1. User provides an NL description (Japanese or English)
 2. Claude generates a CADL definition using few-shot examples
 3. The generated CADL is parsed and type-checked
-4. On validation errors, the system retries with error feedback
+4. With `--verify`, it also goes through the SMT and deadlock checks of `cadl verify`; a check that fails counts as a validation error
+5. On validation errors, the system retries with error feedback
 
 Requires `ANTHROPIC_API_KEY` environment variable and `pip install "cadl-lang[ai]"`.
 
