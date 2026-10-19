@@ -43,9 +43,12 @@ sos:
         views:
           DISPATCHER: "global_map + all_robot_positions"
           "ROBOT[*]": "assigned_route + local_sensors"
+          "CUSTOMER[*]": "own_delivery_status"
         sharing:
           - "ROBOT[*] -> DISPATCHER : position"
           - "DISPATCHER -> ROBOT[*] : route"
+          - "CUSTOMER[*] -> DISPATCHER : delivery_request"
+          - "DISPATCHER -> CUSTOMER[*] : status_update"
       responsibilities:
         DISPATCHER:
           - "compute_conflict_free_routes(all_robots)"

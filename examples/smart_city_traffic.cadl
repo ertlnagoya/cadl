@@ -22,7 +22,7 @@ sos:
         - detect_congestion
       interface:
         input: [traffic_data, incident_report]
-        output: [signal_plan, alert]
+        output: [signal_plan, alert, priority_ack]
 
     - id: "INTERSECTION[1..N]"
       role: "signal_node"
@@ -40,6 +40,9 @@ sos:
       capabilities:
         - request_priority
         - report_incident
+      interface:
+        input: [priority_ack]
+        output: [incident_report]
 
   contracts:
     - id: TRAFFIC_FLOW
@@ -97,6 +100,7 @@ sos:
       trigger: "emergency_request_from(EMERGENCY_SERVICE)"
       steps:
         - "EMERGENCY_SERVICE -> CONTROLLER : incident_report"
+        - "CONTROLLER -> EMERGENCY_SERVICE : priority_ack"
         - "CONTROLLER : optimize_signal_timing"
         - "CONTROLLER -> INTERSECTION[*] : signal_plan"
       timing:
