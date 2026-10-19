@@ -73,7 +73,7 @@ sos:
         - "GATEWAY.has_valid_certificate == true"
       guarantee:
         - "data_anonymized == true"
-        - "retention_period <= 30d"
+        - "retention_period <= 720h"           # 30 days
       authority:
         decision_scope: "data_retention"
         decision_holder: CLOUD

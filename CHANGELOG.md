@@ -17,6 +17,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `occupied(edge(src, dst))`). CADL Explorer reported 13 of them as "not a
   valid expression". `cadl verify` results are unchanged (13/13, 8/8,
   12/12); `cadl sim-gen` output differs only in these strings.
+- `examples/iot_data_sharing.cadl`: `retention_period <= 30d` is written
+  `<= 720h`, since durations have the units `ms`, `s`, `min` and `h`; the
+  item was kept as text and excluded from verification.
 
 ## [0.3.17] — 2026-10-19
 
