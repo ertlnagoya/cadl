@@ -4,7 +4,9 @@
 # contracts: section by the SoS-DSL extension. The structural part is
 # kept minimal so the file focuses on the per-instance contract
 # execution model rather than on A-SoS / authority / information
-# concerns.
+# concerns. One protocol names the messages of an order end to end, so
+# that every message has a sender and a receiver whose interfaces
+# declare it.
 
 sos:
   name: "RobotDeliverySoS_DSLDemo"
@@ -30,8 +32,8 @@ sos:
         - reassign_tasks
         - monitor_fleet
       interface:
-        input:  [position_report, task_completion, failure_report]
-        output: [route_assignment, task_assignment, replan_command]
+        input:  [delivery_request, position_report, ack, task_completion, failure_report]
+        output: [route_assignment, task_assignment, replan_command, delivery_notification]
 
     - id: "ROBOT[1..N]"
       role: "delivery_agent"
@@ -42,7 +44,7 @@ sos:
         - deliver
       interface:
         input:  [route_assignment, replan_command]
-        output: [position_report, task_completion, failure_report]
+        output: [position_report, ack, task_completion, failure_report]
 
     - id: "CUSTOMER[1..M]"
       role: "service_requester"
@@ -143,6 +145,17 @@ sos:
           on_match:
             transition: Violated
             severity: Critical
+
+  # === Protocol: one order from request to notification ===
+  protocols:
+    - id: DeliveryOrder
+      trigger: "new_delivery_request(CUSTOMER[j])"
+      steps:
+        - "CUSTOMER[j] -> DISPATCHER : delivery_request"
+        - "DISPATCHER -> ROBOT[i] : route_assignment"
+        - "ROBOT[i] -> DISPATCHER : ack"
+        - "ROBOT[i] -> DISPATCHER : task_completion"
+        - "DISPATCHER -> CUSTOMER[j] : delivery_notification"
 
   metrics:
     - id: makespan

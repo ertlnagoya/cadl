@@ -7,6 +7,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- `examples/sos_dsl_robot_delivery.cadl`: every message the example sends is
+  declared by the interfaces of its sender and receiver. `ack`, the event of
+  the `accept` transition, is added to the outputs of ROBOT and the inputs of
+  DISPATCHER, and a protocol `DeliveryOrder` names the messages of one order
+  (`delivery_request`, `route_assignment`, `ack`, `task_completion`,
+  `delivery_notification`), so that CUSTOMER sends and receives them too.
+  The lifecycle and monitors are unchanged, and so is the generated Unity C#.
+  CADL Explorer 0.5.5 / 0.5.6 reported the missing `ack` and a CUSTOMER that
+  exchanged no message.
+
+### Changed
 - README (English and Japanese): the `cadl ai` steps describe `--verify`.
 
 ## [0.3.16] — 2026-10-18
