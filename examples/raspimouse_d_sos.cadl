@@ -94,7 +94,7 @@ sos:
 
   protocols:
     - id: EDGE_REQUEST
-      trigger: "ROBOT[i] enters intersection node"
+      trigger: "entered_intersection(ROBOT[i])"
       precondition: "ROBOT[i].at_intersection == true"
       steps:
         - "ROBOT[i] -> ARBITRATOR : next_request(id, src, dst, goal)"
@@ -108,14 +108,14 @@ sos:
       postcondition: "ROBOT[i].moving_to_next_node"
 
     - id: EDGE_RELEASE
-      trigger: "ROBOT[i] leaves edge"
+      trigger: "left_edge(ROBOT[i])"
       steps:
         - "ROBOT[i] -> ARBITRATOR : ret_request(id, src, dst)"
         - "ARBITRATOR : release_edge_flags(src, dst)"
-      postcondition: "edge(src, dst).occupied == false"
+      postcondition: "occupied(edge(src, dst)) == false"
 
     - id: COLLISION_RECOVERY
-      trigger: "ROBOT[i].distance_sensor < 0.1m for > maxT"
+      trigger: "held_for(ROBOT[i].distance_sensor < 0.1) > maxT"   # distance in metres
       steps:
         - "ROBOT[i] : execute_back_handler()"
         - "ROBOT[i] -> ARBITRATOR : next_request(id, src, dst, goal, re=true)"

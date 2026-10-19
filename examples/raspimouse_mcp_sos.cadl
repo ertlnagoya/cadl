@@ -144,7 +144,7 @@ sos:
 
   protocols:
     - id: AUTONOMOUS_MOVE
-      trigger: "ROBOT[i] enters intersection node"
+      trigger: "entered_intersection(ROBOT[i])"
       precondition: "ROBOT[i].status == Moving"
       steps:
         - "ROBOT[i] : check_goal_reached()"
@@ -172,7 +172,7 @@ sos:
       postcondition: "ROBOT[i].status != Collision"
 
     - id: DEADLOCK_RESOLUTION
-      trigger: "multiple ROBOT[*].status == Collision for > 10s"
+      trigger: "held_for(count(ROBOT[*].status == Collision) >= 2) > 10s"
       precondition: "count(ROBOT[*].status == Collision) >= 2"
       steps:
         - "LLM_AGENT : query_world_state(get_all)"
