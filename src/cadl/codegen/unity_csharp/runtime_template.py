@@ -137,7 +137,7 @@ namespace {ns} {{
 
     /// <summary>
     /// Minimal CADL predicate evaluator, kept deliberately small to
-    /// match the v0.1 SoS-DSL examples. Supports: numeric literals,
+    /// match the v0.1 SoS-DSL examples. Supports: signed numeric literals,
     /// double-quoted strings, bare identifiers (enum-like literals
     /// when unresolved), dotted member access, list literals
     /// ([a, b, c]), the comparison operators &lt;, &lt;=, &gt;, &gt;=,
@@ -173,7 +173,7 @@ namespace {ns} {{
 
         private static readonly Regex _tokenRe = new Regex(
             @"\\s*(?:" +
-            @"(?<NUM>\\d+(?:\\.\\d+)?)" +
+            @"(?<NUM>(?:(?<![\\w)\\]""]\\s*)-)?\\d+(?:\\.\\d+)?)" +  // no sign right after an operand
             @"|(?<STR>""[^""]*"")" +
             @"|(?<OP><=|>=|==|!=|<|>)" +
             @"|(?<KW>AND|OR|NOT|IN|in)" +

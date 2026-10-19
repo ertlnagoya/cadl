@@ -6,6 +6,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Expressions accept a unary minus (`permit_state == -2`, `x > -0.5`,
+  `-a * b`), as Appendix A, A.10 of the specification now allows. It binds
+  tighter than `*` and `/`. A negative number is read as a literal; any
+  other operand `x` is read as `0 - x`, so the verifier and the Python,
+  Solidity, OPA and Unity C# generators handle it without change. Up to
+  0.3.17 such an item was kept as text: excluded from verification, and
+  reported as a warning when it was a lifecycle `on:` / `when:` or a
+  monitor `rule:`.
+- The predicate evaluator of the generated Unity C# runtime
+  (`PredicateEvaluator.cs`) reads a minus sign in front of a number. A
+  minus right after an operand (`x -1`) is a subtraction, which the
+  evaluator does not support; such an expression is false, as before.
+  The generated files keep their line counts.
+
 ## [0.3.17] — 2026-10-19
 
 ### Changed

@@ -181,6 +181,31 @@ class TestRuntimeFiles:
         for op in ('"<="', '">="', '"=="', '"!="', '"AND"', '"OR"', '"NOT"', '"IN"'):
             assert op in text or op.replace('"', '') in text, op
 
+    def test_predicate_evaluator_reads_negative_numbers(self, out_dir, tmp_path):
+        # Compiled with Mono when it is installed; the CI runners skip it.
+        import shutil
+        import subprocess
+        if not (shutil.which("mcs") and shutil.which("mono")):
+            pytest.skip("Mono (mcs, mono) is not installed")
+        main = tmp_path / "Main.cs"
+        main.write_text("""
+using System; using System.Collections.Generic; using CADL.SosDsl;
+class M { static void Main() {
+  var w = new Dictionary<string, object>{{"p", -2L}, {"x", 3.0}};
+  foreach (var e in new[]{"p == -2", "p < -1", "x > -0.5", "p IN [-2, 1]",
+                          "p == 2", "x -1", "x-1 > 0"})
+    Console.WriteLine(PredicateEvaluator.Evaluate(e, w));
+}}
+""")
+        exe = tmp_path / "m.exe"
+        subprocess.run(["mcs", "-nologo", f"-out:{exe}", str(main),
+                        str(out_dir / "Runtime" / "PredicateEvaluator.cs")], check=True)
+        out = subprocess.run(["mono", str(exe)], check=True, capture_output=True,
+                             text=True).stdout.split()
+        # A minus right after an operand is a subtraction, which the
+        # evaluator does not support: the expression is false, as before.
+        assert out == ["True", "True", "True", "True", "False", "False", "False"]
+
 
 # ---------------------------------------------------------------------------
 # generate() top-level dispatch
