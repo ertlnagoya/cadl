@@ -4,8 +4,8 @@ title: "CADL: Contract Architecture Description Language"
 type: software
 authors:
   - name: "ERTL, Graduate School of Informatics, Nagoya University"
-version: 0.3.17
-date-released: 2026-10-19
+version: 0.3.18
+date-released: 2026-10-20
 license: Apache-2.0
 repository-code: "https://github.com/ertlnagoya/cadl"
 url: "https://www.ertl.jp/cadl-spec/"
