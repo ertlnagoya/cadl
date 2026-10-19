@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.17] — 2026-10-19
+
 ### Changed
 - `examples/sos_dsl_robot_delivery.cadl`: every message the example sends is
   declared by the interfaces of its sender and receiver. `ack`, the event of
@@ -516,7 +518,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.16...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.17...HEAD
+[0.3.17]: https://github.com/ertlnagoya/cadl/compare/v0.3.16...v0.3.17
 [0.3.16]: https://github.com/ertlnagoya/cadl/compare/v0.3.15...v0.3.16
 [0.3.15]: https://github.com/ertlnagoya/cadl/compare/v0.3.14...v0.3.15
 [0.3.14]: https://github.com/ertlnagoya/cadl/compare/v0.3.13...v0.3.14
