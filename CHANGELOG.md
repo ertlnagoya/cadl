@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.18] — 2026-10-20
+
 ### Added
 - Expressions accept a unary minus (`permit_state == -2`, `x > -0.5`,
   `-a * b`), as Appendix A, A.10 of the specification now allows. It binds
@@ -548,7 +550,8 @@ Initial draft of the CADL compiler (not tagged).
 - CLI entry point `cadl`.
 - Example CADL files under `examples/` and a pytest suite.
 
-[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.17...HEAD
+[Unreleased]: https://github.com/ertlnagoya/cadl/compare/v0.3.18...HEAD
+[0.3.18]: https://github.com/ertlnagoya/cadl/compare/v0.3.17...v0.3.18
 [0.3.17]: https://github.com/ertlnagoya/cadl/compare/v0.3.16...v0.3.17
 [0.3.16]: https://github.com/ertlnagoya/cadl/compare/v0.3.15...v0.3.16
 [0.3.15]: https://github.com/ertlnagoya/cadl/compare/v0.3.14...v0.3.15
