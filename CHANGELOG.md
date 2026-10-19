@@ -21,6 +21,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   evaluator does not support; such an expression is false, as before.
   The generated files keep their line counts.
 
+### Changed
+- `examples/raspimouse_c_sos.cadl`, `raspimouse_d_sos.cadl` and
+  `raspimouse_mcp_sos.cadl`: triggers, conditions and an assumption that
+  were written as prose are written as expressions of Appendix A, A.10 of
+  the specification, so that tools read them instead of keeping them as
+  text (for example `ROBOT[i] enters intersection node` →
+  `entered_intersection(ROBOT[i])`, `goal_sequence.has_next()` →
+  `has_next(goal_sequence)`, `edge(src, dst).occupied` →
+  `occupied(edge(src, dst))`). CADL Explorer reported 13 of them as "not a
+  valid expression". `cadl verify` results are unchanged (13/13, 8/8,
+  12/12); `cadl sim-gen` output differs only in these strings.
+- `examples/iot_data_sharing.cadl`: `retention_period <= 30d` is written
+  `<= 720h`, since durations have the units `ms`, `s`, `min` and `h`; the
+  item was kept as text and excluded from verification.
+
 ## [0.3.17] — 2026-10-19
 
 ### Changed
