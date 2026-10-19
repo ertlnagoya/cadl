@@ -38,8 +38,8 @@ sos:
         - navigate_to_destination
         - broadcast_road_status
       interface:
-        input: [ride_request, road_status_update, incident_alert]
-        output: [road_status_update, ride_offer, position_update]
+        input: [ride_request, ride_acceptance, road_status_update, conflict_notification, traffic_summary, incident_alert]
+        output: [road_status_update, ride_offer, position_update, conflict_notification, incident_report]
 
     - id: "PASSENGER[1..M]"
       role: "ride_requester"
@@ -49,7 +49,7 @@ sos:
         - rate_service
       interface:
         input: [ride_offer, eta_update]
-        output: [ride_request, rating]
+        output: [ride_request, ride_acceptance, rating]
 
     - id: TRAFFIC_CENTER
       role: "information_aggregator"

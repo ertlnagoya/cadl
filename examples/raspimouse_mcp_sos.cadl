@@ -59,8 +59,8 @@ sos:
         - yield_and_wait
         - accept_external_path
       interface:
-        input: [set_path_command, yield_command, resume_command]
-        output: [agent_status_update, collision_event]
+        input: [set_path_command, yield_command, resume_command, occupy_result]
+        output: [agent_status_update, collision_event, occupy_request, release_request, availability_query]
 
     - id: OCCUPANCY_MANAGER
       role: "resource_tracker"

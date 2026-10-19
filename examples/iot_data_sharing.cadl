@@ -29,8 +29,8 @@ sos:
         - aggregate_data
         - filter_anomalies
       interface:
-        input: [sensor_reading]
-        output: [aggregated_data]
+        input: [sensor_reading, recommended_action]
+        output: [aggregated_data, anomaly_report]
 
     - id: CLOUD
       role: "analytics_platform"

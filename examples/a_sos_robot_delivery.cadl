@@ -35,8 +35,8 @@ sos:
         - assign_tasks
         - monitor_fleet
       interface:
-        input: [position_report, task_completion, failure_report]
-        output: [route_assignment, task_assignment, replan_command]
+        input: [delivery_request, position_report, task_completion, failure_report]
+        output: [route_assignment, task_assignment, replan_command, delivery_notification]
 
     - id: "ROBOT[1..N]"
       role: "delivery_agent"

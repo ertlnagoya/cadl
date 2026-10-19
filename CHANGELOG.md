@@ -16,6 +16,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   The lifecycle and monitors are unchanged, and so is the generated Unity C#.
   CADL Explorer 0.5.5 / 0.5.6 reported the missing `ack` and a CUSTOMER that
   exchanged no message.
+- `examples/a_sos_robot_delivery.cadl`, `c_sos_taxi_fleet.cadl`,
+  `iot_data_sharing.cadl` and `raspimouse_mcp_sos.cadl`: the interfaces
+  declare every message the protocols and information sharing send
+  (DISPATCHER's `delivery_request` / `delivery_notification`; TAXI's and
+  PASSENGER's `ride_acceptance`, TAXI's `conflict_notification`,
+  `incident_report` and `traffic_summary`; GATEWAY's `recommended_action` /
+  `anomaly_report`; ROBOT's `occupy_request`, `release_request`,
+  `availability_query` and `occupy_result`). Only interface lists change.
 
 ### Changed
 - README (English and Japanese): the `cadl ai` steps describe `--verify`.
