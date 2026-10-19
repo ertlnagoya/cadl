@@ -439,6 +439,11 @@ class TestNumericEncoding:
     def test_same_call_is_same_symbol(self):
         assert not self._sat("count(late) > 3", "count(late) < 2")
 
+    def test_negative_numbers(self):
+        assert self._sat("permit_state == -2")
+        assert not self._sat("permit_state == -2", "permit_state >= 0")
+        assert not self._sat("x > -1", "-x > 1")
+
     def test_distinct_strings_differ(self):
         assert not self._sat('mode == "auto"', 'mode == "manual"')
 

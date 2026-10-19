@@ -5,7 +5,8 @@
 start: predicate_expr
 
 // === Predicates ===
-// Precedence, loosest to tightest: OR, AND, NOT, comparison, + -, * /
+// Precedence, loosest to tightest: OR, AND, NOT, comparison, + -, * /,
+// unary minus
 // A quantifier may stand wherever a comparison may (after AND / OR / NOT)
 // and scopes over everything to its right, so it is always the last
 // operand of the chain it appears in. The "_open" rules are the forms
@@ -42,6 +43,7 @@ QUANTIFIER: /(?:for\s+all|exists)(?![A-Za-z0-9_])/
 ?term: factor (MUL_OP factor)+          -> term_expr
      | factor
 ?factor: "(" predicate_expr ")"         -> grouped
+       | "-" factor                     -> neg
        | function_call
        | member_access
        | atom

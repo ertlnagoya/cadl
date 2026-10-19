@@ -31,6 +31,9 @@ from cadl.unparse import expr_to_source
     "sum(r.load for r in ROBOT[*]) / count(ROBOT[*])",
     "for all r in ROBOT[*]: r.status != Collision",
     "x > 30s AND NOT (for all r in ROBOT[*]: r.status != Collision)",
+    "permit_state == -2",
+    "a - -2",
+    "2 * -3.5",
 ])
 def test_round_trip(text):
     assert expr_to_source(parse_expr(text)) == text

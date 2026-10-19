@@ -58,6 +58,35 @@ class TestArithmetic:
         )
 
 
+class TestUnaryMinus:
+
+    def test_negative_integer_is_a_literal(self):
+        assert parse_expr("permit_state == -2") == BinaryOp(
+            "==", _name("permit_state"), IntLiteral(-2)
+        )
+
+    def test_negative_float_is_a_literal(self):
+        assert parse_expr("-0.5") == FloatLiteral(-0.5)
+
+    def test_binary_minus_is_unchanged(self):
+        assert parse_expr("a-2") == BinaryOp("-", _name("a"), IntLiteral(2))
+        assert parse_expr("a - -2") == BinaryOp("-", _name("a"), IntLiteral(-2))
+
+    def test_other_operand_is_read_as_zero_minus(self):
+        assert parse_expr("-ROBOT[i].x") == BinaryOp(
+            "-", IntLiteral(0),
+            MemberAccess(ActorRef("ROBOT", _name("i")), "x"),
+        )
+
+    def test_binds_tighter_than_multiplication(self):
+        assert parse_expr("-a * b") == BinaryOp(
+            "*", BinaryOp("-", IntLiteral(0), _name("a")), _name("b")
+        )
+
+    def test_inside_a_call(self):
+        assert parse_expr("f(-1, 2)") == FunctionCall("f", [IntLiteral(-1), IntLiteral(2)])
+
+
 class TestLogic:
 
     def test_and(self):

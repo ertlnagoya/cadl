@@ -193,6 +193,16 @@ class ExprTransformer(Transformer):
     def grouped(self, items):
         return items[0]
 
+    def neg(self, items):
+        # A negative number is a literal; any other operand x is read as
+        # 0 - x, so that every consumer of BinaryOp handles it unchanged.
+        operand = items[0]
+        if isinstance(operand, IntLiteral):
+            return IntLiteral(value=-operand.value)
+        if isinstance(operand, FloatLiteral):
+            return FloatLiteral(value=-operand.value)
+        return BinaryOp(op="-", left=IntLiteral(value=0), right=operand)
+
     def quantified_expr(self, items):
         quantifier = "for_all" if "all" in str(items[0]) else "exists"
         var = str(items[1])
