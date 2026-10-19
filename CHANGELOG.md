@@ -25,6 +25,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `anomaly_report`; ROBOT's `occupy_request`, `release_request`,
   `availability_query` and `occupy_result`). Only interface lists change.
 - README (English and Japanese): the `cadl ai` steps describe `--verify`.
+- `examples/robot_delivery.cadl`: CUSTOMER takes part in the information
+  sharing of `DELIVERY_SLA` (`CUSTOMER[*] -> DISPATCHER : delivery_request`,
+  `DISPATCHER -> CUSTOMER[*] : status_update`, as in Section 7.2 of the
+  specification) and has a view. `examples/smart_city_traffic.cadl`: the
+  CONTROLLER answers an emergency request with `priority_ack` in
+  `EMERGENCY_OVERRIDE`, and EMERGENCY_SERVICE declares an interface. CADL
+  Explorer 0.5.6 reported a CUSTOMER that exchanged no message and an open
+  control loop from EMERGENCY_SERVICE. `cadl verify` results are unchanged
+  (8/8, 19/19).
 
 ## [0.3.16] — 2026-10-18
 
