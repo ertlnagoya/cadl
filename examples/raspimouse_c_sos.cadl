@@ -145,7 +145,7 @@ sos:
         - "ROBOT[*]"
       assume:
         - "TASK_OWNER.is_operational == true"
-        - "goal_sequence is non-empty"
+        - "length(goal_sequence) > 0"
         - "active_robot_count >= 1"
       guarantee:
         - "each_goal_assigned_to_exactly_one_robot()"
@@ -190,7 +190,7 @@ sos:
 
   protocols:
     - id: COLLABORATIVE_ROUTING
-      trigger: "ROBOT[i] enters intersection node"
+      trigger: "entered_intersection(ROBOT[i])"
       precondition: "ROBOT[i].at_intersection == true"
       steps:
         - "ROBOT[i] : compute_local_dijkstra(src, goal)"
@@ -208,7 +208,7 @@ sos:
       postcondition: "ROBOT[i].moving_or_retrying"
 
     - id: RESOURCE_QUERY
-      trigger: "ROBOT[i] needs global occupancy state"
+      trigger: "needs_occupancy_state(ROBOT[i])"
       steps:
         - "ROBOT[i] -> ARBITRATOR : resource_query(id)"
         - "ARBITRATOR -> ROBOT[i] : resource_response(edge_flags, cross_flags)"
@@ -218,7 +218,7 @@ sos:
       postcondition: "ROBOT[i].local_flags_updated"
 
     - id: COLLISION_RECOVERY
-      trigger: "ROBOT[i].distance_sensor < 0.1m for > maxT"
+      trigger: "held_for(ROBOT[i].distance_sensor < 0.1) > maxT"   # distance in metres
       steps:
         - "ROBOT[i] : execute_back_handler()"
         - "ROBOT[i] -> ARBITRATOR : next_request_csos(id, src, dst, next, goal, re=true)"
@@ -229,8 +229,8 @@ sos:
       postcondition: "ROBOT[i].collision_resolved"
 
     - id: DELIVERY_ASSIGNMENT
-      trigger: "TASK_OWNER issues next delivery goal from goal_sequence"
-      precondition: "goal_sequence.has_next() AND active_robot_count >= 1"
+      trigger: "next_goal_due(TASK_OWNER, goal_sequence)"
+      precondition: "has_next(goal_sequence) AND active_robot_count >= 1"
       steps:
         - "TASK_OWNER : select_next_goal_from_sequence()"
         - "TASK_OWNER : broadcast_claim_request() to all active ROBOT[*]"
@@ -253,7 +253,7 @@ sos:
         - "ROBOT[i] -> TASK_OWNER : retirement_notification(id)"
         - "TASK_OWNER : remove_from_active_list(i)"
         - "ROBOT[i] : enter_idle_state()"
-      postcondition: "ROBOT[i].is_retired == true AND TASK_OWNER.active_list excludes i"
+      postcondition: "ROBOT[i].is_retired == true AND NOT contains(TASK_OWNER.active_list, i)"
 
   algorithms:
     routing:
