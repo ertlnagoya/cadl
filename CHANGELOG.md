@@ -24,8 +24,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `incident_report` and `traffic_summary`; GATEWAY's `recommended_action` /
   `anomaly_report`; ROBOT's `occupy_request`, `release_request`,
   `availability_query` and `occupy_result`). Only interface lists change.
-
-### Changed
 - README (English and Japanese): the `cadl ai` steps describe `--verify`.
 
 ## [0.3.16] — 2026-10-18
