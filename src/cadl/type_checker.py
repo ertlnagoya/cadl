@@ -8,6 +8,8 @@ Checks performed (per spec §6.2.2):
    them with the actual message exchanges is planned, not implemented)
 5. Institutional parameter range constraints (0 <= alpha, beta, lambda <= 1)
 6. SoS-DSL static semantics, rules L-1 to M-3 (Appendix E §E.4)
+7. Norms static semantics, rules N-1 to N-12 (Appendix F §F.7), when the
+   file declares `norms: 0.1`
 """
 
 from __future__ import annotations
@@ -26,12 +28,14 @@ from .ast_nodes import (
     ComputeStep,
     ConditionalStep,
     ContractDef,
+    DurationLiteral,
     Expression,
     FunctionCall,
     IncentivesBlock,
     InformationBlock,
     MemberAccess,
     MessageStep,
+    NormDef,
     ParallelStep,
     QuantifiedExpr,
     ProtocolDef,
@@ -54,7 +58,7 @@ RESERVED_WORDS = frozenset({"AND", "OR", "NOT", "IN", "true", "false", "in", "ex
 CODEGEN_TARGETS = ("python", "solidity", "opa", "unity-csharp")
 SIM_TARGETS = ("unity", "go")
 # Extensions this processor implements, with the versions it knows
-KNOWN_EXTENSIONS = {"sos-dsl": ("0.1",)}
+KNOWN_EXTENSIONS = {"sos-dsl": ("0.1",), "norms": ("0.1",)}
 
 
 @dataclass
@@ -101,10 +105,13 @@ class TypeChecker:
         self.actor_names: set[str] = set()
         self.contract_ids: set[str] = set()
         self.protocol_ids: set[str] = set()
+        self.norms_declared = False
 
     def check(self, sos: SoSDefinition) -> TypeCheckResult:
         """Run all type checks on the SoS definition."""
+        from .norms import norms_declared
         self.result = TypeCheckResult()
+        self.norms_declared = norms_declared(sos)
         self._collect_definitions(sos)
         self._check_actors(sos)
         self._check_contracts(sos)
@@ -114,6 +121,8 @@ class TypeChecker:
         self._check_metrics(sos)
         self._check_codegen(sos)
         self._check_extensions(sos)
+        if self.norms_declared:
+            self._check_temporal_elsewhere(sos)
         return self.result
 
     def _collect_definitions(self, sos: SoSDefinition) -> None:
@@ -384,6 +393,534 @@ class TypeChecker:
                         f"the target state, not a transition id", mon.loc,
                     )
 
+    # --- Norms extension (Appendix F, F.7) ---
+
+    _TEMPORAL_SIGNATURES = {
+        "within": "within(d, p)",
+        "throughout": "throughout(d, p)",
+        "until": "until(p, q, d)",
+    }
+
+    def _check_temporal_call(self, call: FunctionCall, where: str, loc) -> None:
+        """N-10: the arguments of F.4, with a duration literal greater than zero."""
+        from .norms import TEMPORAL_OPERATORS
+        arity, dpos = TEMPORAL_OPERATORS[call.name]
+        sig = self._TEMPORAL_SIGNATURES[call.name]
+        if len(call.args) != arity:
+            self.result.add_error(
+                f"{where}: '{call.name}' takes {arity} arguments, {sig}, but is "
+                f"given {len(call.args)} (N-10)", loc,
+            )
+            return
+        duration = call.args[dpos]
+        if not isinstance(duration, DurationLiteral):
+            self.result.add_error(
+                f"{where}: the duration of '{call.name}' must be a duration "
+                f"literal such as 300s, as in {sig} (N-10)", loc,
+            )
+        elif duration.value <= 0:
+            self.result.add_error(
+                f"{where}: the duration of '{call.name}' must be greater than "
+                f"zero, got {duration.value}{duration.unit} (N-10)", loc,
+            )
+        for i, arg in enumerate(call.args):
+            if i != dpos and isinstance(arg, Comprehension):
+                self.result.add_error(
+                    f"{where}: argument {i + 1} of '{call.name}' must be a "
+                    f"predicate, as in {sig} (N-10)", loc,
+                )
+
+    def _check_tpredicate(self, text: str, where: str, loc) -> None:
+        """A predicate in which the temporal operators of F.4 may appear
+        (the content of a norm). As in a rule, `x IN [a, b]` is allowed (F.3)."""
+        from .norms import has_temporal_text, temporal_calls
+        from .parser import parse_rule
+        try:
+            expr = parse_rule(text)
+        except Exception:
+            if has_temporal_text(text):
+                self.result.add_error(
+                    f"{where} uses a temporal operator but is not a predicate "
+                    f"(Appendix A.10); write within(d, p), throughout(d, p) or "
+                    f"until(p, q, d) with a duration literal d (N-10): {text}",
+                    loc,
+                )
+            else:
+                self.result.add_warning(
+                    f"{where} is not a predicate (Appendix A.10) and is kept as "
+                    f"text: {text}", loc,
+                )
+            return
+        for call in temporal_calls(expr):
+            self._check_temporal_call(call, where, loc)
+
+    def _check_no_temporal(self, text, where: str, loc, as_rule: bool = True) -> None:
+        """N-10: no temporal operator outside the places F.4 allows (the
+        assume / guarantee items of a contract and the content of a norm).
+        `text` is a predicate as written or an already parsed expression."""
+        from .ast_nodes import StringLiteral
+        from .norms import has_temporal_text, temporal_calls
+        from .parser import parse_expr, parse_rule
+        if not isinstance(text, str):
+            expr = text
+            text = expr.value if isinstance(expr, StringLiteral) else None
+            if text is None:
+                from .unparse import expr_to_source
+                text = expr_to_source(expr)
+                found = next(temporal_calls(expr), None) is not None
+            else:
+                found = has_temporal_text(text)
+        else:
+            try:
+                expr = (parse_rule if as_rule else parse_expr)(text)
+                found = next(temporal_calls(expr), None) is not None
+            except Exception:
+                found = has_temporal_text(text)
+        if found:
+            self.result.add_error(
+                f"{where} uses a temporal operator (within, throughout, until), "
+                f"which norms 0.1 allows only in assume:, guarantee: and the "
+                f"content: of a norm (N-10): {text}", loc,
+            )
+
+    def _check_temporal_placement(self, contract: ContractDef, ctx: str) -> None:
+        """N-10 for the predicates of the core contract and of Appendix E."""
+        for key, items in (("assume", contract.assume), ("guarantee", contract.guarantee)):
+            for expr in items:
+                self._check_contract_item_temporal(expr, f"An item of {key} of {ctx}", contract.loc)
+        if contract.lifecycle:
+            for tr in contract.lifecycle.transitions:
+                where = f"lifecycle transition '{tr.id}' of {ctx}"
+                if tr.on and not ("->" in tr.on and self._MESSAGE_EVENT_RE.match(tr.on.strip())):
+                    self._check_no_temporal(tr.on, f"'on' of the {where}", tr.loc, True)
+                if tr.when:
+                    self._check_no_temporal(tr.when, f"'when' of the {where}", tr.loc, True)
+        for mon in contract.monitors:
+            if mon.rule:
+                self._check_no_temporal(
+                    mon.rule, f"'rule' of the monitor '{mon.id}' of {ctx}", mon.loc, True
+                )
+
+    def _check_temporal_elsewhere(self, sos: SoSDefinition) -> None:
+        """N-10 for the predicates outside contracts: transition conditions
+        and safety invariants, metric formulas, verification expressions and
+        protocol conditions (F.4)."""
+        for t in sos.transitions:
+            where = f"transition {t.from_regime}->{t.to_regime}"
+            for key in ("condition", "safety_invariant"):
+                text = getattr(t, key)
+                if isinstance(text, str) and text:
+                    self._check_no_temporal(text, f"'{key}' of the {where}", t.loc, False)
+        for m in sos.metrics:
+            if isinstance(m.formula, str) and m.formula:
+                self._check_no_temporal(m.formula, f"'formula' of metric '{m.id}'", m.loc, False)
+        for v in sos.verifications:
+            if v.expr:
+                self._check_no_temporal(v.expr, f"'expr' of verification '{v.id}'", v.loc, False)
+        for proto in sos.protocols:
+            ctx = f"protocol '{proto.id}'"
+            for key in ("precondition", "postcondition", "safety_invariant"):
+                text = getattr(proto, key)
+                if isinstance(text, str) and text:
+                    self._check_no_temporal(text, f"'{key}' of {ctx}", proto.loc, False)
+            if proto.rollback and isinstance(proto.rollback.condition, str) and proto.rollback.condition:
+                self._check_no_temporal(
+                    proto.rollback.condition, f"'rollback.condition' of {ctx}", proto.loc, False
+                )
+            self._check_steps_no_temporal(proto.steps, ctx, proto.loc)
+
+    def _check_steps_no_temporal(self, steps, ctx: str, loc) -> None:
+        for step in steps:
+            if isinstance(step, ConditionalStep):
+                self._check_no_temporal(step.condition, f"a step condition of {ctx}", loc)
+                self._check_steps_no_temporal(step.then_steps, ctx, loc)
+                self._check_steps_no_temporal(step.else_steps, ctx, loc)
+            elif isinstance(step, BarrierStep):
+                self._check_no_temporal(step.condition, f"a barrier condition of {ctx}", loc)
+            elif isinstance(step, ParallelStep):
+                self._check_steps_no_temporal(step.steps, ctx, loc)
+
+    def _check_contract_item_temporal(self, expr: Expression, where: str, loc) -> None:
+        from .ast_nodes import StringLiteral
+        from .norms import has_temporal_text, temporal_calls
+        if isinstance(expr, StringLiteral):
+            # Not a predicate of A.10: kept as an opaque item.
+            if has_temporal_text(expr.value):
+                self.result.add_error(
+                    f"{where} uses a temporal operator but is not a predicate "
+                    f"(Appendix A.10); write within(d, p), throughout(d, p) or "
+                    f"until(p, q, d) with a duration literal d (N-10): {expr.value}",
+                    loc,
+                )
+            return
+        for call in temporal_calls(expr):
+            self._check_temporal_call(call, where, loc)
+
+    def _norm_term_kind(self, text: str, events: set[str]) -> str:
+        """How a trigger, until, content or when is read (F.3, N-8):
+        "event", "message" or "predicate"."""
+        t = text.strip()
+        if t in events and _IDENTIFIER_RE.fullmatch(t) and t not in RESERVED_WORDS:
+            return "event"
+        if "->" in t and self._MESSAGE_EVENT_RE.match(t):
+            return "message"
+        return "predicate"
+
+    def _check_norm_message(self, text: str, where: str, loc) -> str:
+        """N-9: the sender and the receiver of a message event are declared
+        actors. Returns the sender as written in canonical form."""
+        from .parser import _parse_actor_ref_str, parse_expr
+        from .unparse import actor_ref_to_source
+        m = self._MESSAGE_EVENT_RE.match(text.strip())
+        sender = _parse_actor_ref_str(m.group(1).strip())
+        receiver = _parse_actor_ref_str(m.group(2).strip())
+        for ref, role in ((sender, "sender"), (receiver, "receiver")):
+            if ref.name not in self.actor_names:
+                self.result.add_error(
+                    f"The {role} '{actor_ref_to_source(ref)}' of the message event "
+                    f"in {where} is not a declared actor (N-9)", loc,
+                )
+        try:
+            parse_expr(m.group(3).strip())
+        except Exception:
+            self.result.add_warning(
+                f"{where} names a message that is not a function call or "
+                f"an identifier: {m.group(3).strip()}", loc,
+            )
+        return actor_ref_to_source(sender)
+
+    def _check_norm_term(
+        self, text: str, where: str, loc, events: set[str], norm_ids: set[str],
+        temporal: bool = False,
+    ) -> tuple[str, str | None]:
+        """Check a trigger, until, content or when. Returns its kind and,
+        for a message event, the sender. Temporal operators are allowed only
+        when `temporal` is set (the content of a norm, F.4)."""
+        kind = self._norm_term_kind(text, events)
+        if kind == "message":
+            return kind, self._check_norm_message(text, where, loc)
+        if kind == "predicate":
+            t = text.strip()
+            # N-8: a whole identifier that is not an institutional event but
+            # the id of a norm is probably a mistake.
+            if t in norm_ids:
+                self.result.add_warning(
+                    f"{where} is '{t}', the id of a norm; it is read as a state "
+                    f"variable, since it is not an institutional event of a "
+                    f"counts_as: rule (N-8)", loc,
+                )
+            if temporal:
+                self._check_tpredicate(text, where, loc)
+            else:
+                self._check_predicate_text(text, where, loc)
+        return kind, None
+
+    def _check_predicate_text(self, text: str, where: str, loc) -> None:
+        """A predicate of a norm event or a counts_as rule: no temporal
+        operator (N-10); text that is not a predicate is kept as text."""
+        from .parser import parse_rule
+        self._check_no_temporal(text, where, loc)
+        try:
+            parse_rule(text)
+        except Exception:
+            self.result.add_warning(
+                f"{where} is not a predicate (Appendix A.10) and is kept as "
+                f"text: {text}", loc,
+            )
+
+    def _check_norms(self, contract: ContractDef, ctx: str) -> None:
+        from .norms import NORM_KINDS
+        from .parser import _parse_actor_ref_str
+        from .unparse import actor_ref_to_source
+
+        norms_by_id: dict[str, NormDef] = {}
+        norm_ids = {n.id for n in contract.norms if n.id}
+        events = {r.creates for r in contract.counts_as if r.creates}
+        # Events that some rule creates from a predicate rather than a message
+        message_events_only = {
+            r.creates for r in contract.counts_as
+            if r.creates and self._norm_term_kind(r.when, set()) == "message"
+        } - {
+            r.creates for r in contract.counts_as
+            if r.creates and self._norm_term_kind(r.when, set()) != "message"
+        }
+        states = set(contract.lifecycle.states) if contract.lifecycle else set()
+        party_names = {p.name for p in contract.parties}
+
+        # N-1: norm ids are identifiers, unique within the contract.
+        for norm in contract.norms:
+            if not norm.id:
+                self.result.add_error(f"A norm of {ctx} has no id (N-1)", norm.loc)
+                continue
+            self._check_identifier(norm.id, f"Norm ID of {ctx}", norm.loc, rule="N-1")
+            if norm.id in norms_by_id:
+                self.result.add_error(f"Duplicate norm '{norm.id}' of {ctx} (N-1)", norm.loc)
+            else:
+                norms_by_id[norm.id] = norm
+
+        # counts_as: rules; N-1 for the institutional event names.
+        for rule in contract.counts_as:
+            name = rule.creates
+            where = f"the counts_as rule for '{name}' of {ctx}" if name else f"a counts_as rule of {ctx}"
+            if not name:
+                self.result.add_error(
+                    f"A counts_as rule of {ctx} names no institutional event "
+                    f"(creates:) (N-1)", rule.loc,
+                )
+            else:
+                self._check_identifier(
+                    name, f"Institutional event of {ctx}", rule.loc, rule="N-1"
+                )
+                if name in norm_ids:
+                    self.result.add_error(
+                        f"Institutional event '{name}' of {ctx} has the same name as "
+                        f"a norm of the contract (N-1)", rule.loc,
+                    )
+            if not rule.when:
+                self.result.add_error(f"{where[0].upper()}{where[1:]} has no 'when' (F.3)", rule.loc)
+            else:
+                # `when:` is a message event or a predicate, never an event name;
+                # N-8 concerns trigger, until and content only.
+                self._check_norm_term(rule.when, f"'when' of {where}", rule.loc, set(), set())
+            if rule.if_:
+                self._check_predicate_text(rule.if_, f"'if' of {where}", rule.loc)
+
+        for norm in contract.norms:
+            where = f"norm '{norm.id}' of {ctx}"
+            kind = norm.kind
+            # N-2: the kind is one of the four.
+            if kind not in NORM_KINDS:
+                self.result.add_error(
+                    f"The {where} has kind '{kind}'; expected one of "
+                    f"{', '.join(NORM_KINDS)} (N-2)" if kind else
+                    f"The {where} has no kind; expected one of "
+                    f"{', '.join(NORM_KINDS)} (N-2)", norm.loc,
+                )
+
+            # N-3: bearer and counterparty are declared actors, and should
+            # be parties of the contract.
+            if not norm.bearer:
+                self.result.add_error(f"The {where} has no bearer (N-3)", norm.loc)
+            for role, text in (("bearer", norm.bearer), ("counterparty", norm.counterparty)):
+                if not text:
+                    continue
+                ref = _parse_actor_ref_str(text)
+                if ref.name not in self.actor_names:
+                    self.result.add_error(
+                        f"The {role} '{text}' of the {where} is not a declared "
+                        f"actor (N-3)", norm.loc,
+                    )
+                elif ref.index == "*" or isinstance(ref.index, RangeExpr):
+                    # One actor per norm instance: no wildcard, no range.
+                    self.result.add_error(
+                        f"The {role} '{text}' of the {where} is a wildcard or a "
+                        f"range; name one actor, without an index or with an "
+                        f"index the contract instance binds, such as "
+                        f"{ref.name}[i] (N-3)", norm.loc,
+                    )
+                elif ref.name not in party_names:
+                    self.result.add_warning(
+                        f"The {role} '{text}' of the {where} is not a party of "
+                        f"the contract (N-3)", norm.loc,
+                    )
+
+            # N-4: a deadline is a duration, and deadline and on_violation
+            # belong to obligations and prohibitions.
+            if norm.invalid_deadline is not None:
+                self.result.add_error(
+                    f"The {where} has deadline '{norm.invalid_deadline}', which is "
+                    f"not a duration: write an integer followed by ms, s, min or h "
+                    f"(for example 5s) (N-4)", norm.loc,
+                )
+            if kind in ("permission", "power"):
+                if norm.deadline_ms is not None or norm.invalid_deadline is not None:
+                    self.result.add_error(
+                        f"The {where} is a {kind} and cannot have a deadline (N-4)",
+                        norm.loc,
+                    )
+                if norm.on_violation is not None:
+                    self.result.add_error(
+                        f"The {where} is a {kind} and cannot have on_violation (N-4)",
+                        norm.loc,
+                    )
+
+            # N-5: effects belong to powers; a power has at least one.
+            if norm.effects is not None and kind in NORM_KINDS and kind != "power":
+                self.result.add_error(
+                    f"The {where} is a {kind}; only a power can have effects (N-5)",
+                    norm.loc,
+                )
+            if kind == "power":
+                eff = norm.effects
+                targets = (
+                    eff.activate + eff.suspend + eff.resume + eff.discharge
+                    if eff else []
+                )
+                if not targets:
+                    self.result.add_error(
+                        f"The {where} is a power without effects; give at least one "
+                        f"of activate, suspend, resume, discharge (N-5)", norm.loc,
+                    )
+            if norm.effects is not None:
+                eff = norm.effects
+                for effect, names in (("activate", eff.activate), ("suspend", eff.suspend),
+                                      ("resume", eff.resume), ("discharge", eff.discharge)):
+                    for name in names:
+                        if name == norm.id:
+                            self.result.add_error(
+                                f"effects.{effect} of the {where} names the power "
+                                f"itself (N-5)", norm.loc,
+                            )
+                        elif name not in norm_ids:
+                            self.result.add_error(
+                                f"effects.{effect} of the {where} names '{name}', "
+                                f"which is not a norm of {ctx} (N-5)", norm.loc,
+                            )
+
+            if norm.on_violation is not None:
+                ov = norm.on_violation
+                # N-6: a reparation is an obligation or prohibition without
+                # a trigger of its own.
+                if ov.reparation is not None:
+                    rep = norms_by_id.get(ov.reparation)
+                    if rep is None:
+                        self.result.add_error(
+                            f"on_violation.reparation '{ov.reparation}' of the {where} "
+                            f"is not a norm of {ctx} (N-6)", norm.loc,
+                        )
+                    else:
+                        if rep.kind not in ("obligation", "prohibition"):
+                            self.result.add_error(
+                                f"on_violation.reparation '{ov.reparation}' of the "
+                                f"{where} is a {rep.kind or 'norm without kind'}; it must "
+                                f"be an obligation or a prohibition (N-6)", norm.loc,
+                            )
+                        if rep.trigger is not None:
+                            self.result.add_error(
+                                f"on_violation.reparation '{ov.reparation}' of the "
+                                f"{where} has a trigger; a reparation is activated "
+                                f"only by the violation (N-6)", norm.loc,
+                            )
+                # N-7: the transition names a lifecycle state.
+                if ov.transition is not None:
+                    if contract.lifecycle is None:
+                        self.result.add_error(
+                            f"on_violation.transition '{ov.transition}' of the {where} "
+                            f"needs a lifecycle: in {ctx} (N-7)", norm.loc,
+                        )
+                    elif ov.transition not in states:
+                        self.result.add_error(
+                            f"on_violation.transition '{ov.transition}' of the {where} "
+                            f"is not a state listed in lifecycle.states (N-7)", norm.loc,
+                        )
+
+            # Events and content (N-8, N-9, N-10).
+            for key in ("trigger", "until"):
+                text = getattr(norm, key)
+                if text is not None:
+                    self._check_norm_term(text, f"'{key}' of the {where}", norm.loc,
+                                          events, norm_ids)
+            if not norm.content:
+                self.result.add_error(f"The {where} has no content (F.3)", norm.loc)
+            else:
+                term, sender = self._check_norm_term(
+                    norm.content, f"'content' of the {where}", norm.loc, events,
+                    norm_ids, temporal=True,
+                )
+                bearer = (
+                    actor_ref_to_source(_parse_actor_ref_str(norm.bearer))
+                    if norm.bearer else ""
+                )
+                # N-9: a power is exercised by an institutional event created
+                # from a message event, or by a message its bearer sends.
+                if kind == "power":
+                    if term == "predicate":
+                        self.result.add_error(
+                            f"The content of the {where} must be an institutional "
+                            f"event of {ctx} or a message event sent by its bearer, "
+                            f"not '{norm.content}' (N-9)", norm.loc,
+                        )
+                    elif term == "event" and norm.content.strip() not in message_events_only:
+                        self.result.add_error(
+                            f"The content of the {where} is the institutional event "
+                            f"'{norm.content.strip()}', which a counts_as rule creates "
+                            f"from a predicate; a power is exercised by an event "
+                            f"created from a message event (N-9)", norm.loc,
+                        )
+                    elif term == "message" and sender != bearer:
+                        self.result.add_error(
+                            f"The content of the {where} is a message sent by "
+                            f"'{sender}', not by its bearer '{norm.bearer}' (N-9)",
+                            norm.loc,
+                        )
+                # N-9 (SHOULD): the bearer sends the message it is bound to send
+                # or not to send.
+                elif (kind in ("obligation", "prohibition") and term == "message"
+                      and bearer and sender != bearer):
+                    self.result.add_warning(
+                        f"The content of the {where} is a message sent by "
+                        f"'{sender}', not by its bearer '{norm.bearer}' (N-9)",
+                        norm.loc,
+                    )
+
+            # N-11: transform names an identifier; other values are not of F.3.
+            if norm.invalid_on_amendment is not None:
+                self.result.add_error(
+                    f"The {where} has on_amendment '{norm.invalid_on_amendment}'; "
+                    f"expected carry_over, discharge or {{transform: <norm id>}} (F.3)",
+                    norm.loc,
+                )
+            elif norm.on_amendment == "transform":
+                if norm.transform_to is None:
+                    self.result.add_error(
+                        f"on_amendment.transform of the {where} names no norm (N-11)",
+                        norm.loc,
+                    )
+                else:
+                    self._check_identifier(
+                        norm.transform_to, f"on_amendment.transform of the {where}",
+                        norm.loc, rule="N-11",
+                    )
+
+        # N-6: following reparation from a norm never leads back to it.
+        reported: set[frozenset] = set()
+        for start in norms_by_id:
+            path = [start]
+            cur = start
+            while True:
+                ov = norms_by_id[cur].on_violation
+                nxt = ov.reparation if ov else None
+                if nxt is None or nxt not in norms_by_id:
+                    break
+                if nxt == start:
+                    cycle = frozenset(path)
+                    if cycle not in reported:
+                        reported.add(cycle)
+                        self.result.add_error(
+                            f"The reparations of {ctx} form a cycle: "
+                            f"{' -> '.join(path + [start])} (N-6)",
+                            norms_by_id[start].loc,
+                        )
+                    break
+                if nxt in path:
+                    break  # a cycle that does not pass through start
+                path.append(nxt)
+                cur = nxt
+
+        # N-12: a permission and a prohibition of the same bearer and content.
+        for perm in contract.norms:
+            if perm.kind != "permission":
+                continue
+            for proh in contract.norms:
+                if (proh.kind == "prohibition" and perm.bearer == proh.bearer
+                        and perm.content.strip() == proh.content.strip()):
+                    self.result.add_warning(
+                        f"The permission '{perm.id}' and the prohibition "
+                        f"'{proh.id}' of {ctx} have the same bearer and content, so "
+                        f"the two conflict (N-12)",
+                        perm.loc,
+                    )
+
     def _check_actor_ref(self, ref: ActorRef, context: str) -> None:
         """Check that an actor reference refers to a defined actor."""
         if ref.name not in self.actor_names:
@@ -459,6 +996,10 @@ class TypeChecker:
         for mon in contract.monitors:
             if mon.on_match:
                 check(mon.on_match.severity, f"monitor '{mon.id}'")
+        if self.norms_declared:
+            for norm in contract.norms:
+                if norm.on_violation:
+                    check(norm.on_violation.severity, f"norm '{norm.id}'")
 
     def _check_contracts(self, sos: SoSDefinition) -> None:
         """Check contract definitions."""
@@ -514,6 +1055,22 @@ class TypeChecker:
         self._check_severities(contract, ctx)
         self._check_lifecycle(contract, ctx)
         self._check_monitors(contract, ctx)
+
+        # Norms extension (Appendix F): checked only when declared (F.11).
+        if self.norms_declared:
+            self._check_temporal_placement(contract, ctx)
+            self._check_norms(contract, ctx)
+        else:
+            keys = [k for k, v in (("norms:", contract.norms),
+                                   ("counts_as:", contract.counts_as)) if v]
+            if keys:
+                self.result.add_warning(
+                    f"{ctx} uses {' and '.join(keys)}, which belong to the norms "
+                    f"extension, but the file does not declare 'norms: 0.1' under "
+                    f"extensions:; they are undeclared extension keys, and are "
+                    f"neither checked nor lowered to the IR (Appendix F, F.11)",
+                    contract.loc,
+                )
 
     def _check_authority(self, auth: AuthorityBlock, context: str) -> None:
         """Check authority block constraints."""
@@ -673,19 +1230,23 @@ class TypeChecker:
                     )
 
 
-    def _check_identifier(self, name: str, what: str, loc: SourceLocation | None = None) -> None:
+    def _check_identifier(
+        self, name: str, what: str, loc: SourceLocation | None = None, rule: str = ""
+    ) -> None:
         """Identifiers are ASCII and are not reserved words (Appendix A §A.1, §A.11)."""
         if not name:
             return  # a missing id is reported elsewhere
+        tag = f" ({rule})" if rule else ""
         if name in RESERVED_WORDS:
             self.result.add_error(
-                f"{what} '{name}' is a reserved word and cannot be used as an identifier",
+                f"{what} '{name}' is a reserved word and cannot be used as an "
+                f"identifier{tag}",
                 loc,
             )
         elif not _IDENTIFIER_RE.fullmatch(name):
             self.result.add_error(
                 f"{what} '{name}' is not a valid identifier: use ASCII letters, "
-                f"digits and '_' only, not starting with a digit",
+                f"digits and '_' only, not starting with a digit{tag}",
                 loc,
             )
 

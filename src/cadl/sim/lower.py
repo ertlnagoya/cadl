@@ -33,12 +33,14 @@ from .ir import (
     AlgorithmLayer,
     AlgorithmSpec,
     ContractSpec,
+    CountsAsSpecIR,
     GovernanceParams,
     InstitutionLayer,
     LifecycleSpecIR,
     LifecycleTransitionSpec,
     MetricSpec,
     MonitorSpecIR,
+    NormSpecIR,
     ProtocolLayer,
     ProtocolSpec,
     SimIR,
@@ -109,7 +111,11 @@ def _expr_to_value(expr: Expression) -> Any:
 
 def _lower_institution(sos: SoSDefinition) -> InstitutionLayer:
     actors = [_lower_actor(a) for a in sos.actors]
-    contracts = [_lower_contract(c) for c in sos.contracts]
+    from ..norms import norms_declared
+    # Without `norms: 0.1` the norms: and counts_as: blocks are not
+    # interpreted and stay out of the IR (Appendix F, F.11).
+    with_norms = norms_declared(sos)
+    contracts = [_lower_contract(c, with_norms) for c in sos.contracts]
     return InstitutionLayer(actors=actors, contracts=contracts)
 
 
@@ -148,7 +154,7 @@ def _lower_actor(actor) -> ActorSpec:
     )
 
 
-def _lower_contract(contract) -> ContractSpec:
+def _lower_contract(contract, with_norms: bool = False) -> ContractSpec:
     governance = GovernanceParams()
 
     # Extract authority params
@@ -185,6 +191,11 @@ def _lower_contract(contract) -> ContractSpec:
         violation_action=contract.violation.action if contract.violation else None,
         lifecycle=_lower_lifecycle(contract.lifecycle),
         monitors=[_lower_monitor(m) for m in contract.monitors],
+        norms=[_lower_norm(n) for n in contract.norms] if with_norms else [],
+        counts_as=[
+            CountsAsSpecIR(when=r.when, creates=r.creates, if_=r.if_)
+            for r in contract.counts_as
+        ] if with_norms else [],
     )
 
 
@@ -230,6 +241,32 @@ def _lower_monitor(m) -> MonitorSpecIR:
         on_match_violation=(m.on_match.violation if m.on_match else None),
         on_match_transition=(m.on_match.transition if m.on_match else None),
         on_match_severity=(m.on_match.severity if m.on_match else None),
+    )
+
+
+def _lower_norm(n) -> NormSpecIR:
+    """Lower a NormDef AST node to NormSpecIR (Appendix F, F.9)."""
+    ov = n.on_violation
+    eff = n.effects
+    return NormSpecIR(
+        id=n.id,
+        kind=n.kind,
+        bearer=n.bearer,
+        counterparty=n.counterparty,
+        trigger=n.trigger,
+        until=n.until,
+        content=n.content,
+        deadline_ms=n.deadline_ms,
+        on_violation_severity=(ov.severity if ov else None),
+        on_violation_sanction=(ov.sanction if ov else None),
+        on_violation_reparation=(ov.reparation if ov else None),
+        on_violation_transition=(ov.transition if ov else None),
+        effects_activate=list(eff.activate) if eff else [],
+        effects_suspend=list(eff.suspend) if eff else [],
+        effects_resume=list(eff.resume) if eff else [],
+        effects_discharge=list(eff.discharge) if eff else [],
+        on_amendment=n.on_amendment,
+        transform_to=n.transform_to,
     )
 
 

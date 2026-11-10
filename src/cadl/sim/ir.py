@@ -89,6 +89,39 @@ class MonitorSpecIR:
     on_match_severity: str | None = None
 
 
+# --- Norms extension (Appendix F) IR specs -----------------------------------
+
+@dataclass
+class NormSpecIR:
+    """A norm in flattened IR form (F.9); events and content stay text."""
+    id: str
+    kind: str = ""
+    bearer: str = ""
+    counterparty: str | None = None
+    trigger: str | None = None
+    until: str | None = None
+    content: str = ""
+    deadline_ms: int | None = None
+    on_violation_severity: str | None = None
+    on_violation_sanction: str | None = None
+    on_violation_reparation: str | None = None
+    on_violation_transition: str | None = None
+    effects_activate: list[str] = field(default_factory=list)
+    effects_suspend: list[str] = field(default_factory=list)
+    effects_resume: list[str] = field(default_factory=list)
+    effects_discharge: list[str] = field(default_factory=list)
+    on_amendment: str = "carry_over"
+    transform_to: str | None = None
+
+
+@dataclass
+class CountsAsSpecIR:
+    """A counts-as rule in IR form (F.9). ``if_`` is serialized as ``if``."""
+    when: str = ""
+    creates: str = ""
+    if_: str | None = None
+
+
 @dataclass
 class ContractSpec:
     """A contract between actors with governance parameters."""
@@ -102,6 +135,9 @@ class ContractSpec:
     # SoS-DSL extension (Appendix E)
     lifecycle: LifecycleSpecIR | None = None
     monitors: list[MonitorSpecIR] = field(default_factory=list)
+    # Norms extension (Appendix F)
+    norms: list[NormSpecIR] = field(default_factory=list)
+    counts_as: list[CountsAsSpecIR] = field(default_factory=list)
 
 
 @dataclass

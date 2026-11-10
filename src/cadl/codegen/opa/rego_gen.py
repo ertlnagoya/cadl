@@ -15,6 +15,7 @@ from ...ast_nodes import (
     Expression,
     SoSDefinition,
 )
+from ...norms import omitted_comment, omitted_in_codegen
 from ..emitter import sanitize_id, snake_case
 from .rego_expr import RegoContext, expr_to_rego
 
@@ -72,13 +73,17 @@ def generate_contract_rego(contract: ContractDef, sos: SoSDefinition) -> str:
     # assumptions_hold rule
     lines.append("# Assumptions: all must hold")
     lines.append("assumptions_hold if {")
-    if contract.assume:
-        for pred in contract.assume:
-            rego_expr = _compile_predicate(pred, ctx)
-            label = _predicate_label(pred)
-            lines.append(f"    # {label}")
-            lines.append(f"    {rego_expr}")
-    else:
+    generated = 0
+    for pred in contract.assume:
+        if omitted_in_codegen(pred):
+            lines.append(f"    # {omitted_comment(pred)}")
+            continue
+        rego_expr = _compile_predicate(pred, ctx)
+        label = _predicate_label(pred)
+        lines.append(f"    # {label}")
+        lines.append(f"    {rego_expr}")
+        generated += 1
+    if not generated:
         lines.append("    true")
     lines.append("}")
     lines.append("")
@@ -86,13 +91,17 @@ def generate_contract_rego(contract: ContractDef, sos: SoSDefinition) -> str:
     # guarantees_hold rule
     lines.append("# Guarantees: all must hold")
     lines.append("guarantees_hold if {")
-    if contract.guarantee:
-        for pred in contract.guarantee:
-            rego_expr = _compile_predicate(pred, ctx)
-            label = _predicate_label(pred)
-            lines.append(f"    # {label}")
-            lines.append(f"    {rego_expr}")
-    else:
+    generated = 0
+    for pred in contract.guarantee:
+        if omitted_in_codegen(pred):
+            lines.append(f"    # {omitted_comment(pred)}")
+            continue
+        rego_expr = _compile_predicate(pred, ctx)
+        label = _predicate_label(pred)
+        lines.append(f"    # {label}")
+        lines.append(f"    {rego_expr}")
+        generated += 1
+    if not generated:
         lines.append("    true")
     lines.append("}")
     lines.append("")

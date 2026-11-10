@@ -31,6 +31,7 @@ from .ast_nodes import (
     ConditionalStep,
     ContextBlock,
     ContractDef,
+    CountsAsDef,
     DurationLiteral,
     EnvironmentDef,
     Expression,
@@ -51,9 +52,12 @@ from .ast_nodes import (
     MetricDef,
     MonitorDef,
     MotivationBlock,
+    NormDef,
+    NormViolationSpec,
     OnMatchSpec,
     OnViolationSpec,
     ParallelStep,
+    PowerEffects,
     ProtocolDef,
     QuantifiedExpr,
     RangeExpr,
@@ -488,6 +492,19 @@ def _build_contract(data: dict) -> ContractDef:
             _build_monitor(m) for m in mon_data if isinstance(m, dict)
         ]
 
+    # === Norms extension (Appendix F) ===
+    # Read whether or not `norms: 0.1` is declared; without the declaration
+    # `cadl check` reports the keys as undeclared and does not check them,
+    # and they are not lowered to the IR (F.11).
+    norms_data = _get(data, 'norms')
+    if isinstance(norms_data, list):
+        contract.norms = [_build_norm(n) for n in norms_data if isinstance(n, dict)]
+    ca_data = _get(data, 'counts_as')
+    if isinstance(ca_data, list):
+        contract.counts_as = [
+            _build_counts_as(r) for r in ca_data if isinstance(r, dict)
+        ]
+
     return contract
 
 
@@ -666,6 +683,97 @@ def _build_monitor(data: dict) -> MonitorDef:
         sampling=_build_sampling(_get(data, 'sampling')),
         rule=str(_get(data, 'rule', '')),
         on_match=on_match,
+    )
+
+
+# === Norms extension builders (Appendix F) ===
+
+def _opt_text(value) -> str | None:
+    """An optional event, content or condition as written, or None."""
+    if value is None or value == '':
+        return None
+    return _value_as_text(value)
+
+
+def _build_norm_violation(data: dict) -> NormViolationSpec:
+    sanction = _get(data, 'sanction')
+    return NormViolationSpec(
+        severity=str(_get(data, 'severity', 'Major')),
+        sanction=None if sanction is None else _value_as_text(sanction),
+        reparation=_opt_name(_get(data, 'reparation')),
+        transition=_opt_name(_get(data, 'transition')),
+    )
+
+
+def _build_power_effects(data: dict) -> PowerEffects:
+    return PowerEffects(
+        activate=_as_str_list(_get(data, 'activate')),
+        suspend=_as_str_list(_get(data, 'suspend')),
+        resume=_as_str_list(_get(data, 'resume')),
+        discharge=_as_str_list(_get(data, 'discharge')),
+    )
+
+
+def _build_norm(data: dict) -> NormDef:
+    """Build a NormDef from a YAML mapping (F.3)."""
+    raw_deadline = _get(data, 'deadline')
+    # As for lifecycle transitions: `yes` / `no` and negative numbers are
+    # not durations; the text is kept for `cadl check`.
+    deadline_ms = None if isinstance(raw_deadline, bool) else _duration_to_ms(raw_deadline)
+    if deadline_ms is not None and deadline_ms < 0:
+        deadline_ms = None
+
+    on_viol_data = _get(data, 'on_violation')
+    effects_data = _get(data, 'effects')
+
+    # on_amendment: carry_over | discharge | { transform: X }
+    raw_amend = _get(data, 'on_amendment')
+    on_amendment, transform_to, invalid_amend = 'carry_over', None, None
+    if isinstance(raw_amend, dict) and list(raw_amend) == ['transform']:
+        on_amendment = 'transform'
+        transform_to = _opt_name(raw_amend['transform'])
+    elif raw_amend in ('carry_over', 'discharge'):
+        on_amendment = raw_amend
+    elif raw_amend is not None:
+        on_amendment = invalid_amend = _value_as_text(raw_amend)
+
+    return NormDef(
+        id=_id_str(_get(data, 'id', '')),
+        kind=_id_str(_get(data, 'kind', '')),
+        bearer=_id_str(_get(data, 'bearer', '')).strip(),
+        counterparty=_opt_name(_get(data, 'counterparty')),
+        trigger=_opt_text(_get(data, 'trigger')),
+        until=_opt_text(_get(data, 'until')),
+        content=_opt_text(_get(data, 'content')) or '',
+        deadline_ms=deadline_ms,
+        invalid_deadline=(
+            _value_as_text(raw_deadline)
+            if raw_deadline is not None and deadline_ms is None
+            else None
+        ),
+        on_violation=(
+            _build_norm_violation(on_viol_data)
+            if isinstance(on_viol_data, dict) else None
+        ),
+        # An `effects:` that is not a mapping has no effect, but is kept as
+        # present so that `cadl check` can report it (N-5).
+        effects=(
+            _build_power_effects(effects_data)
+            if isinstance(effects_data, dict)
+            else (None if effects_data is None else PowerEffects())
+        ),
+        on_amendment=on_amendment,
+        transform_to=transform_to,
+        invalid_on_amendment=invalid_amend,
+    )
+
+
+def _build_counts_as(data: dict) -> CountsAsDef:
+    """Build a CountsAsDef from a YAML mapping (F.3)."""
+    return CountsAsDef(
+        when=_opt_text(_get(data, 'when')) or '',
+        creates=_id_str(_get(data, 'creates', '')),
+        if_=_opt_text(_get(data, 'if')),
     )
 
 

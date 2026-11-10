@@ -304,6 +304,60 @@ class MonitorDef:
     loc: SourceLocation | None = None
 
 
+# === Norms extension (Appendix F, norms 0.1) ===
+# Obligations, permissions, prohibitions and powers of a contract, and the
+# counts-as rules that create its institutional events. Bearers, events,
+# contents and conditions are kept as written; `cadl check` reads them.
+
+@dataclass
+class NormViolationSpec:
+    """`on_violation:` of a norm (F.3)."""
+    severity: str = "Major"            # "Minor" | "Major" | "Critical"
+    sanction: str | None = None        # text
+    reparation: str | None = None      # id of a norm activated on violation
+    transition: str | None = None      # lifecycle state to move to
+
+
+@dataclass
+class PowerEffects:
+    """`effects:` of a power: the norms each kind of effect applies to."""
+    activate: list[str] = field(default_factory=list)
+    suspend: list[str] = field(default_factory=list)
+    resume: list[str] = field(default_factory=list)
+    discharge: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NormDef:
+    """An obligation, permission, prohibition or power of one bearer."""
+    id: str
+    kind: str                          # obligation | permission | prohibition | power
+    bearer: str = ""                   # actor_ref, as written
+    counterparty: str | None = None
+    trigger: str | None = None         # message event, event name or predicate (raw)
+    until: str | None = None
+    content: str = ""
+    deadline_ms: int | None = None
+    # A `deadline:` that is not a duration, kept as written for `cadl check`.
+    invalid_deadline: str | None = None
+    on_violation: NormViolationSpec | None = None
+    effects: PowerEffects | None = None
+    on_amendment: str = "carry_over"   # "carry_over" | "discharge" | "transform"
+    transform_to: str | None = None    # target of `transform:`
+    # An `on_amendment:` that is none of the forms of F.3, as written.
+    invalid_on_amendment: str | None = None
+    loc: SourceLocation | None = None
+
+
+@dataclass
+class CountsAsDef:
+    """A counts-as rule: `when` creates the institutional event `creates`."""
+    when: str = ""                     # message event or predicate (raw)
+    creates: str = ""                  # institutional event name
+    if_: str | None = None             # condition (`if:`), raw
+    loc: SourceLocation | None = None
+
+
 @dataclass
 class ContractDef:
     id: str
@@ -319,6 +373,9 @@ class ContractDef:
     # SoS-DSL extension (Appendix E)
     lifecycle: LifecycleSpec | None = None
     monitors: list[MonitorDef] = field(default_factory=list)
+    # Norms extension (Appendix F)
+    norms: list[NormDef] = field(default_factory=list)
+    counts_as: list[CountsAsDef] = field(default_factory=list)
     loc: SourceLocation | None = None
 
 
