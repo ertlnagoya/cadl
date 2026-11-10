@@ -155,6 +155,12 @@ cadl codegen examples/robot_delivery.cadl --target opa -o /tmp/rego_out
 # Generate Unity C# for SoS-DSL contracts (lifecycle / monitors)
 cadl codegen examples/sos_dsl_robot_delivery.cadl --target unity-csharp -o /tmp/unity_out
 
+# Agent governance extension (agents 0.1): decide one message at the boundary,
+# and generate the boundary policy as Rego or Cedar
+cadl agents-decide examples/agents_tool_governance.cadl --input examples/agents_inputs/delete_file.json
+cadl codegen examples/agents_tool_governance.cadl --target agent-rego -o /tmp/agent_rego
+cadl codegen examples/agents_tool_governance.cadl --target agent-cedar -o /tmp/agent_cedar
+
 # Analyze regime transitions
 cadl regime-map examples/smart_city_traffic.cadl
 cadl regime-map examples/smart_city_traffic.cadl --format dot -o regime.dot
@@ -246,6 +252,35 @@ Generates C# for contracts that use the SoS-DSL extension (`lifecycle:` / `monit
 - `Runtime/` support classes (contract runtime, event bus, predicate evaluator)
 
 [Chapter 7 of the textbook](https://www.ertl.jp/cadl-spec/docs/textbook/codegen-runtime/) runs this target end to end.
+
+**Agent boundary policy** (`--target agent-rego`, `--target agent-cedar`):
+
+Generates the boundary policy of the agent governance extension (see below) from the enforced contracts of a file that declares `agents: 0.1`; without the declaration `cadl codegen` reports an error. Both are independent of the `opa` target.
+- `agent-rego` writes `agent_policy.rego`, one Rego package (`cadl.agent_policy`) that takes the policy input as `input` and returns the whole result object as `result` (and `decision`), for static and non-static norms alike; the in-force flags of non-static norms and the derived instances are read from `input.instances`. The header lists the norms that are not static
+- `agent-cedar` writes `agent_policy.cedar` and `agent_policy_table.json`. The policies cover the statically decidable part: `forbid` for undeclared tools and static prohibitions, `permit` for static permissions, and Cedar's default denial for tool calls without a permission. Cedar has two outcomes, so an escalation is a denial that the runtime resolves from the table (per prohibition: `escalate_to`, `timeout`, `fallback`, `notify`). The README comment at the top of the file states what is not covered (non-static norms, derived permissions, contract instances); no policy reads an attribute, so none can be skipped because of an evaluation error
+
+### Agent Governance (agents 0.1)
+
+The agent governance extension (Appendix G of the specification) builds on the norms extension. A file declares both `norms: 0.1` and `agents: 0.1`; then `agent:` binds an actor to a kind (`llm_agent`, `tool_server`, `human`, `service`), a protocol, and for a tool server its `tools:`; `enforcement:` makes a contract enforced; `on_denied:` on a prohibition names an approver (`escalate_to:`), a `timeout:`, a `fallback:` message, and an actor to `notify:`; and `delegations:` makes a permission delegable. `examples/agents_tool_governance.cadl` is the example of the appendix.
+
+`cadl agents-decide <file.cadl> --input <input.json> [--format text|json]` is the reference decision function (G.5): for one message it returns `allow`, `deny`, or `escalate`, with the reason, the determining contracts, the norms, the provenance chains of derived permissions, and the escalation data.
+
+```bash
+$ cadl agents-decide examples/agents_tool_governance.cadl --input examples/agents_inputs/delete_file.json
+decision:    escalate
+reason:      prohibition
+contracts:   ASSISTED_REPORTING
+norms:       ASSISTED_REPORTING.no_delete
+provenance:  -
+escalate_to: OPERATOR
+timeout:     600000 ms
+fallback:    PLANNER -> TICKETS : create_ticket
+notify:      OPERATOR
+```
+
+The input is a JSON object with `message` (`from`, `to`, `name`) and optionally `now` and `instances` (per running contract instance: `bindings`, `in_force` flags of the norms that are not static, and the valid `derived` instances with their chains); `examples/agents_inputs/` has the sample calls of the appendix. The exit status is 0 for `allow`, 1 for `deny`, 3 for `escalate`, and 2 for a usage error. A message to a tool server that is a party of an enforced contract is governed whatever its sender, so an actor that is not a party, or not declared at all, is denied by the tool default. Matching is three-valued, and an unknown is resolved fail-closed: an unknown prohibition applies, an unknown permission does not.
+
+The command is stateless. Holds and their release or expiry (G.6), grants, chains and revocations (G.7), and audit records (G.8) are not implemented: a host runtime keeps that state and supplies the in-force flags and the valid derived instances through the input.
 
 ### Regime Transitions
 
@@ -438,6 +473,8 @@ The type checker (`cadl check`) validates:
 10. **SoS-DSL static semantics** (Appendix E, E.4) — in a `lifecycle:`, the initial, terminal, `from`, `to`, and `on_violation.transition` states are listed in `states`, and a terminal state exists and is reachable (L-1, L-2, L-3, L-5); the `on_match.transition` of a monitor is a state of the same contract (M-3); states, transition ids, and monitor ids are identifiers and the ids are unique; the actors of a message event in `on:` are declared, and so is the object of each `observe:` entry (M-1). A `deadline:` is a duration (an integer with `ms`, `s`, `min`, or `h`) and a `sampling:` is `event` or `periodic(<duration>)`; a value that cannot be read is an error. As lenient forms, a non-negative number of seconds (`2.5`), a space before the unit (`5 s`, `periodic( 500ms )`), and the mapping `{kind: periodic, period_ms: <integer>}` are accepted. Warnings: a `deadline:` without `on_violation:` (L-4) and an `on:`, `when:`, or `rule:` that is not a rule of Appendix E
 11. **Norms static semantics** (Appendix F, F.7; only when the file declares `norms: 0.1`) — norm ids are identifiers, unique in the contract, and differ from the institutional events named by `creates:` (N-1); `kind:` is `obligation`, `permission`, `prohibition`, or `power` (N-2); `bearer:` and `counterparty:` are declared actors without a wildcard or range (N-3); `deadline:` is a duration, and `deadline:` and `on_violation:` belong to obligations and prohibitions (N-4); `effects:` belong to powers, which need at least one, and name other norms of the contract (N-5); a `reparation:` is an obligation or prohibition without `trigger:`, and reparations form no cycle (N-6); `on_violation.transition` is a state of the contract's `lifecycle:` (N-7); the actors of a message event are declared, and a power is exercised by an institutional event created from a message or by a message its bearer sends (N-9); `within(d, p)`, `throughout(d, p)`, and `until(p, q, d)` have a duration literal `d > 0` and appear only in `assume:`, `guarantee:`, and a norm's `content:` (N-10); `on_amendment: {transform: X}` names an identifier (N-11). Warnings: a norm id used as a whole `trigger:` / `until:` / `content:` (N-8), a permission and a prohibition with the same bearer and content (N-12), a bearer or counterparty that is not a party (N-3), and an obligation or prohibition whose message is not sent by its bearer (N-9). Without the declaration, `norms:` and `counts_as:` get one warning as undeclared extension keys and are neither checked nor lowered to the IR
 
+12. **Agent governance static semantics** (Appendix G, G.9; only when the file declares `agents: 0.1`) — the file also declares `norms: 0.1` (G-1); `agent:` has a `kind:` of `llm_agent`, `tool_server`, `human`, or `service` and a `protocol:` that is a name (G-2); `tools:` belongs to a tool server, which lists at least one, and tool names are unique identifiers (G-3); a message event whose receiver is a tool server names one of its tools (G-4; a warning for a protocol step); `enforcement.default` is `deny` or `allow` and `enforcement.point` is `caller`, `receiver`, or `gateway` (G-5); in an enforced contract the sender of the message content of a permission or prohibition is its bearer (G-6); `on_denied:` belongs to a prohibition with a message content in an enforced contract, has at least one key, and its `timeout:` is a duration greater than zero that requires `escalate_to:` (G-7); `escalate_to:` and `notify:` name single declared actors, and `escalate_to:` names a party other than the bearer (G-8); a contract with `escalate_to: A` has a `counts_as:` rule that creates `approval` from a message of `A`, and `approval` and `rejection` are reserved in an enforced contract (G-9); a `fallback:` is a message event of the bearer to a declared actor that differs from the prohibited message (G-10); `delegations:` belongs to an enforced contract, and each entry names one permission with a message content whose bearer has no bound index (G-11), lists declared actors other than tool servers under `to:`, and has a `max_depth:` of at least 1 (G-12); `grant:` and `revoke:` are identifiers that differ from each other, from `approval` and `rejection`, and from the tools of the parties (G-13). Warnings: `escalate_to:` without `timeout:` (G-7), an approver that is not `human` (G-8), no rule for `rejection` (G-9), the bearer listed under `to:` (G-12), a permission or prohibition whose content is not a message event or has arguments (G-14), tools left open by `default: allow` and a tool server that is a party of no enforced contract (G-15), and a message the contract needs but would itself deny (G-16). Without the declaration, `agent:`, `enforcement:`, `delegations:`, and `on_denied:` get one warning as undeclared extension keys and are neither checked nor lowered to the IR
+
 It also reports, without failing the check, a `codegen:` target that `cadl codegen` cannot emit (warning), an extension name it does not know, and a `motivation:` block, which it keeps and passes on in `cadl sim-ir` but does not interpret (informational).
 
 ## Hands-on
@@ -483,6 +520,7 @@ This generates the IR JSON, the Unity C# tree, and drops the latter into the Uni
 | `raspimouse_c_sos.cadl` | Raspimouse swarm (C-SoS) | Collaborative | Local DirectionDijkstra + central verification, discrete-time sync |
 | `raspimouse_mcp_sos.cadl` | Raspimouse swarm (MCP-SoS) | Acknowledged | LLM-controlled via MCP tools, Static/Dynamic path modes, 3 regimes |
 | `sos_dsl_robot_delivery.cadl` | Robot delivery with the SoS-DSL extension | Acknowledged | Contract lifecycle (7 states), 3 monitors; the example used by the hands-on course |
+| `agents_tool_governance.cadl` | LLM planner, sub-agent and two tool servers (agents 0.1) | — | Enforced contract, escalation to a human, delegation with provenance; sample inputs in `agents_inputs/` |
 
 ### Demo Scripts
 
@@ -536,6 +574,9 @@ src/cadl/
     opa/
       rego_expr.py     Expression AST -> Rego source
       rego_gen.py      OPA/Rego policy generation
+    agent_policy/
+      rego_gen.py      Boundary policy as Rego (agents 0.1)
+      cedar_gen.py     Boundary policy as Cedar, with the side table (agents 0.1)
     unity_csharp/
       contract_emitter.py  Per-contract C# (state enum, contract, monitors)
       runtime_template.py  C# runtime support emitted with every generation
@@ -583,6 +624,7 @@ tests/
   test_conformance_checks.py      Identifier rules, sharing entries, codegen targets, extensions
   test_codegen_deterministic.py   Generated code is identical across runs
   test_keyword_boundaries.py      Keywords are not split out of longer names
+  test_agents_extension.py        Agent governance extension: G-1 to G-16, decisions, agent-rego / agent-cedar
 
 examples/
   robot_delivery.cadl        Robot delivery SoS (Acknowledged type)
@@ -621,6 +663,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | Simulator IR and config generation (Python, Unity, Go) | Available |
 | SoS-DSL extension (`lifecycle:` / `monitors:`) and Unity C# generation | Available |
 | Norms extension: static checks, and verdicts and amendments on a recorded trace (`cadl norms-eval`, `cadl norms-diff`) | Available |
+| Agent governance extension (agents 0.1): checks, decision function, Rego / Cedar boundary policies | Available (the stateful runtime of holds, delegations and audit is not implemented) |
 | `model_check` / `simulation` / `proof` verification methods | Not supported yet (reported explicitly) |
 
 ## Related Projects

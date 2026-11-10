@@ -1,0 +1,27 @@
+{
+  "message": {
+    "from": "PLANNER",
+    "to": "FILES",
+    "name": "delete_file"
+  },
+  "now": "2026-11-10T09:03:00Z",
+  "instances": [
+    {
+      "contract": "ASSISTED_REPORTING",
+      "instance": "default",
+      "bindings": {},
+      "in_force": {},
+      "derived": [
+        {
+          "norm": "may_read",
+          "holder": "SUMMARIZER",
+          "chain": [
+            "OPERATOR",
+            "PLANNER",
+            "SUMMARIZER"
+          ]
+        }
+      ]
+    }
+  ]
+}

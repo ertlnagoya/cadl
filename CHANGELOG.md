@@ -39,6 +39,52 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - `examples/traces/`: five traces for `examples/norms_robot_delivery.cadl`,
   and `examples/norms_amendment_v1.cadl` / `norms_amendment_v2.cadl` with
   a trace that is amended from the first to the second.
+- Agent governance extension, agents 0.1 (Appendix G of the specification),
+  which builds on norms 0.1. An actor may have `agent:` (`kind:` of
+  `llm_agent`, `tool_server`, `human` or `service`, `protocol:`, and for a
+  tool server `tools:`); a contract may have `enforcement:` (`default:`,
+  `point:`; a null or empty value means enforced with all defaults) and
+  `delegations:` (`norm:`, `to:`, `grant:`, `revoke:`, `max_depth:`,
+  `until:`); a prohibition may have `on_denied:` (`escalate_to:`,
+  `timeout:`, `fallback:`, `notify:`). In a file that declares
+  `agents: 0.1` together with `norms: 0.1`, `cadl check` applies rules G-1
+  to G-16 of G.9: the SHOULDs (G-14, G-15, G-16, the protocol steps of G-4
+  and parts of G-7, G-8, G-9 and G-12) are warnings, the rest errors.
+  Without the declaration the four keys get one warning as undeclared
+  extension keys and are neither checked nor lowered to the IR.
+- `cadl agents-decide <file.cadl> --input <input.json> [--format text|json]`
+  and `cadl.agents.decide`: the reference decision function of G.5 over
+  the policy input of G.10 (`message`, optional `now`, optional `instances`
+  with `bindings`, `in_force` and `derived`). It returns `decision`,
+  `reason`, `contracts`, `norms`, `provenance`, `escalate_to`, `timeout`,
+  `fallback` and `notify`; a message to a tool server that is a party
+  of an enforced contract is governed whatever its sender; matching is
+  three-valued and an unknown is resolved fail-closed. Exit status 0 for allow, 1 for deny, 3 for
+  escalate, 2 for a usage error. The command is stateless: holds, release
+  and expiry (G.6), grants, chains and revocations (G.7) and audit records
+  (G.8) are not implemented, and the in-force flags of the norms that are
+  not static and the valid derived instances come in through the input.
+- `cadl codegen -t agent-rego` writes `agent_policy.rego`: one Rego package
+  (`cadl.agent_policy`) that takes the policy input of G.10 as `input` and
+  returns the result object, for static and non-static norms alike. It is
+  independent of the `opa` target, whose output is unchanged.
+- `cadl codegen -t agent-cedar` writes `agent_policy.cedar` and
+  `agent_policy_table.json`: Cedar policies for the statically decidable
+  part (forbid for undeclared tools and static prohibitions, permit for
+  static permissions, default deny for tool calls), the side table from
+  which a runtime computes the reason, the norms and the escalation data,
+  and a README comment that states what is not covered (norms that are not
+  static, derived permissions, contract instances). Both targets report an
+  error for a file that does not declare the extension.
+- `cadl sim-ir` lowers the new blocks (G.13): `agent_kind`,
+  `agent_protocol` and `agent_tools` of an actor; `enforced`,
+  `enforcement_default`, `enforcement_point` and `delegations` of a
+  contract; `on_denied_escalate_to`, `on_denied_timeout_ms`,
+  `on_denied_fallback` and `on_denied_notify` of a norm. These fields are
+  part of the IR only for a file that declares the extension; the IR of
+  every other file is unchanged.
+- Example `examples/agents_tool_governance.cadl` (the example of G.12) with
+  the sample calls of the appendix in `examples/agents_inputs/`.
 
 ## [0.3.19] — 2026-11-10
 

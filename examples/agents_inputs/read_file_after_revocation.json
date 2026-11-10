@@ -1,0 +1,17 @@
+{
+  "message": {
+    "from": "SUMMARIZER",
+    "to": "FILES",
+    "name": "read_file"
+  },
+  "now": "2026-11-10T09:10:30Z",
+  "instances": [
+    {
+      "contract": "ASSISTED_REPORTING",
+      "instance": "default",
+      "bindings": {},
+      "in_force": {},
+      "derived": []
+    }
+  ]
+}

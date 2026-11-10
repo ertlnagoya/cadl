@@ -38,6 +38,11 @@ class ActorSpec:
     capabilities: list[str] = field(default_factory=list)
     inputs: list[str] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
+    # Agent governance extension (Appendix G, G.13); `agent_kind` is None
+    # for an actor without `agent:`.
+    agent_kind: str | None = None
+    agent_protocol: str | None = None
+    agent_tools: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -112,6 +117,23 @@ class NormSpecIR:
     effects_discharge: list[str] = field(default_factory=list)
     on_amendment: str = "carry_over"
     transform_to: str | None = None
+    # Agent governance extension (Appendix G, G.13): `on_denied:`, flattened;
+    # all None for a norm without it. The fallback stays text.
+    on_denied_escalate_to: str | None = None
+    on_denied_timeout_ms: int | None = None
+    on_denied_fallback: str | None = None
+    on_denied_notify: str | None = None
+
+
+@dataclass
+class DelegationSpecIR:
+    """An entry of `delegations:` in IR form (G.13); `until` stays text."""
+    norm: str = ""
+    to: list[str] = field(default_factory=list)
+    grant: str = ""
+    revoke: str | None = None
+    max_depth: int = 1
+    until: str | None = None
 
 
 @dataclass
@@ -138,6 +160,13 @@ class ContractSpec:
     # Norms extension (Appendix F)
     norms: list[NormSpecIR] = field(default_factory=list)
     counts_as: list[CountsAsSpecIR] = field(default_factory=list)
+    # Agent governance extension (Appendix G, G.13). `enforcement_default`
+    # is None when `default:` is omitted: the default then depends on the
+    # kind of message, and applying it is left to the consumer.
+    enforced: bool = False
+    enforcement_default: str | None = None
+    enforcement_point: str | None = None
+    delegations: list[DelegationSpecIR] = field(default_factory=list)
 
 
 @dataclass
@@ -291,3 +320,8 @@ class SimIR:
     # The source's `motivation:` block of Appendix C, verbatim (§C.6).
     # Absent from the serialized IR when the source has no such block.
     motivation_block: Any = None
+    # True when the source declares the agent governance extension
+    # (`agents: 0.1` with `norms: 0.1`). Not serialized: the fields of
+    # Appendix G (G.13) are part of the serialized IR only when it is set,
+    # so the IR of a file without the extension is unchanged (G.14).
+    agents_extension: bool = False
