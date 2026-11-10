@@ -1241,6 +1241,16 @@ class TestAgentRego:
             assert body.count(a) == body.count(b)
 
 
+class TestAgentRegoNegation:
+    def test_no_lookup_that_can_be_undefined_under_not(self):
+        # In Rego `not f(x[k])` is undefined, not true, when x[k] is undefined.
+        text = generate_agent_rego_text(parse(RICH))
+        body = text[text.index("`)") + 2:]
+        for line in body.splitlines():
+            if line.strip().startswith("not "):
+                assert "[" not in line, line
+
+
 OPA = shutil.which("opa")
 
 
@@ -1273,6 +1283,19 @@ class TestAgentRegoWithOpa:
         inputs = [json.loads(p.read_text()) for p in sorted(INPUTS.glob("*.json"))]
         assert len(inputs) >= 6
         self.compare(parse_file(EXAMPLE), inputs, tmp_path)
+
+    def test_unbound_index_is_unknown_and_a_prohibition_applies(self, tmp_path):
+        # cadl 0.3.20 wrote `not is_number(bindings[ref.var])`, which OPA leaves
+        # undefined when the index is not bound: the prohibition of R[i] did
+        # not apply, and `default: allow` let the message through.
+        src = RICH.replace("    enforcement:\n", "    enforcement: {default: allow}\n", 1)
+        inputs = [msg(s, "U", n, **kw) for s in ("R[1]", "R[2]", "R[7]", "AG")
+                  for n in ("wipe", "write")
+                  for kw in ({}, {"instances": [inst("C1")]},
+                             {"instances": [inst("C1", bindings={"i": 2})]})]
+        self.compare(parse(src), inputs, tmp_path)
+        value = self.evaluate(tmp_path / "agent_policy.rego", msg("R[1]", "U", "wipe"), tmp_path)
+        assert (value["decision"], value["result"]["reason"]) == ("deny", "prohibition")
 
     def test_two_contracts_instances_and_chains(self, tmp_path):
         self.compare(parse(RICH), rich_inputs(), tmp_path)
@@ -1461,3 +1484,65 @@ class TestCodegenDeclaration:
     def test_opa_target_is_independent(self, tmp_path):
         generate(parse_file(EXAMPLE), tmp_path, target="opa")
         assert "agent_policy.rego" not in [p.name for p in tmp_path.iterdir()]
+
+
+CEDAR = shutil.which("cedar")
+
+
+@pytest.mark.skipif(CEDAR is None, reason="the cedar binary is not on PATH: the generated "
+                    "Cedar policies are tested structurally only, not evaluated")
+class TestAgentCedarWithCedar:
+    """Authorize requests with the cedar CLI and compare with the reference
+    decision function on an input without `instances`. Cedar gives Deny
+    where the function gives deny or escalate; a prohibition that is not
+    static is not enforced by the policies (G.10), which is the one
+    difference allowed."""
+
+    def entities(self, table: dict) -> list:
+        out = list(table["entities"]["actors"])
+        for s in table["entities"]["sets"]:
+            out.append({"uid": s["uid"], "attrs": {}, "parents": []})
+            out += s.get("members", [])
+        return out
+
+    def compare(self, sos, senders, receivers, names, tmp_path):
+        generate(sos, tmp_path, target="agent-cedar")
+        policy = build_policy(sos)
+        table = json.loads((tmp_path / "agent_policy_table.json").read_text())
+        (tmp_path / "entities.json").write_text(json.dumps(self.entities(table)))
+        parsed = subprocess.run([CEDAR, "check-parse", "--policies",
+                                 str(tmp_path / "agent_policy.cedar")],
+                                capture_output=True, text=True, timeout=60)
+        assert parsed.returncode == 0, parsed.stderr
+        not_static = set(table["non_static"])
+        for s in senders:
+            for r in receivers:
+                for n in names:
+                    proc = subprocess.run(
+                        [CEDAR, "authorize", "--policies", str(tmp_path / "agent_policy.cedar"),
+                         "--entities", str(tmp_path / "entities.json"),
+                         "--principal", f"CADL::Actor::{json.dumps(s)}",
+                         "--action", f"CADL::Action::{json.dumps(n)}",
+                         "--resource", f"CADL::Actor::{json.dumps(r)}"],
+                        capture_output=True, text=True, timeout=60)
+                    assert proc.returncode in (0, 2), proc.stderr
+                    got = "allow" if "ALLOW" in proc.stdout else "deny"
+                    ref = decide(policy, msg(s, r, n))
+                    want = "allow" if ref["decision"] == "allow" else "deny"
+                    if got != want:
+                        assert got == "allow" and ref["reason"] == "prohibition" \
+                            and set(ref["norms"]) <= not_static, (s, r, n, ref)
+
+    def test_example_of_the_appendix(self, tmp_path):
+        actors = ["OPERATOR", "PLANNER", "SUMMARIZER", "FILES", "TICKETS"]
+        self.compare(parse_file(EXAMPLE), actors + ["GHOST"], actors + ["NOBODY"],
+                     ["read_file", "delete_file", "format_disk", "search_tickets",
+                      "create_ticket", "approve", "hello"], tmp_path)
+
+    @pytest.mark.parametrize("default", ["", " {default: allow}", " {default: deny}"])
+    def test_sets_two_contracts_and_defaults(self, default, tmp_path):
+        src = RICH.replace("    enforcement:\n", f"    enforcement:{default}\n", 1)
+        self.compare(parse(src),
+                     ["OP", "AG", "SUB", "X", "R[1]", "R[7]", "R", "GHOST", "T"],
+                     ["T", "U", "FREE", "AG", "M", "R[2]", "NOBODY"],
+                     ["read", "write", "wipe", "bogus", "ping"], tmp_path)

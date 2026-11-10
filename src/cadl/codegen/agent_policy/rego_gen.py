@@ -304,7 +304,7 @@ ref_true(ref, a, bindings) if {
 	ref.kind == "var"
 	is_member(ref.name, a)
 	a.index != null
-	is_number(bindings[ref.var])
+	is_number(object.get(bindings, ref.var, null))
 	a.index == bindings[ref.var]
 }
 
@@ -313,7 +313,7 @@ ref_unknown(ref, a, bindings) if {
 	ref.kind == "var"
 	is_member(ref.name, a)
 	a.index != null
-	not is_number(bindings[ref.var])
+	not is_number(object.get(bindings, ref.var, null))
 }
 
 ref_match(ref, a, bindings) := 2 if ref_true(ref, a, bindings)
@@ -334,8 +334,8 @@ in_force_value(inst, id) := 2 if inst.in_force[id] == true
 in_force_value(inst, id) := 0 if inst.in_force[id] == false
 
 in_force_value(inst, id) := 1 if {
-	not inst.in_force[id] == true
-	not inst.in_force[id] == false
+	not object.get(inst.in_force, id, null) == true
+	not object.get(inst.in_force, id, null) == false
 }
 
 norm_in_force(n, _) := 2 if n.static
@@ -443,12 +443,12 @@ approver(n, _) := sprintf("%s[%d]", [n.escalate.name, n.escalate.index]) if n.es
 
 approver(n, inst) := sprintf("%s[%d]", [n.escalate.name, inst.bindings[n.escalate.var]]) if {
 	n.escalate.kind == "var"
-	is_number(inst.bindings[n.escalate.var])
+	is_number(object.get(inst.bindings, n.escalate.var, null))
 }
 
 approver(n, inst) := null if {
 	n.escalate.kind == "var"
-	not is_number(inst.bindings[n.escalate.var])
+	not is_number(object.get(inst.bindings, n.escalate.var, null))
 }
 
 approver(n, _) := null if n.escalate.kind in {"all", "range"}

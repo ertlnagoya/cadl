@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+import shutil
+import subprocess
 from fractions import Fraction
 from pathlib import Path
 
@@ -1383,3 +1386,148 @@ def test_codegen_accepts_reward_property_with_quotes(tmp_path):
     sos = parse_file(EXAMPLE)
     for target in ("python", "solidity", "opa"):
         generate(sos, tmp_path / target, target)
+
+
+class TestQuotedNamesInExport:
+    """PRISM 4.11 and Storm reject `label "max"` and `rewards "max"`: a quoted
+    name must still be an identifier that is no keyword (H.11)."""
+
+    def renamed(self):
+        def f(m, s):
+            m["labels"]["max"] = "task == Delivered"
+            m["labels"]["floor"] = "attempts == 3"
+            m["rewards"].append({"id": "module", "items": [{"value": 1}]})
+            m["properties"].append({"id": "KW", "expr": 'R{"module"}=? [ F max OR floor ]'})
+            m["properties"].append({"id": "KW2", "expr": "P=? [ NOT floor U<=3 max ]"})
+        return export_prism(model_of(f))
+
+    def test_keyword_labels_and_rewards_get_one_underscore(self):
+        files = self.renamed()
+        text = files["RobotDeliveryStochastic_CENTRALIZED.prism"]
+        assert 'label "max_" = (task = task_Delivered);' in text
+        assert 'label "floor_" = (attempts = 3);' in text
+        assert 'rewards "module_"' in text and 'rewards "delay"' in text
+        assert 'label "max"' not in text and 'rewards "module"' not in text
+        props = files["RobotDeliveryStochastic_CENTRALIZED.props"]
+        assert 'R{"module_"}=? [ F ("max_" | "floor_") ]' in props
+        assert 'P=? [ (!"floor_") U<=3 "max_" ]' in props
+
+    def test_label_collision_after_renaming_is_an_error(self):
+        def f(m, s):
+            m["labels"]["max"] = "task == Delivered"
+            m["labels"]["max_"] = "attempts == 3"
+        with pytest.raises(ExportError, match="max_"):
+            export_prism(model_of(f))
+
+    def test_reward_collision_after_renaming_is_an_error(self):
+        def f(m, s):
+            m["rewards"].append({"id": "min", "items": [{"value": 1}]})
+            m["rewards"].append({"id": "min_", "items": [{"value": 1}]})
+        with pytest.raises(ExportError, match="min_"):
+            export_prism(model_of(f))
+
+
+# ---------------------------------------------------------------------------
+# The exported files under PRISM and Storm
+# ---------------------------------------------------------------------------
+
+FEATURES = Path(__file__).parent / "data" / "stochastic_features.cadl"
+EXTERNAL_MODELS = [EXAMPLE, FEATURES]
+
+
+def _exported(path: Path, out: Path):
+    """Per design: the model file, the property lines with their values of
+    the reference evaluator, and the constant definitions of the file."""
+    model = checked_model(parse_file(path))
+    files = export_prism(model)
+    for name, text in files.items():
+        (out / name).write_text(text, encoding="utf-8")
+    for d in check_properties(model):
+        stem = next(n[:-6] for n in files if n.endswith(f"_{d['design']}.prism"))
+        lines = files[stem + ".props"].splitlines()
+        consts = ",".join(l[len("// const "):].replace(" ", "")
+                          for l in lines if l.startswith("// const "))
+        by_id, current = {}, None
+        for line in lines:
+            if line.startswith("// const ") or not line.strip():
+                continue
+            if line.startswith("//"):
+                current = line[2:].strip()
+            else:
+                by_id[current] = line
+        props = [(by_id[p["id"]], p) for p in d["properties"]]
+        yield out / (stem + ".prism"), consts, d["states"], props
+
+
+def _same(text: str, value, exact: bool) -> bool:
+    if value is INFINITY:
+        return text in ("Infinity", "Inf", "inf")
+    if text in ("Infinity", "Inf", "inf"):
+        return False
+    if exact:
+        return Fraction(text) == value
+    return abs(float(text) - float(value)) < 1e-9
+
+
+class TestExportWithStorm:
+    """Storm (stormpy) builds the exported model and checks every property
+    in exact rational arithmetic; the values are those of the reference
+    evaluator."""
+
+    @pytest.mark.parametrize("path", EXTERNAL_MODELS, ids=lambda p: p.stem)
+    def test_values_are_equal(self, path, tmp_path):
+        stormpy = pytest.importorskip("stormpy")
+        for file, consts, states, props in _exported(path, tmp_path):
+            program = stormpy.parse_prism_program(str(file))
+            parsed = stormpy.parse_properties(";".join(line for line, _ in props), program)
+            if consts:
+                program, parsed = stormpy.instantiate_constants(program, consts, parsed)
+            chain = stormpy.build_model[stormpy.Rational](program, parsed)
+            assert chain.nr_states == states
+            s0 = chain.initial_states[0]
+            for formula, (line, p) in zip(parsed, props):
+                result = stormpy.model_checking(chain, formula)
+                if p["result"] is None:
+                    assert _same(str(result.get_value(s0)), p["value"], True), (file.name, line)
+                else:
+                    assert bool(result[s0]) == (p["result"] == "satisfied"), (file.name, line)
+
+
+PRISM = shutil.which("prism")
+
+
+@pytest.mark.skipif(PRISM is None, reason="the prism binary is not on PATH: the exported "
+                    "files are compared with the listing of H.12 only, not run")
+class TestExportWithPrism:
+    """PRISM checks the exported files. Its exact engine has no bounded
+    until, so a property with a step bound is compared in floating point."""
+
+    def run(self, file, consts, lines, exact):
+        cmd = [PRISM, str(file), "-pf", ";".join(lines)]
+        cmd += ["-const", consts] if consts else []
+        cmd += ["-exact"] if exact else []
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=300).stdout
+        assert "Syntax error" not in out, out
+        results = []
+        for block in out.split("\nModel checking: ")[1:]:
+            m = re.search(r"^Result: (\S+)", block, re.M)
+            results.append(m.group(1) if m else None)
+        assert len(results) == len(lines), out
+        return results, int(re.search(r"States:\s+(\d+)", out).group(1))
+
+    @pytest.mark.parametrize("path", EXTERNAL_MODELS, ids=lambda p: p.stem)
+    def test_values_are_equal(self, path, tmp_path):
+        for file, consts, states, props in _exported(path, tmp_path):
+            lines = [line for line, _ in props]
+            exact, n = self.run(file, consts, lines, True)
+            rounded, _ = self.run(file, consts, lines, False)
+            assert n == states
+            for line, (_, p), e, r in zip(lines, props, exact, rounded):
+                assert r is not None, (file.name, line)
+                if p["result"] is not None:
+                    assert (e or r) == ("true" if p["result"] == "satisfied" else "false"), line
+                elif e is not None:
+                    assert _same(e, p["value"], True), (file.name, line, e)
+                else:
+                    assert "<=" in line.split("[", 1)[1], line   # only a step bound
+                    assert _same(r, p["value"], False), (file.name, line, r)

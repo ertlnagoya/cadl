@@ -1859,7 +1859,7 @@ def tr(tree: tuple) -> str:
     if kind == "var":
         return _prism_name(tree[1])
     if kind == "label":
-        return f'"{tree[1]}"'
+        return f'"{_prism_name(tree[1])}"'
     if kind == "lit":
         return _prism_name(f"{tree[2]}_{tree[1]}")
     if kind == "par":
@@ -1907,13 +1907,26 @@ def _check_export_names(model: Model) -> None:
         for lit in v.literals:
             add(_prism_name(f"{v.id}_{lit}"), f"the literal '{lit}' of variable '{v.id}'")
     # PRISM always defines the labels "init" and "deadlock" (PRISM manual,
-    # property specification); a model must not define them again. Label
-    # names are quoted and never renamed (H.11), so this is an error.
+    # property specification); a model must not define them again.
     for name in model.labels:
         if name in PRISM_BUILTIN_LABELS:
             raise ExportError(
                 f"cannot export: the label '{name}' has the name of a label that "
                 f"PRISM always defines (\"init\", \"deadlock\"); rename it")
+    # A quoted label or reward name must still be an identifier that is no
+    # keyword: PRISM 4.11 and Storm reject `label "max"` and `rewards "max"`,
+    # and Storm also the built-in function names. They are renamed like the
+    # other names; labels and reward structures each have their own
+    # namespace in PRISM.
+    for kind, ids in (("label", list(model.labels)),
+                      ("reward structure", [r.id for r in model.rewards])):
+        written_as: dict[str, str] = {}
+        for name in ids:
+            written = _prism_name(name)
+            if written_as.setdefault(written, name) != name:
+                raise ExportError(
+                    f"cannot export: the {kind}s '{written_as[written]}' and '{name}' "
+                    f"are both written '{written}' in the PRISM model (H.11)")
     actions: dict[str, str] = {}
     for c in model.commands:
         if c.action:
@@ -1934,7 +1947,7 @@ def _operand(tree: tuple) -> str:
 
 def property_text(prop: PropertyExpr) -> str:
     """A property as written in the properties file (H.11)."""
-    head = "P" if prop.quantity == "P" else f'R{{"{prop.reward}"}}'
+    head = "P" if prop.quantity == "P" else f'R{{"{_prism_name(prop.reward)}"}}'
     head += "=?" if prop.is_query else f"{prop.op}{prop.threshold_text}"
     bound = "" if prop.bound is None else f"<={prop.bound}"
     if prop.path == "F":
@@ -1996,9 +2009,9 @@ def prism_model_text(model: Model, design: Design) -> str:
     if model.labels:
         out.append("")
         for name, (tree, _) in model.labels.items():
-            out.append(f'label "{name}" = ({tr(tree)});')
+            out.append(f'label "{_prism_name(name)}" = ({tr(tree)});')
     for r in model.rewards:
-        out += ["", f'rewards "{r.id}"']
+        out += ["", f'rewards "{_prism_name(r.id)}"']
         for item in r.items:
             action = f"[{_prism_name(item.action)}] " if item.action else ""
             out.append(f"  {action}{tr(item.guard)} : ({_tr_param(item.value)});")

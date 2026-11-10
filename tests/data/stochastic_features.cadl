@@ -1,0 +1,91 @@
+# Test model for the stochastic extension (Appendix H): the features the
+# example of H.12 does not use. `when:`, three-way updates, state and
+# transition rewards with guards, `U` and `U<=k`, a boolean variable, and
+# names that are PRISM keywords or built-in functions (`floor`, `module`,
+# the label `max`). Used by the comparisons with PRISM and Storm in
+# tests/test_stochastic_extension.py.
+sos:
+  name: "Gamble"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+  actors:
+    - { id: HOUSE, role: "house" }
+    - { id: PLAYER, role: "player" }
+  contracts:
+    - id: GAME
+      parties: [HOUSE, PLAYER]
+      information: { alpha: 0.7 }
+      authority: { decision_holder: HOUSE, beta: 0.5 }
+  transitions:
+    - { from: CAUTIOUS, to: BOLD, condition: "x > 1" }
+    - { from: BOLD, to: CAUTIOUS, condition: "x <= 1" }
+  model:
+    kind: dtmc
+    parameters:
+      - { id: p, range: [0, 1], value: 0.45 }
+      - { id: tie, range: [0, 0.3], value: 0.125 }
+      - { id: alpha, from: "GAME.alpha" }
+      - { id: cost, range: [0, 5], value: 0.25 }
+    variables:
+      - { id: floor, type: "[0..4]", init: 2 }
+      - { id: phase, type: "{Play, Won, Lost}", init: Play }
+      - { id: module, type: bool, init: false }
+      - { id: rounds, type: "[0..6]", init: 0 }
+    labels:
+      max: "phase == Won"
+      broke: "phase == Lost"
+      playing: "phase == Play AND rounds < 6"
+    commands:
+      - action: bet
+        when: [CAUTIOUS]
+        guard: "phase == Play AND floor > 0 AND floor < 4 AND rounds < 6"
+        updates:
+          - { prob: "p * alpha", set: { floor: "floor + 1", rounds: "rounds + 1" } }
+          - { prob: tie, set: { rounds: "rounds + 1", module: true } }
+          - { prob: rest, set: { floor: "floor - 1", rounds: "rounds + 1" } }
+      - action: bet
+        when: [BOLD]
+        guard: "phase == Play AND floor > 0 AND floor < 3 AND rounds < 6"
+        updates:
+          - { prob: "p * p", set: { floor: "floor * 2", rounds: "rounds + 1", module: true } }
+          - { prob: rest, set: { floor: 0, rounds: "rounds + 1" } }
+      - action: bet
+        when: [BOLD]
+        guard: "phase == Play AND floor == 3 AND rounds < 6"
+        updates:
+          - { prob: 0.5, set: { floor: 4, rounds: "rounds + 1" } }
+          - { prob: 0.25, set: { floor: 2, rounds: "rounds + 1" } }
+          - { prob: 0.25, set: { rounds: "rounds + 1" } }
+      - action: settle
+        guard: "phase == Play AND floor == 4"
+        updates:
+          - { prob: 1, set: { phase: Won } }
+      - action: settle
+        guard: "phase == Play AND floor == 0"
+        updates:
+          - { prob: 1, set: { phase: Lost } }
+    regimes:
+      CAUTIOUS: { parameters: { tie: 0.125 } }
+      BOLD: { parameters: { tie: 0 } }
+    rewards:
+      - id: time
+        items:
+          - { guard: "phase == Play", value: 1 }
+      - id: spend
+        items:
+          - { action: bet, value: cost }
+          - { action: bet, guard: "module == true", value: "cost * 2 + 0.5" }
+          - { guard: "floor == 3", value: 0.125 }
+    properties:
+      - { id: WIN, expr: "P=? [ F max ]" }
+      - { id: WIN4, expr: "P=? [ F<=4 max ]" }
+      - { id: LOSE, expr: "P=? [ F broke ]" }
+      - { id: SAFE_U, expr: "P=? [ floor >= 2 U max ]" }
+      - { id: SAFE_UK, expr: "P=? [ NOT module U<=5 floor == 4 OR floor == 0 ]" }
+      - { id: FLAG, expr: "P=? [ F module == true AND phase != Lost ]" }
+      - { id: STUCK, expr: "P=? [ F rounds == 6 AND phase == Play ]" }
+      - { id: SPEND, expr: 'R{"spend"}=? [ F max OR broke OR rounds == 6 ]' }
+      - { id: TIME, expr: 'R{"time"}=? [ F max OR broke OR rounds == 6 ]' }
+      - { id: TIME_INF, expr: 'R{"time"}=? [ F max ]' }
+      - { id: BOUND, expr: "P>=0.2 [ F max ]" }
