@@ -6,6 +6,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.19] — 2026-11-10
+
+The norms extension (norms 0.1, Appendix F of the specification).
+
 ### Added
 - Norms extension, norms 0.1 (Appendix F of the specification). A
   contract may have `norms:` (obligations, permissions, prohibitions and
