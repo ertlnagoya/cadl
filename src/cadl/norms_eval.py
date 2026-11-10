@@ -713,6 +713,10 @@ class _Engine:
         self.unauthorised: list[dict] = []
         self.amendments: list[dict] = []
         self._amend_violated: list[_NormInst] = []
+        # Observation index -> ids of norms whose content does not count as
+        # occurring there. Empty in `cadl norms-eval`; the runtime of the
+        # agent governance extension fills it for a released message (G.6).
+        self._exempt: dict[int, set[str]] = {}
         self.assumption_failed_at: float | None = None
         self.ended_at: int | None = None
         self.end_reason: str | None = None
@@ -987,35 +991,43 @@ class _Engine:
 
     def run(self) -> None:
         last = len(self.obs) - 1
-        for n, o in enumerate(self.obs):
-            if n == 0:
-                self._start()
-            self._amend_violated = []
-            if o.amend:
-                self._amend(n, o.amend)                   # F.6, before step 1
-            self._check_state(n)
-            self._contract_items(n)
-            created = self._counts_as(n)                  # step 1
-            self._powers(n, created)                      # step 2
-            self._triggers(n, created)                    # step 3
-            violated = self._amend_violated + self._judge(n, created)   # step 4
-            for norm in violated:                         # step 5
-                self._on_violation(norm, n, activate=True)
-            reason = None                                 # step 6
-            if self.lifecycle and o.state_after in self.lifecycle.terminal:
-                reason = f"terminal state {o.state_after}"
-            elif o.end is True:
-                reason = "end of the instance in the trace"
-            elif n == last and o.end is not False:
-                reason = "last observation of the trace"
-            if reason:
-                self._settle(n, reason)
+        for n in range(len(self.obs)):
+            if self._step(n, n == last):
                 if n < last:
                     self.warnings.append(
                         f"{last - n} observation(s) after the end of the contract instance "
-                        f"(t={_fmt_t(o.t)}) are ignored")
+                        f"(t={_fmt_t(self.obs[n].t)}) are ignored")
                 break
         self._finish_items()
+
+    def _step(self, n: int, last: bool) -> bool:
+        """Process observation n; `last` says that it is the last one of
+        the trace. Returns True when the contract instance ended at it."""
+        o = self.obs[n]
+        if n == 0:
+            self._start()
+        self._amend_violated = []
+        if o.amend:
+            self._amend(n, o.amend)                   # F.6, before step 1
+        self._check_state(n)
+        self._contract_items(n)
+        created = self._counts_as(n)                  # step 1
+        self._powers(n, created)                      # step 2
+        self._triggers(n, created)                    # step 3
+        violated = self._amend_violated + self._judge(n, created)   # step 4
+        for norm in violated:                         # step 5
+            self._on_violation(norm, n, activate=True)
+        reason = None                                 # step 6
+        if self.lifecycle and o.state_after in self.lifecycle.terminal:
+            reason = f"terminal state {o.state_after}"
+        elif o.end is True:
+            reason = "end of the instance in the trace"
+        elif last and o.end is not False:
+            reason = "last observation of the trace"
+        if reason:
+            self._settle(n, reason)
+            return True
+        return False
 
     def _start(self) -> None:
         state = f", state {self.obs[0].state}" if self.lifecycle else ""
@@ -1162,6 +1174,8 @@ class _Engine:
                 hit = None
                 for k in list(norm.candidates):
                     v = norm.content.content(k, n, created)
+                    if v is True and norm.d.id in self._exempt.get(k, ()):
+                        v = False
                     if v is True:
                         hit = k
                         break

@@ -6,6 +6,54 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl]`
+  and `cadl.agents_runtime.run`: the reference runtime of the agent
+  governance extension (Appendix G, G.5 to G.8). It replays a recorded
+  sequence of messages through one logical enforcement point over the
+  enforced contracts of a file. For every message it derives the state
+  that the decision function needs (the in-force flags of the norms that
+  are not static from the verdict engine of `cadl norms-eval`, the valid
+  derived instances from the grants and revocations seen so far, the
+  running contract instances and their bindings), calls the decision
+  function of `cadl agents-decide`, and applies the result: an allowed
+  message becomes an observation of the norms engine, a denied or held
+  message does not. An `escalate` creates a hold (`h-1`, `h-2`, ...); an
+  `approval` or `rejection` of the approver with the hold id as first
+  argument, the timeout, the end of a contract instance or an amendment
+  closes it; an approved message is re-checked and released as the next
+  observation and does not violate its grounds (G.6). Grants and
+  revocations keep the derived instances with their provenance chains,
+  `max_depth`, `to:` and `until:` (G.7). An obligation whose content the
+  contract itself denied or held is `excused`, and a violated prohibition
+  stays in force as G.5 says. The runtime is deterministic and offline:
+  its only clock is `t` of the trace.
+- Trace format of `cadl agents-run`: the JSON Lines of `cadl norms-eval`
+  for the whole enforcement point, with `epoch` (first line: the time of
+  `t = 0`, so that audit times are ISO 8601 time stamps) and `instances`
+  (host-created contract instances with `bindings`, `request`, `state`
+  and `end`).
+- Audit log (G.8), in the JSON output and as JSON Lines with `--audit`:
+  decision records with exactly the fields of G.8 (`time`, `message`,
+  `instances`, the result of G.10, `hold_id`, `outcome`), two per hold,
+  and event records for grants, revocations and unauthorised acts
+  (`event`, `norm`, `chain`, `holders`, `hold_id`, `reason`). The log is
+  reproducible; it has no hash chain or signature, which G.8 does not ask
+  for.
+- `cadl.agents.applying_prohibitions`, `governs` and `message_kind`: parts
+  of the decision function that the runtime needs on their own. `decide`
+  uses them and returns what it returned before.
+- `examples/agents_change_control.cadl` (a prohibition in force between a
+  trigger and an `until:`, a delegation with `max_depth: 1` and `until:`)
+  and five traces under `examples/traces/` for it and for
+  `examples/agents_tool_governance.cadl`.
+
+### Changed
+- `cadl.norms_eval`: the engine can be driven one observation at a time
+  (`_Engine._step`), and a norm can be exempted from the content of one
+  observation; `cadl agents-run` uses both. `cadl norms-eval` and its
+  output are unchanged.
+
 ## [0.3.21] — 2026-11-11
 
 Fixes found by running the generated files with the tools they are

@@ -7,6 +7,8 @@
 #   cadl check  examples/agents_tool_governance.cadl
 #   cadl agents-decide examples/agents_tool_governance.cadl \
 #       --input examples/agents_inputs/delete_file_escalate.json
+#   cadl agents-run examples/agents_tool_governance.cadl \
+#       --trace examples/traces/agents_tool_governance_a_approved.jsonl
 #   cadl codegen examples/agents_tool_governance.cadl -t agent-rego  -o out/
 #   cadl codegen examples/agents_tool_governance.cadl -t agent-cedar -o out/
 

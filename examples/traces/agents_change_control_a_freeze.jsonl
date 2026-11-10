@@ -1,0 +1,12 @@
+{"t": 0, "messages": [{"from": "LEAD", "to": "REPO", "name": "push_change"}]}
+{"t": 10, "messages": [{"from": "OWNER", "to": "LEAD", "name": "freeze"}]}
+{"t": 20, "messages": [{"from": "LEAD", "to": "REPO", "name": "push_change"}]}
+{"t": 30, "messages": [{"from": "LEAD", "to": "REPO", "name": "force_push"}]}
+{"t": 40, "messages": [{"from": "OWNER", "to": "LEAD", "name": "approve", "args": ["h-1"]}]}
+{"t": 50, "messages": [{"from": "LEAD", "to": "REPO", "name": "push_change"}]}
+{"t": 60, "messages": [{"from": "OWNER", "to": "LEAD", "name": "reject", "args": ["h-2"]}]}
+{"t": 70, "messages": [{"from": "LEAD", "to": "REPO", "name": "push_change"}]}
+{"t": 400, "messages": [{"from": "OWNER", "to": "LEAD", "name": "thaw"}]}
+{"t": 410, "messages": [{"from": "LEAD", "to": "REPO", "name": "push_change"}]}
+{"t": 420, "messages": [{"from": "LEAD", "to": "REPO", "name": "open_issue"}]}
+{"t": 430, "messages": [{"from": "WORKER[1]", "to": "REPO", "name": "delete_branch"}]}

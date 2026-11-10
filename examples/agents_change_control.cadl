@@ -1,0 +1,83 @@
+# Agent governance extension (agents 0.1) — a second example for the
+# runtime of Appendix G (`cadl agents-run`): a prohibition that is not
+# static (it is in force between a trigger and an `until:`), and a
+# delegation with `max_depth: 1` and an `until:`.
+#
+# An owner lets a lead agent push changes to a repository. During a
+# freeze a push needs the owner's approval. The owner may let the lead and
+# the workers read the repository until the review is closed; a holder
+# cannot pass the permission on.
+#
+# `cadl check` reports one warning (N-12): `may_push` and
+# `no_push_in_freeze` have the same bearer and content. That is intended
+# here: while the prohibition is in force it overrides the permission (G.5).
+#
+#   cadl check      examples/agents_change_control.cadl
+#   cadl agents-run examples/agents_change_control.cadl \
+#       --trace examples/traces/agents_change_control_a_freeze.jsonl
+#   cadl agents-run examples/agents_change_control.cadl \
+#       --trace examples/traces/agents_change_control_b_delegation.jsonl
+
+sos:
+  name: "ChangeControl"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+
+  actors:
+    - id: OWNER
+      role: "Human owner of the repository"
+      agent: { kind: human }
+    - id: LEAD
+      role: "LLM agent that prepares and pushes changes"
+      agent: { kind: llm_agent, protocol: a2a }
+    - id: "WORKER[1..2]"
+      role: "LLM sub-agents that review changes"
+      agent: { kind: llm_agent, protocol: a2a }
+    - id: REPO
+      role: "Source repository"
+      agent: { kind: tool_server, protocol: mcp, tools: [read_repo, push_change, force_push, open_issue] }
+
+  contracts:
+    - id: CHANGE_CONTROL
+      parties: [OWNER, LEAD, "WORKER[*]", REPO]
+      enforcement:
+        point: gateway
+      counts_as:
+        - { when: "OWNER -> LEAD : approve", creates: approval }
+        - { when: "OWNER -> LEAD : reject",  creates: rejection }
+      norms:
+        - id: may_read
+          kind: permission
+          bearer: OWNER
+          content: "OWNER -> REPO : read_repo"
+        - id: may_push
+          kind: permission
+          bearer: LEAD
+          content: "LEAD -> REPO : push_change"
+        - id: may_open_issue
+          kind: permission
+          bearer: LEAD
+          content: "LEAD -> REPO : open_issue"
+        - id: no_push_in_freeze
+          kind: prohibition
+          bearer: LEAD
+          trigger: "OWNER -> LEAD : freeze"
+          until: "OWNER -> LEAD : thaw"
+          content: "LEAD -> REPO : push_change"
+          on_denied:
+            escalate_to: OWNER
+            timeout: 5min
+            fallback: "LEAD -> REPO : open_issue"
+            notify: OWNER
+        - id: no_force_push
+          kind: prohibition
+          bearer: LEAD
+          content: "LEAD -> REPO : force_push"
+      delegations:
+        - norm: may_read
+          to: [LEAD, "WORKER[*]"]
+          grant: grant_read
+          revoke: revoke_read
+          max_depth: 1
+          until: "OWNER -> LEAD : close_review"
