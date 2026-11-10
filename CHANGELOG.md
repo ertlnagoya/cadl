@@ -6,6 +6,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.20] — 2026-11-10
+
+Verdicts and amendments of the norms extension on a recorded trace
+(Appendix F), the agent governance extension (agents 0.1, Appendix G),
+and the stochastic model extension (stochastic 0.1, Appendix H).
+
 ### Added
 - `cadl norms-eval FILE --trace TRACE [--contract ID] [--format text|json]`:
   an offline verdict engine for the norms extension (Appendix F, F.4 and
