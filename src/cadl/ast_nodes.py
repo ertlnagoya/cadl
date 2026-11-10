@@ -163,6 +163,21 @@ class InterfaceDef:
 
 
 @dataclass
+class AgentBinding:
+    """`agent:` of an actor (Appendix G, G.3), kept as written."""
+    kind: str = ""                     # llm_agent | tool_server | human | service
+    protocol: str | None = None        # hyphen_name, e.g. mcp, a2a
+    tools: list[str] = field(default_factory=list)
+    has_tools: bool = False            # the key `tools:` is present
+    # Entries of `tools:` that the YAML loader did not read as a string
+    # (an unquoted yes / no / on / off / true / false / null, a number).
+    tools_not_names: list[str] = field(default_factory=list)
+    # An `agent:` or `tools:` value of the wrong shape, as written.
+    invalid: str | None = None
+    invalid_tools: str | None = None
+
+
+@dataclass
 class ActorDef:
     id: ActorRef
     role: str
@@ -173,6 +188,8 @@ class ActorDef:
     # An `autonomy:` value outside low / medium / high, kept as text so
     # that `cadl check` can report it; `autonomy` is then the default.
     invalid_autonomy: str | None = None
+    # Agent governance extension (Appendix G): `agent:`, None when absent.
+    agent: AgentBinding | None = None
 
 
 # === Contract definition ===
@@ -327,6 +344,50 @@ class PowerEffects:
     discharge: list[str] = field(default_factory=list)
 
 
+# === Agent governance extension (Appendix G, agents 0.1) ===
+# `enforcement:` and `delegations:` of a contract and `on_denied:` of a
+# prohibition. Actor references and events are kept as written.
+
+@dataclass
+class DenialRecovery:
+    """`on_denied:` of a prohibition (G.3, G.6)."""
+    escalate_to: str | None = None     # actor_ref, as written
+    timeout_ms: int | None = None
+    # A `timeout:` that is not a duration, kept as written for `cadl check`.
+    invalid_timeout: str | None = None
+    fallback: str | None = None        # message event (raw)
+    notify: str | None = None          # actor_ref, as written
+    # An `on_denied:` value that is not a mapping, as written.
+    invalid: str | None = None
+
+
+@dataclass
+class EnforcementBlock:
+    """`enforcement:` of a contract (G.3); its presence makes the contract
+    enforced. `default` and `point` are None when omitted."""
+    default: str | None = None         # "deny" | "allow", as written
+    point: str | None = None           # "caller" | "receiver" | "gateway", as written
+    # An `enforcement:` value that is neither null nor a mapping, as written.
+    invalid: str | None = None
+
+
+@dataclass
+class DelegationDef:
+    """An entry of `delegations:`: one delegable permission (G.3, G.7)."""
+    norm: str = ""                     # id of the permission
+    to: list[str] = field(default_factory=list)     # actor_refs, as written
+    grant: str = ""
+    revoke: str | None = None
+    max_depth: int = 1
+    # A `max_depth:` that is not an integer of at least 1, as written.
+    invalid_max_depth: str | None = None
+    until: str | None = None           # norm event (raw)
+    # Keys among norm / grant / revoke whose value the YAML loader did not
+    # read as a string (an unquoted yes / no / on / off / true / false).
+    not_names: list[str] = field(default_factory=list)
+    loc: SourceLocation | None = None
+
+
 @dataclass
 class NormDef:
     """An obligation, permission, prohibition or power of one bearer."""
@@ -346,6 +407,8 @@ class NormDef:
     transform_to: str | None = None    # target of `transform:`
     # An `on_amendment:` that is none of the forms of F.3, as written.
     invalid_on_amendment: str | None = None
+    # Agent governance extension (Appendix G): `on_denied:`, None when absent.
+    on_denied: DenialRecovery | None = None
     loc: SourceLocation | None = None
 
 
@@ -376,6 +439,12 @@ class ContractDef:
     # Norms extension (Appendix F)
     norms: list[NormDef] = field(default_factory=list)
     counts_as: list[CountsAsDef] = field(default_factory=list)
+    # Agent governance extension (Appendix G); `enforcement` is None for a
+    # contract without the key (not enforced).
+    enforcement: EnforcementBlock | None = None
+    delegations: list[DelegationDef] = field(default_factory=list)
+    # A `delegations:` value that is not a list, as written.
+    invalid_delegations: str | None = None
     loc: SourceLocation | None = None
 
 

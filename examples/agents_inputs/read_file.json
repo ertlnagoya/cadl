@@ -1,0 +1,7 @@
+{
+  "message": {
+    "from": "SUMMARIZER",
+    "to": "FILES",
+    "name": "read_file"
+  }
+}

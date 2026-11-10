@@ -18,6 +18,7 @@ from lark import Lark, Token, Transformer, v_args
 from .ast_nodes import (
     ActorDef,
     ActorRef,
+    AgentBinding,
     AgentMotivationBlock,
     AlgorithmDef,
     AuthorityBlock,
@@ -32,7 +33,10 @@ from .ast_nodes import (
     ContextBlock,
     ContractDef,
     CountsAsDef,
+    DelegationDef,
+    DenialRecovery,
     DurationLiteral,
+    EnforcementBlock,
     EnvironmentDef,
     Expression,
     FallbackBlock,
@@ -339,6 +343,9 @@ def _build_actor(data: dict) -> ActorDef:
         capabilities=[str(c) for c in capabilities],
         interface=interface,
         invalid_autonomy=invalid_autonomy,
+        # Agent governance extension (Appendix G); read whether or not
+        # `agents: 0.1` is declared, as for the norms keys below.
+        agent=_build_agent(data['agent']) if 'agent' in data else None,
     )
 
 
@@ -504,6 +511,23 @@ def _build_contract(data: dict) -> ContractDef:
         contract.counts_as = [
             _build_counts_as(r) for r in ca_data if isinstance(r, dict)
         ]
+
+    # === Agent governance extension (Appendix G) ===
+    # Read whether or not `agents: 0.1` is declared; without the declaration
+    # `cadl check` reports the keys as undeclared and does not check them,
+    # and they are not lowered to the IR (G.14).
+    if 'enforcement' in data:
+        # The bare key (null) and an empty mapping mean "enforced with all
+        # defaults" (G.3).
+        contract.enforcement = _build_enforcement(data['enforcement'])
+    if 'delegations' in data:
+        del_data = data['delegations']
+        if isinstance(del_data, list):
+            contract.delegations = [
+                _build_delegation(d) for d in del_data if isinstance(d, dict)
+            ]
+        elif del_data is not None:
+            contract.invalid_delegations = _value_as_text(del_data)
 
     return contract
 
@@ -765,6 +789,9 @@ def _build_norm(data: dict) -> NormDef:
         on_amendment=on_amendment,
         transform_to=transform_to,
         invalid_on_amendment=invalid_amend,
+        on_denied=(
+            _build_denial_recovery(data['on_denied']) if 'on_denied' in data else None
+        ),
     )
 
 
@@ -775,6 +802,111 @@ def _build_counts_as(data: dict) -> CountsAsDef:
         creates=_id_str(_get(data, 'creates', '')),
         if_=_opt_text(_get(data, 'if')),
     )
+
+
+# === Agent governance extension builders (Appendix G) ===
+
+def _opt_ref(value) -> str | None:
+    """An optional actor reference as written, or None when absent."""
+    if value is None or value == '':
+        return None
+    return _id_str(value).strip()
+
+
+def _build_agent(data) -> AgentBinding:
+    """Build the `agent:` binding of an actor (G.3)."""
+    if not isinstance(data, dict):
+        return AgentBinding(invalid='null' if data is None else _value_as_text(data))
+    kind = _get(data, 'kind')
+    protocol = _get(data, 'protocol')
+    binding = AgentBinding(
+        kind='' if kind is None else _id_str(kind),
+        protocol=None if protocol is None else _id_str(protocol),
+        has_tools='tools' in data,
+    )
+    tools = _get(data, 'tools')
+    if isinstance(tools, list):
+        for item in tools:
+            # YAML 1.1 reads an unquoted yes / no / on / off / true / false
+            # as a boolean and null as None: these are not names (G-3).
+            if isinstance(item, str):
+                binding.tools.append(item)
+            else:
+                binding.tools_not_names.append(
+                    'null' if item is None else _value_as_text(item))
+    elif tools is not None:
+        binding.invalid_tools = _value_as_text(tools)
+    return binding
+
+
+def _build_enforcement(data) -> EnforcementBlock:
+    """Build `enforcement:`; null and {} are valid (G.3, G-5)."""
+    if data is None:
+        return EnforcementBlock()
+    if not isinstance(data, dict):
+        return EnforcementBlock(invalid=_value_as_text(data))
+    default = _get(data, 'default')
+    point = _get(data, 'point')
+    return EnforcementBlock(
+        default=None if default is None else _id_str(default),
+        point=None if point is None else _id_str(point),
+    )
+
+
+def _build_denial_recovery(data) -> DenialRecovery:
+    """Build `on_denied:` of a prohibition (G.3)."""
+    if not isinstance(data, dict):
+        return DenialRecovery(invalid='null' if data is None else _value_as_text(data))
+    raw_timeout = _get(data, 'timeout')
+    # As for `deadline:`: `yes` / `no` and negative numbers are not durations.
+    timeout_ms = None if isinstance(raw_timeout, bool) else _duration_to_ms(raw_timeout)
+    if timeout_ms is not None and timeout_ms < 0:
+        timeout_ms = None
+    return DenialRecovery(
+        escalate_to=_opt_ref(_get(data, 'escalate_to')),
+        timeout_ms=timeout_ms,
+        invalid_timeout=(
+            _value_as_text(raw_timeout)
+            if raw_timeout is not None and timeout_ms is None else None
+        ),
+        fallback=_opt_text(_get(data, 'fallback')),
+        notify=_opt_ref(_get(data, 'notify')),
+    )
+
+
+def _build_delegation(data: dict) -> DelegationDef:
+    """Build an entry of `delegations:` (G.3)."""
+    raw_depth = _get(data, 'max_depth')
+    max_depth, invalid_depth = 1, None
+    if raw_depth is not None:
+        if isinstance(raw_depth, int) and not isinstance(raw_depth, bool) and raw_depth >= 1:
+            max_depth = raw_depth
+        else:
+            invalid_depth = _value_as_text(raw_depth)
+    to = _get(data, 'to')
+    return DelegationDef(
+        norm=_id_str(_get(data, 'norm', '')) if _get(data, 'norm') is not None else '',
+        to=_as_str_list(to) if isinstance(to, list) else _parse_ref_texts(to),
+        grant=_id_str(_get(data, 'grant')) if _get(data, 'grant') is not None else '',
+        revoke=_opt_name(_get(data, 'revoke')),
+        max_depth=max_depth,
+        invalid_max_depth=invalid_depth,
+        until=_opt_text(_get(data, 'until')),
+        not_names=[
+            k for k in ('norm', 'grant', 'revoke')
+            if _get(data, k) is not None and not isinstance(_get(data, k), str)
+        ],
+    )
+
+
+def _parse_ref_texts(value) -> list[str]:
+    """`to: A` or `to: "[A, B[*]]"` as a list of actor references as written."""
+    if value is None:
+        return []
+    from .unparse import actor_ref_to_source
+    if isinstance(value, str):
+        return [actor_ref_to_source(r) for r in _parse_actor_ref_list(value)]
+    return [_id_str(value).strip()]
 
 
 def _build_step(data) -> Optional[Any]:

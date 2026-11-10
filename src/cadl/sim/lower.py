@@ -34,6 +34,7 @@ from .ir import (
     AlgorithmSpec,
     ContractSpec,
     CountsAsSpecIR,
+    DelegationSpecIR,
     GovernanceParams,
     InstitutionLayer,
     LifecycleSpecIR,
@@ -77,7 +78,13 @@ def lower_to_ir(sos: SoSDefinition) -> SimIR:
             if sos.motivation is not None and sos.motivation.raw is not None
             else None
         ),
+        agents_extension=_agents_active(sos),
     )
+
+
+def _agents_active(sos: SoSDefinition) -> bool:
+    from ..agents import agents_active
+    return agents_active(sos)
 
 
 # ---------------------------------------------------------------------------
@@ -110,16 +117,20 @@ def _expr_to_value(expr: Expression) -> Any:
 # ---------------------------------------------------------------------------
 
 def _lower_institution(sos: SoSDefinition) -> InstitutionLayer:
-    actors = [_lower_actor(a) for a in sos.actors]
+    from ..agents import agents_active
     from ..norms import norms_declared
     # Without `norms: 0.1` the norms: and counts_as: blocks are not
-    # interpreted and stay out of the IR (Appendix F, F.11).
+    # interpreted and stay out of the IR (Appendix F, F.11); likewise the
+    # keys of the agent governance extension without `agents: 0.1`
+    # (Appendix G, G.14).
     with_norms = norms_declared(sos)
-    contracts = [_lower_contract(c, with_norms) for c in sos.contracts]
+    with_agents = agents_active(sos)
+    actors = [_lower_actor(a, with_agents) for a in sos.actors]
+    contracts = [_lower_contract(c, with_norms, with_agents) for c in sos.contracts]
     return InstitutionLayer(actors=actors, contracts=contracts)
 
 
-def _lower_actor(actor) -> ActorSpec:
+def _lower_actor(actor, with_agents: bool = False) -> ActorSpec:
     ref = actor.id
     count = None
     actor_id = ref.name
@@ -137,6 +148,7 @@ def _lower_actor(actor) -> ActorSpec:
     elif isinstance(ref.index, int):
         count = 1
 
+    agent = actor.agent if with_agents else None
     inputs: list[str] = []
     outputs: list[str] = []
     if actor.interface:
@@ -151,10 +163,15 @@ def _lower_actor(actor) -> ActorSpec:
         capabilities=list(actor.capabilities),
         inputs=inputs,
         outputs=outputs,
+        agent_kind=(agent.kind or None) if agent else None,
+        agent_protocol=agent.protocol if agent else None,
+        agent_tools=list(agent.tools) if agent else [],
     )
 
 
-def _lower_contract(contract, with_norms: bool = False) -> ContractSpec:
+def _lower_contract(
+    contract, with_norms: bool = False, with_agents: bool = False,
+) -> ContractSpec:
     governance = GovernanceParams()
 
     # Extract authority params
@@ -181,6 +198,9 @@ def _lower_contract(contract, with_norms: bool = False) -> ContractSpec:
         governance.lambda_ = contract.incentives.lambda_
         governance.incentive_type = contract.incentives.type
 
+    from ..agents import DEFAULT_POINT
+    enf = contract.enforcement if with_agents else None
+
     return ContractSpec(
         id=contract.id,
         parties=[_actor_ref_str(p) for p in contract.parties],
@@ -191,11 +211,21 @@ def _lower_contract(contract, with_norms: bool = False) -> ContractSpec:
         violation_action=contract.violation.action if contract.violation else None,
         lifecycle=_lower_lifecycle(contract.lifecycle),
         monitors=[_lower_monitor(m) for m in contract.monitors],
-        norms=[_lower_norm(n) for n in contract.norms] if with_norms else [],
+        norms=[_lower_norm(n, with_agents) for n in contract.norms] if with_norms else [],
         counts_as=[
             CountsAsSpecIR(when=r.when, creates=r.creates, if_=r.if_)
             for r in contract.counts_as
         ] if with_norms else [],
+        enforced=enf is not None,
+        enforcement_default=enf.default if enf else None,
+        enforcement_point=(enf.point or DEFAULT_POINT) if enf else None,
+        delegations=[
+            DelegationSpecIR(
+                norm=d.norm, to=list(d.to), grant=d.grant, revoke=d.revoke,
+                max_depth=d.max_depth, until=d.until,
+            )
+            for d in contract.delegations
+        ] if with_agents else [],
     )
 
 
@@ -244,8 +274,9 @@ def _lower_monitor(m) -> MonitorSpecIR:
     )
 
 
-def _lower_norm(n) -> NormSpecIR:
-    """Lower a NormDef AST node to NormSpecIR (Appendix F, F.9)."""
+def _lower_norm(n, with_agents: bool = False) -> NormSpecIR:
+    """Lower a NormDef AST node to NormSpecIR (Appendix F, F.9; G.13)."""
+    od = n.on_denied if with_agents else None
     ov = n.on_violation
     eff = n.effects
     return NormSpecIR(
@@ -267,6 +298,10 @@ def _lower_norm(n) -> NormSpecIR:
         effects_discharge=list(eff.discharge) if eff else [],
         on_amendment=n.on_amendment,
         transform_to=n.transform_to,
+        on_denied_escalate_to=od.escalate_to if od else None,
+        on_denied_timeout_ms=od.timeout_ms if od else None,
+        on_denied_fallback=od.fallback if od else None,
+        on_denied_notify=od.notify if od else None,
     )
 
 

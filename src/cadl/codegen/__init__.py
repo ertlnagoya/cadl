@@ -3,7 +3,8 @@
 Public API:
     generate(sos, output_dir, target="python") -> None
 
-Supported targets: python, solidity, opa, unity-csharp
+Supported targets: python, solidity, opa, unity-csharp, agent-rego,
+agent-cedar
 """
 
 from __future__ import annotations
@@ -12,7 +13,10 @@ from pathlib import Path
 
 from ..ast_nodes import SoSDefinition
 
-SUPPORTED_TARGETS = {"python", "solidity", "opa", "unity-csharp"}
+SUPPORTED_TARGETS = {"python", "solidity", "opa", "unity-csharp",
+                     "agent-rego", "agent-cedar"}
+# Boundary policies of the agent governance extension (Appendix G, G.10)
+AGENT_TARGETS = {"agent-rego", "agent-cedar"}
 
 
 def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> None:
@@ -22,11 +26,22 @@ def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> No
         sos: Parsed SoS definition.
         output_dir: Directory to write generated files.
         target: Code generation target — "python", "solidity", "opa",
-            or "unity-csharp" (Unity C# for the SoS-DSL extension,
-            Appendix E).
+            "unity-csharp" (Unity C# for the SoS-DSL extension,
+            Appendix E), or "agent-rego" / "agent-cedar" (boundary policy
+            of the agent governance extension, Appendix G; the file must
+            declare `agents: 0.1`).
     """
     if target not in SUPPORTED_TARGETS:
         raise ValueError(f"Unsupported target: {target!r}. Choose from: {sorted(SUPPORTED_TARGETS)}")
+
+    if target in AGENT_TARGETS:
+        from ..agents import agents_active
+        if not agents_active(sos):
+            raise ValueError(
+                f"target {target!r} generates the boundary policy of the agent "
+                f"governance extension, but the file does not declare it: add "
+                f"'norms: 0.1' and 'agents: 0.1' under extensions: (Appendix G)"
+            )
 
     if target != "unity-csharp":
         from .safety import check_codegen_input
@@ -64,6 +79,12 @@ def _generate_target(sos: SoSDefinition, output_dir: Path, target: str) -> None:
     elif target == "unity-csharp":
         from .unity_csharp import generate_unity_csharp
         generate_unity_csharp(sos, output_dir)
+    elif target == "agent-rego":
+        from .agent_policy import generate_agent_rego
+        generate_agent_rego(sos, output_dir)
+    elif target == "agent-cedar":
+        from .agent_policy import generate_agent_cedar
+        generate_agent_cedar(sos, output_dir)
 
 
 def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:

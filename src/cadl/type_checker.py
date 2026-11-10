@@ -10,6 +10,8 @@ Checks performed (per spec §6.2.2):
 6. SoS-DSL static semantics, rules L-1 to M-3 (Appendix E §E.4)
 7. Norms static semantics, rules N-1 to N-12 (Appendix F §F.7), when the
    file declares `norms: 0.1`
+8. Agent governance static semantics, rules G-1 to G-16 (Appendix G §G.9),
+   when the file declares `agents: 0.1` (which requires `norms: 0.1`)
 """
 
 from __future__ import annotations
@@ -55,10 +57,11 @@ _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Appendix A §A.11 and Appendix E §E.3 (the same set as the expression grammar)
 RESERVED_WORDS = frozenset({"AND", "OR", "NOT", "IN", "true", "false", "in", "exists"})
 # Targets `cadl codegen` emits, and the simulator configs of `cadl sim-gen`
-CODEGEN_TARGETS = ("python", "solidity", "opa", "unity-csharp")
+CODEGEN_TARGETS = ("python", "solidity", "opa", "unity-csharp",
+                   "agent-rego", "agent-cedar")
 SIM_TARGETS = ("unity", "go")
 # Extensions this processor implements, with the versions it knows
-KNOWN_EXTENSIONS = {"sos-dsl": ("0.1",), "norms": ("0.1",)}
+KNOWN_EXTENSIONS = {"sos-dsl": ("0.1",), "norms": ("0.1",), "agents": ("0.1",)}
 
 
 @dataclass
@@ -106,14 +109,22 @@ class TypeChecker:
         self.contract_ids: set[str] = set()
         self.protocol_ids: set[str] = set()
         self.norms_declared = False
+        # Agent governance extension: interpreted only when `agents: 0.1`
+        # is declared together with `norms: 0.1` (G-1).
+        self.agents_active = False
+        self.tool_servers: dict[str, list[str]] = {}
+        self.agent_kinds: dict[str, str] = {}
 
     def check(self, sos: SoSDefinition) -> TypeCheckResult:
         """Run all type checks on the SoS definition."""
         from .norms import norms_declared
         self.result = TypeCheckResult()
         self.norms_declared = norms_declared(sos)
+        self._check_agents_declaration(sos)
         self._collect_definitions(sos)
         self._check_actors(sos)
+        if self.agents_active:
+            self._check_agent_actors(sos)
         self._check_contracts(sos)
         self._check_protocols(sos)
         self._check_transitions(sos)
@@ -123,6 +134,8 @@ class TypeChecker:
         self._check_extensions(sos)
         if self.norms_declared:
             self._check_temporal_elsewhere(sos)
+        if self.agents_active:
+            self._check_ungoverned_tool_servers(sos)
         return self.result
 
     def _collect_definitions(self, sos: SoSDefinition) -> None:
@@ -921,6 +934,611 @@ class TypeChecker:
                         perm.loc,
                     )
 
+    # --- Agent governance extension (Appendix G, G.9) ---
+
+    _YAML_NAME_NOTE = (
+        "a YAML 1.1 loader reads an unquoted yes, no, on, off, true, false "
+        "or null as a value, not as a name"
+    )
+
+    def _check_agents_declaration(self, sos: SoSDefinition) -> None:
+        """G-1, and the undeclared use of the keys (G.14)."""
+        from .agents import agent_keys_used, agents_declared
+        declared = agents_declared(sos)
+        self.agents_active = declared and self.norms_declared
+        self.tool_servers = {}
+        if declared and not self.norms_declared:
+            self.result.add_error(
+                "The file declares 'agents: 0.1' without 'norms: 0.1', which the "
+                "agent governance extension requires; agent:, enforcement:, "
+                "delegations: and on_denied: are not interpreted (G-1)",
+                sos.loc,
+            )
+        elif not declared:
+            keys = agent_keys_used(sos)
+            if keys:
+                self.result.add_warning(
+                    f"The file uses {', '.join(keys)}, which belong{'s' if len(keys) == 1 else ''} "
+                    f"to the agent governance extension, but does not declare "
+                    f"'agents: 0.1' under extensions:; they are undeclared extension "
+                    f"keys, and are neither checked nor lowered to the IR "
+                    f"(Appendix G, G.14)",
+                    sos.loc,
+                )
+        if self.agents_active:
+            self.tool_servers = {
+                a.id.name: list(a.agent.tools) for a in sos.actors
+                if a.agent is not None and a.agent.kind == "tool_server"
+            }
+
+    def _check_agent_actors(self, sos: SoSDefinition) -> None:
+        """G-2 and G-3: the `agent:` binding of an actor."""
+        from .agents import AGENT_KINDS, is_hyphen_name
+        self.agent_kinds = {
+            a.id.name: a.agent.kind for a in sos.actors if a.agent is not None
+        }
+        for actor in sos.actors:
+            ag = actor.agent
+            if ag is None:
+                continue
+            where = f"agent: of actor '{actor.id.name}'"
+            if ag.invalid is not None:
+                self.result.add_error(
+                    f"The {where} is '{ag.invalid}'; expected a mapping with "
+                    f"kind: (G-2)", actor.loc,
+                )
+                continue
+            if ag.kind not in AGENT_KINDS:
+                self.result.add_error(
+                    (f"The {where} has kind '{ag.kind}'; expected one of "
+                     if ag.kind else f"The {where} has no kind; expected one of ")
+                    + f"{', '.join(AGENT_KINDS)} (G-2)", actor.loc,
+                )
+            if ag.protocol is not None and not is_hyphen_name(ag.protocol):
+                self.result.add_error(
+                    f"The {where} has protocol '{ag.protocol}', which is not a "
+                    f"name such as mcp or a2a (letters, digits, '_' and '-') (G-2)",
+                    actor.loc,
+                )
+            if ag.kind != "tool_server":
+                if ag.has_tools and ag.kind in AGENT_KINDS:
+                    self.result.add_error(
+                        f"The {where} has tools:, which is allowed only for a "
+                        f"tool_server, not for a {ag.kind} (G-3)", actor.loc,
+                    )
+                continue
+            # G-3: a tool server lists at least one tool; names are unique
+            # identifiers.
+            if ag.invalid_tools is not None:
+                self.result.add_error(
+                    f"tools: in the {where} is '{ag.invalid_tools}'; expected a "
+                    f"list of tool names (G-3)", actor.loc,
+                )
+            elif not ag.tools and not ag.tools_not_names:
+                self.result.add_error(
+                    f"The {where} is a tool_server and must list at least one "
+                    f"tool under tools: (G-3)", actor.loc,
+                )
+            for text in ag.tools_not_names:
+                self.result.add_error(
+                    f"tools: in the {where} has the entry '{text}', which is not "
+                    f"a name: {self._YAML_NAME_NOTE} (G-3)", actor.loc,
+                )
+            seen: set[str] = set()
+            for tool in ag.tools:
+                if not tool:
+                    self.result.add_error(
+                        f"tools: in the {where} has an empty name (G-3)", actor.loc)
+                    continue
+                self._check_identifier(tool, f"Tool name in the {where}", actor.loc,
+                                       rule="G-3")
+                if tool in seen:
+                    self.result.add_error(
+                        f"Duplicate tool '{tool}' in the {where} (G-3)", actor.loc)
+                seen.add(tool)
+
+    def _check_tool_message(self, text, where: str, loc) -> None:
+        """G-4: the message a tool server receives is one of its tools."""
+        from .agents import parse_message_event
+        msg = parse_message_event(text)
+        if msg is None or msg.name is None:
+            return
+        tools = self.tool_servers.get(msg.receiver["name"])
+        if tools is not None and msg.name not in tools:
+            self.result.add_error(
+                f"{where} sends '{msg.name}' to the tool server "
+                f"'{msg.receiver['name']}', which does not list it under tools: "
+                f"(G-4)", loc,
+            )
+
+    def _check_tool_step(self, step: MessageStep, context: str) -> None:
+        """G-4 (SHOULD): a message step of a protocol to a tool server."""
+        tools = self.tool_servers.get(step.receiver.name)
+        message = step.message
+        name = getattr(message, "name", None)
+        if tools is None or not isinstance(name, str):
+            return
+        if isinstance(message, ActorRef) and message.index is not None:
+            return
+        if name not in tools:
+            self.result.add_warning(
+                f"A message step of {context} sends '{name}' to the tool server "
+                f"'{step.receiver.name}', which does not list it under tools: "
+                f"(G-4)", step.loc,
+            )
+
+    def _check_ungoverned_tool_servers(self, sos: SoSDefinition) -> None:
+        """G-15 (b): a tool server that is a party of no enforced contract."""
+        governed = {
+            p.name for c in sos.contracts if c.enforcement is not None
+            for p in c.parties
+        }
+        for name in self.tool_servers:
+            if name not in governed:
+                self.result.add_warning(
+                    f"The tool server '{name}' is a party of no enforced contract, "
+                    f"so its tool calls are ungoverned (G-15)", sos.loc,
+                )
+
+    def _check_agent_contract(self, contract: ContractDef, ctx: str) -> None:
+        """G-4 to G-16 for one contract."""
+        from .agents import (
+            ENFORCEMENT_DEFAULTS, ENFORCEMENT_POINTS, HOLD_EVENTS,
+            norm_message, parse_message_event, parse_ref, ref_text,
+        )
+        enf = contract.enforcement
+        enforced = enf is not None
+        loc = contract.loc
+        party_names = {p.name for p in contract.parties}
+        events = {r.creates for r in contract.counts_as if r.creates}
+        norm_ids = {n.id for n in contract.norms if n.id}
+
+        # G-4: messages to a tool server, wherever a message event is written.
+        for norm in contract.norms:
+            for key in ("trigger", "until", "content"):
+                self._check_tool_message(
+                    getattr(norm, key), f"'{key}' of the norm '{norm.id}' of {ctx}",
+                    norm.loc)
+        for rule in contract.counts_as:
+            self._check_tool_message(
+                rule.when, f"'when' of the counts_as rule '{rule.creates}' of {ctx}",
+                rule.loc)
+        if contract.lifecycle:
+            for tr in contract.lifecycle.transitions:
+                self._check_tool_message(
+                    tr.on, f"'on' of the lifecycle transition '{tr.id}' of {ctx}",
+                    tr.loc)
+
+        # G-5: enforcement.default and enforcement.point.
+        if enforced:
+            if enf.invalid is not None:
+                self.result.add_error(
+                    f"enforcement: of {ctx} is '{enf.invalid}'; expected a mapping "
+                    f"with default: and point:, or no value (G-5)", loc,
+                )
+            if enf.default is not None and enf.default not in ENFORCEMENT_DEFAULTS:
+                self.result.add_error(
+                    f"enforcement.default of {ctx} is '{enf.default}'; expected "
+                    f"deny or allow (G-5)", loc,
+                )
+            if enf.point is not None and enf.point not in ENFORCEMENT_POINTS:
+                self.result.add_error(
+                    f"enforcement.point of {ctx} is '{enf.point}'; expected one of "
+                    f"{', '.join(ENFORCEMENT_POINTS)} (G-5)", loc,
+                )
+
+        # Message contents of the permissions and prohibitions, for the
+        # coverage rules (G-15, G-16): (kind, sender, receiver name, name, norm).
+        covering = []
+        escalate_targets: list[str] = []
+        fallbacks = []
+        for norm in contract.norms:
+            where = f"norm '{norm.id}' of {ctx}"
+            msg = norm_message(contract, norm) if norm.content else None
+            bearer = ref_text(norm.bearer) if norm.bearer else ""
+            if norm.kind in ("permission", "prohibition") and msg is not None \
+                    and msg.name is not None:
+                covering.append((norm.kind, msg.sender["text"],
+                                 msg.receiver["name"], msg.name, norm))
+            if enforced and norm.kind in ("permission", "prohibition") and norm.content:
+                if msg is None:
+                    # G-14 (a)
+                    self.result.add_warning(
+                        f"The content of the {norm.kind} '{norm.id}' of {ctx} is not "
+                        f"a message event, so it has no effect at the boundary and "
+                        f"is monitored under Appendix F only (G-14)", norm.loc,
+                    )
+                else:
+                    # G-6
+                    if bearer and msg.sender["text"] != bearer:
+                        self.result.add_error(
+                            f"The content of the {where} is a message sent by "
+                            f"'{msg.sender['text']}'; in an enforced contract the "
+                            f"sender must be textually equal to its bearer "
+                            f"'{norm.bearer}' (G-6)", norm.loc,
+                        )
+                    # G-14 (b)
+                    if msg.has_args:
+                        self.result.add_warning(
+                            f"The message event content of the {where} has "
+                            f"arguments, which are not considered at the boundary "
+                            f"(G-14)", norm.loc,
+                        )
+            # G-9: the names of the hold events are reserved.
+            if enforced and norm.id in HOLD_EVENTS:
+                self.result.add_error(
+                    f"The norm id '{norm.id}' of {ctx} is reserved in an enforced "
+                    f"contract for the institutional event of an escalation (G-9)",
+                    norm.loc,
+                )
+            od = norm.on_denied
+            if od is None:
+                continue
+
+            # G-7: where on_denied: is allowed, and its keys.
+            if norm.kind != "prohibition":
+                self.result.add_error(
+                    f"The {where} is a {norm.kind or 'norm without kind'}; "
+                    f"on_denied: is allowed only on a prohibition (G-7)", norm.loc,
+                )
+            elif msg is None:
+                self.result.add_error(
+                    f"The {where} has on_denied:, which is allowed only on a "
+                    f"prohibition whose content is a message event (G-7)", norm.loc,
+                )
+            if not enforced:
+                self.result.add_error(
+                    f"The {where} has on_denied:, but {ctx} is not enforced: it "
+                    f"has no enforcement: key (G-7)", norm.loc,
+                )
+            has_timeout = od.timeout_ms is not None or od.invalid_timeout is not None
+            if od.invalid is not None or not (
+                    od.escalate_to or has_timeout or od.fallback or od.notify):
+                self.result.add_error(
+                    f"on_denied: of the {where} must have at least one of "
+                    f"escalate_to, timeout, fallback, notify (G-7)", norm.loc,
+                )
+                continue
+            if od.invalid_timeout is not None:
+                self.result.add_error(
+                    f"on_denied.timeout of the {where} is '{od.invalid_timeout}', "
+                    f"which is not a duration: write a number with a unit ms, s, "
+                    f"min or h (for example 10min) (G-7)", norm.loc,
+                )
+            elif od.timeout_ms == 0:
+                self.result.add_error(
+                    f"on_denied.timeout of the {where} must be greater than zero "
+                    f"(G-7)", norm.loc,
+                )
+            if has_timeout and not od.escalate_to:
+                self.result.add_error(
+                    f"on_denied.timeout of the {where} requires escalate_to: "
+                    f"(G-7)", norm.loc,
+                )
+            if od.escalate_to and not has_timeout:
+                self.result.add_warning(
+                    f"on_denied.escalate_to of the {where} has no timeout:, so a "
+                    f"held message may be held for ever (G-7)", norm.loc,
+                )
+
+            # G-8: escalate_to and notify name single declared actors.
+            for key, text in (("escalate_to", od.escalate_to), ("notify", od.notify)):
+                if not text:
+                    continue
+                ref = parse_ref(text)
+                if ref["name"] not in self.actor_names:
+                    self.result.add_error(
+                        f"on_denied.{key} '{text}' of the {where} is not a declared "
+                        f"actor (G-8)", norm.loc,
+                    )
+                    continue
+                if ref["kind"] in ("all", "range"):
+                    self.result.add_error(
+                        f"on_denied.{key} '{text}' of the {where} is a wildcard or "
+                        f"a range; name one actor (G-8)", norm.loc,
+                    )
+                    continue
+                if key != "escalate_to":
+                    continue
+                if norm.kind == "prohibition":
+                    escalate_targets.append(ref["text"])
+                if ref["name"] not in party_names:
+                    self.result.add_error(
+                        f"on_denied.escalate_to '{text}' of the {where} is not a "
+                        f"party of the contract, so its messages would not be "
+                        f"governed (G-8)", norm.loc,
+                    )
+                if bearer and ref["text"] == bearer:
+                    self.result.add_error(
+                        f"on_denied.escalate_to of the {where} is its bearer "
+                        f"'{norm.bearer}': an actor cannot approve its own message "
+                        f"(G-8)", norm.loc,
+                    )
+                if self.agent_kinds.get(ref["name"]) != "human":
+                    self.result.add_warning(
+                        f"on_denied.escalate_to '{text}' of the {where} is not an "
+                        f"actor with agent.kind: human (G-8)", norm.loc,
+                    )
+
+            # G-10: the fallback is another message of the bearer.
+            if od.fallback:
+                fb = parse_message_event(od.fallback)
+                if fb is None:
+                    self.result.add_error(
+                        f"on_denied.fallback of the {where} must be a message event "
+                        f"(A -> B : msg), not '{od.fallback}' (G-10)", norm.loc,
+                    )
+                else:
+                    if bearer and fb.sender["text"] != bearer:
+                        self.result.add_error(
+                            f"on_denied.fallback of the {where} is sent by "
+                            f"'{fb.sender['text']}'; the sender must be textually "
+                            f"equal to the bearer '{norm.bearer}' (G-10)", norm.loc,
+                        )
+                    if fb.receiver["name"] not in self.actor_names:
+                        self.result.add_error(
+                            f"The receiver '{fb.receiver['text']}' of "
+                            f"on_denied.fallback of the {where} is not a declared "
+                            f"actor (G-10)", norm.loc,
+                        )
+                    if msg is not None and fb.receiver["text"] == msg.receiver["text"] \
+                            and fb.name == msg.name:
+                        self.result.add_error(
+                            f"on_denied.fallback of the {where} must differ from "
+                            f"the content of the prohibition in receiver or message "
+                            f"name (G-10)", norm.loc,
+                        )
+                    self._check_tool_message(
+                        od.fallback, f"on_denied.fallback of the {where}", norm.loc)
+                    if fb.name is not None:
+                        fallbacks.append((f"on_denied.fallback of the {where}", fb))
+
+        # G-9: approval and rejection are created by the approver's messages.
+        hold_rules = []
+        for rule in contract.counts_as:
+            if rule.creates in HOLD_EVENTS:
+                hold_rules.append((rule, parse_message_event(rule.when)))
+        for target in dict.fromkeys(escalate_targets):
+            created = {r.creates for r, m in hold_rules
+                       if m is not None and m.sender["text"] == target}
+            if "approval" not in created:
+                self.result.add_error(
+                    f"{ctx} has escalate_to: {target} but no counts_as rule that "
+                    f"creates 'approval' from a message event sent by {target} "
+                    f"(G-9)", loc,
+                )
+            if "rejection" not in created:
+                self.result.add_warning(
+                    f"{ctx} has escalate_to: {target} but no counts_as rule that "
+                    f"creates 'rejection' from a message event sent by {target} "
+                    f"(G-9)", loc,
+                )
+        if enforced:
+            for rule, m in hold_rules:
+                if m is None or m.sender["text"] not in escalate_targets:
+                    self.result.add_error(
+                        f"The counts_as rule that creates '{rule.creates}' in {ctx} "
+                        f"must have as when: a message event whose sender is the "
+                        f"escalate_to: of a prohibition of the contract; the name "
+                        f"is reserved in an enforced contract (G-9)", rule.loc,
+                    )
+
+        self._check_delegations(contract, ctx, events, norm_ids)
+
+        if not enforced:
+            return
+        permissions = [c for c in covering if c[0] == "permission"]
+        prohibitions = [c for c in covering if c[0] == "prohibition"]
+
+        def is_tool(receiver: str, name: str) -> bool:
+            return name in self.tool_servers.get(receiver, ())
+
+        # G-15 (a): tools left open by `default: allow`.
+        if enf.default == "allow":
+            for party in dict.fromkeys(p.name for p in contract.parties):
+                open_tools = [
+                    t for t in self.tool_servers.get(party, [])
+                    if not any(c[2] == party and c[3] == t for c in covering)
+                ]
+                if open_tools:
+                    self.result.add_warning(
+                        f"{ctx} has default: allow, and no permission or prohibition "
+                        f"covers the tool{'s' if len(open_tools) > 1 else ''} "
+                        f"{', '.join(open_tools)} of its party '{party}' (G-15)", loc,
+                    )
+
+        # G-16 (a): a message the contract needs and would itself deny.
+        needed = list(fallbacks)
+        for norm in contract.norms:
+            if norm.kind == "obligation":
+                m = norm_message(contract, norm) if norm.content else None
+                if m is not None and m.name is not None:
+                    needed.append((f"content of the obligation '{norm.id}' of {ctx}", m))
+        for what, m in needed:
+            recv, name = m.receiver["name"], m.name
+            if (is_tool(recv, name) and enf.default != "allow"
+                    and not any(c[1] == m.sender["text"] and c[2] == recv and c[3] == name
+                                for c in permissions)):
+                self.result.add_warning(
+                    f"The {what} is the tool call '{m.text}', which no permission "
+                    f"of its sender covers; the contract would deny it by default "
+                    f"(G-16)", loc,
+                )
+            for c in prohibitions:
+                # Only a prohibition of the sender itself would deny it.
+                if (c[2] == recv and c[3] == name and not c[4].trigger
+                        and c[4].bearer and ref_text(c[4].bearer) == m.sender["text"]):
+                    self.result.add_warning(
+                        f"The {what} is '{m.text}', which the prohibition "
+                        f"'{c[4].id}' of its sender, without trigger:, covers; the "
+                        f"contract would deny it (G-16)", loc,
+                    )
+
+        # G-16 (b): under default: deny, the messages of delegation and
+        # escalation need a permission.
+        if enf.default == "deny":
+            for d in contract.delegations:
+                for key, name in (("grant", d.grant), ("revoke", d.revoke)):
+                    if name and not any(c[3] == name for c in permissions):
+                        self.result.add_warning(
+                            f"{ctx} has default: deny, and no permission covers the "
+                            f"{key}: message '{name}' of the delegation of "
+                            f"'{d.norm}', so it would be denied (G-16)", loc,
+                        )
+            for rule, m in hold_rules:
+                if m is not None and m.name is not None and not any(
+                        c[2] == m.receiver["name"] and c[3] == m.name
+                        for c in permissions):
+                    self.result.add_warning(
+                        f"{ctx} has default: deny, and no permission covers "
+                        f"'{m.text}', the when: of the rule that creates "
+                        f"'{rule.creates}', so it would be denied (G-16)", loc,
+                    )
+
+    def _check_delegations(
+        self, contract: ContractDef, ctx: str, events: set[str], norm_ids: set[str],
+    ) -> None:
+        """G-11 to G-13: the `delegations:` of a contract."""
+        from .agents import HOLD_EVENTS, norm_message, parse_ref
+        loc = contract.loc
+        if contract.invalid_delegations is not None:
+            self.result.add_error(
+                f"delegations: of {ctx} is '{contract.invalid_delegations}'; "
+                f"expected a list of entries with norm:, to: and grant: (G-11)", loc,
+            )
+        if not contract.delegations:
+            return
+        if contract.enforcement is None:
+            self.result.add_error(
+                f"{ctx} has delegations:, which is allowed only in an enforced "
+                f"contract: it has no enforcement: key (G-11)", loc,
+            )
+        norms_by_id: dict[str, NormDef] = {}
+        for n in contract.norms:
+            norms_by_id.setdefault(n.id, n)
+        party_tools = {
+            tool: party for party in sorted({p.name for p in contract.parties})
+            for tool in self.tool_servers.get(party, [])
+        }
+        seen_norms: set[str] = set()
+        names: list[str] = []
+        for d in contract.delegations:
+            where = (f"delegation of '{d.norm}' in {ctx}" if d.norm
+                     else f"delegation without norm: in {ctx}")
+            # G-11: the delegable permission.
+            bearer = None
+            if not d.norm or "norm" in d.not_names:
+                self.result.add_error(
+                    f"A delegation in {ctx} must name with norm: the id of a "
+                    f"permission of the contract (G-11)", d.loc,
+                )
+            else:
+                target = norms_by_id.get(d.norm)
+                if target is None:
+                    self.result.add_error(
+                        f"The {where} names '{d.norm}', which is not a norm of "
+                        f"{ctx} (G-11)", d.loc,
+                    )
+                elif target.kind != "permission" or norm_message(contract, target) is None:
+                    self.result.add_error(
+                        f"The {where} names '{d.norm}', which is not a permission "
+                        f"whose content is a message event; only such a permission "
+                        f"can be delegated (G-11)", d.loc,
+                    )
+                elif target.bearer:
+                    bearer = parse_ref(target.bearer)
+                    if bearer["kind"] == "var":
+                        self.result.add_error(
+                            f"The {where} names a permission whose bearer "
+                            f"'{target.bearer}' has an index bound by the contract "
+                            f"instance; the first actor of a chain must be readable "
+                            f"from the file (G-11)", d.loc,
+                        )
+                        bearer = None
+                if d.norm in seen_norms:
+                    self.result.add_error(
+                        f"More than one delegation in {ctx} names the norm "
+                        f"'{d.norm}'; at most one entry may name a norm (G-11)", d.loc,
+                    )
+                seen_norms.add(d.norm)
+
+            # G-12: to, max_depth, until.
+            if not d.to:
+                self.result.add_error(
+                    f"The {where} must list at least one actor under to: (G-12)",
+                    d.loc,
+                )
+            for text in d.to:
+                ref = parse_ref(text)
+                if ref["name"] not in self.actor_names:
+                    self.result.add_error(
+                        f"'{text}' in to: of the {where} is not a declared actor "
+                        f"(G-12)", d.loc,
+                    )
+                elif ref["kind"] == "var":
+                    self.result.add_error(
+                        f"'{text}' in to: of the {where} has an index bound by the "
+                        f"contract instance; use an actor, a wildcard or a range "
+                        f"(G-12)", d.loc,
+                    )
+                elif ref["name"] in self.tool_servers:
+                    self.result.add_error(
+                        f"'{text}' in to: of the {where} is a tool server, which "
+                        f"cannot hold a delegated permission (G-12)", d.loc,
+                    )
+                elif bearer is not None and ref["name"] == bearer["name"] and (
+                        ref["text"] == bearer["text"] or ref["kind"] == "all"
+                        or (ref["kind"] == "range" and bearer["kind"] == "index"
+                            and ref["lo"] <= bearer["index"] <= ref["hi"])):
+                    self.result.add_warning(
+                        f"to: of the {where} includes '{text}', the bearer of the "
+                        f"permission, which holds it already (G-12)", d.loc,
+                    )
+            if d.invalid_max_depth is not None:
+                self.result.add_error(
+                    f"max_depth of the {where} is '{d.invalid_max_depth}'; expected "
+                    f"an integer of at least 1 (G-12)", d.loc,
+                )
+            if d.until:
+                self._check_norm_term(
+                    d.until, f"'until' of the {where}", d.loc, events, norm_ids)
+
+            # G-13: the grant and revoke messages.
+            for key, name in (("grant", d.grant), ("revoke", d.revoke)):
+                if key in d.not_names:
+                    self.result.add_error(
+                        f"{key}: of the {where} is '{name}', which is not a name: "
+                        f"{self._YAML_NAME_NOTE} (G-13)", d.loc,
+                    )
+                    continue
+                if not name:
+                    if key == "grant":
+                        self.result.add_error(
+                            f"The {where} has no grant:, the name of the message "
+                            f"that delegates (G-13)", d.loc,
+                        )
+                    continue
+                self._check_identifier(name, f"{key}: of the {where}", d.loc,
+                                       rule="G-13")
+                if name in names:
+                    self.result.add_error(
+                        f"{key}: '{name}' of the {where} is used more than once; "
+                        f"all grant: and revoke: names of a contract must differ "
+                        f"(G-13)", d.loc,
+                    )
+                if name in HOLD_EVENTS:
+                    self.result.add_error(
+                        f"{key}: '{name}' of the {where} must differ from approval "
+                        f"and rejection (G-13)", d.loc,
+                    )
+                if name in party_tools:
+                    self.result.add_error(
+                        f"{key}: '{name}' of the {where} is a tool of the tool "
+                        f"server '{party_tools[name]}', a party of the contract "
+                        f"(G-13)", d.loc,
+                    )
+                names.append(name)
+
     def _check_actor_ref(self, ref: ActorRef, context: str) -> None:
         """Check that an actor reference refers to a defined actor."""
         if ref.name not in self.actor_names:
@@ -1072,6 +1690,10 @@ class TypeChecker:
                     contract.loc,
                 )
 
+        # Agent governance extension (Appendix G): checked only when declared.
+        if self.agents_active:
+            self._check_agent_contract(contract, ctx)
+
     def _check_authority(self, auth: AuthorityBlock, context: str) -> None:
         """Check authority block constraints."""
         if auth.decision_holder:
@@ -1134,6 +1756,8 @@ class TypeChecker:
         if isinstance(step, MessageStep):
             self._check_actor_ref(step.sender, f"{context} message step sender")
             self._check_actor_ref(step.receiver, f"{context} message step receiver")
+            if self.agents_active:
+                self._check_tool_step(step, context)
         elif isinstance(step, ComputeStep):
             self._check_actor_ref(step.actor, f"{context} compute step")
         elif isinstance(step, ConditionalStep):

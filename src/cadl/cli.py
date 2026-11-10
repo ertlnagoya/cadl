@@ -37,11 +37,32 @@ def main(argv: list[str] | None = None) -> int:
     codegen_cmd = subparsers.add_parser("codegen", help="Generate runtime code from a CADL file")
     codegen_cmd.add_argument("file", type=Path, help="CADL file to generate from")
     codegen_cmd.add_argument("--target", "-t",
-                             choices=["python", "solidity", "opa", "unity-csharp"],
+                             choices=["python", "solidity", "opa", "unity-csharp",
+                                      "agent-rego", "agent-cedar"],
                              default="python",
-                             help="Code generation target (default: python)")
+                             help="Code generation target (default: python); "
+                                  "agent-rego and agent-cedar generate the boundary "
+                                  "policy of the agent governance extension "
+                                  "(agents 0.1)")
     codegen_cmd.add_argument("--output", "-o", type=Path, default=Path("generated"),
                              help="Output directory (default: generated/)")
+
+    # agents-decide command
+    decide_cmd = subparsers.add_parser(
+        "agents-decide",
+        help="Decide one message at the boundary: allow, deny or escalate "
+             "(agent governance extension, agents 0.1)",
+        description="Reference decision function of the agent governance "
+                    "extension (Appendix G, G.5) for one message. The policy input "
+                    "(G.10) has 'message' (from, to, name) and optionally 'now' and "
+                    "'instances' (bindings, in_force, derived). Stateless: holds, "
+                    "grants and revocations belong to a host runtime. Exit status: "
+                    "0 allow, 1 deny, 3 escalate, 2 usage error.")
+    decide_cmd.add_argument("file", type=Path, help="CADL file with enforced contracts")
+    decide_cmd.add_argument("--input", "-i", type=Path, required=True,
+                            help="Policy input as a JSON file ('-' for stdin)")
+    decide_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                            help="Output format (default: text)")
 
     # regime-map command
     regime_cmd = subparsers.add_parser("regime-map", help="Analyze regime transitions and build a regime map")
@@ -128,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_verify(args)
     elif args.command == "codegen":
         return _cmd_codegen(args)
+    elif args.command == "agents-decide":
+        return _cmd_agents_decide(args)
     elif args.command == "regime-map":
         return _cmd_regime_map(args)
     elif args.command == "iec62853":
@@ -374,6 +397,57 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
     return 0
 
 
+# Exit status of `cadl agents-decide`, by decision; 2 is a usage error.
+_DECISION_STATUS = {"allow": 0, "deny": 1, "escalate": 3}
+
+
+def _cmd_agents_decide(args: argparse.Namespace) -> int:
+    import json
+    from .agents import AgentsInputError, build_policy, decide, format_result
+    from .parser import parse_file
+    from .type_checker import type_check
+
+    def usage_error(message: str) -> int:
+        print(f"Error: {message}", file=sys.stderr)
+        return 2
+
+    path = args.file
+    if not path.exists():
+        return usage_error(f"File not found: {path}")
+    try:
+        sos = parse_file(path)
+    except Exception as e:
+        return usage_error(f"Parse error: {e}")
+    tc_result = type_check(sos)
+    if not tc_result.ok:
+        for e in tc_result.errors:
+            print(f"  {e}", file=sys.stderr)
+        return usage_error("Type check failed: cannot decide")
+    try:
+        policy = build_policy(sos)
+    except ValueError as e:
+        return usage_error(str(e))
+
+    try:
+        if str(args.input) == "-":
+            text = sys.stdin.read()
+        else:
+            text = args.input.read_text(encoding="utf-8")
+        result = decide(policy, json.loads(text))
+    except OSError as e:
+        return usage_error(f"Cannot read the policy input: {e}")
+    except json.JSONDecodeError as e:
+        return usage_error(f"The policy input is not JSON: {e}")
+    except AgentsInputError as e:
+        return usage_error(f"Invalid policy input: {e}")
+
+    if args.format == "json":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_result(result))
+    return _DECISION_STATUS[result["decision"]]
+
+
 def _cmd_regime_map(args: argparse.Namespace) -> int:
     import json as json_mod
     from .parser import parse_file
@@ -561,6 +635,21 @@ def _ir_to_dict(ir) -> dict:
     """Serialize SimIR to a plain dict for YAML/JSON output."""
     from dataclasses import asdict
     d = asdict(ir)
+    # The fields of the agent governance extension (Appendix G, G.13) are
+    # part of the IR only for a file that declares it (G.14).
+    if not d.pop("agents_extension", False):
+        inst = d.get("institution", {})
+        for a in inst.get("actors", []):
+            for key in ("agent_kind", "agent_protocol", "agent_tools"):
+                a.pop(key, None)
+        for c in inst.get("contracts", []):
+            for key in ("enforced", "enforcement_default", "enforcement_point",
+                        "delegations"):
+                c.pop(key, None)
+            for n in c.get("norms", []):
+                for key in ("on_denied_escalate_to", "on_denied_timeout_ms",
+                            "on_denied_fallback", "on_denied_notify"):
+                    n.pop(key, None)
     # Rename lambda_ back to lambda for readability
     for c in d.get("institution", {}).get("contracts", []):
         gov = c.get("governance", {})

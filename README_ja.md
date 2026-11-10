@@ -155,6 +155,12 @@ cadl codegen examples/robot_delivery.cadl --target opa -o /tmp/rego_out
 # SoS-DSL契約（lifecycle / monitors）からUnity C#を生成
 cadl codegen examples/sos_dsl_robot_delivery.cadl --target unity-csharp -o /tmp/unity_out
 
+# エージェントガバナンス拡張（agents 0.1）：境界で1通のメッセージを判定し、
+# 境界ポリシーをRegoまたはCedarとして生成
+cadl agents-decide examples/agents_tool_governance.cadl --input examples/agents_inputs/delete_file.json
+cadl codegen examples/agents_tool_governance.cadl --target agent-rego -o /tmp/agent_rego
+cadl codegen examples/agents_tool_governance.cadl --target agent-cedar -o /tmp/agent_cedar
+
 # 運用モードの遷移を分析
 cadl regime-map examples/smart_city_traffic.cadl
 cadl regime-map examples/smart_city_traffic.cadl --format dot -o regime.dot
@@ -245,6 +251,35 @@ SoS-DSL拡張（`lifecycle:` / `monitors:`）を使う契約からC#を生成：
 - `Runtime/` のサポートクラス（契約ランタイム、イベントバス、述語評価器）
 
 [テキストブックの第 7 章](https://www.ertl.jp/cadl-spec/ja/docs/textbook/codegen-runtime/)で、このターゲットを一通り実行できます。
+
+**エージェント境界ポリシー** (`--target agent-rego`, `--target agent-cedar`):
+
+`agents: 0.1` を宣言したファイルの執行対象の契約から、エージェントガバナンス拡張（後述）の境界ポリシーを生成します。宣言がないファイルでは `cadl codegen` がエラーを報告します。どちらも `opa` ターゲットとは独立です。
+- `agent-rego` は `agent_policy.rego` を出力します。一つのRegoパッケージ（`cadl.agent_policy`）が、ポリシー入力を `input` として受け取り、結果オブジェクト全体を `result`（および `decision`）として返します。静的な規範もそうでない規範も扱い、静的でない規範の発効フラグと派生インスタンスは `input.instances` から読みます。ファイルの先頭に、静的でない規範の一覧を出力します
+- `agent-cedar` は `agent_policy.cedar` と `agent_policy_table.json` を出力します。ポリシーは静的に判定できる部分を扱います。未宣言のツールと静的な禁止は `forbid`、静的な許可は `permit` になり、許可のないツール呼び出しはCedarの既定の拒否に落ちます。Cedarの結果は2値なので、エスカレーションは拒否として返り、ランタイムが表（禁止ごとの `escalate_to`・`timeout`・`fallback`・`notify`）から解決します。ファイル先頭のREADMEコメントに、扱わないもの（静的でない規範、派生した許可、契約インスタンス）を明記します。どのポリシーも属性を読まないので、評価エラーでスキップされることはありません
+
+### エージェントガバナンス（agents 0.1）
+
+エージェントガバナンス拡張（仕様の付録G）は規範拡張の上に成り立ちます。ファイルは `norms: 0.1` と `agents: 0.1` の両方を宣言します。そのうえで、`agent:` がアクターに種別（`llm_agent`・`tool_server`・`human`・`service`）とプロトコル、ツールサーバの場合は `tools:` を与え、`enforcement:` が契約を執行対象にします。禁止に付ける `on_denied:` は承認者（`escalate_to:`）、`timeout:`、代替メッセージ（`fallback:`）、通知先（`notify:`）を指定し、`delegations:` は許可を委任可能にします。`examples/agents_tool_governance.cadl` は付録の例です。
+
+`cadl agents-decide <file.cadl> --input <input.json> [--format text|json]` は判定関数（G.5）の参照実装です。1通のメッセージに対して `allow`・`deny`・`escalate` のいずれかを、理由、決定に関わった契約、規範、派生した許可の来歴チェーン、エスカレーションのデータとともに返します。
+
+```bash
+$ cadl agents-decide examples/agents_tool_governance.cadl --input examples/agents_inputs/delete_file.json
+decision:    escalate
+reason:      prohibition
+contracts:   ASSISTED_REPORTING
+norms:       ASSISTED_REPORTING.no_delete
+provenance:  -
+escalate_to: OPERATOR
+timeout:     600000 ms
+fallback:    PLANNER -> TICKETS : create_ticket
+notify:      OPERATOR
+```
+
+入力はJSONオブジェクトで、`message`（`from`・`to`・`name`）と、省略可能な `now`、`instances`（動作中の契約インスタンスごとの `bindings`、静的でない規範の発効フラグ `in_force`、有効な派生インスタンス `derived` とそのチェーン）を持ちます。`examples/agents_inputs/` に付録のサンプル呼び出しがあります。終了ステータスは `allow` が0、`deny` が1、`escalate` が3、使い方の誤りが2です。執行対象の契約の当事者であるツールサーバ宛てのメッセージは、送信者が誰であっても統治されます。当事者でないアクターや未定義のアクターからのツール呼び出しは、ツールの既定によって拒否されます。照合は3値で、不明はフェイルクローズに解決します。不明な禁止は適用され、不明な許可は適用されません。
+
+このコマンドは状態を持ちません。保留とその解放・期限切れ（G.6）、付与・チェーン・取り消し（G.7）、監査記録（G.8）は実装していません。これらの状態はホスト側のランタイムが保持し、発効フラグと有効な派生インスタンスを入力として渡します。
 
 ### 運用モード遷移の分析
 
@@ -437,6 +472,8 @@ cadl norms-eval FILE --trace TRACE [--contract ID] [--format text|json]
 10. **SoS-DSLの静的意味論**（付録E、E.4） — `lifecycle:` の初期状態・終端状態・`from`・`to`・`on_violation.transition` が `states` に列挙されていること、終端状態が存在し到達可能であること（L-1、L-2、L-3、L-5）。モニタの `on_match.transition` が同じ契約の状態であること（M-3）。状態名・遷移id・モニタidが識別子であり、idが重複していないこと。`on:` のメッセージイベントのアクターと、`observe:` の各項目の対象が定義済みであること（M-1）。`deadline:` が期間（整数に `ms`・`s`・`min`・`h` を付けたもの）であり、`sampling:` が `event` か `periodic(<期間>)` であること。読めない値はエラーとします。寛容な形式として、負でない秒数（`2.5`）、単位の前の空白（`5 s`、`periodic( 500ms )`）、マッピング `{kind: periodic, period_ms: <整数>}` を受け付けます。警告：`on_violation:` のない `deadline:`（L-4）、付録Eの規則として読めない `on:` / `when:` / `rule:`
 11. **規範拡張の静的意味論**（付録F、F.7。`norms: 0.1` を宣言したファイルのみ） — 規範のidが識別子であり、契約内で重複せず、`creates:` が名付ける制度的事象と異なること（N-1）。`kind:` が `obligation` / `permission` / `prohibition` / `power` のいずれかであること（N-2）。`bearer:` と `counterparty:` がワイルドカードや範囲を含まない定義済みのアクターであること（N-3）。`deadline:` が期間であり、`deadline:` と `on_violation:` は義務と禁止にだけ書けること（N-4）。`effects:` は権能にだけ書け、権能には一つ以上必要で、契約内のほかの規範を名指すこと（N-5）。`reparation:` がトリガのない義務か禁止であり、`reparation:` をたどって循環しないこと（N-6）。`on_violation.transition` が契約の `lifecycle:` の状態であること（N-7）。メッセージイベントのアクターが定義済みであり、権能はメッセージから作られる制度的事象か担い手が送るメッセージで行使されること（N-9）。`within(d, p)`・`throughout(d, p)`・`until(p, q, d)` の `d` が0より大きい期間リテラルであり、`assume:`・`guarantee:`・規範の `content:` にだけ現れること（N-10）。`on_amendment: {transform: X}` が識別子を名指すこと（N-11）。警告：`trigger:` / `until:` / `content:` 全体として使われた規範のid（N-8）、担い手と内容が同じ許可と禁止（N-12）、契約の当事者でない担い手・相手方（N-3）、担い手以外が送るメッセージを内容とする義務・禁止（N-9）。宣言がない場合、`norms:` と `counts_as:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換もしません
 
+12. **エージェントガバナンス拡張の静的意味論**（付録G、G.9。`agents: 0.1` を宣言したファイルのみ） — ファイルが `norms: 0.1` も宣言していること（G-1）。`agent:` の `kind:` が `llm_agent` / `tool_server` / `human` / `service` のいずれかで、`protocol:` が名前であること（G-2）。`tools:` はツールサーバにだけ書け、ツールサーバには一つ以上必要で、ツール名が重複しない識別子であること（G-3）。受信者がツールサーバであるメッセージイベントがそのツールを名指すこと（G-4。プロトコルのステップでは警告）。`enforcement.default` が `deny` か `allow`、`enforcement.point` が `caller` / `receiver` / `gateway` のいずれかであること（G-5）。執行対象の契約では、許可・禁止の内容であるメッセージの送信者が担い手であること（G-6）。`on_denied:` は執行対象の契約の、メッセージを内容とする禁止にだけ書け、キーが一つ以上あり、`timeout:` が0より大きい期間で `escalate_to:` を伴うこと（G-7）。`escalate_to:` と `notify:` が定義済みの単一のアクターを名指し、`escalate_to:` が担い手以外の当事者であること（G-8）。`escalate_to: A` を持つ契約に、`A` のメッセージから `approval` を作る `counts_as:` ルールがあり、執行対象の契約では `approval` と `rejection` が予約されていること（G-9）。`fallback:` が、担い手から定義済みのアクターへの、禁止されたメッセージとは異なるメッセージイベントであること（G-10）。`delegations:` は執行対象の契約にだけ書け、各項目が、担い手に束縛される添字のない、メッセージを内容とする許可を一つ名指すこと（G-11）。`to:` にツールサーバ以外の定義済みのアクターを並べ、`max_depth:` が1以上であること（G-12）。`grant:` と `revoke:` が識別子で、互いに異なり、`approval`・`rejection` や当事者のツールとも異なること（G-13）。警告：`timeout:` のない `escalate_to:`（G-7）、`human` でない承認者（G-8）、`rejection` のルールがないこと（G-9）、`to:` に含まれる担い手（G-12）、内容がメッセージイベントでない、または引数を持つ許可・禁止（G-14）、`default: allow` で開いたままのツールと、執行対象の契約の当事者でないツールサーバ（G-15）、契約が必要としながら自ら拒否するメッセージ（G-16）。宣言がない場合、`agent:`・`enforcement:`・`delegations:`・`on_denied:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換もしません
+
 このほか、検査を失敗させずに次を報告します。`cadl codegen` が出力できない `codegen:` のターゲット（警告）、未知の拡張名、`motivation:` ブロック（情報）。`motivation:` ブロックは解釈しませんが、保持して `cadl sim-ir` の出力に引き渡します。
 
 ## ハンズオン
@@ -482,6 +519,7 @@ IR JSON と Unity C# ツリーが生成され、後者が [cadl-raspimouse-simul
 | `raspimouse_c_sos.cadl` | Raspimouse群ロボット（C-SoS） | 協調型 | ローカルDirectionDijkstra＋中央検証、離散時間同期 |
 | `raspimouse_mcp_sos.cadl` | Raspimouse群ロボット（MCP-SoS） | 認知型 | MCPツールによるLLM制御、Static/Dynamicパスモード、3つの運用モード |
 | `sos_dsl_robot_delivery.cadl` | SoS-DSL拡張を使ったロボット配送 | 認知型 | 契約ライフサイクル（7状態）、3つのモニタ。ハンズオン講座で使うサンプル |
+| `agents_tool_governance.cadl` | LLMプランナ、サブエージェント、2つのツールサーバ（agents 0.1） | — | 執行対象の契約、人へのエスカレーション、来歴つきの委任。サンプル入力は `agents_inputs/` |
 
 ### デモスクリプト
 
@@ -535,6 +573,9 @@ src/cadl/
     opa/
       rego_expr.py     式AST → Regoソース変換
       rego_gen.py      OPA/Regoポリシー生成
+    agent_policy/
+      rego_gen.py      境界ポリシーのRego生成（agents 0.1）
+      cedar_gen.py     境界ポリシーのCedar生成と付随する表（agents 0.1）
     unity_csharp/
       contract_emitter.py  契約ごとのC#（状態enum・契約・モニタ）
       runtime_template.py  生成のたびに出力するC#ランタイム
@@ -582,6 +623,7 @@ tests/
   test_conformance_checks.py      識別子の規則、共有の項目、codegenのターゲット、拡張
   test_codegen_deterministic.py   生成コードが実行ごとに同一であること
   test_keyword_boundaries.py      キーワードが長い名前から切り出されないこと
+  test_agents_extension.py        エージェントガバナンス拡張：G-1〜G-16、判定、agent-rego / agent-cedar
 
 examples/
   robot_delivery.cadl        ロボット配送SoS（認知型）
@@ -620,6 +662,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | シミュレータIR・設定生成（Python, Unity, Go） | 利用可能 |
 | SoS-DSL拡張（`lifecycle:` / `monitors:`）とUnity C#生成 | 利用可能 |
 | 規範拡張：静的検査と、記録済みトレースに対する判定と改正（`cadl norms-eval`、`cadl norms-diff`） | 利用可能 |
+| エージェントガバナンス拡張（agents 0.1）：検査、判定関数、Rego / Cedarの境界ポリシー | 利用可能（保留・委任・監査の状態を持つランタイムは未実装） |
 | 検証メソッド `model_check` / `simulation` / `proof` | 未対応（未対応である旨を明示的に報告） |
 
 ## 関連プロジェクト

@@ -1,0 +1,71 @@
+# Agent governance extension (agents 0.1) — the example of Appendix G, G.12.
+#
+# A human operator asks an LLM planner to prepare a report. The planner
+# calls the tools of two tool servers and uses a sub-agent to summarise
+# files.
+#
+#   cadl check  examples/agents_tool_governance.cadl
+#   cadl agents-decide examples/agents_tool_governance.cadl \
+#       --input examples/agents_inputs/delete_file_escalate.json
+#   cadl codegen examples/agents_tool_governance.cadl -t agent-rego  -o out/
+#   cadl codegen examples/agents_tool_governance.cadl -t agent-cedar -o out/
+
+sos:
+  name: "AssistedReporting"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+
+  actors:
+    - id: OPERATOR
+      role: "Human operator who owns the task and the files"
+      agent: { kind: human }
+    - id: PLANNER
+      role: "LLM agent that plans the report and calls tools"
+      agent: { kind: llm_agent, protocol: a2a }
+    - id: SUMMARIZER
+      role: "LLM sub-agent that summarises files for the planner"
+      agent: { kind: llm_agent, protocol: a2a }
+    - id: FILES
+      role: "File store"
+      agent: { kind: tool_server, protocol: mcp, tools: [read_file, delete_file] }
+    - id: TICKETS
+      role: "Issue tracker"
+      agent: { kind: tool_server, protocol: mcp, tools: [search_tickets, create_ticket] }
+
+  contracts:
+    - id: ASSISTED_REPORTING
+      parties: [OPERATOR, PLANNER, SUMMARIZER, FILES, TICKETS]
+      enforcement:
+        point: gateway      # default: omitted -> deny tool calls, allow other messages
+      counts_as:
+        - { when: "OPERATOR -> PLANNER : approve", creates: approval }
+        - { when: "OPERATOR -> PLANNER : reject",  creates: rejection }
+      norms:
+        - id: may_read
+          kind: permission
+          bearer: OPERATOR
+          content: "OPERATOR -> FILES : read_file"
+        - id: may_search
+          kind: permission
+          bearer: PLANNER
+          content: "PLANNER -> TICKETS : search_tickets"
+        - id: may_file_ticket
+          kind: permission
+          bearer: PLANNER
+          content: "PLANNER -> TICKETS : create_ticket"
+        - id: no_delete
+          kind: prohibition
+          bearer: PLANNER
+          content: "PLANNER -> FILES : delete_file"
+          on_denied:
+            escalate_to: OPERATOR
+            timeout: 10min
+            fallback: "PLANNER -> TICKETS : create_ticket"
+            notify: OPERATOR
+      delegations:
+        - norm: may_read
+          to: [PLANNER, SUMMARIZER]
+          grant: grant_read
+          revoke: revoke_read
+          max_depth: 2

@@ -1,0 +1,7 @@
+{
+  "message": {
+    "from": "PLANNER",
+    "to": "TICKETS",
+    "name": "search_tickets"
+  }
+}

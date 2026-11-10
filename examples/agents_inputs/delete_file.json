@@ -1,0 +1,7 @@
+{
+  "message": {
+    "from": "PLANNER",
+    "to": "FILES",
+    "name": "delete_file"
+  }
+}
