@@ -1,6 +1,8 @@
 """Norms extension (Appendix F, norms 0.1): parsing, rules N-1 to N-12 of
 F.7, the temporal operators of F.4, the verifier (F.7) and the IR (F.9)."""
 
+from __future__ import annotations
+
 import json
 import subprocess
 import sys
