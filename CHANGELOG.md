@@ -6,6 +6,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `cadl codegen -t python`: for a file that declares `norms: 0.1` the
+  generated package has a new module `norms_monitor.py`, an online
+  monitor of the norms extension (Appendix F, F.4 and F.5). A running
+  system makes a `NormsMonitor` for a contract instance, feeds it one
+  observation at a time (`observe`, with the content of one trace line
+  of `cadl norms-eval`) and gets back the changes of that observation:
+  which norm instance, guarantee or assumption changed to which state
+  and verdict (`pending`, `fulfilled`, `violated`, `excused`), with time
+  and reason. `end()` settles the norms, `verdicts()` and `result()`
+  give the current state, and `next_deadline()` the next time a deadline
+  of a norm is over. The module needs only the standard library (Python
+  3.9 or later) and does not import cadl. It holds the contracts as data
+  and a verbatim copy of the engine of `cadl norms-eval`, so there is one
+  implementation of F.5; `python -m PACKAGE.norms_monitor TRACE.jsonl`
+  prints what `cadl norms-eval --format json` prints, without the key
+  `file`. Amendments (F.6) work when the model of the new version is
+  given (`versions=`, `--version NAME=MODEL.json`). See "Norms Monitor in
+  Generated Python Code" in the README, also for what an online monitor
+  cannot know.
+- The generated package of such a file can be imported where cadl is not
+  installed: `NormsMonitor` works, and the other names, which need
+  `cadl.codegen.runtime_support`, raise the import error when used.
+
+### Changed
+- `cadl codegen`: the warning for an `assume:` / `guarantee:` item with a
+  temporal operator says, for the Python target, that the item is left
+  out of `contracts.py` and monitored by `norms_monitor.py`, and for the
+  other targets that only the Python target generates a monitor for it.
+  `contracts.py` has a second comment line under each left-out item.
+- `cadl/norms_eval.py`: the engine reaches the parser through three
+  functions, reads a trace one observation at a time (`_TraceReader`) and
+  processes one observation per call (`_Engine._step`), so that the
+  generated monitor can use the same code. The public functions and the
+  output of `cadl norms-eval` are unchanged.
+
 ## [0.3.21] — 2026-11-11
 
 Fixes found by running the generated files with the tools they are

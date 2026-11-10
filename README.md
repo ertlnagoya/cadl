@@ -172,6 +172,10 @@ cadl iec62853 examples/smart_city_traffic.cadl --format json
 # Verdicts of the norms extension on a recorded trace
 cadl norms-eval examples/norms_robot_delivery.cadl --trace examples/traces/norms_robot_delivery_a_fulfilled.jsonl
 
+# The same verdicts from the monitor in the generated Python package (it runs without cadl)
+cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
+(cd /tmp/gen && python -m robot_delivery_norms.norms_monitor "$OLDPWD/examples/traces/norms_robot_delivery_a_fulfilled.jsonl" --format text)
+
 # What an amendment from one version to the next does to the norms
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
 # Stochastic model extension: export the model: block to PRISM, one model
@@ -234,8 +238,9 @@ The CADL toolchain follows a standard compiler pipeline:
 | `transitions.py` | Regime controller with transition conditions |
 | `metrics.py` | Metrics collector with formula computation |
 | `runtime.py` | Top-level orchestrator wiring all components |
+| `norms_monitor.py` | Only for a file that declares `norms: 0.1`: an online monitor of the norms, counts-as rules and temporal items of its contracts ([below](#norms-monitor-in-generated-python-code)) |
 
-Generated code inherits from base classes in `cadl.codegen.runtime_support`.
+Generated code inherits from base classes in `cadl.codegen.runtime_support`; `norms_monitor.py` does not import cadl.
 
 **Solidity** (`--target solidity`):
 
@@ -451,6 +456,60 @@ The file must declare `norms: 0.1` and pass `cadl check`. `--contract` is needed
 `cadl norms-diff OLD NEW [--contract ID] [--format text|json]` reports, without a trace, what such an amendment does: norms removed, added or of a changed kind, every norm that carries over with a changed `content` or `deadline:` (the report F.6 asks for), `transform:` targets the new version lacks, and changed `counts_as:` rules. Each finding has a level (`error`, `warning`, `info`); JSON has `old`, `new`, `contracts[]` (`id`, `findings[]` with `level`, `kind`, `text` and details), `errors[]` and `ok`. The exit status is 0 when nothing prevents the amendment, 1 on an error (a missing transform target, an invalid new version), and 2 on a usage error.
 
 `examples/traces/` has five traces for `examples/norms_robot_delivery.cadl`: all norms fulfilled (a), a missed acknowledgement repaired by a failure report (b), both missed (c), a late delivery excused because the dispatcher stopped operating (d), and a reassignment that discharges the obligations (e). `norms_amendment_v1_to_v2.jsonl` is a trace of `examples/norms_amendment_v1.cadl` that is amended to `examples/norms_amendment_v2.cadl` while a failure report is due.
+### Norms Monitor in Generated Python Code
+
+For a file that declares `norms: 0.1`, `cadl codegen -t python` also writes `norms_monitor.py`: an online monitor of one contract instance (Appendix F, F.5). A running system feeds it observations as they happen and gets back the changes of the norm states and of the four-valued verdicts, including those of `assume:` / `guarantee:` items with temporal operators, which `contracts.py` leaves out.
+
+```python
+from robot_delivery_norms.norms_monitor import NormsMonitor   # the generated package
+
+m = NormsMonitor("DELIVERY_SLA", bindings={"i": 2})
+m.observe({"t": 0.0, "values": {"DISPATCHER.is_operational": True, "ROBOT[2].status": "Idle"}})
+m.observe({"t": 1.0, "state": "Assigned",
+           "messages": [{"from": "DISPATCHER", "to": "ROBOT[2]", "name": "route_assignment"}]})
+# -> [{"t": 1.0, "kind": "norm", "id": "acknowledge", "state": "active", "verdict": "pending",
+#      "previous_state": "inactive", "previous_verdict": "pending", "reason": "trigger occurred: ..."}]
+m.next_deadline()        # 6.0: acknowledge is due 5 s after its activation
+m.observe({"t": 6.5})    # -> acknowledge violated, report_failure active
+m.verdicts()             # current state and verdict of every norm and item
+m.end()                  # the instance has ended: settle the norms
+m.result()               # everything, with the keys of `cadl norms-eval --format json`
+```
+
+| Call | Meaning |
+|---|---|
+| `NormsMonitor(contract=None, bindings=None, request=None, quantities=None, versions=None)` | A monitor of one contract instance. `contract` may be left out when one contract has `norms:` or `counts_as:` |
+| `observe(observation)` | Process one observation: a dict with the keys of one trace line of `cadl norms-eval` (`t` required; `values`, `messages`, `state`, `end`; `bindings` and `request` in the first one). Returns the changes of this step |
+| `end()` | End the instance at the last observation received and settle its norms (F.5, item 6). An observation with `"end": True` or with a terminal `state` ends it too |
+| `verdicts()` | `norms` (`state`, `verdict` per id), `assumptions` (`status`), `guarantees` (`verdict`), `ok` |
+| `result()` | The result of `cadl norms-eval --format json` for the observations so far, without `file`; before the end it is the result of a prefix |
+| `next_deadline()` | The earliest time at which a deadline of an active obligation or the window of an active prohibition is over, or `None` |
+| `started`, `ended`, `contract` | State of the monitor |
+
+A change is a dict: for a norm `t`, `kind: "norm"`, `id`, `state`, `verdict`, `previous_state`, `previous_verdict`, `reason` (one per norm and step, with the state the step left it in); for an item `t`, `kind: "guarantee"` or `"assumption"`, `index`, `text`, `verdict` (or `status`: `holds`, `failed`), `previous`, `reason`.
+
+**One implementation.** `norms_monitor.py` does not import cadl; it needs only the standard library of Python 3.9 or later and can be copied on its own. It holds the contracts of the file as data and, copied verbatim, the engine of `cadl norms-eval` (the part of `cadl/norms_eval.py` between its `monitor-runtime` marks) with the AST classes it uses. Where the engine calls the parser of cadl, the monitor looks up what the parser returned at generation time. The generated package can be imported where cadl is not installed; its other modules still need `cadl.codegen.runtime_support`, and their names raise the import error when used. A recorded trace is replayed with
+
+```bash
+python -m robot_delivery_norms.norms_monitor TRACE.jsonl [--contract ID] [--format json|text]
+```
+
+which prints what `cadl norms-eval` prints for the same file and trace (JSON without the key `file`), with the same exit status. The tests compare the two on the example traces, on every case of `tests/test_norms_eval.py`, and on 1,500 random traces, in a process in which cadl cannot be imported.
+
+**What an online monitor knows.** The monitor decides each observation with the observations received so far, so `result()` after an observation is the result of `cadl norms-eval` on the trace up to it as a prefix (`"end": false`). Three points differ from reading a whole trace:
+
+- A missed deadline, and a temporal operator that is false (`within`, `until`) or true (`throughout`) because its interval is over, is detected at the first observation after that time, and a violation is judged `violated` or `excused` then. A host with nothing to report sends a time-only observation `{"t": ...}`; `next_deadline()` gives the time for the deadlines of norms (not for the intervals of temporal operators).
+- The instance does not end "at the last line": call `end()`, or send an observation with `"end": True` or a terminal `state`. Observations after the end are ignored and counted in a warning of `result()`.
+- A name written without an actor (`load`, not `ROBOT[1].load`) that has no value yet cannot be told from an enum-like literal. `cadl norms-eval` takes the names of quantities from the whole trace; the monitor takes them from `quantities=[...]` and from the values received so far. This matters only for such a name compared with a string before its first value. Warnings about names without a value are given when they are first met.
+
+A malformed observation raises `TraceError` and leaves the monitor unchanged. The monitor keeps the observations of its instance (temporal operators and "becomes true" need them): make one monitor per contract instance and drop it after the end. It is not thread-safe, and, like `cadl norms-eval`, it reads the lifecycle state from the observations and reports a requested `transition:` without applying it.
+
+**Amendments.** An observation with `"amend": "NAME"` needs the model of the new version: generate the monitor of the new file too and pass its `MODEL`, `NormsMonitor(..., versions={"NAME": new_package.norms_monitor.MODEL})`; on the command line `--version NAME=MODEL.json`, where the file is written by `python -m NEW_PACKAGE.norms_monitor --dump-model`. Without it the observation is refused. Loading a `.cadl` file at run time is not possible, since the monitor has no parser.
+
+**Strings of the file.** Everything the monitor takes from the `.cadl` file is in `MODEL`, written with `pprint` (the `repr` of strings, numbers, lists and dicts); none of it is formatted into code. The input check of `cadl codegen` still applies to the whole file, so a string with a quote, a backslash or a control character is refused before anything is generated.
+
+The Solidity and OPA targets do not monitor norms; they leave the temporal items out and say so in a warning.
+
 ### Stochastic Model (PRISM Export)
 
 A file that declares `stochastic: 0.1` under `extensions:` may carry a `model:` block (Appendix H of the specification): a parametric discrete-time Markov chain written as guarded probabilistic commands over finite state variables, in which parameters can be bound to `alpha`, `beta`, or `lambda` of a contract. Each regime of `transitions:` is a *design* with its own parameter values and commands. See `examples/stochastic_robot_delivery.cadl`.
@@ -598,6 +657,8 @@ src/cadl/
     transition_gen.py  Regime controller generation
     metric_gen.py      Metrics collector generation
     runtime_gen.py     Orchestrator generation
+    norms_monitor_gen.py       Norms monitor generation (norms_monitor.py of the Python target)
+    norms_monitor_template.py  Text copied into the generated norms monitor (not imported)
     solidity/
       solidity_expr.py Expression AST -> Solidity source
       solidity_gen.py  Solidity smart contract generation
@@ -646,6 +707,8 @@ tests/
   test_expr_parser.py    Expression grammar tests
   test_unparse.py        Expression round-trip tests
   test_norms_eval.py     Norm verdicts on a trace (`cadl norms-eval`)
+  test_norms_monitor.py  Generated norms monitor against `cadl norms-eval` (examples, recorded and random traces)
+  norms_monitor_cases.py pytest plugin that records the cases of test_norms_eval.py for it
   test_name_resolution.py Actor vs state-variable resolution in generated code
   test_method_dispatch.py Verification method dispatch tests
   test_codegen_safety.py Code generation input-safety tests
@@ -693,6 +756,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | Simulator IR and config generation (Python, Unity, Go) | Available |
 | SoS-DSL extension (`lifecycle:` / `monitors:`) and Unity C# generation | Available |
 | Norms extension: static checks, and verdicts and amendments on a recorded trace (`cadl norms-eval`, `cadl norms-diff`) | Available |
+| Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available (Solidity, OPA and Unity C# do not monitor norms; no translation to a model checker) |
 | Agent governance extension (agents 0.1): checks, decision function, Rego / Cedar boundary policies | Available (the stateful runtime of holds, delegations and audit is not implemented) |
 | `model_check` / `simulation` / `proof` verification methods | Not supported yet (reported explicitly) |
 

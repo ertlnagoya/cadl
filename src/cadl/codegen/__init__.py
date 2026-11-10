@@ -49,6 +49,7 @@ def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> No
 
     # With norms 0.1 declared, assume / guarantee items that contain a
     # temporal operator are left out, with a comment (Appendix F, F.7).
+    # The Python target monitors them, and the norms, in norms_monitor.py.
     from ..norms import norms_declared, temporal_items_omitted
     with temporal_items_omitted(norms_declared(sos)):
         _generate_target(sos, output_dir, target)
@@ -97,15 +98,24 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
       - transitions.py     Regime controller
       - metrics.py         Metrics collector
       - runtime.py         Top-level orchestrator
+      - norms_monitor.py   Monitor of the norms extension (Appendix F), for
+                           a file that declares norms 0.1; it does not
+                           import cadl
       - __init__.py        Package exports
     """
     from .actor_gen import generate_actors_module
     from .expr_compiler import declared_actors
     from .contract_gen import generate_contracts_module
     from .metric_gen import generate_metrics_module
+    from .norms_monitor_gen import (
+        MODULE_NAME, generate_norms_monitor_module, has_norms_monitor,
+    )
     from .protocol_gen import generate_protocols_module
     from .runtime_gen import generate_runtime_module
     from .transition_gen import generate_transitions_module
+
+    # Before anything is written: it fails for a contract that cannot be read.
+    monitor = generate_norms_monitor_module(sos) if has_norms_monitor(sos) else None
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -124,8 +134,11 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
         _write(output_dir / "metrics.py", generate_metrics_module(sos.metrics))
         _write(output_dir / "runtime.py", generate_runtime_module(sos))
 
+    if monitor is not None:
+        _write(output_dir / f"{MODULE_NAME}.py", monitor)
+
     # Generate __init__.py
-    _write(output_dir / "__init__.py", _generate_init(sos))
+    _write(output_dir / "__init__.py", _generate_init(sos, norms_monitor=monitor is not None))
 
 
 def _write(path: Path, content: str) -> None:
@@ -133,8 +146,14 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def _generate_init(sos: SoSDefinition) -> str:
-    """Generate the __init__.py that exports all generated classes."""
+def _generate_init(sos: SoSDefinition, norms_monitor: bool = False) -> str:
+    """Generate the __init__.py that exports all generated classes.
+
+    With `norms_monitor`, the package also exports `NormsMonitor`, and it
+    can be imported where cadl is not installed: the norms monitor needs
+    only the standard library, while the other modules import
+    `cadl.codegen.runtime_support`. Their names then raise the import
+    error when they are used."""
     from .emitter import sanitize_id, snake_case
 
     lines = []
@@ -175,7 +194,36 @@ def _generate_init(sos: SoSDefinition) -> str:
     exports.append(runtime_class)
 
     lines.append("")
+    if norms_monitor:
+        head, imports = lines[:2], [l for l in lines[2:] if l]
+        lines = head + [
+            "# The modules below need cadl (cadl.codegen.runtime_support). The norms",
+            "# monitor (norms_monitor.py) does not: where cadl is not installed the",
+            "# package can still be imported for it, and the other names raise the",
+            "# import error when they are used.",
+            "_import_error = None",
+            "try:",
+            *("    " + l for l in imports),
+            "except ModuleNotFoundError as _e:",
+            "    if (_e.name or \"\").split(\".\")[0] != \"cadl\":",
+            "        raise",
+            "    _import_error = _e",
+            "",
+        ]
+        exports.append("NormsMonitor")
     lines.append(f"__all__ = {exports!r}")
     lines.append("")
+    if norms_monitor:
+        lines += [
+            "",
+            "def __getattr__(name):",
+            "    if name == \"NormsMonitor\":",
+            "        from .norms_monitor import NormsMonitor",
+            "        return NormsMonitor",
+            "    if _import_error is not None and name in __all__:",
+            "        raise _import_error",
+            "    raise AttributeError(f\"module {__name__!r} has no attribute {name!r}\")",
+            "",
+        ]
 
     return "\n".join(lines)

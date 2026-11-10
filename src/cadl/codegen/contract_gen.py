@@ -30,6 +30,7 @@ def generate_contract_monitor(contract: ContractDef) -> str:
         for pred in contract.assume:
             if omitted_in_codegen(pred):
                 lines.append(f"        # {omitted_comment(pred)}")
+                lines.append("        # (norms_monitor.py monitors it)")
                 continue
             py_expr = _compile_predicate(pred)
             pred_str = _predicate_label(pred)
@@ -47,6 +48,7 @@ def generate_contract_monitor(contract: ContractDef) -> str:
         for pred in contract.guarantee:
             if omitted_in_codegen(pred):
                 lines.append(f"        # {omitted_comment(pred)}")
+                lines.append("        # (norms_monitor.py monitors it)")
                 continue
             py_expr = _compile_predicate(pred)
             pred_str = _predicate_label(pred)

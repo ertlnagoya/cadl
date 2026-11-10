@@ -70,6 +70,29 @@ from .ast_nodes import (
 )
 from .norms import TEMPORAL_OPERATORS, contains_temporal, item_text, norms_declared
 
+
+# The engine reaches the parser only through these three functions. The
+# monitor that `cadl codegen -t python` generates (codegen/norms_monitor_gen.py)
+# contains the text between the "monitor-runtime" marks of this file
+# verbatim, and replaces these functions by lookups in a table of the
+# expressions parsed at generation time, so that it runs without cadl.
+
+def _parse_rule(text: str) -> Any:
+    from .parser import parse_rule
+    return parse_rule(text)
+
+
+def _parse_expr(text: str) -> Any:
+    from .parser import parse_expr
+    return parse_expr(text)
+
+
+def _parse_actor(text: str) -> ActorRef:
+    from .parser import _parse_actor_ref_str
+    return _parse_actor_ref_str(text)
+
+
+# >>> monitor-runtime
 _EPS = 1e-9
 _UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "min": 60.0, "h": 3600.0}
 _MESSAGE_EVENT_RE = re.compile(r"^(.+?)\s*->\s*(.+?)\s*:\s*(.+)$")
@@ -78,6 +101,8 @@ _ACTOR_RE = re.compile(r"^([A-Za-z_]\w*)(?:\[(.*)\])?$")
 _TRACE_KEYS = {"t", "bindings", "request", "values", "messages", "state", "end", "amend"}
 _MESSAGE_KEYS = {"from", "to", "name", "args"}
 FINAL_STATES = ("fulfilled", "violated", "discharged")
+_STATE_IGNORED = "the trace gives 'state' but the contract has no lifecycle:; it is ignored"
+_END_LAST = "last observation of the trace"
 
 
 class TraceError(ValueError):
@@ -135,21 +160,20 @@ def _canon_actor(text: str) -> str:
     return re.sub(r"\s+", "", str(text))
 
 
-def parse_trace(lines, path: str | None = None) -> Trace:
-    """Read a trace from an iterable of JSON Lines. The lifecycle state is
-    left as written; `evaluate` fills in the initial state."""
-    trace = Trace(observations=[], path=path)
-    snapshot: dict[str, Any] = {}
-    state: str | None = None
-    prev_t: float | None = None
-    for lineno, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        where = f"line {lineno}"
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError as e:
-            raise TraceError(f"{where}: not JSON ({e.msg})") from None
+class _TraceReader:
+    """Reads the observations of one contract instance into a `Trace`, one
+    at a time."""
+
+    def __init__(self, trace: Trace) -> None:
+        self.trace = trace
+        self.snapshot: dict[str, Any] = {}
+        self.state: str | None = None
+        self.prev_t: float | None = None
+
+    def add(self, rec: Any, where: str) -> Observation:
+        """Check one observation and append it to the trace. Nothing is
+        changed when it is malformed."""
+        trace = self.trace
         if not isinstance(rec, dict):
             raise TraceError(f"{where}: an observation must be a JSON object")
         unknown = sorted(set(rec) - _TRACE_KEYS)
@@ -158,9 +182,9 @@ def parse_trace(lines, path: str | None = None) -> Trace:
         t = rec.get("t")
         if isinstance(t, bool) or not isinstance(t, (int, float)):
             raise TraceError(f"{where}: 't' must be a number (seconds)")
+        prev_t = self.prev_t
         if prev_t is not None and t < prev_t:
             raise TraceError(f"{where}: time {t:g} is before the previous observation ({prev_t:g})")
-        prev_t = t
         first = not trace.observations
         for key in ("bindings", "request"):
             if key in rec:
@@ -168,12 +192,9 @@ def parse_trace(lines, path: str | None = None) -> Trace:
                     raise TraceError(f"{where}: '{key}' is allowed only on the first line")
                 if not isinstance(rec[key], dict):
                     raise TraceError(f"{where}: '{key}' must be an object")
-                setattr(trace, key, rec[key])
         values = rec.get("values", {})
         if not isinstance(values, dict):
             raise TraceError(f"{where}: 'values' must be an object")
-        for k, v in values.items():
-            snapshot[_canon_actor(k)] = v
         messages = rec.get("messages", [])
         if not isinstance(messages, list):
             raise TraceError(f"{where}: 'messages' must be a list")
@@ -189,21 +210,46 @@ def parse_trace(lines, path: str | None = None) -> Trace:
                 raise TraceError(f"{where}: 'args' of a message must be a list")
             msgs.append({"from": _canon_actor(m["from"]), "to": _canon_actor(m["to"]),
                          "name": m["name"].strip(), "args": args})
-        before = state
-        if "state" in rec:
-            if not isinstance(rec["state"], str):
-                raise TraceError(f"{where}: 'state' must be a string")
-            state = rec["state"]
+        if "state" in rec and not isinstance(rec["state"], str):
+            raise TraceError(f"{where}: 'state' must be a string")
         end = rec.get("end")
         if end is not None and not isinstance(end, bool):
             raise TraceError(f"{where}: 'end' must be true or false")
         amend = rec.get("amend")
         if amend is not None and (not isinstance(amend, str) or not amend.strip()):
             raise TraceError(f"{where}: 'amend' must be the path of a CADL file")
-        trace.observations.append(Observation(
-            t=float(t), values=dict(snapshot), messages=msgs,
-            state=before, state_after=state, end=end, amend=amend,
-        ))
+        # The observation is well-formed: from here on the reader changes.
+        self.prev_t = t
+        for key in ("bindings", "request"):
+            if key in rec:
+                setattr(trace, key, rec[key])
+        for k, v in values.items():
+            self.snapshot[_canon_actor(k)] = v
+        before = self.state
+        if "state" in rec:
+            self.state = rec["state"]
+        obs = Observation(
+            t=float(t), values=dict(self.snapshot), messages=msgs,
+            state=before, state_after=self.state, end=end, amend=amend,
+        )
+        trace.observations.append(obs)
+        return obs
+
+
+def parse_trace(lines, path: str | None = None) -> Trace:
+    """Read a trace from an iterable of JSON Lines. The lifecycle state is
+    left as written; `evaluate` fills in the initial state."""
+    trace = Trace(observations=[], path=path)
+    reader = _TraceReader(trace)
+    for lineno, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        where = f"line {lineno}"
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise TraceError(f"{where}: not JSON ({e.msg})") from None
+        reader.add(rec, where)
     if not trace.observations:
         raise TraceError("the trace has no observation")
     return trace
@@ -551,7 +597,6 @@ class _Term:
     message event or a predicate (F.3)."""
 
     def __init__(self, text: str, events: set[str], ev: _Evaluator, temporal: bool = False) -> None:
-        from .parser import parse_expr, parse_rule
         self.text = text.strip()
         self.ev = ev
         self.error: str | None = None
@@ -561,14 +606,13 @@ class _Term:
         if self.text in events and _IDENTIFIER_RE.fullmatch(self.text):
             self.kind = "event"
         elif m:
-            from .parser import _parse_actor_ref_str
             self.kind = "message"
-            self.sender = _parse_actor_ref_str(m.group(1).strip())
-            self.receiver = _parse_actor_ref_str(m.group(2).strip())
+            self.sender = _parse_actor(m.group(1).strip())
+            self.receiver = _parse_actor(m.group(2).strip())
             self.msg_name = m.group(3).strip()
             self.msg_args: list | None = None
             try:
-                msg = parse_expr(self.msg_name)
+                msg = _parse_expr(self.msg_name)
             except Exception:
                 msg = None
             if isinstance(msg, FunctionCall):
@@ -582,7 +626,7 @@ class _Term:
         else:
             self.kind = "predicate"
             try:
-                self.expr = parse_rule(self.text)
+                self.expr = _parse_rule(self.text)
             except Exception:
                 self.error = "it is not a predicate (Appendix A.10)"
             else:
@@ -673,8 +717,7 @@ class _NormInst:
         self.history: list[dict] = []
         bearer_ref = None
         if d.bearer:
-            from .parser import _parse_actor_ref_str
-            bearer_ref = _parse_actor_ref_str(d.bearer)
+            bearer_ref = _parse_actor(d.bearer)
         self.bearer_ref = bearer_ref
 
     def elapsed(self, t: float) -> float:
@@ -741,8 +784,7 @@ class _Engine:
         if lc is None:
             if any(o.state_after is not None for o in self.obs) and not any(
                     o.amend for o in self.obs):
-                self.warnings.append(
-                    "the trace gives 'state' but the contract has no lifecycle:; it is ignored")
+                self.warnings.append(_STATE_IGNORED)
             return
         self._fill_states(0)
 
@@ -762,12 +804,11 @@ class _Engine:
                 f"lifecycle of {self.contract.id}")
 
     def _item(self, expr: Any, start: int) -> dict:
-        from .parser import parse_rule
         text = item_text(expr)
         if isinstance(expr, StringLiteral):
             # kept as text by the parser; it may still be a rule with IN
             try:
-                expr = parse_rule(expr.value)
+                expr = _parse_rule(expr.value)
             except Exception:
                 expr = None
         temporal = expr is not None and contains_temporal(expr)
@@ -987,35 +1028,46 @@ class _Engine:
 
     def run(self) -> None:
         last = len(self.obs) - 1
-        for n, o in enumerate(self.obs):
-            if n == 0:
-                self._start()
-            self._amend_violated = []
-            if o.amend:
-                self._amend(n, o.amend)                   # F.6, before step 1
-            self._check_state(n)
-            self._contract_items(n)
-            created = self._counts_as(n)                  # step 1
-            self._powers(n, created)                      # step 2
-            self._triggers(n, created)                    # step 3
-            violated = self._amend_violated + self._judge(n, created)   # step 4
-            for norm in violated:                         # step 5
-                self._on_violation(norm, n, activate=True)
-            reason = None                                 # step 6
-            if self.lifecycle and o.state_after in self.lifecycle.terminal:
-                reason = f"terminal state {o.state_after}"
-            elif o.end is True:
-                reason = "end of the instance in the trace"
-            elif n == last and o.end is not False:
-                reason = "last observation of the trace"
-            if reason:
-                self._settle(n, reason)
+        for n in range(len(self.obs)):
+            if self._step(n, n == last):
                 if n < last:
-                    self.warnings.append(
-                        f"{last - n} observation(s) after the end of the contract instance "
-                        f"(t={_fmt_t(o.t)}) are ignored")
+                    self.warnings.append(self._ignored_warning(last - n))
                 break
         self._finish_items()
+
+    def _step(self, n: int, is_last: bool) -> bool:
+        """Process observation n, given the observations before it. Returns
+        True when the contract instance ended at it. `is_last` says that the
+        trace stops here, which ends the instance unless the observation
+        says ``"end": false``."""
+        o = self.obs[n]
+        if n == 0:
+            self._start()
+        self._amend_violated = []
+        if o.amend:
+            self._amend(n, o.amend)                   # F.6, before step 1
+        self._check_state(n)
+        self._contract_items(n)
+        created = self._counts_as(n)                  # step 1
+        self._powers(n, created)                      # step 2
+        self._triggers(n, created)                    # step 3
+        violated = self._amend_violated + self._judge(n, created)   # step 4
+        for norm in violated:                         # step 5
+            self._on_violation(norm, n, activate=True)
+        reason = None                                 # step 6
+        if self.lifecycle and o.state_after in self.lifecycle.terminal:
+            reason = f"terminal state {o.state_after}"
+        elif o.end is True:
+            reason = "end of the instance in the trace"
+        elif is_last and o.end is not False:
+            reason = _END_LAST
+        if reason:
+            self._settle(n, reason)
+        return bool(reason)
+
+    def _ignored_warning(self, count: int) -> str:
+        return (f"{count} observation(s) after the end of the contract instance "
+                f"(t={_fmt_t(self.obs[self.ended_at].t)}) are ignored")
 
     def _start(self) -> None:
         state = f", state {self.obs[0].state}" if self.lifecycle else ""
@@ -1374,6 +1426,8 @@ def select_contract(sos: SoSDefinition, contract_id: str | None = None) -> Contr
         f"({', '.join(c.id for c in pool)})")
 
 
+# <<< monitor-runtime
+
 def load_version(path) -> SoSDefinition:
     """Parse and type-check a CADL file that declares norms 0.1."""
     from .parser import parse_file
@@ -1420,6 +1474,7 @@ def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
     return engine.result()
 
 
+# >>> monitor-runtime
 # === Text report ===========================================================
 
 def _table(rows: list[list[str]], indent: str = "  ") -> list[str]:
@@ -1517,6 +1572,8 @@ def format_text(result: dict) -> str:
         lines.append("Result: VIOLATED — " + ", ".join(result["violated"]))
     return "\n".join(lines)
 
+
+# <<< monitor-runtime
 
 def evaluate_files(cadl_path, trace_path, contract_id: str | None = None) -> dict:
     """Parse and type-check a CADL file, read a trace and evaluate it."""
