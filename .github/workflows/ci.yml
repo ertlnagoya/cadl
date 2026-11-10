@@ -39,8 +39,34 @@ jobs:
         with:
           version: latest
 
+      # The comparisons of generated Cedar policies with the reference
+      # decision function are skipped without the cedar binary. The archive
+      # is the release of the Cedar project, pinned by its SHA-256.
+      - name: Install the Cedar CLI
+        env:
+          CEDAR_VERSION: "4.14.1"
+          CEDAR_SHA256: "5833e9f4734eac0d95b3dab7ae119a9212caf0a82e02720b989e2fce6f3bfdad"
+        run: |
+          name="cedar-policy-cli-x86_64-unknown-linux-gnu"
+          curl -fsSL -o "$RUNNER_TEMP/cedar.tar.xz" \
+            "https://github.com/cedar-policy/cedar/releases/download/cedar-policy-cli-v${CEDAR_VERSION}/${name}.tar.xz"
+          echo "${CEDAR_SHA256}  $RUNNER_TEMP/cedar.tar.xz" | sha256sum -c -
+          mkdir -p "$HOME/.local/cedar"
+          tar -xJf "$RUNNER_TEMP/cedar.tar.xz" -C "$HOME/.local/cedar" --strip-components=1
+          echo "$HOME/.local/cedar" >> "$GITHUB_PATH"
+          "$HOME/.local/cedar/cedar" --version
+
+      # The comparisons of the exported PRISM files with Storm are skipped
+      # without stormpy, which has wheels for Python 3.11 and later.
+      - name: Install Storm (stormpy)
+        if: ${{ matrix.python-version != '3.9' && matrix.python-version != '3.10' }}
+        run: |
+          pip install "stormpy==2.0.0"
+          python -c "import stormpy; print('stormpy', stormpy.__version__)"
+
+      # -rs lists the tests that were skipped and why.
       - name: Run tests
-        run: pytest --cov=cadl --cov-report=term-missing --cov-report=xml tests/
+        run: pytest -rs --cov=cadl --cov-report=term-missing --cov-report=xml tests/
 
       - name: Smoke-test examples
         run: |
