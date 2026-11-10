@@ -163,6 +163,12 @@ cadl regime-map examples/smart_city_traffic.cadl --format dot -o regime.dot
 cadl iec62853 examples/robot_delivery.cadl
 cadl iec62853 examples/smart_city_traffic.cadl --format json
 
+# 記録済みトレースに対する規範拡張の判定
+cadl norms-eval examples/norms_robot_delivery.cadl --trace examples/traces/norms_robot_delivery_a_fulfilled.jsonl
+
+# ある版から次の版への改正が規範に及ぼす効果
+cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
+
 # 自然言語からCADLを生成（ANTHROPIC_API_KEYが必要）
 cadl ai "5台の自律ドローンが農地を測量するシステム。地上局が統括する。"
 cadl ai -f requirements.txt -o output.cadl
@@ -341,6 +347,68 @@ cadl sim-gen examples/raspimouse_c_sos.cadl --target unity -o output/raspimouse_
 cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimouse_mcp_sos_unity.json
 ```
 
+### トレースに対する規範の判定
+
+`cadl norms-eval` は、規範拡張（仕様書の付録F、F.4とF.5）の判定を、記録済みのトレース上の一つの契約インスタンスについて計算します。オフラインのモニタであり、システムもライフサイクルの状態機械も実行しません。
+
+```bash
+cadl norms-eval examples/norms_robot_delivery.cadl \
+    --trace examples/traces/norms_robot_delivery_b_reparation.jsonl
+cadl norms-eval FILE --trace TRACE [--contract ID] [--format text|json]
+```
+
+ファイルは `norms: 0.1` を宣言し、`cadl check` に通る必要があります。`--contract` は、`norms:` か `counts_as:` を持つ契約が複数あるときにだけ必要です。終了ステータスは、判定が `violated` の規範も保証もなければ0（`excused` と `pending` は失敗にしません）、あれば1、使い方の誤り（`norms: 0.1` がない、型検査エラー、トレースの形式誤り）は2です。
+
+**トレース。** JSON Lines形式で、1行が一つの観測です。時刻は非減少とします。一つのトレースが一つの契約インスタンスです。
+
+```json
+{"t": 0.0, "bindings": {"i": 2}, "values": {"DISPATCHER.is_operational": true, "ROBOT[2].status": "Idle"}}
+{"t": 1.0, "messages": [{"from": "DISPATCHER", "to": "ROBOT[2]", "name": "route_assignment"}], "state": "Assigned"}
+{"t": 2.5, "messages": [{"from": "ROBOT[2]", "to": "DISPATCHER", "name": "ack", "args": ["accepted"]}]}
+{"t": 120.0, "values": {"ROBOT[2].status": "Delivered"}, "state": "Completed"}
+```
+
+| キー | 意味 |
+|---|---|
+| `t` | 秒単位の時刻（必須）。述語の `now` |
+| `bindings` | 先頭行のみ。インスタンスが束縛する添字（`ROBOT[i]` を `ROBOT[2]` と読む） |
+| `request` | 先頭行のみ。`request` のフィールド |
+| `values` | スナップショットの更新。キーは述語に書く名前（`ROBOT[2].battery`、`delivery_time`）。値は変更されるまで保たれる |
+| `messages` | この観測で送られたメッセージ。`from`、`to`、`name`、省略可能な `args`。メッセージイベントは送信者・受信者・名前で照合し、CADL側に引数があれば（`ack(accepted)`）`args` と一致する必要がある |
+| `state` | この観測の後の、インスタンスのライフサイクル状態。変更されるまで保たれ、初期値は `lifecycle.initial`。ある観測の述語は、その観測の前の状態を読む（F.5の手順6が最後であるため） |
+| `amend` | CADLファイルの新しい版のパス（トレースファイルからの相対）。この観測で契約を改正する（後述） |
+| `end` | `true` はこの観測でインスタンスを終了する。最初の終端状態でも終了し、どちらもなければ最終行で終了する。最終行が `"end": false` のときは、トレースを途中までの記録とみなし、清算しない |
+
+**出力。** テキストの報告は、タイムラインと、規範、違反、制度的事象、権限のない行為、前提、保証の表からなります。`--format json` は同じ内容を一つのオブジェクトで出力します。
+
+| キー | 内容 |
+|---|---|
+| `file`、`trace`、`contract`、`norms_version` | 評価の対象 |
+| `instance` | `bindings`、`start`、`end`（途中までの記録ではnull）、`ended`、`end_reason`、`state`（最後のライフサイクル状態）、`observations` |
+| `norms[]` | `id`、`kind`、`bearer`、`state`（F.5の六つの状態）、`verdict`、`activated_at`、最後の変化の `time` と `reason`、`evaluable`、`history[]`（`t`、`from`、`state`、`reason`） |
+| `violations[]` | `t`、`norm`、`severity`、`verdict`（`violated` か `excused`）、`sanction`、`reparation`、`reparation_activated`、`transition`（要求されたライフサイクル状態。報告するだけで適用しない） |
+| `institutional_events[]` | `t`、`name`、`performer`（メッセージの送信者。述語から作られたものはnull）、`source` |
+| `unauthorised[]` | `t`、`act`、`performer`、`reason`。行為者の該当する権能が有効でないときに行われた、権能の内容 |
+| `amendments[]` | `t`、`file`、`effects[]`（`norm`、`effect`、`from_state`、`to_state`、`reason`）。`effect` は `carry_over`、`discharge`、`transform`、`activated`、`new_definition`、`removed`、`added` のいずれか |
+| `assumptions[]` | `index`、`text`、`temporal`、`status`（`holds`、`failed`、`pending`）、`time`、`reason` |
+| `guarantees[]` | `index`、`text`、`temporal`、`verdict`、`time`、`reason` |
+| `timeline[]` | `t`、`kind`（`start`、`norm`、`violation`、`event`、`power`、`unauthorised`、`ignored`、`amend`、`assume`、`guarantee`、`end`）、`text` |
+| `warnings[]`、`violated[]`、`ok` | 警告、判定が `violated` の規範と保証、それが一つもないかどうか |
+
+**読み方。** F.4とF.5が選択の余地を残す箇所は、次のように読みます。
+
+- すべての変化には、それが決まった観測の時刻を付けます。期限切れは、期限の後の最初の観測で検出し、その時点で `violated` か `excused` かを決めます。理由には期限が過ぎた時刻を示します。
+- 時相演算子を含む `assume:` / `guarantee:` の項目は、インスタンスの開始時点で一度だけ評価します。含まない項目は状態述語であり、観測ごとに判定します。最初に偽になった観測で失敗とし、偽にならないままインスタンスが終了すれば `holds` / `fulfilled` とします。
+- 時相演算子が偽（`within`、`until`）または真（`throughout`）に決まるのは、区間の後の観測があるときだけです。その前にインスタンスが終了すれば項目は `pending` のままで、時相的な内容が決まっていない規範も同様です。
+- トレースに値のない名前を使う述語は未定義です。成り立たないものとして扱い、前提や保証を失敗にはせず、その名前を一度だけ警告します。値のない裸の名前は、`==`・`!=`・`IN` で文字列の値と比較されるときにだけ列挙値のリテラルとして読みます（`status == Delivered`）。それ以外（`ok == true`、単独の `flag`）では未定義です。時相演算子以外の関数呼出しは評価できないので、その規範や項目は理由を付けて `pending` のままにします。
+- トリガのない規範は、最初の観測の手順1の前に有効になります。手順4の中の順序は、期限、内容、`until:` です。停止中の規範に対する内容は数えません。インスタンスの終了時に見つかった違反は報告しますが、修復規範の有効化も遷移の要求もしません。インスタンスが終了する観測で有効になった規範は `discharged` とします。
+
+**改正。** `"amend": "new_version.cadl"` を持つ行は、その観測のほかの手順の前に、契約をそのファイルの同じidの契約に置き換え、規範インスタンスをF.6のとおりに扱います。有効または停止中のインスタンスは、旧版の `on_amendment:` に従います。`carry_over` は状態と経過時間を保ったまま新しい定義に引き継ぎます（idがなくなるか種別が変われば `discharged`、経過時間が新しい期限をすでに超えている義務はただちに `violated`）。`discharge` は解除します。`transform: X` は解除したうえで、未発効の `X` を経過時間を引き継いで有効にします。未発効のインスタンスは新しい定義に置き換わるか削除され、トリガのない新しい規範はただちに有効になり、確定済みのインスタンスは影響を受けません。新版の `counts_as:` 規則と `lifecycle:` はその時点から適用します。新しいファイルは `norms: 0.1` を宣言し、`cadl check` に通り、同じidの契約と現在のライフサイクル状態を持つ必要があります。そうでなければ終了ステータスは2です。F.6が定めていない点は次のように読みます。文面が変わらない `assume:` / `guarantee:` の項目は継続し、新しい項目は改正の時点から評価し、未決のまま消えた項目は `pending` のままとし、引き継いだ禁止の経過時間が新しい期間を超えていれば `fulfilled` とします。
+
+`cadl norms-diff OLD NEW [--contract ID] [--format text|json]` は、トレースなしで、この改正が何を引き起こすかを報告します。削除・追加・種別変更された規範、`content` か `deadline:` が変わって引き継がれる規範（F.6が求める報告）、新版にない `transform:` の対象、変更された `counts_as:` 規則です。各所見にはレベル（`error`、`warning`、`info`）があります。JSONは `old`、`new`、`contracts[]`（`id`、`findings[]`：`level`、`kind`、`text` と詳細）、`errors[]`、`ok` からなります。終了ステータスは、改正を妨げるものがなければ0、エラー（`transform:` の対象がない、新版が不正）があれば1、使い方の誤りは2です。
+
+`examples/traces/` には `examples/norms_robot_delivery.cadl` 用のトレースが五つあります。すべての規範が履行される場合（a）、応答の不履行を障害報告で修復する場合（b）、両方とも不履行の場合（c）、配車係の停止により遅配が免責される場合（d）、再割当てにより義務が解除される場合（e）です。`norms_amendment_v1_to_v2.jsonl` は、`examples/norms_amendment_v1.cadl` のトレースで、障害報告の期限内に `examples/norms_amendment_v2.cadl` へ改正されます。
+
 ### AI統合
 
 `cadl ai` は自然言語の記述からClaude APIを用いてCADL定義を生成します：
@@ -447,6 +515,8 @@ src/cadl/
   regime_map.py        運用モードの遷移グラフ分析
   iec62853.py          IEC 62853を参考にした要約
   unparse.py           式ASTをCADLのソーステキストに戻す
+  norms_eval.py        記録済みトレースに対する規範拡張の判定
+  norms_diff.py        改正が規範に及ぼす効果（二つの版の比較）
   cli.py               コマンドラインインタフェース
   codegen/
     __init__.py        公開generate() API（マルチターゲット対応）
@@ -503,6 +573,7 @@ tests/
   test_unity_csharp_structural.py 生成C#の構造チェック
   test_expr_parser.py    式文法のテスト
   test_unparse.py        式の往復変換テスト
+  test_norms_eval.py     トレースに対する規範の判定（`cadl norms-eval`）
   test_name_resolution.py 生成コードでのアクター／状態変数の解決
   test_method_dispatch.py 検証メソッドの振り分けテスト
   test_codegen_safety.py コード生成の入力安全性テスト
@@ -548,6 +619,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | IEC 62853レポート、Solidity・OPA/Rego生成 | 利用可能 |
 | シミュレータIR・設定生成（Python, Unity, Go） | 利用可能 |
 | SoS-DSL拡張（`lifecycle:` / `monitors:`）とUnity C#生成 | 利用可能 |
+| 規範拡張：静的検査と、記録済みトレースに対する判定と改正（`cadl norms-eval`、`cadl norms-diff`） | 利用可能 |
 | 検証メソッド `model_check` / `simulation` / `proof` | 未対応（未対応である旨を明示的に報告） |
 
 ## 関連プロジェクト

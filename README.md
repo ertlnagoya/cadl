@@ -163,6 +163,12 @@ cadl regime-map examples/smart_city_traffic.cadl --format dot -o regime.dot
 cadl iec62853 examples/robot_delivery.cadl
 cadl iec62853 examples/smart_city_traffic.cadl --format json
 
+# Verdicts of the norms extension on a recorded trace
+cadl norms-eval examples/norms_robot_delivery.cadl --trace examples/traces/norms_robot_delivery_a_fulfilled.jsonl
+
+# What an amendment from one version to the next does to the norms
+cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
+
 # Generate CADL from natural language (requires ANTHROPIC_API_KEY)
 cadl ai "A fleet of 5 autonomous drones surveying farmland, coordinated by a ground station"
 cadl ai -f requirements.txt -o output.cadl
@@ -342,6 +348,68 @@ cadl sim-gen examples/raspimouse_c_sos.cadl --target unity -o output/raspimouse_
 cadl sim-gen examples/raspimouse_mcp_sos.cadl --target unity -o output/raspimouse_mcp_sos_unity.json
 ```
 
+### Norm Verdicts on a Trace
+
+`cadl norms-eval` computes the verdicts of the norms extension (Appendix F, F.4 and F.5 of the specification) for one contract instance on a recorded trace. It is an offline monitor: it does not run the system, and it does not run the lifecycle state machine.
+
+```bash
+cadl norms-eval examples/norms_robot_delivery.cadl \
+    --trace examples/traces/norms_robot_delivery_b_reparation.jsonl
+cadl norms-eval FILE --trace TRACE [--contract ID] [--format text|json]
+```
+
+The file must declare `norms: 0.1` and pass `cadl check`. `--contract` is needed only when several contracts have `norms:` or `counts_as:`. The exit status is 0 when no norm and no guarantee has the verdict `violated` (`excused` and `pending` do not fail), 1 otherwise, and 2 on a usage error (no `norms: 0.1`, type-check errors, a malformed trace).
+
+**Trace.** JSON Lines, one observation per line, in non-decreasing time. One trace is one contract instance.
+
+```json
+{"t": 0.0, "bindings": {"i": 2}, "values": {"DISPATCHER.is_operational": true, "ROBOT[2].status": "Idle"}}
+{"t": 1.0, "messages": [{"from": "DISPATCHER", "to": "ROBOT[2]", "name": "route_assignment"}], "state": "Assigned"}
+{"t": 2.5, "messages": [{"from": "ROBOT[2]", "to": "DISPATCHER", "name": "ack", "args": ["accepted"]}]}
+{"t": 120.0, "values": {"ROBOT[2].status": "Delivered"}, "state": "Completed"}
+```
+
+| Key | Meaning |
+|---|---|
+| `t` | Time in seconds (required); `now` in predicates |
+| `bindings` | First line only: the indices the instance binds (`ROBOT[i]` is read as `ROBOT[2]`) |
+| `request` | First line only: the fields of `request` |
+| `values` | Updates of the snapshot, keyed by the name as written in predicates (`ROBOT[2].battery`, `delivery_time`); a value stays until it changes |
+| `messages` | Messages sent at this observation: `from`, `to`, `name`, optional `args`. A message event matches on sender, receiver and name; when the CADL text gives arguments (`ack(accepted)`), they must equal `args` |
+| `state` | Lifecycle state of the instance after this observation; it stays until it changes and starts as `lifecycle.initial`. Predicates of an observation read the state before it (step 6 of F.5 comes last) |
+| `amend` | Path of a new version of the CADL file, relative to the trace file: the contract is amended at this observation (see below) |
+| `end` | `true` ends the instance here. It also ends at the first terminal `state`, and otherwise at the last line, unless that line says `"end": false`: the trace is then a prefix and nothing is settled |
+
+**Output.** The text report has a timeline and tables of norms, violations, institutional events, unauthorised acts, assumptions and guarantees. `--format json` gives the same as one object:
+
+| Key | Content |
+|---|---|
+| `file`, `trace`, `contract`, `norms_version` | What was evaluated |
+| `instance` | `bindings`, `start`, `end` (null for a prefix), `ended`, `end_reason`, `state` (last lifecycle state), `observations` |
+| `norms[]` | `id`, `kind`, `bearer`, `state` (the six states of F.5), `verdict`, `activated_at`, `time` and `reason` of the last change, `evaluable`, `history[]` (`t`, `from`, `state`, `reason`) |
+| `violations[]` | `t`, `norm`, `severity`, `verdict` (`violated` or `excused`), `sanction`, `reparation`, `reparation_activated`, `transition` (the requested lifecycle state; it is reported, not applied) |
+| `institutional_events[]` | `t`, `name`, `performer` (the sender of the message; null for a predicate), `source` |
+| `unauthorised[]` | `t`, `act`, `performer`, `reason`: the content of a power performed while no matching power of the performer is active |
+| `amendments[]` | `t`, `file`, `effects[]` (`norm`, `effect`, `from_state`, `to_state`, `reason`); `effect` is `carry_over`, `discharge`, `transform`, `activated`, `new_definition`, `removed` or `added` |
+| `assumptions[]` | `index`, `text`, `temporal`, `status` (`holds`, `failed`, `pending`), `time`, `reason` |
+| `guarantees[]` | `index`, `text`, `temporal`, `verdict`, `time`, `reason` |
+| `timeline[]` | `t`, `kind` (`start`, `norm`, `violation`, `event`, `power`, `unauthorised`, `ignored`, `amend`, `assume`, `guarantee`, `end`), `text` |
+| `warnings[]`, `violated[]`, `ok` | Warnings; the norms and guarantees with verdict `violated`; whether there are none |
+
+**Readings.** Where F.4 and F.5 leave a choice, the command reads them as follows.
+
+- Every change carries the time of the observation at which it is decided. A missed deadline is detected, and judged `violated` or `excused`, at the first observation after it; the reason gives the time the deadline passed.
+- An `assume:` or `guarantee:` item with a temporal operator is evaluated once, at the start of the instance. An item without one is a state predicate and is judged at every observation: it fails at the first observation at which it is false, and is `holds` / `fulfilled` when the instance ends without that.
+- A temporal operator is decided false (`within`, `until`) or true (`throughout`) only by an observation after its interval. If the instance ends first, the item stays `pending`, and so does a norm whose temporal content is not decided.
+- A predicate that uses a name without a value in the trace is undefined: it does not hold, it does not make an assumption or a guarantee fail, and the name is reported once. A bare name without a value is an enum-like literal only when `==`, `!=` or `IN` compares it with a string value (`status == Delivered`); anywhere else (`ok == true`, `flag` alone) it is undefined. A function call other than a temporal operator is not evaluable: the norm or item stays `pending` with that reason.
+- Trigger-less norms become active before step 1 of the first observation. Within step 4 the order is deadline, content, `until:`. Content while a norm is suspended does not count. A violation found when the instance ends is reported, but activates no reparation and requests no transition. A norm activated at the observation at which the instance ends is `discharged`.
+
+**Amendments.** A line with `"amend": "new_version.cadl"` replaces the contract by the contract with the same id in that file, before the other steps of the observation, and treats the norm instances as F.6 says. An active or suspended instance follows the `on_amendment:` of the old version: `carry_over` keeps its state and elapsed time under the new definition (it is `discharged` when the id is gone or the kind differs, and an obligation is `violated` at once when the elapsed time exceeds the new deadline), `discharge` discharges it, and `transform: X` discharges it and activates an inactive `X` with the elapsed time counted. An inactive instance takes the new definition or is removed, a new norm without trigger is active at once, and final instances are not affected. The `counts_as:` rules and the `lifecycle:` of the new version apply from then on. The new file must declare `norms: 0.1`, pass `cadl check`, have the contract, and have the current lifecycle state; otherwise the exit status is 2. Where F.6 is silent: an `assume:` / `guarantee:` item whose text is unchanged continues, a new item is evaluated from the amendment on, an undecided item that is gone stays `pending`, and a carried-over prohibition whose elapsed time exceeds a new window is `fulfilled`.
+
+`cadl norms-diff OLD NEW [--contract ID] [--format text|json]` reports, without a trace, what such an amendment does: norms removed, added or of a changed kind, every norm that carries over with a changed `content` or `deadline:` (the report F.6 asks for), `transform:` targets the new version lacks, and changed `counts_as:` rules. Each finding has a level (`error`, `warning`, `info`); JSON has `old`, `new`, `contracts[]` (`id`, `findings[]` with `level`, `kind`, `text` and details), `errors[]` and `ok`. The exit status is 0 when nothing prevents the amendment, 1 on an error (a missing transform target, an invalid new version), and 2 on a usage error.
+
+`examples/traces/` has five traces for `examples/norms_robot_delivery.cadl`: all norms fulfilled (a), a missed acknowledgement repaired by a failure report (b), both missed (c), a late delivery excused because the dispatcher stopped operating (d), and a reassignment that discharges the obligations (e). `norms_amendment_v1_to_v2.jsonl` is a trace of `examples/norms_amendment_v1.cadl` that is amended to `examples/norms_amendment_v2.cadl` while a failure report is due.
+
 ### AI Integration
 
 `cadl ai` generates CADL from natural language descriptions via Claude API:
@@ -448,6 +516,8 @@ src/cadl/
   regime_map.py        Regime transition graph analysis
   iec62853.py          IEC 62853-oriented dependability summary
   unparse.py           Expression AST back to CADL source text
+  norms_eval.py        Verdicts of the norms extension on a recorded trace
+  norms_diff.py        Effect of an amendment on the norms (two versions compared)
   cli.py               Command-line interface
   codegen/
     __init__.py        Public generate() API (multi-target dispatch)
@@ -504,6 +574,7 @@ tests/
   test_unity_csharp_structural.py Structural checks on the generated C#
   test_expr_parser.py    Expression grammar tests
   test_unparse.py        Expression round-trip tests
+  test_norms_eval.py     Norm verdicts on a trace (`cadl norms-eval`)
   test_name_resolution.py Actor vs state-variable resolution in generated code
   test_method_dispatch.py Verification method dispatch tests
   test_codegen_safety.py Code generation input-safety tests
@@ -549,6 +620,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | IEC 62853 report, Solidity and OPA/Rego generation | Available |
 | Simulator IR and config generation (Python, Unity, Go) | Available |
 | SoS-DSL extension (`lifecycle:` / `monitors:`) and Unity C# generation | Available |
+| Norms extension: static checks, and verdicts and amendments on a recorded trace (`cadl norms-eval`, `cadl norms-diff`) | Available |
 | `model_check` / `simulation` / `proof` verification methods | Not supported yet (reported explicitly) |
 
 ## Related Projects

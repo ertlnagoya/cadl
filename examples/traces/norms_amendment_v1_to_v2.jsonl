@@ -1,0 +1,7 @@
+{"t": 0.0, "bindings": {"i": 2}, "values": {"DISPATCHER.is_operational": true, "ROBOT[2].battery": 80, "ROBOT[2].status": "Idle"}}
+{"t": 1.0, "messages": [{"from": "DISPATCHER", "to": "ROBOT[2]", "name": "route_assignment"}], "state": "Assigned"}
+{"t": 6.5, "values": {"ROBOT[2].battery": 79}}
+{"t": 7.5, "amend": "../norms_amendment_v2.cadl"}
+{"t": 9.0, "messages": [{"from": "ROBOT[2]", "to": "DISPATCHER", "name": "help_request"}]}
+{"t": 30.0, "values": {"ROBOT[2].status": "InTransit", "ROBOT[2].battery": 14}, "state": "Delivering"}
+{"t": 110.0, "values": {"ROBOT[2].status": "Delivered"}, "state": "Completed"}

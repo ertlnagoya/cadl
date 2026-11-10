@@ -1,0 +1,6 @@
+{"t": 0.0, "bindings": {"i": 2}, "values": {"DISPATCHER.is_operational": true, "ROBOT[2].battery": 80, "ROBOT[2].status": "Idle"}}
+{"t": 1.0, "messages": [{"from": "DISPATCHER", "to": "ROBOT[2]", "name": "route_assignment"}], "state": "Assigned"}
+{"t": 2.0, "messages": [{"from": "ROBOT[2]", "to": "DISPATCHER", "name": "ack", "args": ["accepted"]}]}
+{"t": 10.0, "values": {"ROBOT[2].status": "InTransit"}, "state": "Delivering"}
+{"t": 150.0, "values": {"DISPATCHER.is_operational": false}}
+{"t": 320.0, "values": {"ROBOT[2].status": "Delivered"}, "state": "Completed"}

@@ -1,0 +1,109 @@
+# Norms Extension: Amendment Demo, version 2 (Appendix F, F.6)
+#
+# The new version of norms_amendment_v1.cadl. The robot must acknowledge
+# within 3 s instead of 5 s; instead of reporting a failure it must ask
+# for help (request_help, to which an active report_failure is
+# transformed); driving is prohibited below 15 % battery instead of 10 %;
+# the permission to return to charge is replaced by a permission to ask
+# for a battery swap; and a reassignment also discharges request_help.
+
+sos:
+  name: "RobotDeliveryAmendment"
+  type: Acknowledged
+  version: "2.0.0"
+  description: "Robot-delivery SoS used to demonstrate amendments of norms (version 2)."
+  extensions:
+    - sos-dsl: 0.1
+    - norms: 0.1
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities:
+        - assign_tasks
+        - reassign_tasks
+        - monitor_fleet
+      interface:
+        input:  [delivery_request, ack, help_request, swap_request]
+        output: [route_assignment, replan_command, delivery_notification]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities:
+        - follow_path
+        - pick_up
+        - deliver
+      interface:
+        input:  [route_assignment, replan_command]
+        output: [ack, help_request, swap_request]
+
+    - id: "CUSTOMER[1..M]"
+      role: "service_requester"
+      autonomy: medium
+      capabilities:
+        - submit_order
+        - confirm_receipt
+      interface:
+        input:  [delivery_notification]
+        output: [delivery_request]
+
+  contracts:
+    - id: DELIVERY_SLA
+      parties: [DISPATCHER, "ROBOT[*]", "CUSTOMER[*]"]
+      assume:
+        - "throughout(300s, DISPATCHER.is_operational == true)"
+      guarantee:
+        - "within(300s, ROBOT[i].status == Delivered)"
+
+      lifecycle:
+        states:   [Proposed, Assigned, Delivering, Completed, Violated]
+        initial:  Proposed
+        terminal: [Completed, Violated]
+        transitions:
+          - { id: assign,   from: Proposed,   to: Assigned,   on: "DISPATCHER -> ROBOT[i] : route_assignment" }
+          - { id: start,    from: Assigned,   to: Delivering, on: "ROBOT[i].status == InTransit" }
+          - { id: complete, from: Delivering, to: Completed,  on: "ROBOT[i].status == Delivered" }
+
+      counts_as:
+        - when: "DISPATCHER -> ROBOT[i] : replan_command"
+          creates: reassignment
+
+      norms:
+        - id: acknowledge
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: DISPATCHER
+          trigger: "DISPATCHER -> ROBOT[i] : route_assignment"
+          content: "ROBOT[i] -> DISPATCHER : ack(accepted)"
+          deadline: 3s
+          on_violation:
+            severity: Major
+            reparation: request_help
+        - id: request_help
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: DISPATCHER
+          content: "ROBOT[i] -> DISPATCHER : help_request"
+          deadline: 4s
+          on_violation:
+            severity: Critical
+            transition: Violated
+        - id: no_low_battery_driving
+          kind: prohibition
+          bearer: "ROBOT[i]"
+          content: "ROBOT[i].battery < 15 AND ROBOT[i].status == InTransit"
+          on_violation:
+            severity: Critical
+            sanction: "removed from the dispatch pool for one period"
+        - id: may_swap_battery
+          kind: permission
+          bearer: "ROBOT[i]"
+          content: "ROBOT[i] -> DISPATCHER : swap_request"
+        - id: reassign
+          kind: power
+          bearer: DISPATCHER
+          content: reassignment
+          effects:
+            discharge: [acknowledge, request_help]

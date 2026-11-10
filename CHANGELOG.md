@@ -6,6 +6,40 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `cadl norms-eval FILE --trace TRACE [--contract ID] [--format text|json]`:
+  an offline verdict engine for the norms extension (Appendix F, F.4 and
+  F.5). For one contract instance recorded as a timed trace (JSON Lines:
+  `t`, `bindings`, `request`, `values`, `messages`, `state`, `end`), it
+  computes the state of every norm instance over time and its verdict
+  (`pending`, `fulfilled`, `violated`, `excused`), the reported violations
+  with severity, sanction, activated reparation and requested lifecycle
+  transition, the institutional events of `counts_as:` rules, unauthorised
+  acts, and the verdicts of `assume:` and `guarantee:` items, including
+  those with `within`, `throughout` and `until`. The lifecycle state is
+  taken from the trace; a requested transition is reported, not applied.
+  Exit status 0 when nothing is `violated`, 1 otherwise, 2 on a usage
+  error. The README lists the trace format, the JSON output and the
+  readings chosen where the specification leaves a choice.
+- Amendments (Appendix F, F.6) in `cadl norms-eval`: a trace line with
+  `"amend": "<new version of the file>"` replaces the contract at that
+  observation. Active and suspended norm instances follow the
+  `on_amendment:` of the old version (`carry_over`, `discharge`,
+  `transform:`), inactive ones take the new definition or are removed, new
+  norms start, and the `counts_as:` rules and `lifecycle:` of the new
+  version apply from then on. The effects are in the timeline and under
+  `amendments[]` in the JSON output.
+- `cadl norms-diff OLD NEW [--contract ID] [--format text|json]`: what an
+  amendment from one version to the next does to the norms of each
+  contract: norms removed, added or of a changed kind, norms that carry
+  over with a changed `content` or `deadline:`, `transform:` targets the
+  new version lacks (an error), and changed `counts_as:` rules. Exit
+  status 0 when nothing prevents the amendment, 1 on an error, 2 on a
+  usage error.
+- `examples/traces/`: five traces for `examples/norms_robot_delivery.cadl`,
+  and `examples/norms_amendment_v1.cadl` / `norms_amendment_v2.cadl` with
+  a trace that is amended from the first to the second.
+
 ## [0.3.19] — 2026-11-10
 
 The norms extension (norms 0.1, Appendix F of the specification).

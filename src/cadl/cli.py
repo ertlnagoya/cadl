@@ -80,6 +80,27 @@ def main(argv: list[str] | None = None) -> int:
     sim_gen_cmd.add_argument("--output", "-o", type=Path, default=None,
                              help="Output file (default: stdout)")
 
+    # norms-eval command
+    norms_cmd = subparsers.add_parser("norms-eval",
+        help="Compute the verdicts of a norms 0.1 contract on a recorded trace (Appendix F, F.5)")
+    norms_cmd.add_argument("file", type=Path, help="CADL file that declares norms: 0.1")
+    norms_cmd.add_argument("--trace", type=Path, required=True,
+                           help="Timed trace of one contract instance (JSON Lines)")
+    norms_cmd.add_argument("--contract", default=None, metavar="ID",
+                           help="Contract to evaluate (default: the only one with norms)")
+    norms_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                           help="Output format (default: text)")
+
+    # norms-diff command
+    diff_cmd = subparsers.add_parser("norms-diff",
+        help="Report what an amendment from OLD to NEW does to the norms (Appendix F, F.6)")
+    diff_cmd.add_argument("old", type=Path, help="Old version of the CADL file")
+    diff_cmd.add_argument("new", type=Path, help="New version of the CADL file")
+    diff_cmd.add_argument("--contract", default=None, metavar="ID",
+                          help="Contract to compare (default: every contract with norms)")
+    diff_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                          help="Output format (default: text)")
+
     # ai command
     ai_cmd = subparsers.add_parser("ai", help="Generate CADL from natural language description")
     ai_cmd.add_argument("description", nargs="?", default=None,
@@ -117,6 +138,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_sim_ir(args)
     elif args.command == "sim-gen":
         return _cmd_sim_gen(args)
+    elif args.command == "norms-eval":
+        return _cmd_norms_eval(args)
+    elif args.command == "norms-diff":
+        return _cmd_norms_diff(args)
     elif args.command == "ai":
         return _cmd_ai(args)
 
@@ -599,6 +624,65 @@ def _cmd_sim_gen(args: argparse.Namespace) -> int:
         print(config_str)
 
     return 0
+
+
+def _cmd_norms_eval(args: argparse.Namespace) -> int:
+    """Exit status: 0 when no norm or guarantee is `violated` (`excused`
+    and `pending` do not fail), 1 otherwise, 2 on a usage error."""
+    from .norms_eval import NormsEvalError, TraceError, evaluate_files, format_text
+
+    try:
+        result = evaluate_files(args.file, args.trace, args.contract)
+    except TraceError as e:
+        print(f"Trace error: {args.trace}: {e}", file=sys.stderr)
+        return 2
+    except NormsEvalError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+    if args.format == "json":
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_text(result))
+    return 0 if result["ok"] else 1
+
+
+def _cmd_norms_diff(args: argparse.Namespace) -> int:
+    """Exit status: 0 when nothing prevents the amendment, 1 on an
+    error-level finding (a missing transform target, an invalid new
+    version), 2 on a usage error."""
+    from .norms_diff import diff_versions, format_diff_text
+    from .norms_eval import NormsEvalError, load_version
+
+    for path in (args.old, args.new):
+        if not path.exists():
+            print(f"Error: File not found: {path}", file=sys.stderr)
+            return 2
+    try:
+        old = load_version(args.old)
+    except NormsEvalError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    try:
+        new = load_version(args.new)
+    except NormsEvalError as e:
+        # The new version cannot take effect: a finding, not a usage error.
+        result = {"contracts": [], "invalid": [str(e)], "errors": [str(e)], "ok": False}
+    else:
+        try:
+            result = diff_versions(old, new, args.contract)
+        except NormsEvalError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
+    result = {"old": str(args.old), "new": str(args.new), **result}
+
+    if args.format == "json":
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_diff_text(result))
+    return 0 if result["ok"] else 1
 
 
 def _cmd_ai(args: argparse.Namespace) -> int:
