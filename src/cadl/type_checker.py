@@ -12,6 +12,8 @@ Checks performed (per spec §6.2.2):
    file declares `norms: 0.1`
 8. Agent governance static semantics, rules G-1 to G-16 (Appendix G §G.9),
    when the file declares `agents: 0.1` (which requires `norms: 0.1`)
+9. Stochastic model static semantics, rules S-1 to S-15 (Appendix H §H.10),
+   when the file declares `stochastic: 0.1`
 """
 
 from __future__ import annotations
@@ -61,7 +63,8 @@ CODEGEN_TARGETS = ("python", "solidity", "opa", "unity-csharp",
                    "agent-rego", "agent-cedar")
 SIM_TARGETS = ("unity", "go")
 # Extensions this processor implements, with the versions it knows
-KNOWN_EXTENSIONS = {"sos-dsl": ("0.1",), "norms": ("0.1",), "agents": ("0.1",)}
+KNOWN_EXTENSIONS = {"sos-dsl": ("0.1",), "norms": ("0.1",), "agents": ("0.1",),
+                    "stochastic": ("0.1",)}
 
 
 @dataclass
@@ -136,7 +139,33 @@ class TypeChecker:
             self._check_temporal_elsewhere(sos)
         if self.agents_active:
             self._check_ungoverned_tool_servers(sos)
+        self._check_stochastic_model(sos)
         return self.result
+
+    # --- Stochastic model extension (Appendix H, H.10) ---
+
+    def _check_stochastic_model(self, sos: SoSDefinition) -> None:
+        """Rules S-1 to S-15 for `model:`, when the file declares
+        `stochastic: 0.1`; otherwise one warning (H.15)."""
+        from .stochastic import analyse, stochastic_declared
+        if sos.model is None:
+            return
+        if not stochastic_declared(sos):
+            self.result.add_warning(
+                "The file uses model:, which belongs to the stochastic extension, "
+                "but does not declare 'stochastic: 0.1' under extensions:; it is an "
+                "undeclared extension key, and is neither checked, lowered to the IR "
+                "nor exported (Appendix H, H.15)",
+                sos.loc,
+            )
+            return
+        analysis = analyse(sos)
+        for message in analysis.infos:
+            self.result.add_info(message, sos.loc)
+        for message in analysis.warnings:
+            self.result.add_warning(message, sos.loc)
+        for message in analysis.errors:
+            self.result.add_error(message, sos.loc)
 
     def _collect_definitions(self, sos: SoSDefinition) -> None:
         """Collect all defined names for reference checking."""

@@ -325,3 +325,7 @@ class SimIR:
     # Appendix G (G.13) are part of the serialized IR only when it is set,
     # so the IR of a file without the extension is unchanged (G.14).
     agents_extension: bool = False
+    # Stochastic model extension (Appendix H, H.13): the interpreted
+    # `model:` block, or None (serialized as null) when the file has none
+    # or does not declare `stochastic: 0.1`.
+    stochastic_model: Any = None

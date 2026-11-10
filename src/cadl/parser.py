@@ -53,6 +53,15 @@ from .ast_nodes import (
     LifecycleTransition,
     MemberAccess,
     MessageStep,
+    ModelBlock,
+    ModelCommandDef,
+    ModelParamDef,
+    ModelPropertyDef,
+    ModelRegimeMapDef,
+    ModelRewardDef,
+    ModelRewardItemDef,
+    ModelUpdateDef,
+    ModelVarDef,
     MetricDef,
     MonitorDef,
     MotivationBlock,
@@ -1076,6 +1085,85 @@ def _entry_as_text(item) -> str:
     return str(item)
 
 
+# === Stochastic model extension builders (Appendix H) ===
+#
+# The values are kept as the YAML loader read them; `cadl.stochastic`
+# applies the rules of H.10 and parses the expression sub-languages.
+
+def _model_entries(block: ModelBlock, data: dict, key: str, rule: str, build) -> list:
+    """The entries of a list-valued key of `model:`, each built from a mapping."""
+    value = data.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        block.malformed.append((rule, f"model.{key} must be a sequence of mappings"))
+        return []
+    out = []
+    for i, item in enumerate(value, start=1):
+        if isinstance(item, dict):
+            out.append(build(item))
+        else:
+            block.malformed.append(
+                (rule, f"entry {i} of model.{key} is not a mapping: {_value_as_text(item)}"))
+    return out
+
+
+def _model_keys(data: dict) -> tuple:
+    return tuple(k for k in data)
+
+
+def _build_model_command(data: dict) -> ModelCommandDef:
+    updates = data.get('updates')
+    if isinstance(updates, list):
+        updates = [
+            ModelUpdateDef(prob=u.get('prob'), set=u.get('set'), keys=_model_keys(u))
+            if isinstance(u, dict) else u
+            for u in updates
+        ]
+    return ModelCommandDef(
+        action=data.get('action'), when=data.get('when'), guard=data.get('guard'),
+        updates=updates, keys=_model_keys(data),
+    )
+
+
+def _build_model_reward(data: dict) -> ModelRewardDef:
+    items = data.get('items')
+    if isinstance(items, list):
+        items = [
+            ModelRewardItemDef(action=i.get('action'), guard=i.get('guard'),
+                               value=i.get('value'), keys=_model_keys(i))
+            if isinstance(i, dict) else i
+            for i in items
+        ]
+    return ModelRewardDef(id=data.get('id'), items=items, keys=_model_keys(data))
+
+
+def _build_model(data) -> ModelBlock:
+    """Build a ModelBlock from the value of `model:` (H.2)."""
+    block = ModelBlock()
+    if not isinstance(data, dict):
+        block.malformed.append(("S-1", "model: must be a mapping"))
+        return block
+    block.keys = _model_keys(data)
+    block.kind = data.get('kind')
+    block.parameters = _model_entries(block, data, 'parameters', "S-2", lambda d: ModelParamDef(
+        id=d.get('id'), source=d.get('from'), range=d.get('range'),
+        value=d.get('value'), keys=_model_keys(d)))
+    block.variables = _model_entries(block, data, 'variables', "S-1", lambda d: ModelVarDef(
+        id=d.get('id'), type=d.get('type'), init=d.get('init'), keys=_model_keys(d)))
+    block.commands = _model_entries(block, data, 'commands', "S-1", _build_model_command)
+    block.labels = data.get('labels')
+    block.regimes = data.get('regimes')
+    block.rewards = _model_entries(block, data, 'rewards', "S-12", _build_model_reward)
+    block.properties = _model_entries(block, data, 'properties', "S-13", lambda d: ModelPropertyDef(
+        id=d.get('id'), regimes=d.get('regimes'), expr=d.get('expr'), keys=_model_keys(d)))
+    block.regime_maps = _model_entries(block, data, 'regime_maps', "S-14", lambda d: ModelRegimeMapDef(
+        id=d.get('id'), over=d.get('over'), regimes=d.get('regimes'),
+        objective=d.get('objective'), constraint=d.get('constraint'),
+        resolution=d.get('resolution'), keys=_model_keys(d)))
+    return block
+
+
 def _build_extensions(data) -> list:
     """Read `extensions:` as (name, version) pairs (Appendix A §A.2)."""
     out = []
@@ -1174,6 +1262,7 @@ def _build_sos(data: dict) -> SoSDefinition:
             for k, v in env_data.items():
                 sk = str(k)
                 sv = str(v)
+                env.raw[sk] = v
                 # Preserve quoted strings from YAML as-is (avoid
                 # expression parsing of e.g. "unity-mcp-custom")
                 if isinstance(v, str):
@@ -1272,6 +1361,12 @@ def _build_sos(data: dict) -> SoSDefinition:
     # Extension declarations and the motivation block (Appendices A.2, C)
     sos.extensions = _build_extensions(_get(sos_data, 'extensions'))
     sos.motivation = _build_motivation(_get(sos_data, 'motivation'))
+
+    # Stochastic model extension (Appendix H). Read whether or not
+    # `stochastic: 0.1` is declared; without the declaration the block is
+    # not interpreted (H.15).
+    if 'model' in sos_data:
+        sos.model = _build_model(sos_data['model'])
 
     return sos
 

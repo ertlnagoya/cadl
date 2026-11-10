@@ -550,6 +550,9 @@ class MetricDef:
 @dataclass
 class EnvironmentDef:
     entries: dict[str, Expression] = field(default_factory=dict)
+    # The entries as the YAML loader read them. The stochastic extension
+    # needs to know whether an entry is a YAML number (Appendix H, H.3).
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -626,6 +629,107 @@ class MotivationBlock:
     loc: SourceLocation | None = None
 
 
+# === Stochastic model extension (Appendix H, stochastic 0.1) ===
+#
+# The nodes keep the values as the YAML loader read them (``Any``): the
+# rules S-1 to S-15 of H.10 are applied by `cadl.stochastic`, which also
+# parses the three expression sub-languages of H.2. ``keys`` lists the
+# keys written in the mapping, so that an omitted key and the reserved
+# keys of H.1 can be told apart.
+
+@dataclass
+class ModelParamDef:
+    """An entry of `model.parameters:` (H.3)."""
+    id: Any = None
+    source: Any = None                 # `from:` as written
+    range: Any = None
+    value: Any = None
+    keys: tuple = ()
+
+
+@dataclass
+class ModelVarDef:
+    """An entry of `model.variables:` (H.4)."""
+    id: Any = None
+    type: Any = None
+    init: Any = None
+    keys: tuple = ()
+
+
+@dataclass
+class ModelUpdateDef:
+    """An update of a command (H.5). ``prob`` is None when omitted."""
+    prob: Any = None
+    set: Any = None
+    keys: tuple = ()
+
+
+@dataclass
+class ModelCommandDef:
+    """An entry of `model.commands:` (H.5)."""
+    action: Any = None
+    when: Any = None
+    guard: Any = None
+    updates: Any = None                # list[ModelUpdateDef], or the value as written
+    keys: tuple = ()
+
+
+@dataclass
+class ModelRewardItemDef:
+    action: Any = None
+    guard: Any = None
+    value: Any = None
+    keys: tuple = ()
+
+
+@dataclass
+class ModelRewardDef:
+    """An entry of `model.rewards:` (H.8)."""
+    id: Any = None
+    items: Any = None                  # list[ModelRewardItemDef], or the value as written
+    keys: tuple = ()
+
+
+@dataclass
+class ModelPropertyDef:
+    """An entry of `model.properties:` (H.8)."""
+    id: Any = None
+    regimes: Any = None
+    expr: Any = None
+    keys: tuple = ()
+
+
+@dataclass
+class ModelRegimeMapDef:
+    """An entry of `model.regime_maps:` (H.9)."""
+    id: Any = None
+    over: Any = None
+    regimes: Any = None
+    objective: Any = None
+    constraint: Any = None
+    resolution: Any = None
+    keys: tuple = ()
+
+
+@dataclass
+class ModelBlock:
+    """The `model:` block of an SoS (Appendix H, H.2)."""
+    kind: Any = None
+    parameters: list[ModelParamDef] = field(default_factory=list)
+    variables: list[ModelVarDef] = field(default_factory=list)
+    commands: list[ModelCommandDef] = field(default_factory=list)
+    labels: Any = None                 # mapping name -> state_pred, as written
+    regimes: Any = None                # mapping regime -> {parameters: {...}}, as written
+    rewards: list[ModelRewardDef] = field(default_factory=list)
+    properties: list[ModelPropertyDef] = field(default_factory=list)
+    regime_maps: list[ModelRegimeMapDef] = field(default_factory=list)
+    keys: tuple = ()
+    # Structural problems found while reading the block (an entry that is
+    # not a mapping, ...), as (rule, message) pairs for the type checker.
+    malformed: list[tuple[str, str]] = field(default_factory=list)
+    loc: SourceLocation | None = None
+
+
 # === Top-level SoS ===
 
 @dataclass
@@ -646,4 +750,7 @@ class SoSDefinition:
     # `extensions:` declarations as (name, version) pairs (Appendix A §A.2).
     extensions: list[tuple[str, str]] = field(default_factory=list)
     motivation: MotivationBlock | None = None  # Appendix C (v0.1-ext)
+    # Stochastic model extension (Appendix H); read whether or not
+    # `stochastic: 0.1` is declared, interpreted only when it is.
+    model: ModelBlock | None = None
     loc: SourceLocation | None = None

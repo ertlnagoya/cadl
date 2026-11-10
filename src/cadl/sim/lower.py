@@ -79,12 +79,23 @@ def lower_to_ir(sos: SoSDefinition) -> SimIR:
             else None
         ),
         agents_extension=_agents_active(sos),
+        stochastic_model=_lower_stochastic_model(sos),
     )
 
 
 def _agents_active(sos: SoSDefinition) -> bool:
     from ..agents import agents_active
     return agents_active(sos)
+
+
+def _lower_stochastic_model(sos: SoSDefinition) -> Any:
+    """The `stochastic_model` field (Appendix H, H.13): the model: block of
+    a file that declares `stochastic: 0.1`, or None. A block that breaks a
+    rule of H.10 is not interpreted and is None as well; `cadl check`
+    reports why."""
+    from ..stochastic import checked_model, model_to_ir
+    model = checked_model(sos)
+    return None if model is None else model_to_ir(model)
 
 
 # ---------------------------------------------------------------------------
