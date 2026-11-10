@@ -6,6 +6,53 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Norms extension, norms 0.1 (Appendix F of the specification). A
+  contract may have `norms:` (obligations, permissions, prohibitions and
+  powers with a bearer, trigger, until, content, deadline, `on_violation:`,
+  `effects:` and `on_amendment:`) and `counts_as:` rules (`when:`,
+  `creates:`, `if:`). In a file that declares `norms: 0.1` under
+  `extensions:`, `within(d, p)`, `throughout(d, p)` and `until(p, q, d)`
+  are bounded temporal operators; the expression grammar is unchanged.
+  `cadl check` applies rules N-1 to N-12 of F.7: N-8, N-12 and the SHOULDs
+  of N-3 and N-9 are warnings, the rest errors. A temporal operator is an
+  error (N-10) outside `assume:`, `guarantee:` and the `content:` of a
+  norm, for example in a monitor `rule:`, a lifecycle `on:` / `when:`, a
+  norm `trigger:` / `until:`, a `counts_as:` rule, a `condition:` or a
+  metric `formula:`. Verdicts and amendments (F.5, F.6) are not computed.
+- `cadl verify` leaves `assume:` and `guarantee:` items with a temporal
+  operator out of the SMT checks when `norms: 0.1` is declared, and
+  reports each one as not checked (`not_supported`, shown as `[SKIP]`),
+  which does not fail verification. When this leaves a contract without
+  assumptions (or without assumes or guarantees), the assumption and
+  entailment lines say that no state-predicate items are left after the
+  temporal items were left out, instead of "No assumptions (the contract
+  applies unconditionally)".
+- `cadl codegen` (python, solidity, opa, unity-csharp) leaves `assume:`
+  and `guarantee:` items with a temporal operator out of the generated
+  checks when `norms: 0.1` is declared, writes a comment in their place
+  ("not generated: the item has a temporal operator (norms 0.1)"), and
+  prints one warning per left-out item. Before, the Solidity and OPA
+  targets emitted calls to `within` / `throughout`, which are not defined
+  there. A Rego rule left without items is `true`. Without the
+  declaration, generation is unchanged.
+- The simulator IR has two more fields on every contract, `norms` and
+  `counts_as`, in the flattened form of F.9 (`on_violation_*`,
+  `effects_*`, `on_amendment`, `transform_to`; `when`, `creates`, `if`).
+  They are empty lists for a contract without norms, so `cadl sim-ir`
+  output of every file gains `"norms": []` and `"counts_as": []`.
+- `examples/norms_robot_delivery.cadl`, the example of F.8: the delivery
+  contract with an obligation and its contrary-to-duty obligation, a
+  prohibition, a permission, a power, and a counts-as rule.
+
+### Changed
+- `cadl check` no longer gives the informational "extension not known"
+  diagnostic for `norms: 0.1`; another version of `norms` gets the same
+  information as other unknown versions. Without the declaration,
+  `norms:` and `counts_as:` get one warning per contract as undeclared
+  extension keys and are neither checked nor lowered to the IR (F.11);
+  `within`, `throughout` and `until` remain ordinary function names.
+
 ## [0.3.18] — 2026-10-20
 
 ### Added

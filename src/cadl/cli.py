@@ -303,7 +303,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 def _cmd_codegen(args: argparse.Namespace) -> int:
     from .parser import parse_file
     from .type_checker import type_check
-    from .codegen import generate
+    from .codegen import generate, omitted_temporal_items
 
     path = args.file
     if not path.exists():
@@ -330,6 +330,9 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
     # Generate
     target = args.target
     output_dir = args.output
+    for contract_id, key, text in omitted_temporal_items(sos):
+        print(f"  [WARNING]: {key} item of contract '{contract_id}' has a temporal "
+              f"operator (norms 0.1) and is not generated: {text}", file=sys.stderr)
     try:
         generate(sos, output_dir, target=target)
     except Exception as e:
@@ -538,6 +541,10 @@ def _ir_to_dict(ir) -> dict:
         gov = c.get("governance", {})
         if "lambda_" in gov:
             gov["lambda"] = gov.pop("lambda_")
+        # Likewise if_ of a counts-as rule (Appendix F, F.9)
+        for rule in c.get("counts_as", []):
+            if "if_" in rule:
+                rule["if"] = rule.pop("if_")
     # The verbatim motivation block is an optional key: present only when
     # the source has a `motivation:` block.
     if d.get("motivation_block") is None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import List
 
 from ..ast_nodes import ContractDef, Expression
+from ..norms import omitted_comment, omitted_in_codegen
 from .emitter import sanitize_id
 from .expr_compiler import CompilerContext, expr_to_python
 
@@ -27,6 +28,9 @@ def generate_contract_monitor(contract: ContractDef) -> str:
     lines.append("        results = []")
     if contract.assume:
         for pred in contract.assume:
+            if omitted_in_codegen(pred):
+                lines.append(f"        # {omitted_comment(pred)}")
+                continue
             py_expr = _compile_predicate(pred)
             pred_str = _predicate_label(pred)
             lines.append(f"        try:")
@@ -41,6 +45,9 @@ def generate_contract_monitor(contract: ContractDef) -> str:
     lines.append("        results = []")
     if contract.guarantee:
         for pred in contract.guarantee:
+            if omitted_in_codegen(pred):
+                lines.append(f"        # {omitted_comment(pred)}")
+                continue
             py_expr = _compile_predicate(pred)
             pred_str = _predicate_label(pred)
             lines.append(f"        try:")

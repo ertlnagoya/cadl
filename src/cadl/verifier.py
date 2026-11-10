@@ -8,6 +8,9 @@ Performs:
 5. Regime reachability, dead states and safety invariants
 
 Whether guarantees follow from assumes is reported as information only.
+In a file that declares the norms extension (Appendix F), assume /
+guarantee items with temporal operators are left out of these checks and
+reported as not checked (F.7).
 """
 
 from __future__ import annotations
@@ -462,7 +465,9 @@ def _parse_condition(cond_str: str, ctx: Z3Context) -> Any:
         return ctx.get_bool(f"cond_{sanitized}")
 
 
-def _check_assumption_satisfiability(contract: ContractDef) -> VerificationResult:
+def _check_assumption_satisfiability(
+    contract: ContractDef, temporal_left_out: bool = False
+) -> VerificationResult:
     """Check that a contract's assumptions can hold together.
 
     A contract C = (A, G) only binds its parties in environments that
@@ -475,7 +480,12 @@ def _check_assumption_satisfiability(contract: ContractDef) -> VerificationResul
         return VerificationResult(
             check_name=check_name,
             status="passed",
-            message="No assumptions (the contract applies unconditionally)",
+            message=(
+                "No state-predicate assumptions are left after the items with "
+                "temporal operators were left out; nothing to check"
+                if temporal_left_out else
+                "No assumptions (the contract applies unconditionally)"
+            ),
         )
 
     ctx = Z3Context()
@@ -503,7 +513,9 @@ def _check_assumption_satisfiability(contract: ContractDef) -> VerificationResul
     )
 
 
-def _check_guarantee_entailment(contract: ContractDef) -> VerificationResult:
+def _check_guarantee_entailment(
+    contract: ContractDef, temporal_left_out: bool = False
+) -> VerificationResult:
     """Report whether the guarantees already follow from the assumptions.
 
     In an assume-guarantee contract the guarantees are obligations the
@@ -517,7 +529,12 @@ def _check_guarantee_entailment(contract: ContractDef) -> VerificationResult:
         return VerificationResult(
             check_name=check_name,
             status="passed",
-            message="No assumes or guarantees to check entailment",
+            message=(
+                "No state-predicate assumes or guarantees are left after the "
+                "items with temporal operators were left out; nothing to check"
+                if temporal_left_out else
+                "No assumes or guarantees to check entailment"
+            ),
         )
 
     ctx = Z3Context()
@@ -800,6 +817,29 @@ def dispatch_spec(
     )
 
 
+def _without_temporal_items(
+    contract: ContractDef,
+) -> Tuple[ContractDef, List[VerificationResult]]:
+    """Leave out of the SMT checks the assume / guarantee items that contain
+    a temporal operator of the norms extension (Appendix F, F.4, F.7); they
+    are not state predicates, and are reported as not checked."""
+    from .norms import split_temporal_items
+
+    checked, omitted = split_temporal_items(contract)
+    skipped = [
+        VerificationResult(
+            check_name=f"Contract '{contract.id}' {key}",
+            status="not_supported",
+            message=(
+                f"not checked: the item has a temporal operator (norms 0.1) "
+                f"and is left out of the SMT checks: {text}"
+            ),
+        )
+        for key, text in omitted
+    ]
+    return checked, skipped
+
+
 def verify(sos: SoSDefinition) -> List[VerificationResult]:
     """Run all verification checks on a CADL SoS definition.
 
@@ -810,22 +850,39 @@ def verify(sos: SoSDefinition) -> List[VerificationResult]:
 
     Returns a list of VerificationResult objects.
     """
+    from .norms import norms_declared
+
     results: List[VerificationResult] = []
 
+    # 0. With the norms extension declared, items with temporal operators
+    # are not state predicates and are left out (Appendix F, F.7).
+    contracts = list(sos.contracts)
+    # Which of assume / guarantee lost items, per contract (by position)
+    left_out: List[Set[str]] = [set() for _ in contracts]
+    if norms_declared(sos):
+        contracts = []
+        for i, contract in enumerate(sos.contracts):
+            checked, skipped = _without_temporal_items(contract)
+            contracts.append(checked)
+            results.extend(skipped)
+            left_out[i] = {r.check_name.rsplit(" ", 1)[1] for r in skipped}
+
     # 1. Check each contract for internal consistency
-    for contract in sos.contracts:
+    for contract in contracts:
         results.append(_check_contract_consistency(contract))
 
     # 1b. Check that each contract's assumptions can hold at all
-    for contract in sos.contracts:
-        results.append(_check_assumption_satisfiability(contract))
+    for contract, lost in zip(contracts, left_out):
+        results.append(_check_assumption_satisfiability(contract, "assume" in lost))
 
     # 1c. Report (informationally) whether guarantees follow from assumes
-    for contract in sos.contracts:
-        results.append(_check_guarantee_entailment(contract))
+    for contract, lost in zip(contracts, left_out):
+        emptied = ("assume" in lost and not contract.assume) or (
+            "guarantee" in lost and not contract.guarantee)
+        results.append(_check_guarantee_entailment(contract, emptied))
 
     # 2. Check cross-contract consistency for contracts sharing parties
-    for c1, c2 in combinations(sos.contracts, 2):
+    for c1, c2 in combinations(contracts, 2):
         parties1 = {p.name for p in c1.parties}
         parties2 = {p.name for p in c2.parties}
         if parties1 & parties2:  # shared parties

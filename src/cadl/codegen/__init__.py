@@ -32,6 +32,27 @@ def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> No
         from .safety import check_codegen_input
         check_codegen_input(sos)
 
+    # With norms 0.1 declared, assume / guarantee items that contain a
+    # temporal operator are left out, with a comment (Appendix F, F.7).
+    from ..norms import norms_declared, temporal_items_omitted
+    with temporal_items_omitted(norms_declared(sos)):
+        _generate_target(sos, output_dir, target)
+
+
+def omitted_temporal_items(sos: SoSDefinition) -> list[tuple[str, str, str]]:
+    """The (contract id, key, text) of each assume / guarantee item that
+    `generate` leaves out because it has a temporal operator (norms 0.1)."""
+    from ..norms import norms_declared, split_temporal_items
+    if not norms_declared(sos):
+        return []
+    return [
+        (contract.id, key, text)
+        for contract in sos.contracts
+        for key, text in split_temporal_items(contract)[1]
+    ]
+
+
+def _generate_target(sos: SoSDefinition, output_dir: Path, target: str) -> None:
     if target == "python":
         _generate_python(sos, output_dir)
     elif target == "solidity":

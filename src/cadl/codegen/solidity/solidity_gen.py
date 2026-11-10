@@ -17,6 +17,7 @@ from ...ast_nodes import (
     SoSDefinition,
     TransitionDef,
 )
+from ...norms import omitted_comment, omitted_in_codegen
 from ..emitter import sanitize_id, snake_case
 from ..expr_compiler import declared_actors
 from .solidity_expr import SolidityContext, expr_to_solidity, predicate_to_solidity
@@ -98,6 +99,9 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition) -> str:
     lines.append("    function checkAssumptions() public view returns (bool) {")
     if contract.assume:
         for pred in contract.assume:
+            if omitted_in_codegen(pred):
+                lines.append(f"        // {omitted_comment(pred)}")
+                continue
             sol_expr = _compile_predicate(pred, ctx)
             label = _predicate_label(pred)
             lines.append(f"        // {label}")
@@ -110,6 +114,9 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition) -> str:
     lines.append("    function checkGuarantees() public view returns (bool) {")
     if contract.guarantee:
         for pred in contract.guarantee:
+            if omitted_in_codegen(pred):
+                lines.append(f"        // {omitted_comment(pred)}")
+                continue
             sol_expr = _compile_predicate(pred, ctx)
             label = _predicate_label(pred)
             lines.append(f"        // {label}")
