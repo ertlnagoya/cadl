@@ -6,6 +6,43 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.21] — 2026-11-11
+
+Fixes found by running the generated files with the tools they are
+written for: OPA 1.22.3, the Cedar CLI 4.14.1, PRISM 4.11 and Storm
+(stormpy 2.0.0).
+
+### Fixed
+- `cadl codegen -t agent-rego`: a reference `A[i]` whose index the
+  contract instance does not bind is unknown again, as G.4 requires. The
+  policy of 0.3.20 tested `not is_number(bindings[ref.var])`, which OPA
+  leaves undefined rather than true when the entry is missing, so the
+  reference counted as no match. A prohibition with such a bearer did not
+  apply; in a contract with `default: allow` the message was allowed where
+  `cadl agents-decide` denies it, and elsewhere the result carried the
+  reason `default` instead of `prohibition`. Regenerate policies written
+  by 0.3.20. The lookups under `not` now use `object.get`.
+- `cadl model-export`: a label or a reward structure named like a keyword
+  of the PRISM language or one of its built-in functions (`max`, `min`,
+  `module`, `floor`, ...) gets one trailing underscore, like every other
+  name, in the model and in the properties. PRISM and Storm reject
+  `label "max"` and `rewards "max"` although the name is quoted, so the
+  files of 0.3.20 did not load. Two labels, or two reward structures,
+  that are written alike after renaming are an export error.
+
+### Added
+- Tests that run the generated files when the tool is installed, and are
+  skipped otherwise: the Cedar policies under `cedar authorize` against
+  the reference decision function; the exported models under PRISM
+  (`prism` on PATH) and under Storm (`stormpy` importable) against the
+  reference evaluator, in exact rational arithmetic where the tool has
+  it. `tests/data/stochastic_features.cadl` is a second model for them
+  with `when:`, three-way updates, guarded state and transition rewards,
+  `U`, `U<=k` and keyword names.
+- A test without OPA for the first fix: no rule of the generated Rego has
+  a lookup under `not`. The comparisons with OPA are skipped where the
+  `opa` binary is absent, as in CI, which is how the defect went unnoticed.
+
 ## [0.3.20] — 2026-11-11
 
 Verdicts and amendments of the norms extension on a recorded trace
