@@ -64,6 +64,24 @@ jobs:
           pip install "stormpy==2.0.0"
           python -c "import stormpy; print('stormpy', stormpy.__version__)"
 
+      # The comparisons of the exported PRISM files with PRISM itself are
+      # skipped without the prism binary. The archive is the release of the
+      # PRISM project, pinned by its SHA-256; it runs on the Java of the runner.
+      - name: Install PRISM
+        env:
+          PRISM_VERSION: "4.11"
+          PRISM_SHA256: "6d4677b6ab64daa16a8bb5ad05f79c46313ad67835cb8445ee770e7f57f611c8"
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/prism.tar.gz" \
+            "https://github.com/prismmodelchecker/prism/releases/download/v${PRISM_VERSION}/prism-${PRISM_VERSION}-linux64-x86.tar.gz"
+          echo "${PRISM_SHA256}  $RUNNER_TEMP/prism.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/prism"
+          tar -xzf "$RUNNER_TEMP/prism.tar.gz" -C "$HOME/.local/prism" --strip-components=1
+          (cd "$HOME/.local/prism" && ./install.sh silent)
+          echo "$HOME/.local/prism/bin" >> "$GITHUB_PATH"
+          java -version
+          "$HOME/.local/prism/bin/prism" -version
+
       # -rs lists the tests that were skipped and why.
       - name: Run tests
         run: pytest -rs --cov=cadl --cov-report=term-missing --cov-report=xml tests/
