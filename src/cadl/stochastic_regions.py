@@ -410,6 +410,18 @@ def relax(chain: ParametricChain, box: dict) -> list:
         for p in polys:
             lo, hi = _p_interval(p, cell)
             if lo < 0 or hi > 1:
+                # The enclosure proves nothing here. A value outside [0, 1]
+                # at the centre or a corner of the cell shows that the map
+                # violates S-14, which is an error of the file and not an
+                # undecided cell.
+                centre = tuple((b[0] + b[1]) / 2 for b in cell)
+                for point in (centre,) + tuple(itertools.product(*cell)):
+                    if not 0 <= _p_eval(p, point) <= 1:
+                        at = ", ".join(f"{n}={decimal_text(x)}"
+                                       for n, x in zip(chain.names, point))
+                        raise EvaluationError(
+                            f"the design {chain.design} is not well-defined at {at}: a "
+                            f"probability of command {index} is outside [0, 1] (S-14)")
                 raise _Unknown(
                     f"command {index} of design {chain.design} has a probability that is "
                     f"not multi-affine in the open parameters, and interval arithmetic "

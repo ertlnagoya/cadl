@@ -26,6 +26,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   enclosed by interval arithmetic; cells that are not graph-preserving
   are analysed soundly. `--grid N` still prints estimates at sample
   points, separately; `--grid` and `--certify` cannot be combined.
+  A probability that is not multi-affine and leaves [0, 1] inside the
+  region, where the corner check of S-14 in `cadl check` cannot see it,
+  is reported as an error (exit status 2) when the centre or a corner of
+  a cell shows it.
 - Tests: every `decided` and `infeasible` cell of eight maps is checked
   at sample points with the exact point evaluator, and, when `stormpy`
   is installed, the bounds are compared with Storm's parameter lifting

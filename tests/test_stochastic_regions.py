@@ -774,3 +774,31 @@ class TestAgainstStorm:
         assert enclosed
         print(f"\nstorm {map_id}: {len(jobs)} design-cells, {equal} bound pairs equal, "
               f"{enclosed} extrema enclosed, {verdicts} verdicts equal")
+
+
+def test_ill_defined_region_is_an_error_not_an_undecided_cell(tmp_path):
+    """S-14 is checked at the corners by `cadl check`; a probability that is
+    not multi-affine can leave [0, 1] inside the region only. The certified
+    mode reports that as an error instead of bisecting the zone forever."""
+    text = REGIONS.read_text(encoding="utf-8")
+    data = yaml.safe_load(text)
+    model = data["sos"]["model"]
+    model["parameters"] = [{"id": "p", "range": [0, 1], "value": 0.1}]
+    model["variables"] = [{"id": "s", "type": "{Try, Done}", "init": "Try"}]
+    model["labels"] = {"done": "s == Done"}
+    regimes = sorted({t["from"] for t in data["sos"]["transitions"]})[:2]
+    model["commands"] = [{"action": "a", "guard": "s == Try", "when": [r], "updates": [
+        {"prob": prob, "set": {"s": "Done"}}, {"prob": "rest"}]}
+        for r, prob in zip(regimes, ("4.5 * p * (1 - p)", 0.5))]
+    model["regimes"] = {}
+    model["rewards"] = []
+    model["properties"] = [{"id": "X", "expr": "P=? [ F done ]"}]
+    model["regime_maps"] = [{"id": "m", "over": {"p": [0, 1]}, "regimes": regimes,
+                             "objective": {"maximize": "P=? [ F done ]"}, "resolution": 0.01}]
+    path = tmp_path / "ill.cadl"
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    sos = parse_file(path)
+    assert type_check(sos).ok          # the corners p=0 and p=1 are fine
+    with pytest.raises(EvaluationError, match=r"not well-defined at p=0\.5.*S-14"):
+        certified_regime_map(checked_model(sos), "m")
+    assert main(["model-check", str(path), "--regime-map", "m", "--certify"]) == 2
