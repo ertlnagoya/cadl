@@ -122,6 +122,35 @@ def main(argv: list[str] | None = None) -> int:
     diff_cmd.add_argument("--format", choices=["text", "json"], default="text",
                           help="Output format (default: text)")
 
+    # model-export command (stochastic extension, Appendix H)
+    mexp_cmd = subparsers.add_parser("model-export",
+        help="Export the model: block (stochastic 0.1) to PRISM, one model file "
+             "and one properties file per design")
+    mexp_cmd.add_argument("file", type=Path, help="CADL file to export from")
+    mexp_cmd.add_argument("--output", "-o", type=Path, default=Path("."),
+                          help="Output directory (default: current directory)")
+    mexp_cmd.add_argument("--regime", default=None,
+                          help="Export only the design of this regime")
+
+    # model-check command (stochastic extension, Appendix H)
+    mchk_cmd = subparsers.add_parser("model-check",
+        help="Evaluate the properties of the model: block (stochastic 0.1) with the "
+             "internal reference evaluator (exact arithmetic; not a model checker)")
+    mchk_cmd.add_argument("file", type=Path, help="CADL file to evaluate")
+    mchk_cmd.add_argument("--regime", default=None,
+                          help="Evaluate only the design of this regime")
+    mchk_cmd.add_argument("--set", dest="assignments", action="append", default=[],
+                          metavar="p=v", help="Give parameter p the value v (a decimal "
+                          "or n/d) instead of its fixed value; may be repeated")
+    mchk_cmd.add_argument("--regime-map", dest="regime_map", default=None, metavar="ID",
+                          help="Evaluate this regime map query at sample points "
+                               "(estimates; not a certified regime map)")
+    mchk_cmd.add_argument("--grid", type=int, default=4, metavar="N",
+                          help="With --regime-map: intervals per open parameter of the "
+                               "uniform grid whose corner points are evaluated (default: 4)")
+    mchk_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                          help="Output format (default: text)")
+
     # ai command
     ai_cmd = subparsers.add_parser("ai", help="Generate CADL from natural language description")
     ai_cmd.add_argument("description", nargs="?", default=None,
@@ -165,6 +194,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_norms_eval(args)
     elif args.command == "norms-diff":
         return _cmd_norms_diff(args)
+    elif args.command == "model-export":
+        return _cmd_model_export(args)
+    elif args.command == "model-check":
+        return _cmd_model_check(args)
     elif args.command == "ai":
         return _cmd_ai(args)
 
@@ -772,6 +805,164 @@ def _cmd_norms_diff(args: argparse.Namespace) -> int:
     else:
         print(format_diff_text(result))
     return 0 if result["ok"] else 1
+
+
+def _load_stochastic_model(path: Path):
+    """Parse and type-check a file and return its interpreted model: block
+    (Appendix H), or None after printing why there is none."""
+    from .parser import parse_file
+    from .stochastic import analyse, stochastic_declared
+    from .type_checker import type_check
+
+    if not path.exists():
+        print(f"Error: File not found: {path}", file=sys.stderr)
+        return None
+    try:
+        sos = parse_file(path)
+    except Exception as e:
+        print(f"Parse error: {e}", file=sys.stderr)
+        return None
+    tc_result = type_check(sos)
+    for w in tc_result.warnings:
+        print(f"  {w}", file=sys.stderr)
+    if not tc_result.ok:
+        for e in tc_result.errors:
+            print(f"  {e}", file=sys.stderr)
+        print("Type check failed: the model is not interpreted", file=sys.stderr)
+        return None
+    if sos.model is None:
+        print(f"Error: {path} has no model: block", file=sys.stderr)
+        return None
+    if not stochastic_declared(sos):
+        print(f"Error: {path} does not declare 'stochastic: 0.1' under extensions:; "
+              f"its model: block is not interpreted (Appendix H, H.15)", file=sys.stderr)
+        return None
+    return analyse(sos).model
+
+
+def _cmd_model_export(args: argparse.Namespace) -> int:
+    from .stochastic import ExportError, export_prism
+
+    model = _load_stochastic_model(args.file)
+    if model is None:
+        return 1
+    try:
+        files = export_prism(model, args.regime)
+    except ExportError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    args.output.mkdir(parents=True, exist_ok=True)
+    for name, text in files.items():
+        (args.output / name).write_text(text, encoding="utf-8")
+        print(f"Exported: {args.output / name}")
+    return 0
+
+
+def _cmd_model_check(args: argparse.Namespace) -> int:
+    from .stochastic import decimal_text
+    from .stochastic_eval import (
+        ESTIMATE_NOTE, NOTE, EvaluationError, check_properties, exact_text,
+        parse_number, regime_map_estimate, value_text,
+    )
+
+    # Exit status: 0 when every threshold property evaluated is satisfied
+    # (queries do not count), 1 when at least one is violated, 2 when
+    # nothing could be evaluated (usage error, or no interpreted model).
+    model = _load_stochastic_model(args.file)
+    if model is None:
+        return 2
+    try:
+        overrides = {}
+        for item in args.assignments:
+            name, sep, value = item.partition("=")
+            if not sep:
+                raise EvaluationError(f"--set expects p=v, not '{item}'")
+            overrides[name.strip()] = parse_number(value)
+        if args.regime_map is not None:
+            estimate = regime_map_estimate(model, args.regime_map, args.grid, overrides)
+            designs = []
+        else:
+            estimate = None
+            designs = check_properties(model, args.regime, overrides)
+    except EvaluationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    status = 1 if any(p["result"] == "violated"
+                      for d in designs for p in d["properties"]) else 0
+
+    if args.format == "json":
+        import json
+        output = {"file": str(args.file), "sos": model.sos_name, "evaluator": NOTE}
+        if estimate is None:
+            output["designs"] = [
+                {
+                    "design": d["design"],
+                    "parameters": {k: decimal_text(v) for k, v in d["parameters"].items()},
+                    "reachable_states": d["states"],
+                    "properties": [
+                        {"id": p["id"], "expr": p["expr"], "value": exact_text(p["value"]),
+                         "decimal": value_text(p["value"]), "result": p["result"]}
+                        for p in d["properties"]
+                    ],
+                }
+                for d in designs
+            ]
+        else:
+            output["regime_map_estimate"] = {
+                **{k: estimate[k] for k in ("id", "note", "direction", "objective",
+                                            "constraint", "open", "regimes", "grid")},
+                "points": [
+                    {
+                        "point": {k: decimal_text(v) for k, v in pt["point"].items()},
+                        "regimes": {
+                            r: {"value": exact_text(x["value"]),
+                                "decimal": value_text(x["value"]),
+                                "constraint": x["constraint"], "sat": x["sat"]}
+                            for r, x in pt["regimes"].items()
+                        },
+                        "best_at_point": pt["best"],
+                    }
+                    for pt in estimate["points"]
+                ],
+            }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        return status
+
+    print(f"Model check: {args.file}")
+    print(f"  SoS: {model.sos_name}")
+    print(f"  Evaluator: {NOTE}")
+    print()
+    if estimate is None:
+        for d in designs:
+            params = ", ".join(f"{k}={decimal_text(v)}" for k, v in d["parameters"].items())
+            print(f"--- Design {d['design']} ({params}; "
+                  f"{d['states']} reachable state(s)) ---")
+            for p in d["properties"]:
+                result = f"  {p['result']}" if p["result"] else "  (query)"
+                print(f"  {p['id']}: {p['expr']}")
+                print(f"    value = {value_text(p['value'])}  (exact: "
+                      f"{exact_text(p['value'])}){result}")
+            if not d["properties"]:
+                print("  (no property concerns this design)")
+            print()
+        return status
+
+    print(f"--- Regime map query '{estimate['id']}': {ESTIMATE_NOTE} ---")
+    print(f"  objective: {estimate['direction']} {estimate['objective']}")
+    if estimate["constraint"]:
+        print(f"  constraint: {estimate['constraint']}")
+    print(f"  Each line is the exact evaluation at one sample point (grid of "
+          f"{estimate['grid']} interval(s) per open parameter). No cell is decided.")
+    for pt in estimate["points"]:
+        at = ", ".join(f"{k}={decimal_text(v)}" for k, v in pt["point"].items())
+        values = ", ".join(
+            f"{r}={value_text(x['value'])}"
+            + ("" if x["constraint"] else " (violates the constraint)")
+            for r, x in pt["regimes"].items()
+        )
+        best = ", ".join(pt["best"]) if pt["best"] else "none (no regime satisfies the constraint)"
+        print(f"  {at}: {values}; best at this point: {best}")
+    return 0
 
 
 def _cmd_ai(args: argparse.Namespace) -> int:

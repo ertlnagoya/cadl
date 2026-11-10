@@ -85,6 +85,49 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   every other file is unchanged.
 - Example `examples/agents_tool_governance.cadl` (the example of G.12) with
   the sample calls of the appendix in `examples/agents_inputs/`.
+- Stochastic model extension, stochastic 0.1 (Appendix H of the
+  specification). In a file that declares `stochastic: 0.1` under
+  `extensions:`, the `model:` block of an SoS is read: `kind`,
+  `parameters` (free, or bound with `from:` to `alpha`, `beta`, `lambda`
+  of a contract or to an entry of `context.environment`), `variables`,
+  `commands` (guarded, with probabilistic `updates`), `labels`, `regimes`,
+  `rewards`, `properties`, and `regime_maps`. The three expression
+  sub-languages of H.2 (`state_pred`, `param_expr`, `property`) have
+  parsers of their own in `cadl.stochastic`; the expression grammar of
+  A.10 is unchanged.
+- `cadl check` applies rules S-1 to S-15 of H.10 (the SHOULDs as
+  warnings, S-15 as informational diagnostics). Numbers are exact: a YAML
+  number is read as its shortest round-trip decimal. S-7 and S-9 are
+  decided by enumerating the full state space; a model with more than
+  200 000 states is refused with an error that names the limit. Names
+  that a YAML 1.1 loader reads as booleans or null (`ON`, `No`, `Yes`,
+  ...) are reported where they are mapping keys or `init:` values.
+- The IR has a top-level field `stochastic_model` (H.13): the interpreted
+  block, or `null`.
+- `cadl model-export <file> [--output DIR] [--regime NAME]` writes, per
+  design, a PRISM model file `<sos name>_<design>.prism` and a properties
+  file `<sos name>_<design>.props` by the rules of H.11. A name equal to
+  a PRISM keyword or built-in function name gets a trailing underscore;
+  a name collision after that is an error.
+- `cadl model-check <file> [--regime NAME] [--set p=v ...]
+  [--format text|json]`: an internal reference evaluator for checking and
+  tests, not a model checker. For a design with every parameter fixed it
+  builds the Markov chain by enumeration and evaluates the properties of
+  `model.properties:` in exact rational arithmetic (`P` with `F`,
+  `F<=k`, `U`, `U<=k`; `R{"r"}` with `F`, including the value +inf).
+  `--regime-map ID --grid N` evaluates a regime map query at the corner
+  points of a uniform grid and prints the best regime at each point,
+  labelled as estimates at sample points and not a certified regime map.
+  Exit status: 0 when every threshold property evaluated is satisfied,
+  1 when at least one is violated, 2 when nothing could be evaluated.
+- `examples/stochastic_robot_delivery.cadl`, the example of H.12.
+
+### Changed
+- `cadl sim-ir` output has the new key `stochastic_model`, `null` for a
+  file without an interpreted `model:` block.
+- Without the declaration `stochastic: 0.1`, a `model:` block gets one
+  warning as an undeclared extension key and is not checked, lowered to
+  the IR, or exported.
 
 ## [0.3.19] — 2026-11-10
 

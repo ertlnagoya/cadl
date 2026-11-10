@@ -1,0 +1,73 @@
+# Stochastic model extension (Appendix H, stochastic 0.1): the example of H.12.
+#
+# A dispatcher and robots deliver parcels. In the centralised regime most
+# delivery decisions are taken by the dispatcher, whose plan is good when
+# information is shared (alpha) but reaches the robot only when the
+# dispatcher is up and the message is not lost. In the distributed regime
+# most decisions are taken by the robot from local information, with a
+# fixed quality. beta is the probability that a decision is taken
+# centrally. A robot makes at most three attempts.
+#
+#   cadl check        examples/stochastic_robot_delivery.cadl
+#   cadl model-export examples/stochastic_robot_delivery.cadl -o out/
+#   cadl model-check  examples/stochastic_robot_delivery.cadl
+#   cadl model-check  examples/stochastic_robot_delivery.cadl --regime-map best_for_delivery --grid 5
+
+sos:
+  name: "RobotDeliveryStochastic"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+
+  actors:
+    - { id: DISPATCHER,    role: "Assigns and replans routes" }
+    - { id: "ROBOT[1..N]", role: "Delivers parcels" }
+
+  contracts:
+    - id: DELIVERY
+      parties: [DISPATCHER, "ROBOT[*]"]
+      information: { alpha: 0.9 }
+      authority:   { decision_holder: DISPATCHER, beta: 0.9 }
+
+  transitions:
+    - { from: CENTRALIZED, to: DISTRIBUTED, condition: "loss_rate > 0.3" }
+    - { from: DISTRIBUTED, to: CENTRALIZED, condition: "loss_rate <= 0.2" }
+
+  model:
+    kind: dtmc
+    parameters:
+      - { id: p_fail,  range: [0, 0.5], value: 0.05 }   # dispatcher out of service during an attempt
+      - { id: p_loss,  range: [0, 0.5], value: 0.1 }    # message from the dispatcher lost
+      - { id: alpha,   from: "DELIVERY.alpha" }         # 0.9, range [0, 1]
+      - { id: beta,    from: "DELIVERY.beta" }          # assigned by the regimes
+      - { id: q_local, range: [0, 1],   value: 0.6 }    # success of a local decision
+    variables:
+      - { id: task,     type: "{Pending, Delivered}", init: Pending }
+      - { id: attempts, type: "[0..3]",               init: 0 }
+    labels:
+      delivered: "task == Delivered"
+      given_up:  "task == Pending AND attempts == 3"
+    commands:
+      - action: attempt
+        guard: "task == Pending AND attempts < 3"
+        updates:
+          - prob: "beta * alpha * (1 - p_fail) * (1 - p_loss) + (1 - beta) * q_local"
+            set: { task: Delivered, attempts: "attempts + 1" }
+          - prob: rest
+            set: { attempts: "attempts + 1" }
+    regimes:
+      CENTRALIZED: { parameters: { beta: 0.9 } }
+      DISTRIBUTED: { parameters: { beta: 0.1 } }
+    rewards:
+      - { id: delay, items: [ { action: attempt, value: 1 } ] }
+    properties:
+      - { id: P_DELIVERY, expr: "P>=0.95 [ F<=3 delivered ]" }
+      - { id: P_EVENTUAL, expr: "P=? [ F delivered ]" }
+      - { id: P_DELAY, regimes: [CENTRALIZED], expr: 'R{"delay"}<=1.5 [ F delivered OR given_up ]' }
+    regime_maps:
+      - id: best_for_delivery
+        over: { p_fail: [0, 0.5], p_loss: [0, 0.5] }
+        regimes: [CENTRALIZED, DISTRIBUTED]
+        objective: { maximize: "P=? [ F<=3 delivered ]" }
+        constraint: "P>=0.9 [ F<=3 delivered ]"
+        resolution: 0.05

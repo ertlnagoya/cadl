@@ -17,7 +17,7 @@ import re
 from enum import Enum
 from typing import Any, List
 
-from ..ast_nodes import LifecycleSpec, MonitorDef, SoSDefinition
+from ..ast_nodes import LifecycleSpec, ModelBlock, MonitorDef, SoSDefinition
 
 
 class UnsafeCodegenInput(ValueError):
@@ -50,8 +50,12 @@ _NAME_FIELDS = {
 # least one target language.
 _FORBIDDEN = ('"', "'", "\\", "`", "*/")
 
-# Blocks that only the Unity C# emitter reads.
-_SKIPPED_TYPES = (LifecycleSpec, MonitorDef)
+# Blocks that the emitters covered here never read: the Unity C# emitter
+# alone reads the first two, and `sos.model:` (Appendix H) goes only to
+# `cadl model-export` and `cadl model-check`, which parse its expressions
+# and escape names themselves. A property such as `R{"delay"}<=1.5 [ F done ]`
+# needs the double quote.
+_SKIPPED_TYPES = (LifecycleSpec, MonitorDef, ModelBlock)
 
 
 def check_codegen_input(sos: SoSDefinition) -> None:
