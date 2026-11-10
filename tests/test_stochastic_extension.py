@@ -1372,3 +1372,14 @@ class TestEvaluator:
         assert main(["model-check", str(EXAMPLE), "--regime", "DISTRIBUTED"]) == 1
         capsys.readouterr()
         capsys.readouterr()
+
+
+def test_codegen_accepts_reward_property_with_quotes(tmp_path):
+    """`sos.model:` is not emitted by the source generators, so the quote in
+    `R{"delay"}` must not trip the code generation input check."""
+    from cadl.codegen import generate
+    from cadl.parser import parse_file
+
+    sos = parse_file(EXAMPLE)
+    for target in ("python", "solidity", "opa"):
+        generate(sos, tmp_path / target, target)
