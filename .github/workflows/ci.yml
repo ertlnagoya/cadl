@@ -32,6 +32,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      # The comparisons of generated Rego with the reference implementations
+      # are skipped without the opa binary.
+      - name: Install OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+
       - name: Run tests
         run: pytest --cov=cadl --cov-report=term-missing --cov-report=xml tests/
 
