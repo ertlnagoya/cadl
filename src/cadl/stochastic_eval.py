@@ -10,7 +10,8 @@ properties of H.8 with exact rational arithmetic (`fractions.Fraction`).
 
 For a regime map it evaluates the objective and the constraint at sample
 points only. That gives exact values at those points and nothing about
-the cells between them, so it is never a certified regime map (H.9).
+the cells between them, so it is never a certified regime map (H.9);
+`stochastic_regions` computes that.
 """
 
 from __future__ import annotations

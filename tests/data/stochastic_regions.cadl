@@ -1,0 +1,126 @@
+# Test model for certified regime maps (Appendix H, H.9): what the example
+# of H.12 does not exercise. Three regimes; cycles (unbounded properties);
+# `minimize:` with an expected reward, which is +inf for one regime
+# everywhere and for the others at p = 0 or q = 0; a constraint that makes
+# part of the region infeasible; a probability that is not multi-affine
+# (`p * p`); cells that are not graph-preserving (p = 0, q = 0); a tie of
+# two regimes on whole cells; a map over three parameters. Used by
+# tests/test_stochastic_regions.py.
+#
+#   DIRECT  sends over the direct link, which works with probability p,
+#           and retries until it does: expected time 1/p.
+#   RELAY   hands the message to a relay (one step), which sends with
+#           success probability q and retries: expected time 1 + 1/q.
+#   LAZY    needs two independent successes of the direct link at once
+#           and may drop the message for good: `done` is never certain.
+sos:
+  name: "LinkChoice"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+  actors:
+    - { id: SENDER, role: "sends" }
+    - { id: RELAY_NODE, role: "relays" }
+  contracts:
+    - id: LINK
+      parties: [SENDER, RELAY_NODE]
+      information: { alpha: 0.5 }
+  transitions:
+    - { from: DIRECT, to: RELAY, condition: "p < 0.3" }
+    - { from: RELAY, to: LAZY, condition: "q < 0.3" }
+    - { from: LAZY, to: DIRECT, condition: "p >= 0.3" }
+  model:
+    kind: dtmc
+    parameters:
+      - { id: p, range: [0, 1], value: 0.5 }
+      - { id: q, range: [0, 1], value: 0.5 }
+      - { id: drop, range: [0, 0.5], value: 0.1 }
+      - { id: fee, range: [0, 5], value: 2 }
+    variables:
+      - { id: phase, type: "{Try, Relay, Done, Dead}", init: Try }
+    labels:
+      done: "phase == Done"
+      dead: "phase == Dead"
+    commands:
+      - action: send
+        when: [DIRECT]
+        guard: "phase == Try"
+        updates:
+          - { prob: p, set: { phase: Done } }
+          - { prob: rest }
+      - action: hand
+        when: [RELAY]
+        guard: "phase == Try"
+        updates:
+          - { prob: 1, set: { phase: Relay } }
+      - action: send
+        when: [RELAY]
+        guard: "phase == Relay"
+        updates:
+          - { prob: q, set: { phase: Done } }
+          - { prob: rest }
+      - action: send
+        when: [LAZY]
+        guard: "phase == Try"
+        updates:
+          - { prob: "0.5 * p * p", set: { phase: Done } }
+          - { prob: drop, set: { phase: Dead } }
+          - { prob: rest }
+    rewards:
+      - id: time
+        items:
+          - { guard: "phase == Try OR phase == Relay", value: 1 }
+      - id: cost
+        items:
+          - { action: send, value: 1 }
+          - { action: hand, value: fee }
+    properties:
+      - { id: EVENTUALLY, expr: "P=? [ F done ]" }
+      - { id: TIME, regimes: [DIRECT, RELAY], expr: 'R{"time"}=? [ F done ]' }
+      - { id: TIME_LAZY, regimes: [LAZY], expr: 'R{"time"}=? [ F done ]' }
+      - { id: COST, expr: 'R{"cost"}=? [ F done OR dead ]' }
+      - { id: SOON, expr: "P>=0.5 [ NOT dead U<=4 done ]" }
+    regime_maps:
+      # DIRECT where 1/p <= 1 + 1/q and p >= 1/4; RELAY where the reverse
+      # holds and q >= 1/3; infeasible where p < 1/4 and q < 1/3.
+      - id: fastest
+        over: { p: [0, 1], q: [0, 1] }
+        objective: { minimize: 'R{"time"}=? [ F done ]' }
+        constraint: 'R{"time"}<=4 [ F done ]'
+        resolution: 0.1
+      # Without a constraint: LAZY is out because its value is +inf.
+      - id: fastest_free
+        over: { p: [0, 1], q: [0, 1] }
+        objective: { minimize: 'R{"time"}=? [ F done ]' }
+        resolution: 0.1
+      # Cost 1/p for DIRECT and fee + 1/q = 2 + 1/q for RELAY.
+      - id: cheapest
+        over: { p: [0, 1], q: [0, 1] }
+        regimes: [DIRECT, RELAY]
+        objective: { minimize: 'R{"cost"}=? [ F done ]' }
+        constraint: "P>=0.5 [ F<=3 done ]"
+        resolution: 0.1
+      # Bounded: 1 - (1-p)^4 against 1 - (1-q)^3; LAZY is below DIRECT.
+      # Infeasible where both are below 0.5.
+      - id: most_reliable
+        over: { p: [0, 1], q: [0, 1] }
+        objective: { maximize: "P=? [ F<=4 done ]" }
+        constraint: "P>=0.5 [ F<=4 done ]"
+        resolution: 0.1
+      # Unbounded: DIRECT and RELAY both have probability 1 away from
+      # p = 0 and q = 0, so they tie on whole cells.
+      - id: eventually
+        over: { p: [0, 1], q: [0, 1] }
+        objective: { maximize: "P=? [ NOT dead U done ]" }
+        resolution: 0.1
+      # A region away from p = 0 and q = 0: the root cell is decided
+      # with both regimes.
+      - id: eventually_tie
+        over: { p: [0.5, 1], q: [0.25, 1] }
+        objective: { maximize: "P=? [ NOT dead U done ]" }
+        resolution: 0.1
+      # Three open parameters, one of them (drop) only in LAZY.
+      - id: reliable_3d
+        over: { p: [0, 1], q: [0, 1], drop: [0, 0.5] }
+        objective: { maximize: "P=? [ F<=4 done ]" }
+        resolution: 0.25

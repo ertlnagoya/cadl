@@ -1432,7 +1432,34 @@ class TestQuotedNamesInExport:
 # ---------------------------------------------------------------------------
 
 FEATURES = Path(__file__).parent / "data" / "stochastic_features.cadl"
-EXTERNAL_MODELS = [EXAMPLE, FEATURES]
+REGIONS = Path(__file__).parent / "data" / "stochastic_regions.cadl"
+EXTERNAL_MODELS = [EXAMPLE, FEATURES, REGIONS]
+
+
+def test_export_omits_reward_items_of_absent_actions():
+    """H.11, step 8: a transition reward whose action no command of the
+    design has is not written (PRISM and Storm reject it), and a
+    structure without items gets `true : (0);` (Storm rejects an empty
+    structure)."""
+    model = checked_model(parse_file(REGIONS))
+    files = export_prism(model)
+    direct = files["LinkChoice_DIRECT.prism"]
+    assert 'rewards "cost"\n  [send] true : (1);\nendrewards' in direct
+    assert "[hand]" not in direct
+    relay = files["LinkChoice_RELAY.prism"]
+    assert 'rewards "cost"\n  [send] true : (1);\n  [hand] true : (fee);\nendrewards' in relay
+
+    def only_hand(m, sos):
+        m["rewards"] = [{"id": "delay", "items": [{"action": "attempt", "value": 1}]},
+                        {"id": "idle", "items": [{"action": "wait", "value": 1}]}]
+        m["commands"].append({"action": "wait", "when": ["DISTRIBUTED"],
+                              "guard": "task == Delivered AND attempts == 0",
+                              "updates": [{"prob": 1}]})
+    files = export_prism(model_of(only_hand))
+    assert 'rewards "idle"\n  true : (0);\nendrewards' in \
+        files["RobotDeliveryStochastic_CENTRALIZED.prism"]
+    assert 'rewards "idle"\n  [wait] true : (1);\nendrewards' in \
+        files["RobotDeliveryStochastic_DISTRIBUTED.prism"]
 
 
 def _exported(path: Path, out: Path):
