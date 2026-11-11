@@ -41,6 +41,8 @@ PROB_HUMP = DATA / "prob_hump.cadl"
 NONMONOTONE = DATA / "nonmonotone.cadl"
 DETOUR = DATA / "detour.cadl"
 ENTRY = DATA / "entry.cadl"
+BSTATE = DATA / "bstate.cadl"                  # from the independent review
+NS_AFFINE_ZERO = DATA / "ns_affine_zero.cadl"  # from the independent review
 F = Fraction
 
 
@@ -299,6 +301,65 @@ class TestEveryReachableState:
         assert "largest gain from a state of Reach_p = 5  (exact: 5), from (loc=1)" in out
         assert "canonical best response from that state: ok in (loc=1)" in out
         assert "p in [0.03125, 1]: not_equilibrium, deviators: A (from (loc=1))" in out
+
+
+# ---------------------------------------------------------------------------
+# Files of the independent review of this version
+# ---------------------------------------------------------------------------
+
+def check_bstate(d: dict) -> None:
+    """From loc = 1, A gains max(0, λ − 1/2) (y instead of x); the term of
+    x has the expected value 0 from s₀ under the profile but 1 from
+    loc = 1, so condition B holds from s₀ only. An equilibrium from every
+    reachable state exactly for λ ≤ 1/2."""
+    assert d["resolution_reached"]
+    for c in d["cells"]:
+        a, b = c.box["lam"]
+        if c.status == "equilibrium":
+            assert b <= F(1, 2), (a, b)
+        if c.status == "not_equilibrium":
+            assert a > F(1, 2) and c.deviation_states["A"][0] == {"loc": 1}, (a, b)
+
+
+def check_ns_affine_zero(d: dict) -> None:
+    """At p = 0 the state loc = 1 is not reachable and the profile is an
+    equilibrium from every reachable state; the cell that contains p = 0
+    stays undecided."""
+    assert d["resolution_reached"]
+    for c in d["cells"]:
+        if c.box["p"][0] == 0:
+            assert c.status == "undecided", c.box
+        elif c.status == "not_equilibrium":
+            assert c.deviators == ["A"]
+
+
+class TestReviewFiles:
+    def test_condition_b_is_checked_per_state(self):
+        d = design_of(BSTATE, "mp")
+        check_bstate(d)
+        assert [c.status for c in d["cells"]] == ["equilibrium", "undecided", "not_equilibrium"]
+        assert F(49, 100) < d["cells"][0].box["lam"][1] <= F(1, 2)
+        assert F(1, 2) < d["cells"][2].box["lam"][0] < F(51, 100)
+        nash = design_of(BSTATE, "mpn")
+        assert [(c.box["lam"], c.status) for c in nash["cells"]] == [((F(1, 4), 1), "equilibrium")]
+
+    def test_condition_b_from_the_initial_state_only_is_unsound(self):
+        d = design_of(BSTATE, "mp", "endpoints_b_from_initial")
+        with pytest.raises(AssertionError):
+            check_bstate(d)
+
+    @pytest.mark.parametrize("query", ["mp", "mp2"])
+    def test_the_cell_at_p_zero_stays_undecided(self, query):
+        d = design_of(NS_AFFINE_ZERO, query)
+        check_ns_affine_zero(d)
+        assert d["cells"][0].status == "undecided"
+        assert all(c.status == "not_equilibrium" for c in d["cells"][1:])
+
+    @pytest.mark.parametrize("query", ["mp", "mp2"])
+    def test_without_the_reachability_certificate(self, query):
+        d = design_of(NS_AFFINE_ZERO, query, "drop_reach_certificate")
+        with pytest.raises(AssertionError):
+            check_ns_affine_zero(d)
 
 
 # ---------------------------------------------------------------------------

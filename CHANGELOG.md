@@ -34,6 +34,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   threat is not credible), and fuzzing with 3 and 4 players, 3 open
   parameters and the new concept (`tests/games_fuzz.py --mode scale`,
   `--mode endpoints`, `--concept every|both`).
+  Two files of the independent review (`bstate.cadl`: condition B must
+  be checked per state; `ns_affine_zero.cadl`: the cell at p = 0 stays
+  undecided) are tests too, with the mutant `endpoints_b_from_initial`.
 
 ### Changed
 - The end-point certification of a cell (formerly J-14 of Appendix J)

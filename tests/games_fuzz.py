@@ -675,6 +675,15 @@ def mutation(name: str | None):
             states = set(range(len(game.states)))
             return {"decreasing": states, "increasing": set(states)}
         ge.endpoint_monotone_states = everywhere
+    elif name == "endpoints_b_from_initial":
+        # Condition B checked from s0 only and taken for every state.
+        original_ms = saved["endpoint_monotone_states"]
+
+        def from_initial(game, profile, player, name):
+            sets = original_ms(game, profile, player, name)
+            states = set(range(len(game.states)))
+            return {k: (states if 0 in v else set()) for k, v in sets.items()}
+        ge.endpoint_monotone_states = from_initial
     elif name == "drop_reach_certificate":
         # N_s: every state of R_C(p) taken to be in Reach_p on the whole cell.
         ge.certified_reach = lambda game, profile, player, cell: set(range(len(game.states)))
@@ -696,7 +705,7 @@ def mutation(name: str | None):
 MUTATIONS = ("swap_bound_direction", "drop_admissibility", "profile_command_for_deviator",
              "lower_corner_only", "swap_reward_bounds")
 ENDPOINT_MUTATIONS = ("endpoints_drop_probability", "endpoints_drop_affine",
-                      "endpoints_drop_condition_b")
+                      "endpoints_drop_condition_b", "endpoints_b_from_initial")
 EVERY_STATE_MUTATIONS = ("drop_reach_certificate", "every_state_as_nash")
 
 
