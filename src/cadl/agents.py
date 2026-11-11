@@ -508,7 +508,7 @@ def parse_concrete_actor(text) -> dict | None:
     """A concrete actor of a message (`PLANNER`, `ROBOT[2]`), or None."""
     if not isinstance(text, str):
         return None
-    m = _CONCRETE_ACTOR_RE.match(text)
+    m = _CONCRETE_ACTOR_RE.fullmatch(text)
     if not m:
         return None
     return {"name": m.group(1), "index": None if m.group(2) is None else int(m.group(2)),

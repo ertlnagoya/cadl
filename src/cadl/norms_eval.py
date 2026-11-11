@@ -183,10 +183,29 @@ def _finite(text: str) -> float:
     return value
 
 
+_LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def _no_lone_surrogates(obj: Any) -> None:
+    if isinstance(obj, str):
+        if _LONE_SURROGATE_RE.search(obj):
+            raise ValueError("a string has a lone surrogate (\\ud800 to \\udfff), "
+                             "which is not UTF-8")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _no_lone_surrogates(k)
+            _no_lone_surrogates(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _no_lone_surrogates(v)
+
+
 def loads_strict(line: str) -> Any:
-    """`json.loads` that rejects NaN, Infinity and numbers that overflow
-    to infinity; raises ValueError."""
-    return json.loads(line, parse_constant=_not_json_number, parse_float=_finite)
+    """`json.loads` that rejects NaN, Infinity, numbers that overflow to
+    infinity, and lone surrogates in strings; raises ValueError."""
+    obj = json.loads(line, parse_constant=_not_json_number, parse_float=_finite)
+    _no_lone_surrogates(obj)
+    return obj
 
 
 def declared_actors(sos: SoSDefinition) -> dict[str, tuple]:
