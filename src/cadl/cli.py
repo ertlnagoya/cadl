@@ -775,7 +775,10 @@ def _ir_to_dict(ir) -> dict:
                 for key in ("on_denied_escalate_to", "on_denied_timeout_ms",
                             "on_denied_fallback", "on_denied_notify"):
                     n.pop(key, None)
-    # Likewise the fields of the grounding extension (Appendix J, J.10).
+    # Likewise the fields of the grounding extension (Appendix J, J.10);
+    # the quantities of the SoS only when there are any.
+    if d.get("institution", {}).get("grounding", 0) is None:
+        d["institution"].pop("grounding")
     if not d.pop("grounding_extension", False):
         for c in d.get("institution", {}).get("contracts", []):
             c.pop("grounding", None)

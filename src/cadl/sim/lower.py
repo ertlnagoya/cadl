@@ -94,9 +94,12 @@ def _lower_grounding(sos: SoSDefinition, institution) -> bool:
     """The fields of the grounding extension (Appendix J, J.10): the field
     `grounding` of every contract and four fields of every norm. Returns
     whether the extension is active; nothing is written when it is not."""
-    from ..grounding import annotations, grounding_active, ir_contract, ir_norm_fields
+    from ..grounding import (
+        annotations, grounding_active, ir_contract, ir_norm_fields, ir_sos,
+    )
     if not grounding_active(sos):
         return False
+    institution.grounding = ir_sos(sos)
     for contract, spec in zip(sos.contracts, institution.contracts):
         spec.grounding = ir_contract(sos, contract)
         for norm_spec, ann in zip(spec.norms, annotations(sos, contract).norms):

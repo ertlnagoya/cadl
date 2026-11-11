@@ -233,6 +233,287 @@ def _bound_refs(contract: ContractDef) -> set:
     return out
 
 
+# === Wildcard and range references in predicates (F.5) ======================
+#
+# `A[*]` or `A[lo..hi]` outside the domain of a quantifier or comprehension
+# is shorthand (F.5, "Wildcard and range references"):
+#
+# 1. The argument e of an aggregate f(e) that is not a comprehension binds
+#    every such reference in e outside a nested aggregate call: f(e) is
+#    f(e' for x in D), with all references of one set and index form
+#    replaced by the member A[x]. Two sets or forms there: not evaluable.
+# 2. Every other reference is bound by its smallest enclosing comparison,
+#    or, outside every comparison, by the operand of AND, OR, NOT, the body
+#    of a quantifier or the predicate argument of a temporal operator that
+#    contains it (the whole predicate at the top): the site s becomes
+#    `for all x1 in D1: ... for all xn in Dn: s'`, one variable per set and
+#    index form, in the order of their first occurrence.
+#
+# The variables are named `*1`, `*2`, ...: no written name can hide them.
+
+_COMPARISON_OPS = ("==", "!=", "<", "<=", ">", ">=")
+
+
+def _wildcard_key(node: Any) -> Any:
+    """(set, "*") for `A[*]`, (set, lo, hi) for `A[lo..hi]`, else None."""
+    if isinstance(node, ActorRef):
+        if node.index == "*":
+            return (node.name, "*")
+        if isinstance(node.index, RangeExpr):
+            return (node.name, node.index.start, node.index.end)
+    return None
+
+
+def wildcard_text(key: tuple) -> str:
+    """`A[*]` or `A[lo..hi]` for a key of `_wildcard_key`."""
+    if len(key) == 2:
+        return f"{key[0]}[*]"
+    return f"{key[0]}[{key[1]}..{key[2]}]"
+
+
+def _wildcard_domain(key: tuple) -> ActorRef:
+    if len(key) == 2:
+        return ActorRef(name=key[0], index="*")
+    return ActorRef(name=key[0], index=RangeExpr(start=key[1], end=key[2]))
+
+
+def _is_aggregate_shorthand(node: Any) -> bool:
+    """An aggregate call whose one argument is not a comprehension."""
+    return (isinstance(node, FunctionCall) and node.name in AGGREGATES
+            and len(node.args) == 1 and not isinstance(node.args[0], Comprehension))
+
+
+def _wildcards(node: Any, out: list, nested_aggregates: bool) -> None:
+    """The free wildcard and range references of `node`, in the order in
+    which they are written: not in the domain of a quantifier or
+    comprehension, and not in the argument of an aggregate shorthand that
+    could not be rewritten. With `nested_aggregates` False, nothing inside
+    a nested aggregate call either (rule 1)."""
+    key = _wildcard_key(node)
+    if key is not None:
+        out.append(key)
+    elif isinstance(node, ActorRef):
+        if node.index is not None and not isinstance(node.index, (str, int)):
+            _wildcards(node.index, out, nested_aggregates)
+    elif isinstance(node, MemberAccess):
+        _wildcards(node.obj, out, nested_aggregates)
+    elif isinstance(node, UnaryOp):
+        _wildcards(node.operand, out, nested_aggregates)
+    elif isinstance(node, BinaryOp):
+        _wildcards(node.left, out, nested_aggregates)
+        _wildcards(node.right, out, nested_aggregates)
+    elif isinstance(node, QuantifiedExpr):
+        _wildcards(node.predicate, out, nested_aggregates)
+    elif isinstance(node, Comprehension):
+        _wildcards(node.element, out, nested_aggregates)
+    elif isinstance(node, FunctionCall):
+        if node.name in AGGREGATES and (not nested_aggregates or _is_aggregate_shorthand(node)):
+            return
+        for a in node.args:
+            _wildcards(a, out, nested_aggregates)
+
+
+def _substitute(node: Any, names: dict, nested_aggregates: bool) -> Any:
+    """`node` with every free reference of `_wildcards` whose key is in
+    `names` replaced by the member `A[x]` of the variable x = names[key]."""
+    def sub(n: Any) -> Any:
+        return _substitute(n, names, nested_aggregates)
+    key = _wildcard_key(node)
+    if key is not None:
+        if key in names:
+            return ActorRef(name=node.name, index=ActorRef(name=names[key]))
+        return node
+    if isinstance(node, ActorRef):
+        if node.index is not None and not isinstance(node.index, (str, int)):
+            return replace(node, index=sub(node.index))
+        return node
+    if isinstance(node, MemberAccess):
+        return replace(node, obj=sub(node.obj))
+    if isinstance(node, UnaryOp):
+        return replace(node, operand=sub(node.operand))
+    if isinstance(node, BinaryOp):
+        return replace(node, left=sub(node.left), right=sub(node.right))
+    if isinstance(node, QuantifiedExpr):
+        return replace(node, predicate=sub(node.predicate))
+    if isinstance(node, Comprehension):
+        return replace(node, element=sub(node.element))
+    if isinstance(node, FunctionCall):
+        if node.name in AGGREGATES and (not nested_aggregates or _is_aggregate_shorthand(node)):
+            return node
+        return replace(node, args=[sub(a) for a in node.args])
+    return node
+
+
+class _Desugar:
+    """The rewriting of `desugar_wildcards`; `notes` collects the readings
+    that may surprise, as (kind, text) with kind `not`, `pairs`, `or` or
+    `aggregate`."""
+
+    def __init__(self, notes: list | None) -> None:
+        self.count = 0
+        self.notes = notes
+
+    def note(self, kind: str, text: str) -> None:
+        if self.notes is not None and (kind, text) not in self.notes:
+            self.notes.append((kind, text))
+
+    def fresh(self) -> str:
+        self.count += 1
+        return f"*{self.count}"
+
+    # rule 1, innermost aggregate first
+    def aggregates(self, node: Any) -> Any:
+        if isinstance(node, ActorRef):
+            if node.index is not None and not isinstance(node.index, (str, int)) \
+                    and _wildcard_key(node) is None:
+                return replace(node, index=self.aggregates(node.index))
+            return node
+        if isinstance(node, MemberAccess):
+            return replace(node, obj=self.aggregates(node.obj))
+        if isinstance(node, UnaryOp):
+            return replace(node, operand=self.aggregates(node.operand))
+        if isinstance(node, BinaryOp):
+            return replace(node, left=self.aggregates(node.left),
+                           right=self.aggregates(node.right))
+        if isinstance(node, QuantifiedExpr):
+            return replace(node, predicate=self.aggregates(node.predicate))
+        if isinstance(node, Comprehension):
+            return replace(node, element=self.aggregates(node.element))
+        if not isinstance(node, FunctionCall):
+            return node
+        node = replace(node, args=[self.aggregates(a) for a in node.args])
+        if not _is_aggregate_shorthand(node):
+            return node
+        keys: list = []
+        _wildcards(node.args[0], keys, False)
+        keys = list(dict.fromkeys(keys))
+        if len(keys) != 1:
+            if keys:
+                self.note("aggregate", f"the argument of {node.name}() refers to "
+                          f"{' and '.join(wildcard_text(k) for k in keys)}, so it is not "
+                          f"evaluated; write a comprehension")
+            return node
+        var = self.fresh()
+        element = _substitute(node.args[0], {keys[0]: var}, False)
+        return replace(node, args=[Comprehension(element=element, variable=var,
+                                                 domain=_wildcard_domain(keys[0]))])
+
+    # rule 2
+    def bind(self, node: Any, negated: bool) -> tuple:
+        keys: list = []
+        _wildcards(node, keys, True)
+        keys = list(dict.fromkeys(keys))
+        if not keys:
+            return node, set()
+        names = {k: self.fresh() for k in keys}
+        body = _substitute(node, names, True)
+        for k in reversed(keys):
+            body = QuantifiedExpr(quantifier="for_all", variable=names[k],
+                                  domain=_wildcard_domain(k), predicate=body)
+        texts = " and ".join(wildcard_text(k) for k in keys)
+        if negated:
+            self.note("not", f"{texts} under NOT: NOT applies to 'for all' over the members, "
+                      f"so the predicate holds when some member does not satisfy the "
+                      f"comparison")
+        if len(keys) > 1:
+            self.note("pairs", f"{texts} in one comparison: it must hold for every "
+                      f"combination of their members")
+        return body, set(keys)
+
+    def walk(self, node: Any, pred: bool, negated: bool) -> tuple:
+        """(node rewritten, keys bound in it); `pred`: the node stands where
+        a predicate is expected."""
+        if isinstance(node, BinaryOp) and node.op in ("AND", "OR"):
+            left, kl = self.walk(node.left, True, negated)
+            right, kr = self.walk(node.right, True, negated)
+            if node.op == "OR":
+                for k in sorted(kl & kr, key=str):
+                    self.note("or", f"{wildcard_text(k)} in both operands of OR: each "
+                              f"comparison quantifies over the members on its own")
+            return replace(node, left=left, right=right), kl | kr
+        if isinstance(node, UnaryOp) and node.op == "NOT":
+            operand, keys = self.walk(node.operand, True, not negated)
+            return replace(node, operand=operand), keys
+        if isinstance(node, QuantifiedExpr):
+            body, keys = self.walk(node.predicate, True, negated)
+            return replace(node, predicate=body), keys
+        if isinstance(node, FunctionCall) and node.name in TEMPORAL_OPERATORS:
+            args, keys = [], set()
+            for a in node.args:
+                if isinstance(a, DurationLiteral):
+                    args.append(a)
+                else:
+                    a, k = self.walk(a, True, negated)
+                    args.append(a)
+                    keys |= k
+            return replace(node, args=args), keys
+        keys: set = set()
+        if isinstance(node, ActorRef):
+            if node.index is not None and not isinstance(node.index, (str, int)) \
+                    and _wildcard_key(node) is None:
+                index, keys = self.walk(node.index, False, negated)
+                node = replace(node, index=index)
+        elif isinstance(node, MemberAccess):
+            obj, keys = self.walk(node.obj, False, negated)
+            node = replace(node, obj=obj)
+        elif isinstance(node, UnaryOp):
+            operand, keys = self.walk(node.operand, False, negated)
+            node = replace(node, operand=operand)
+        elif isinstance(node, BinaryOp):
+            left, kl = self.walk(node.left, False, negated)
+            right, kr = self.walk(node.right, False, negated)
+            node, keys = replace(node, left=left, right=right), kl | kr
+        elif isinstance(node, Comprehension):
+            element, keys = self.walk(node.element, False, negated)
+            node = replace(node, element=element)
+        elif isinstance(node, FunctionCall) and not _is_aggregate_shorthand(node):
+            # (an aggregate shorthand that rule 1 left is not evaluated)
+            args = []
+            for a in node.args:
+                a, k = self.walk(a, False, negated)
+                args.append(a)
+                keys |= k
+            node = replace(node, args=args)
+        if pred or (isinstance(node, BinaryOp) and node.op in _COMPARISON_OPS):
+            node, k = self.bind(node, negated)
+            keys |= k
+        return node, keys
+
+
+def _has_wildcard(node: Any) -> bool:
+    """Whether a wildcard or range reference stands in `node` outside the
+    domains of its quantifiers and comprehensions."""
+    if _wildcard_key(node) is not None:
+        return True
+    if isinstance(node, ActorRef):
+        return node.index is not None and not isinstance(node.index, (str, int)) \
+            and _has_wildcard(node.index)
+    if isinstance(node, MemberAccess):
+        return _has_wildcard(node.obj)
+    if isinstance(node, UnaryOp):
+        return _has_wildcard(node.operand)
+    if isinstance(node, BinaryOp):
+        return _has_wildcard(node.left) or _has_wildcard(node.right)
+    if isinstance(node, QuantifiedExpr):
+        return _has_wildcard(node.predicate)
+    if isinstance(node, Comprehension):
+        return _has_wildcard(node.element)
+    if isinstance(node, FunctionCall):
+        return any(_has_wildcard(a) for a in node.args)
+    return False
+
+
+def desugar_wildcards(expr: Any, notes: list | None = None) -> Any:
+    """A predicate with its wildcard and range references outside the
+    domains of quantifiers and comprehensions rewritten as quantifiers and
+    comprehensions (F.5); `expr` itself when it has none. `notes`, when
+    given, receives the readings that may surprise (N-15)."""
+    if not _has_wildcard(expr):
+        return expr
+    d = _Desugar(notes)
+    return d.walk(d.aggregates(expr), True, False)[0]
+
+
 class _TraceReader:
     """Reads the observations of one contract instance into a `Trace`, one
     at a time."""
@@ -474,6 +755,15 @@ class _Evaluator:
                         or self.unsupported(comp.element, False, {
                             **bound,
                             comp.variable: None if isinstance(dom, RangeExpr) else dom.name}))
+            if _is_aggregate_shorthand(expr):
+                keys: list = []
+                _wildcards(expr.args[0], keys, False)
+                keys = list(dict.fromkeys(keys))
+                if len(keys) > 1:
+                    # what desugar_wildcards leaves (F.5, rule 1)
+                    return (f"the argument of {expr.name}() refers to "
+                            f"{' and '.join(wildcard_text(k) for k in keys)}; "
+                            f"an aggregate ranges over one set or range")
             return f"the function call {expr.name}() is not evaluable"
         return f"{type(expr).__name__} is not evaluable"
 
@@ -1019,7 +1309,7 @@ class _Term:
         else:
             self.kind = "predicate"
             try:
-                self.expr = _parse_rule(self.text)
+                self.expr = desugar_wildcards(_parse_rule(self.text))
             except Exception:
                 self.error = "it is not a predicate (Appendix A.10)"
             else:
@@ -1223,6 +1513,8 @@ class _Engine:
                 expr = _parse_rule(expr.value)
             except Exception:
                 expr = None
+        if expr is not None:
+            expr = desugar_wildcards(expr)
         temporal = expr is not None and contains_temporal(expr)
         error = ("it is not a predicate (Appendix A.10)" if expr is None
                  else self.ev.unsupported(expr, True))

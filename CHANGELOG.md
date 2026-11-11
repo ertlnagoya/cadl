@@ -6,6 +6,49 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Wildcard and range references in predicates (Appendix F, F.5,
+  "Wildcard and range references"). `A[*]` or `A[lo..hi]` outside the
+  domain of a quantifier or comprehension is now shorthand: in the
+  argument of `sum`, `count`, `min`, `max` or `avg` it ranges over the
+  members (`count(ROBOT[*].status == Collision)` is
+  `count(ROBOT[j].status == Collision for j in ROBOT[*])`), and anywhere
+  else its smallest enclosing comparison must hold for every member
+  (`ROBOT[*].battery > 10` is `for all j in ROBOT[*]: ROBOT[j].battery >
+  10`); the references of one set and form in one comparison denote the
+  same member, two sets in one comparison every pair. `cadl norms-eval`,
+  the generated `norms_monitor.py` and `cadl agents-run` rewrite such a
+  predicate when they read the contract (`desugar_wildcards` in
+  `cadl.norms_eval`, in the region the monitor copies) and evaluate the
+  quantified form, so open domains, the 10 000-member limit and the
+  prefix property apply unchanged. An aggregate argument with two sets
+  and a reference in the arguments of a message event stay not
+  evaluable. Up to 0.3.23 such a predicate was not evaluated.
+- N-15 (`cadl check`, warning): a wildcard or range reference bound
+  under `NOT`, two sets in one comparison, the same set in both operands
+  of `OR`, and an aggregate argument over two sets.
+- The quantities of the SoS (Appendix J, J.4, "The quantities of the
+  SoS"): alpha^_SoS, beta^_SoS and chi_SoS over all contracts of a file,
+  with an item qualified by its contract and the powers of one single
+  actor counted over all contracts. `cadl norms-indices` reports them
+  in a last section and under the JSON key `sos` for a file with two or
+  more contracts (without `--contract`); `cadl sim-ir` writes them as
+  `institution.grounding`. They are not weighted and not compared with
+  any declared value. The output for each contract is unchanged.
+
+### Changed
+
+- `cadl agents-run`: a norm whose `trigger:`, `until:` or `content:` has
+  a wildcard or range reference outside a quantifier is now judged (it
+  was not, and its in-force flag was unknown for the whole run). The
+  runtime reads predicates through the norms engine, so
+  `agents_runtime.py` itself is unchanged.
+- The outputs of the bundled examples (`check`, `sim-ir`, `sim-gen`,
+  `codegen`, `norms-eval`, `agents-run`, `norms-indices`) are identical
+  to 0.3.23 except the copied engine in the generated
+  `norms_monitor.py`.
+
 ## [0.3.23] — 2026-11-11
 
 Two new extensions and an extension of the norms engine. The strategic

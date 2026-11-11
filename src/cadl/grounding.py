@@ -689,6 +689,116 @@ def file_indices(sos: SoSDefinition) -> list:
     return [contract_indices(sos, c) for c in sos.contracts]
 
 
+# --- J.4: the quantities of the SoS ---------------------------------------------
+# Over all contracts of a file (one version). An item is qualified by its
+# contract: the pairs of the SoS are the disjoint union of the pairs of the
+# contracts, so each ratio below is the ratio of the sums of the counts of
+# the contracts, except that β̂ counts the powers of one single actor over
+# all contracts. No declared value is compared with them.
+
+@dataclass
+class SoSIndices:
+    contracts: list                     # ContractIndices, in file order
+
+    @property
+    def ids(self) -> list:
+        return [ci.id for ci in self.contracts]
+
+    # α̂
+    @property
+    def pairs(self) -> int:
+        return sum(len(ci.alpha.pairs) for ci in self.contracts)
+
+    @property
+    def given(self) -> int:
+        return sum(len(ci.alpha.given_pairs) for ci in self.contracts)
+
+    def by(self, way: str) -> int:
+        return sum(len(ci.alpha.by(way)) for ci in self.contracts)
+
+    @property
+    def member_specific(self) -> int:
+        return sum(len(ci.alpha.member_specific) for ci in self.contracts)
+
+    @property
+    def alpha(self) -> Optional[Fraction]:
+        return Fraction(self.given, self.pairs) if self.pairs else None
+
+    # β̂
+    @property
+    def powers(self) -> int:
+        return sum(len(ci.beta.powers) for ci in self.contracts)
+
+    @property
+    def bearers(self) -> dict:
+        """Bearer reference, as written -> number of powers in all contracts."""
+        out: dict = {}
+        for ci in self.contracts:
+            for b, n in ci.beta.bearers.items():
+                out[b] = out.get(b, 0) + n
+        return out
+
+    @property
+    def singles(self) -> dict:
+        """Single actor -> K(a), the number of its powers in all contracts."""
+        out: dict = {}
+        for ci in self.contracts:
+            for a, n in ci.beta.singles.items():
+                out[a] = out.get(a, 0) + n
+        return out
+
+    @property
+    def largest(self) -> int:
+        return max(self.singles.values(), default=0)
+
+    @property
+    def top(self) -> Optional[str]:
+        """The single actor with the largest K(a), the first in file order
+        when several have it; None when no single actor bears a power."""
+        k = self.largest
+        return next((a for a, n in self.singles.items() if n == k), None)
+
+    @property
+    def beta(self) -> Optional[Fraction]:
+        return Fraction(self.largest, self.powers) if self.powers else None
+
+    # χ
+    @property
+    def norms(self) -> int:
+        return sum(len(ci.coverage.norms) for ci in self.contracts)
+
+    @property
+    def incentive(self) -> int:
+        return sum(len(ci.coverage.incentive) for ci in self.contracts)
+
+    @property
+    def reparation_only(self) -> int:
+        return sum(len(ci.coverage.reparation_only) for ci in self.contracts)
+
+    @property
+    def transition(self) -> int:
+        return sum(len(ci.coverage.transition) for ci in self.contracts)
+
+    @property
+    def coverage(self) -> Optional[Fraction]:
+        return Fraction(self.incentive, self.norms) if self.norms else None
+
+    def undefined_reason(self, quantity: str) -> Optional[str]:
+        if quantity == "alpha":
+            return None if self.pairs else "no contract has a pair (item, party)"
+        if quantity == "beta":
+            return None if self.powers else "no contract has a power"
+        return None if self.norms else "no contract has an obligation or a prohibition"
+
+
+def sos_indices(sos: SoSDefinition, indices: Optional[list] = None) -> Optional[SoSIndices]:
+    """The quantities of the SoS (J.4), over every contract of a file in
+    which the extension is active; None when the file has fewer than two
+    contracts or the extension is not active."""
+    indices = file_indices(sos) if indices is None else indices
+    return SoSIndices(list(indices)) if len(indices) >= 2 else None
+
+
 # --- J.8: the rules --------------------------------------------------------------
 # Every rule returns diagnostics as (level, text) pairs; level is "error",
 # "warning" or "info".
@@ -1191,11 +1301,27 @@ def report(sos: SoSDefinition, contract_id: Optional[str] = None) -> dict:
         if not any(ci.id == contract_id for ci in indices):
             raise GroundingError(f"no contract '{contract_id}' in the file")
     shown = [ci for ci in indices if contract_id is None or ci.id == contract_id]
-    return {
+    out = {
         "grounding": GROUNDING_EXTENSION[1],
         "contracts": [contract_report(ci) for ci in shown],
         "designs": [{"level": level, "text": text} for level, text in rule_j9(sos, shown)],
     }
+    si = sos_indices(sos, indices) if contract_id is None else None
+    if si is not None:
+        out["sos"] = sos_report(si)
+    return out
+
+
+def sos_report(si: SoSIndices) -> dict:
+    """The quantities of the SoS as JSON-serializable data (J.4)."""
+    alpha = _ratio(si.alpha, si.given, si.pairs, si.undefined_reason("alpha"))
+    alpha.update(by_sharing=si.by("sharing"), by_obligation=si.by("obligation"),
+                 by_permission=si.by("permission"), member_specific=si.member_specific)
+    beta = _ratio(si.beta, si.largest, si.powers, si.undefined_reason("beta"))
+    beta.update(largest_bearer=si.top, bearers=si.bearers, single_actors=si.singles)
+    chi = _ratio(si.coverage, si.incentive, si.norms, si.undefined_reason("coverage"))
+    chi.update(reparation_only=si.reparation_only, transition=si.transition)
+    return {"contracts": si.ids, "alpha": alpha, "beta": beta, "coverage": chi}
 
 
 def format_report_text(result: dict) -> str:
@@ -1270,6 +1396,34 @@ def format_report_text(result: dict) -> str:
         lines += ["", "The file has no contract"]
     for d in result.get("designs", []):
         lines.append(f"  {d['level']:<8} {d['text']}")
+    if "sos" in result:
+        q = result["sos"]
+        a, b, x = q["alpha"], q["beta"], q["coverage"]
+        lines += ["", f"SoS: all {len(q['contracts'])} contracts "
+                      f"({', '.join(q['contracts'])}); items qualified by their contract"]
+        lines.append(head("alpha^_SoS (information sharing)", a)
+                     + ("" if not a["defined"] else "  given pairs / pairs of all contracts"))
+        lines.append(f"    pairs given by a sharing entry: {a['by_sharing']}, by an "
+                     f"obligation: {a['by_obligation']}, by a permission: "
+                     f"{a['by_permission']}; member-specific entries and norms (no pair): "
+                     f"{a['member_specific']}")
+        lines.append(head("beta^_SoS (concentration of powers)", b)
+                     + ("" if not b["defined"] else
+                        "  largest number of powers of one single actor / powers of all "
+                        "contracts"))
+        if b["bearers"]:
+            lines.append("    powers per bearer: " + ", ".join(
+                f"{k}: {v}" for k, v in b["bearers"].items()))
+        if b["largest_bearer"] is not None:
+            lines.append(f"    single actor with the most powers: {b['largest_bearer']}")
+        lines.append(head("chi_SoS (incentive coverage)", x)
+                     + ("" if not x["defined"] else
+                        "  norms that carry an incentive / obligations and prohibitions "
+                        "of all contracts"))
+        lines.append(f"    reparation only: {x['reparation_only']}; with a transition: "
+                     f"{x['transition']}")
+        lines.append("    no declared value is compared: v0.3 declares alpha, beta and "
+                     "lambda per contract only")
     return "\n".join(lines)
 
 
@@ -1303,6 +1457,29 @@ def ir_contract(sos: SoSDefinition, contract: ContractDef) -> dict:
                 "incentive": len(cov.incentive), "norms": len(cov.norms),
                 "reparation_only": len(cov.reparation_only),
                 "transition": len(cov.transition)},
+        },
+    }
+
+
+def ir_sos(sos: SoSDefinition) -> Optional[dict]:
+    """The field ``grounding`` of the institution layer of the IR (J.10):
+    the quantities of the SoS, or None when `sos_indices` gives none."""
+    si = sos_indices(sos)
+    if si is None:
+        return None
+    return {
+        "contracts": si.ids,
+        "indices": {
+            "alpha": None if si.alpha is None else {
+                "given": si.given, "pairs": si.pairs,
+                "by_sharing": si.by("sharing"), "by_obligation": si.by("obligation"),
+                "by_permission": si.by("permission"),
+                "member_specific": si.member_specific},
+            "beta": None if si.beta is None else {
+                "largest": si.largest, "powers": si.powers, "bearers": si.bearers},
+            "coverage": None if si.coverage is None else {
+                "incentive": si.incentive, "norms": si.norms,
+                "reparation_only": si.reparation_only, "transition": si.transition},
         },
     }
 
