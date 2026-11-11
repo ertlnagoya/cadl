@@ -183,6 +183,39 @@ def is_static(contract: ContractDef, norm: NormDef) -> bool:
     return all(r["kind"] != "var" for r in refs)
 
 
+def predicate_index_vars(expr: Any) -> set[str]:
+    """The index variables of the actor references of a parsed predicate
+    (`W[j].alarm == true` gives ``{"j"}``), without those that a quantifier
+    of the predicate binds (`for_all j in ...: ...`)."""
+    import dataclasses
+    from .ast_nodes import ActorRef, QuantifiedExpr
+    found: set[str] = set()
+
+    def walk(node: Any, bound: frozenset) -> None:
+        if isinstance(node, QuantifiedExpr):
+            walk(node.domain, bound)
+            walk(node.predicate, bound | {node.variable})
+            return
+        if isinstance(node, ActorRef):
+            index = node.index
+            if isinstance(index, ActorRef) and index.index is None:
+                index = index.name
+            if isinstance(index, str):
+                if index != "*" and not index.isdigit() and index not in bound:
+                    found.add(index)
+                return
+        if dataclasses.is_dataclass(node) and not isinstance(node, type):
+            for f in dataclasses.fields(node):
+                if f.name != "loc":
+                    walk(getattr(node, f.name), bound)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item, bound)
+
+    walk(expr, frozenset())
+    return found
+
+
 def ref_covered(ref: dict, parties: list, actors: dict | None = None) -> bool:
     """Whether every actor that an actor reference can name matches one of
     the party references (as `parse_ref` data), as G.5 reads `parties:`:

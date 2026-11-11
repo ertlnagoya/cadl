@@ -1,0 +1,23 @@
+sos:
+  name: Q
+  extensions:
+    - sos-dsl: 0.1
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - {id: A, role: a}
+    - {id: B, role: b}
+  contracts:
+    - id: C
+      parties: [A, B]
+      enforcement:
+        point: gateway
+      norms:
+        - id: may
+          kind: permission
+          bearer: A
+          content: "A -> B : hello"
+        - id: n
+          kind: prohibition
+          bearer: A
+          content: "A.mode != target"
