@@ -1,0 +1,30 @@
+sos:
+  name: "T"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+    - games: 0.1
+  actors:
+    - { id: X, role: "x" }
+  model:
+    kind: smg
+    parameters:
+      - { id: p, range: [0, 1], value: 0.2 }
+    variables:
+      - { id: loc, type: "[0..2]", init: 0 }
+    players:
+      - { id: A, actors: [X] }
+    commands:
+      - { action: c0, guard: "loc == 0", updates: [ { prob: "p", set: { loc: 1 } }, { prob: rest, set: { loc: 2 } } ] }
+      - { action: stop, owner: A, guard: "loc == 1", updates: [ { set: { loc: 2 } } ] }
+      - { action: grab, owner: A, guard: "loc == 1", updates: [ { set: { loc: 2 } } ] }
+    rewards:
+      - { id: rg, items: [ { action: grab, value: 1 } ] }
+    profiles:
+      s: [ { choose: stop } ]
+    compliance: s
+    payoffs:
+      - { player: A, until: "loc == 2", terms: [ { reward: rg, weight: 1 } ] }
+    equilibria:
+      - { id: mp, concept: every_reachable_state, over: { p: [0, 1] }, resolution: 0.01 }
+      - { id: mp2, concept: every_reachable_state, over: { p: [0, 0.6] }, resolution: 0.01 }

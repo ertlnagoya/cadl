@@ -63,6 +63,57 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `codegen`, `norms-eval`, `agents-run`, `norms-indices`) are identical
   to 0.3.23 except the copied engine in the generated
   `norms_monitor.py`.
+- Strategic models (games 0.1, Appendix I): `concept:` on an entry of
+  `equilibria:`. `concept: every_reachable_state` asks whether the
+  profile is an (ε-)equilibrium from every reachable state: no player
+  gains by deviating alone from any state of Reach_p, the states it
+  reaches by its own deviations while the others follow the profile
+  (I.7). `concept: nash` is the default. A check reports, per player,
+  the largest gain from a state of Reach_p (`state_gain`), the first
+  state that attains it (`state`) and the canonical best response from
+  there. On a map, a cell is `equilibrium` by E2, by E1 at every state
+  of the relaxed process (E1*), or from its end points; a player is a
+  deviator by N or by N_s, which names a state that is in Reach_p at
+  every valuation of the cell (a path of transitions whose
+  probabilities are positive on the whole cell, at every corner when
+  multi-affine and by exact interval arithmetic otherwise) and a
+  deviation that gains more than ε from it (`deviation_states`). The
+  notion is weaker than subgame perfection, which stays undefined
+  (I.7). `concept: subgame_perfect` and `correlated` are reserved
+  (I-11 information and I-9 error); any other value is an I-9 error.
+  The IR of I.13 has a field `concept` on every entry of `equilibria`.
+- `tests/test_games_next.py` and `tests/data/games_next/`: fixed files
+  on which each new soundness mutant is detected deterministically (a
+  gain with a hump in a weight and in the probabilities, a gain that is
+  convex but not monotone, a state reached only by the player's own
+  deviation with probability p, and an entry-deterrence game whose
+  threat is not credible), and fuzzing with 3 and 4 players, 3 open
+  parameters and the new concept (`tests/games_fuzz.py --mode scale`,
+  `--mode endpoints`, `--concept every|both`).
+  Two files of the independent review (`bstate.cadl`: condition B must
+  be checked per state; `ns_affine_zero.cadl`: the cell at p = 0 stays
+  undecided) are tests too, with the mutant `endpoints_b_from_initial`.
+
+### Changed
+- The end-point certification of a cell (formerly J-14 of Appendix J)
+  is a method of I.9 and is used by `cadl game-check --certify` for any
+  strategic model, also without `grounding: 0.1`, on the cells that the
+  conditions N, E1 and E2 leave undecided; every claim of those
+  conditions is kept. Its conditions are stated in terms of Appendix I:
+  A (one open parameter ℓ, in no probability and no reward value, with a
+  power of at most one in every weight, counted on the text) and, for a
+  deviator, B− or B+ (every term of the player whose weight has a
+  non-zero coefficient of ℓ at the fixed values of the other parameters
+  has a coefficient of one sign and the expected value 0 under the
+  profile; the gain is then non-increasing, resp. non-decreasing, so the
+  gain at b, resp. a, decides). A constant part of a weight, such as
+  `1 - 2 * lambda`, no longer prevents a claim, and B+ is new. J-14 now
+  refers to the method of I.9. In the output, the map field `j14` is
+  replaced by `endpoints` (`applicable`, `parameter`, `non_increasing`,
+  `non_decreasing`, or `reason`), the text line "J-14 applies ..." by
+  "end points (I.9): ...", and the cell method `endpoints (J-14)` by
+  `end points (I.9)`. On the bundled examples every claim of 0.3.23 is
+  unchanged.
 
 ## [0.3.23] — 2026-11-11
 
