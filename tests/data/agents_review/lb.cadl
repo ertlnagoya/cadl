@@ -1,0 +1,33 @@
+sos:
+  name: "LB"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - { id: OP, role: "approver", agent: { kind: human } }
+    - { id: "R[2..N]", role: "symbolic set from 2", agent: { kind: llm_agent } }
+    - { id: "B[2..4]", role: "bounded set", agent: { kind: llm_agent } }
+    - { id: "Z[0..N]", role: "symbolic set from 0", agent: { kind: llm_agent } }
+    - { id: "T[1..N]", role: "tools", agent: { kind: tool_server, tools: [act, read] } }
+  contracts:
+    - id: C
+      parties: [OP, "R[i]", "B[*]", "Z[*]", "T[*]"]
+      enforcement: { default: allow }
+      counts_as:
+        - { when: "OP -> R[i] : approve", creates: approval }
+      norms:
+        - { id: may_act, kind: permission, bearer: OP, content: "OP -> T[*] : act" }
+        - { id: r_read, kind: permission, bearer: "R[i]", content: "R[i] -> T[1] : read" }
+        - id: no_act
+          kind: prohibition
+          bearer: "R[i]"
+          content: "R[i] -> T[*] : act"
+          on_denied: { escalate_to: OP, timeout: 1min }
+        - { id: b_no, kind: prohibition, bearer: "B[3]", content: "B[3] -> T[2..3] : act" }
+      delegations:
+        - { norm: may_act, to: ["R[*]", "B[2..3]", "Z[*]"], grant: g, revoke: r, max_depth: 2 }
+    - id: D
+      parties: ["B[*]", "T[1..2]"]
+      enforcement: {}
+      norms:
+        - { id: d_act, kind: permission, bearer: "B[2]", content: "B[2] -> T[1..2] : act" }

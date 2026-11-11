@@ -1425,7 +1425,7 @@ class TestAtomicObserve:
         m.observe({"t": 0})
         m.observe({"t": 1, "messages": [ASSIGN]})
         before = m.result()
-        for t in (10 ** 400, -10 ** 400, 1e11, float("nan"), float("inf"), True, None, "1"):
+        for t in (10 ** 400, -10 ** 400, 2.0 ** 53 + 2, 1e17, float("nan"), float("inf"), True, None, "1"):
             with pytest.raises(robot.TraceError, match="'t' must be"):
                 m.observe({"t": t, "values": {"ROBOT[2].battery": 1}})
             assert m._reader.prev_t == 1 and "ROBOT[2].battery" not in m._reader.snapshot
@@ -1433,7 +1433,7 @@ class TestAtomicObserve:
         assert m.observe({"t": 2}) == []
 
     @pytest.mark.parametrize("line", ['{"t": 1' + "0" * 400 + "}", '{"t": 1e400}', '{"t": NaN}',
-                                      '{"t": Infinity}', '{"t": -1e11}', '{"t": true}'])
+                                      '{"t": Infinity}', '{"t": -1e17}', '{"t": 9007199254740993}', '{"t": true}'])
     def test_offline_reader_refuses_the_same_times(self, line, robot):
         with pytest.raises(TraceError):
             parse_trace(['{"t": 0}', line])
@@ -1572,7 +1572,7 @@ class TestNextCheck:
         changes = m.observe({"t": check})
         assert ("acknowledge", "violated") in [(c["id"], c["state"]) for c in changes]
 
-    @pytest.mark.parametrize("t0", [0.0, 12345.678, 1e9, 9.9e9])
+    @pytest.mark.parametrize("t0", [0.0, 12345.678, 1e9, 1.7e12, 2.0 ** 52, 2.0 ** 53 - 1000])
     def test_loop_decides_everything_that_waits_for_time(self, t0, robot):
         """Also where the step of the floating-point numbers is larger
         than the tolerance of 1e-9 s."""
@@ -1763,6 +1763,32 @@ class TestActorRanges:
         assert history["pong"] == [(3.0, "active"), (5.0, "fulfilled")]
         assert history["quiet"] == [(0.0, "active"), (6.0, "discharged")]
         assert [e["t"] for e in offline["institutional_events"]] == [3.0, 6.0]
+        (got,) = _batch(tmp_path, [{"source": generate_norms_monitor_module(sos),
+                                    "lines": _lines(*records), "steps": True}])
+        assert got["result"] == got["manual"] == offline
+        for k, at_k in enumerate(got["prefixes"]):
+            want = _norms_eval(sos, _prefix(_lines(*records), k))["result"]
+            assert _strip(at_k) == _strip(want)
+
+    def test_lower_bound_of_a_set_with_a_symbolic_upper_bound(self, tmp_path):
+        """R[1..N] has every index from 1 on: R[0] is no member, R[99] is."""
+        sos = _small(self.BLOCKS.replace("R[2..3]", "R[*]"),
+                     "    - {id: D, role: d}\n    - {id: \"R[1..N]\", role: r}\n",
+                     "[D, \"R[*]\"]")
+        model = build_model(sos)
+        assert model["actors"][1]["index"] == {"#": "RangeExpr", "start": 1, "end": "N"}
+        m = self._msg
+        records = [{"t": 0}, {"t": 1, "messages": [m("R[0]", "D", "ping"), m("R[0]", "D", "stop"),
+                                                   m("R[0]", "D", "noise")]},
+                   {"t": 2, "messages": [m("D", "R[0]", "pong")]},
+                   {"t": 3, "messages": [m("R[99]", "D", "ping")]},
+                   {"t": 4, "messages": [m("D", "R[0]", "pong")]},
+                   {"t": 5, "messages": [m("D", "R[99]", "pong"), m("R[99]", "D", "stop")]},
+                   {"t": 6, "end": True}]
+        offline = _norms_eval(sos, _lines(*records))["result"]
+        history = {n["id"]: [(h["t"], h["state"]) for h in n["history"]] for n in offline["norms"]}
+        assert history["pong"] == [(3.0, "active"), (5.0, "fulfilled")]
+        assert history["quiet"] == [(0.0, "active"), (5.0, "discharged")]
         (got,) = _batch(tmp_path, [{"source": generate_norms_monitor_module(sos),
                                     "lines": _lines(*records), "steps": True}])
         assert got["result"] == got["manual"] == offline

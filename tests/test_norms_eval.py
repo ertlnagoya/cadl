@@ -1511,7 +1511,7 @@ class TestTraceValues:
         ('{"t": NaN}', "not JSON"),
         ('{"t": Infinity}', "not JSON"),
         ('{"t": 1e999}', "not JSON"),
-        ('{"t": 2e10}', "at most"),
+        ('{"t": 1e16}', "at most"),
         ('{"t": 1, "messages": [{"from": "D D", "to": "R[1]", "name": "x"}]}', "concrete actor"),
         ('{"t": 1, "messages": [{"from": "D", "to": "R[ 1 ]", "name": "x"}]}', "concrete actor"),
         ('{"t": 1, "messages": [{"from": "D", "to": "R[1]", "name": "x y"}]}', "message name"),
@@ -1519,3 +1519,28 @@ class TestTraceValues:
     def test_malformed_values_are_trace_errors(self, line, text):
         with pytest.raises(TraceError, match=text):
             parse_trace(['{"t": 0}', line])
+
+
+class TestSymbolicUpperBound:
+    """A set declared as `S[1..N]` has every index from 1 on, not `S[0]`
+    (z1.cadl is the reviewer's file)."""
+
+    def states(self, sender: str) -> dict:
+        from cadl.parser import parse_file
+        sos = parse_file(Path(__file__).parent / "data" / "agents_review" / "z1.cadl")
+        trace = parse_trace(json.dumps(o) for o in [
+            {"t": 0}, {"t": 1, "messages": [msg(sender, "P", "go")]}, {"t": 2, "end": False}])
+        result = evaluate(sos, trace)
+        return {n["id"]: n["state"] for n in result["norms"]}
+
+    def test_lower_bound_of_a_set_with_a_symbolic_upper_bound(self):
+        below, inside, far = self.states("S[0]"), self.states("S[2]"), self.states("S[50]")
+        assert (below["n_sym"], below["n_symr"], below["n_symi"]) == ("inactive",) * 3
+        assert (inside["n_sym"], inside["n_symr"], inside["n_symi"]) == ("active",) * 3
+        assert (far["n_sym"], far["n_symr"], far["n_symi"]) == ("active", "active", "inactive")
+
+    def test_time_in_epoch_milliseconds(self):
+        trace = parse_trace(['{"t": 1700000000000}', '{"t": 1700000000001.5}'])
+        assert trace.observations[1].t == 1700000000001.5
+        with pytest.raises(TraceError, match="at most"):
+            parse_trace(['{"t": 9007199254740994}'])

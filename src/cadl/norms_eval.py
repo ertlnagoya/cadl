@@ -21,8 +21,9 @@ Trace format (JSON Lines, one observation per line, non-decreasing ``t``)::
     {"t": 2.0, "state": "Assigned"}
     {"t": 9.0, "end": true}
 
-``t``         time in seconds (required): a finite number of at most
-              1e10 in absolute value (about 317 years).
+``t``         time (required): a finite number of at most 2**53 in
+              absolute value, so that it is exact; seconds for the
+              durations of the file.
 ``bindings``  index bindings of the instance (first line only).
 ``request``   fields of ``request`` (first line only).
 ``values``    updates of the snapshot; a value stays until it is changed.
@@ -104,9 +105,9 @@ _ACTOR_RE = re.compile(r"^([A-Za-z_]\w*)(?:\[(.*)\])?$")
 # whitespace is removed, so `PLAN NER` is not read as `PLANNER`.
 _TRACE_ACTOR_RE = re.compile(r"[A-Za-z_]\w*(?:\[(?:0|[1-9][0-9]*)\])?")
 _TRACE_NAME_RE = re.compile(r"[A-Za-z_]\w*")
-# Largest |t| of a trace, in seconds: far inside the range in which a time
-# can be added to an ISO 8601 epoch without overflow.
-MAX_T = 1e10
+# Largest |t| of a trace: up to it every integer is an exact float, so
+# epoch seconds and epoch milliseconds are accepted.
+MAX_T = float(2 ** 53)
 _TRACE_KEYS = {"t", "bindings", "request", "values", "messages", "state", "end", "amend"}
 _MESSAGE_KEYS = {"from", "to", "name", "args"}
 FINAL_STATES = ("fulfilled", "violated", "discharged")
@@ -187,16 +188,16 @@ def loads_strict(line: str) -> Any:
 
 
 def declared_actors(sos: SoSDefinition) -> dict[str, tuple]:
-    """The declared actors: name -> (indexed, lo, hi); `lo` and `hi` are
-    None when the set has no integer bounds."""
+    """The declared actors: name -> (indexed, lo, hi); a bound that is
+    not an integer is None (`A[1..N]` gives lo 1 and hi None)."""
     out: dict[str, tuple] = {}
     for a in sos.actors:
         index = a.id.index
-        if isinstance(index, RangeExpr) and isinstance(index.start, int) \
-                and isinstance(index.end, int):
-            out[a.id.name] = (True, index.start, index.end)
-        else:
-            out[a.id.name] = (index is not None, None, None)
+        lo = hi = None
+        if isinstance(index, RangeExpr):
+            lo = index.start if isinstance(index.start, int) else None
+            hi = index.end if isinstance(index.end, int) else None
+        out[a.id.name] = (index is not None, lo, hi)
     return out
 
 
@@ -224,7 +225,7 @@ class _TraceReader:
             raise TraceError(f"{where}: 't' must be a number (seconds)")
         if abs(t) > MAX_T or not math.isfinite(t):
             raise TraceError(f"{where}: 't' must be a finite number of at most "
-                             f"{MAX_T:g} seconds in absolute value")
+                             f"2**53 in absolute value")
         prev_t = self.prev_t
         if prev_t is not None and t < prev_t:
             raise TraceError(f"{where}: time {t:g} is before the previous observation ({prev_t:g})")
@@ -369,7 +370,7 @@ class _Evaluator:
             return not indexed and index is None
         if not index.isdigit():
             return False
-        return lo is None or lo <= int(index) <= hi
+        return (lo is None or lo <= int(index)) and (hi is None or int(index) <= hi)
 
     def warn(self, text: str) -> None:
         if text not in self._warned:

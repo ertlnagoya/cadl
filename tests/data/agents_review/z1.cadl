@@ -1,0 +1,28 @@
+sos:
+  name: "Z1"
+  extensions:
+    - norms: 0.1
+  actors:
+    - { id: "R[1..3]", role: "r" }
+    - { id: "S[1..N]", role: "s" }
+    - { id: P, role: "p" }
+    - { id: "Q[1..1]", role: "q" }
+  contracts:
+    - id: C
+      parties: ["R[*]", "S[*]", P, "Q[*]"]
+      counts_as:
+        - { when: "R[2..3] -> P : sig", creates: signal }
+      norms:
+        - { id: n_range, kind: permission, bearer: P, trigger: "R[1..2] -> P : go", content: "P -> R[1] : x" }
+        - { id: n_all, kind: permission, bearer: P, trigger: "R[*] -> P : go", content: "P -> R[1] : x" }
+        - { id: n_unb, kind: permission, bearer: P, trigger: "R[j] -> P : go", content: "P -> R[1] : x" }
+        - { id: n_lit, kind: permission, bearer: P, trigger: "R[3] -> P : go", content: "P -> R[1] : x" }
+        - { id: n_sym, kind: permission, bearer: P, trigger: "S[*] -> P : go", content: "P -> R[1] : x" }
+        - { id: n_symr, kind: permission, bearer: P, trigger: "S[1..N] -> P : go", content: "P -> R[1] : x" }
+        - { id: n_symi, kind: permission, bearer: P, trigger: "S[2..3] -> P : go", content: "P -> R[1] : x" }
+        - { id: n_q, kind: permission, bearer: P, trigger: "Q[1] -> P : go", content: "P -> R[1] : x" }
+        - { id: n_qall, kind: permission, bearer: P, trigger: "Q[*] -> P : go", content: "P -> R[1] : x" }
+        - { id: n_recv, kind: permission, bearer: P, trigger: "P -> R[1..2] : go", content: "P -> R[1] : x" }
+        - { id: n_sig, kind: permission, bearer: P, trigger: signal, content: "P -> R[1] : x" }
+        - { id: o_range, kind: obligation, bearer: "R[j]", trigger: "P -> R[*] : ask", content: "R[1..2] -> P : go" }
+        - { id: pw, kind: power, bearer: "R[j]", content: "R[j] -> P : go", effects: { discharge: [n_q] } }

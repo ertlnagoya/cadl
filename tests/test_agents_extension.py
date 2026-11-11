@@ -771,7 +771,10 @@ class TestExampleDecisions:
             ("allow", ["ASSISTED_REPORTING.may_read"], [])
 
 
-# Two enforced contracts over the same agent and tool server.
+# Two enforced contracts over the same agent and tool server. The party
+# `R[i]` binds the index of the norms of R[i] (G-18); for governing it stands
+# for every member of R, like `R[*]` (G.5). `decide` still takes inputs whose
+# instances do not bind i: the match is then unknown (G.4).
 RICH_ACTORS = """
 - {id: OP, role: operator, agent: {kind: human}}
 - {id: SUP, role: supervisor, agent: {kind: human}}
@@ -789,7 +792,7 @@ RICH = "sos:\n  name: Rich\n  extensions:\n    - norms: 0.1\n    - agents: 0.1\n
     "  actors:\n" + indent(RICH_ACTORS, 4) + indent("""
 contracts:
   - id: C1
-    parties: [OP, AG, SUB, T, U, M, "R[*]"]
+    parties: [OP, AG, SUB, T, U, M, "R[i]"]
     enforcement:
     counts_as:
       - { when: "OP -> AG : approve", creates: approval }
@@ -1019,6 +1022,8 @@ ESCALATION = source(
         proh("g", "R[i]", "R[i] -> T : read", 'on_denied: { escalate_to: "R[1]", timeout: 1s }'),
         perm("h", "AG", "AG -> T : wipe"),
     ),
+    # G-18: the index i of the norm g is the index of a party.
+    parties='[OP, SUP, AG, SUB, T, "R[i]"]',
 )
 
 

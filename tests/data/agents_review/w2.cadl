@@ -1,0 +1,25 @@
+sos:
+  name: "W2"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - { id: OP, role: "approver", agent: { kind: human } }
+    - { id: "W[1..3]", role: "workers", agent: { kind: llm_agent } }
+    - { id: AG, role: "agent", agent: { kind: llm_agent } }
+    - { id: TOOL, role: "tool", agent: { kind: tool_server, tools: [act, read] } }
+  contracts:
+    - id: C
+      parties: [OP, "W[i]", AG, TOOL]
+      enforcement: {}
+      counts_as:
+        - { when: "OP -> W[i] : approve", creates: approval }
+        - { when: "OP -> W[i] : reject", creates: rejection }
+      norms:
+        - id: no_act
+          kind: prohibition
+          bearer: AG
+          content: "AG -> TOOL : act"
+          on_denied: { escalate_to: OP, timeout: 10min, fallback: "AG -> TOOL : read" }
+        - { id: may_read, kind: permission, bearer: AG, until: "W[i] -> AG : stop", content: "AG -> TOOL : read" }
+        - { id: lockdown, kind: prohibition, bearer: AG, trigger: "W[i] -> AG : lock", content: "AG -> TOOL : read" }

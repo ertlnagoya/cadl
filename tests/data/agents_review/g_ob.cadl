@@ -1,0 +1,34 @@
+sos:
+  name: "G"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - { id: OP, role: "approver", agent: { kind: human } }
+    - { id: "SUP[1..3]", role: "supervisors", agent: { kind: human } }
+    - { id: "W[1..N]", role: "workers", agent: { kind: llm_agent } }
+    - { id: AG, role: "agent", agent: { kind: llm_agent } }
+    - { id: TOOL, role: "tool", agent: { kind: tool_server, tools: [act, read] } }
+  contracts:
+    - id: C
+      parties: [OP, "SUP[k]", AG, TOOL]
+      enforcement: {}
+      counts_as:
+        - { when: "OP -> AG : approve", creates: approval }
+        - { when: "OP -> AG : reject", creates: rejection }
+      norms:
+        - id: no_act
+          kind: prohibition
+          bearer: AG
+          content: "AG -> TOOL : act"
+          on_denied: { escalate_to: OP, timeout: 10min }
+        - { id: may_act, kind: permission, bearer: AG, content: "AG -> TOOL : act" }
+        - id: ob
+          kind: obligation
+          bearer: AG
+          trigger: "OP -> AG : ask"
+          deadline: 10s
+          content: "AG -> SUP[k] : answer"
+          on_violation: { reparation: lock }
+        - { id: lock, kind: prohibition, bearer: AG, content: "AG -> TOOL : read" }
+        - { id: may_read, kind: permission, bearer: AG, content: "AG -> TOOL : read" }

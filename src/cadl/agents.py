@@ -183,10 +183,15 @@ def is_static(contract: ContractDef, norm: NormDef) -> bool:
     return all(r["kind"] != "var" for r in refs)
 
 
-def ref_covered(ref: dict, parties: list) -> bool:
+def ref_covered(ref: dict, parties: list, actors: dict | None = None) -> bool:
     """Whether every actor that an actor reference can name matches one of
     the party references (as `parse_ref` data), as G.5 reads `parties:`:
-    a party `A[i]` or `A[*]` stands for every member of `A`."""
+    a party `A[i]` or `A[*]` stands for every member of `A`. With the
+    declared `actors` (as in the boundary policy), a reference to a whole
+    set with integer bounds is read as the range of its declaration."""
+    decl = (actors or {}).get(ref["name"])
+    if ref["kind"] in ("all", "var") and decl and decl["bounded"]:
+        ref = dict(ref, kind="range", lo=decl["lo"], hi=decl["hi"])
     for p in parties:
         if p["name"] != ref["name"]:
             continue
@@ -197,6 +202,8 @@ def ref_covered(ref: dict, parties: list) -> bool:
             return True
         elif p["kind"] == "index":
             if ref["kind"] == "index" and ref["index"] == p["index"]:
+                return True
+            if ref["kind"] == "range" and ref["lo"] == ref["hi"] == p["index"]:
                 return True
         elif ref["kind"] == "index":
             if p["lo"] <= ref["index"] <= p["hi"]:
@@ -217,6 +224,8 @@ def _actor_entry(actor: ActorDef) -> dict:
     }
     if isinstance(index, RangeExpr) and isinstance(index.end, int):
         entry.update(bounded=True, lo=index.start, hi=index.end)
+    elif isinstance(index, RangeExpr) and isinstance(index.start, int):
+        entry["lo"] = index.start       # symbolic upper bound: `A[1..N]`
     if actor.agent is not None:
         entry["kind"] = actor.agent.kind or None
         entry["tools"] = list(actor.agent.tools)
@@ -331,7 +340,8 @@ def is_member(policy: dict, name: str, actor: dict) -> bool:
         return False
     if decl["bounded"]:
         return decl["lo"] <= actor["index"] <= decl["hi"]
-    return True
+    # A symbolic upper bound: every index from the lower bound on (G.4).
+    return decl["lo"] is None or actor["index"] >= decl["lo"]
 
 
 def ref_match(policy: dict, ref: dict, actor: dict, bindings: dict):

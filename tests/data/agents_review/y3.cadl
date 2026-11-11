@@ -1,0 +1,29 @@
+sos:
+  name: "Y3"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - { id: OP, role: "approver", agent: { kind: human } }
+    - { id: "R[1..N]", role: "robots", agent: { kind: llm_agent } }
+    - { id: "Q[1..1]", role: "singleton set", agent: { kind: llm_agent } }
+    - { id: "OPS[1..3]", role: "ops", agent: { kind: human } }
+    - { id: TOOL, role: "tool", agent: { kind: tool_server, tools: [act, read] } }
+  contracts:
+    - id: C
+      parties: [OP, "R[*]", "Q[*]", "OPS[1..2]", TOOL]
+      enforcement: {}
+      counts_as:
+        - { when: "OPS[1] -> R[1] : approve", creates: approval }
+      norms:
+        - { id: may_read, kind: permission, bearer: "R[1]", trigger: "R[1..N] -> OP : ready", content: "R[1] -> TOOL : read" }
+        - { id: q_read, kind: permission, bearer: "Q[1]", trigger: "OPS[*] -> Q[1] : enable", content: "Q[1] -> TOOL : read" }
+        - id: no_act
+          kind: prohibition
+          bearer: "R[1]"
+          until: "OPS[1..3] -> R[1] : thaw"
+          content: "R[1] -> TOOL : act"
+          on_denied: { escalate_to: "OPS[1]", timeout: 10min }
+        - { id: may_act, kind: permission, bearer: "R[1]", content: "R[1] -> TOOL : act" }
+      delegations:
+        - { norm: may_act, to: ["R[*]", "Q[1..1]"], grant: g, revoke: r }

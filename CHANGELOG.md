@@ -115,11 +115,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   and five traces under `examples/traces/` for it and for
   `examples/agents_tool_governance.cadl`.
 
-- `cadl check`, rule G-9: the sender and the receiver of the `when:`
-  message of a `counts_as:` rule that creates `approval` or `rejection`
-  must be parties of the contract, so that the contract governs the
-  approver's message. A file that `cadl` 0.3.21 accepted with such a rule
-  between other actors now has an error.
+- `cadl agents-run`: every contract instance must bind the index
+  variables of the parties of its contract (`bindings`); an instance
+  without such a binding is a trace error. `cadl.agents_runtime.run`
+  refuses a file with errors of `cadl check`; `check=False` is an unsafe
+  switch for tests. As defence in depth, an occurrence that depends on an
+  unbound index is unknown and never has an effect that lets a message
+  through (activate or resume a permission, end, suspend or discharge a
+  prohibition, create an institutional event, exercise a power, fulfil an
+  obligation), and always has the effects that block.
 
 ### Changed
 - `cadl codegen`: the warning for an `assume:` / `guarantee:` item with a
@@ -138,6 +142,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   (`_Engine._step`), and a norm can be exempted from the content of one
   observation; `cadl agents-run` uses both. `cadl norms-eval` and its
   output are unchanged.
+- `cadl norms-eval`: `from`, `to` and `name` of a message of a trace must
+  be written exactly: a concrete actor (`ROBOT[2]`) and an identifier.
+  Whitespace inside them is no longer removed, so a trace with
+  `"ROBOT[ 2 ]"` or `"ROB OT"`, which 0.3.21 read as `ROBOT[2]` and
+  `ROBOT`, is now a trace error. This is deliberate: two spellings of one
+  actor in a log are a way to slip past a check that compares names.
+- `cadl check`, new rules for an enforced contract (Appendix G): G-17,
+  the sender and the receiver of every message event of the contract
+  (`trigger:`, `until:` and `content:` of its norms, `when:` of its
+  `counts_as:` rules, `until:` of a delegation) must be covered by its
+  parties, by one reference of `parties:`, and must name only declared
+  members (`SUP[7]` for a set `SUP[1..3]` is an error); G-18, every index
+  variable of the contract (in bearers, counterparties, `escalate_to:`,
+  `notify:`, `fallback:` and the senders and receivers of its message
+  events) must be one that a party binds (`i` with a party `ROBOT[i]`).
+  Both are errors. A contract with parties `ROBOT[*]` and norms of
+  `ROBOT[i]` has to write the party as `ROBOT[i]`. A file that 0.3.21
+  accepted with such an event has to name the actor as a party. For
+  the rules that create `approval` and `rejection`, G-17 makes sure that
+  the contract governs the approver's message.
 
 ### Fixed
 - `cadl model-export`: a transition reward whose action label no command
@@ -165,15 +189,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   longer produces the warning about a contract without `lifecycle:`.
 - `cadl norms-eval`: a time `t` written as an integer too large for a
   floating-point number (more than about 300 digits) is rejected like
-  every time above 1e10 s, instead of ending in an internal error.
+  every time above 2**53 s, instead of ending in an internal error.
 - A number in a predicate that overflows to infinity (`1e999`) is no
   longer read as infinity: the text is not a predicate (`cadl check`
   warns that it is kept as text; a norm with it is not evaluated).
+- `cadl norms-eval` and `cadl agents-decide`: a set declared with a
+  symbolic upper bound (`R[1..N]`) has every index from its lower bound
+  on; `R[0]` was taken as a member. The Rego policy of `-t agent-rego`
+  tests the lower bound too: regenerate it.
 - `cadl norms-eval`: a trace is rejected (exit status 2) when `t` is
-  `NaN`, infinite or larger than 1e10 in absolute value, when another
-  number of a line is `NaN` or infinite, or when `from`, `to` or `name` of
-  a message is not well-formed. Whitespace inside these names is no
-  longer removed: `"ROB OT"` was read as `ROBOT`.
+  `NaN`, infinite or larger than 2**53 in absolute value, or when another
+  number of a line is `NaN` or infinite. Epoch seconds and epoch
+  milliseconds are within the bound.
 
 ## [0.3.21] — 2026-11-11
 
