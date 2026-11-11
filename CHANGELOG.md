@@ -59,11 +59,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   and five traces under `examples/traces/` for it and for
   `examples/agents_tool_governance.cadl`.
 
-- `cadl check`, rule G-9: the sender and the receiver of the `when:`
-  message of a `counts_as:` rule that creates `approval` or `rejection`
-  must be parties of the contract, so that the contract governs the
-  approver's message. A file that `cadl` 0.3.21 accepted with such a rule
-  between other actors now has an error.
+- `cadl agents-run`: an occurrence of a message event that depends on an
+  index which the contract instance does not bind is unknown and resolved
+  fail-closed (it does not activate a permission, end a prohibition or
+  create `approval`; it does activate a prohibition and end a permission).
 
 ### Fixed
 - `cadl norms-eval`: an actor reference in a `trigger:`, an `until:`, the
@@ -75,13 +74,32 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   specification says: a range only its members, `A[*]` and an unbound
   `A[i]` only members of the declared set, an undeclared actor never. The
   verdicts on the six bundled traces are unchanged.
+- `cadl norms-eval` and `cadl agents-decide`: a set declared with a
+  symbolic upper bound (`R[1..N]`) has every index from its lower bound
+  on; `R[0]` was taken as a member. The Rego policy of `-t agent-rego`
+  tests the lower bound too: regenerate it.
 - `cadl norms-eval`: a trace is rejected (exit status 2) when `t` is
-  `NaN`, infinite or larger than 1e10 in absolute value, when another
-  number of a line is `NaN` or infinite, or when `from`, `to` or `name` of
-  a message is not well-formed. Whitespace inside these names is no
-  longer removed: `"ROB OT"` was read as `ROBOT`.
+  `NaN`, infinite or larger than 2**53 in absolute value, or when another
+  number of a line is `NaN` or infinite. Epoch seconds and epoch
+  milliseconds are within the bound.
 
 ### Changed
+- `cadl norms-eval`: `from`, `to` and `name` of a message of a trace must
+  be written exactly: a concrete actor (`ROBOT[2]`) and an identifier.
+  Whitespace inside them is no longer removed, so a trace with
+  `"ROBOT[ 2 ]"` or `"ROB OT"`, which 0.3.21 read as `ROBOT[2]` and
+  `ROBOT`, is now a trace error. This is deliberate: two spellings of one
+  actor in a log are a way to slip past a check that compares names.
+- `cadl check`, new rules for an enforced contract (Appendix G): G-17,
+  the sender and the receiver of every message event of the contract
+  (`trigger:`, `until:` and `content:` of its norms, `when:` of its
+  `counts_as:` rules, `until:` of a delegation) must be covered by its
+  parties; G-18, an index variable in the sender or receiver of a
+  `trigger:`, an `until:` or a `when:` must be one that a party binds
+  (`i` with a party `ROBOT[i]`). Both are errors. A file that 0.3.21
+  accepted with such an event has to name the actor as a party. For
+  the rules that create `approval` and `rejection`, G-17 makes sure that
+  the contract governs the approver's message.
 - `cadl.norms_eval`: the engine can be driven one observation at a time
   (`_Engine._step`), and a norm can be exempted from the content of one
   observation; `cadl agents-run` uses both. `cadl norms-eval` and its

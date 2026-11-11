@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any
 
 from . import agents as G
-from .ast_nodes import SoSDefinition
+from .ast_nodes import ActorRef, SoSDefinition
 from .norms_eval import (
     _EPS,
     NormsEvalError,
@@ -87,6 +87,7 @@ class Line:
     obs: Observation
     state: str | None = None            # `state` as written on this line
     instances: list[dict] = field(default_factory=list)
+    lineno: int = 0
 
 
 @dataclass
@@ -168,19 +169,22 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
         if "bindings" in rec and isinstance(rec["bindings"], dict):
             _check_bindings(rec["bindings"], where)
         state = rec.get("state") if isinstance(rec.get("state"), str) else None
-        extras.append((state, entries))
+        extras.append((state, entries, lineno))
         plain.append(json.dumps(rec))
     base = parse_trace(plain, path=path)
     if epoch is not None:
-        for o in base.observations:
+        # Only with an epoch does a time have to be an instant that an
+        # ISO 8601 time stamp can express.
+        for o, (_, _, lineno) in zip(base.observations, extras):
             try:
                 epoch + timedelta(seconds=o.t)
             except OverflowError:
-                raise TraceError(f"t={_fmt_t(o.t)} added to 'epoch' is not a "
-                                 f"representable time") from None
+                raise TraceError(f"line {lineno}: t={_fmt_t(o.t)} seconds after 'epoch' "
+                                 f"is not a time that an ISO 8601 time stamp can "
+                                 f"express") from None
     return RunTrace(
-        lines=[Line(obs=o, state=s, instances=e)
-               for o, (s, e) in zip(base.observations, extras)],
+        lines=[Line(obs=o, state=s, instances=e, lineno=n)
+               for o, (s, e, n) in zip(base.observations, extras)],
         bindings=base.bindings, request=base.request, epoch=epoch, path=path)
 
 
@@ -247,6 +251,43 @@ class _Instance:
         return self.contract, self.name
 
 
+class _BoundaryTerm(_Term):
+    """A message event of an enforced contract. Where the contract
+    instance does not bind an index of the sender or the receiver, the
+    occurrence is unknown (G.4), and `unknown_as` says how the use of the
+    event resolves it fail-closed (G.5): an unknown occurrence does not
+    activate a permission, end a prohibition or create an institutional
+    event; it does activate a prohibition and end a permission."""
+
+    unknown_as = True
+
+    def _unbound(self, ref: ActorRef) -> str | None:
+        index = ref.index
+        if isinstance(index, ActorRef) and index.index is None:
+            index = index.name
+        if isinstance(index, str) and index != "*" and not index.isdigit() \
+                and index not in self.ev.bindings:
+            return index
+        return None
+
+    def _actor_matches(self, ref: ActorRef, actual: str, k: int) -> bool:
+        matched = super()._actor_matches(ref, actual, k)
+        name = self._unbound(ref)
+        if matched and name is not None:
+            self.ev.warn(
+                f"the index '{name}' of {ref.name}[{name}] in '{self.text}' is not bound: "
+                f"its occurrence is unknown and is resolved fail-closed (G.5), here as "
+                f"{'occurring' if self.unknown_as else 'not occurring'}")
+            return self.unknown_as
+        return matched
+
+
+def _resolve_unknown(term, value: bool) -> None:
+    if term is not None and term.kind == "message":
+        term.__class__ = _BoundaryTerm
+        term.unknown_as = value
+
+
 class _BoundaryEngine(_Engine):
     """The verdict engine of the norms extension, driven one observation
     at a time, with the additions of Appendix G to F.5: the in-force flag
@@ -264,6 +305,20 @@ class _BoundaryEngine(_Engine):
         # Violated prohibitions that are still in force at the boundary.
         self.kept: dict[str, dict] = {}
         self._mark = 0
+        self._harden()
+
+    def _harden(self) -> None:
+        """Resolve unknown occurrences fail-closed (see `_BoundaryTerm`).
+        The events of obligations and powers keep the reading of F.3."""
+        for _, when, _ in self.rules:
+            _resolve_unknown(when, False)
+        for norm in self.norms:
+            if norm.d.kind == "permission":
+                _resolve_unknown(norm.trigger, False)
+                _resolve_unknown(norm.until, True)
+            elif norm.d.kind == "prohibition":
+                _resolve_unknown(norm.trigger, True)
+                _resolve_unknown(norm.until, False)
 
     def push(self, o: Observation) -> bool:
         """Append one observation and process it; True when the contract
@@ -310,6 +365,7 @@ class _BoundaryEngine(_Engine):
     def _amend(self, n: int, name: str) -> None:
         old = {nid: self.by_id[nid].d for nid in self.kept}
         super()._amend(n, name)
+        self._harden()
         new = {d.id: d for d in self.contract.norms}
         for nid, k in self.kept.items():
             nd = new.get(nid)
@@ -400,6 +456,7 @@ class AgentsRuntime:
         self._events: list[tuple] = []
         self._current: dict | None = None
         self._snapshot: dict[str, Any] = {}
+        self._lineno = 0
         self._known: set[str] = set()
         for line in trace.lines:
             self._known.update(line.obs.values)
@@ -435,8 +492,10 @@ class AgentsRuntime:
         try:
             at = (self.trace.epoch + timedelta(seconds=t)).astimezone(timezone.utc)
         except OverflowError:
-            raise TraceError(f"t={_fmt_t(t)} added to 'epoch' is not a representable "
-                             f"time") from None
+            raise TraceError(
+                f"line {self._lineno}: t={_fmt_t(t)} seconds after 'epoch' (a time of "
+                f"the trace or the deadline of a hold) is not a time that an ISO 8601 "
+                f"time stamp can express") from None
         text = at.strftime("%Y-%m-%dT%H:%M:%S")
         if at.microsecond:
             text += f".{at.microsecond:06d}".rstrip("0")
@@ -523,6 +582,7 @@ class AgentsRuntime:
             if not d["until"]:
                 continue
             term = _Term(d["until"], inst.engine.events, inst.engine.ev)
+            _resolve_unknown(term, True)        # unknown: the derived instances end
             if term.error:
                 inst.engine.ev.warn(f"until of the delegation of '{nid}' is not evaluated: "
                                     f"'{term.text}': {term.error}")
@@ -762,6 +822,8 @@ class AgentsRuntime:
         applying = G.applying_prohibitions(self.policy, inp)
         index = len(self.holds) + 1
         deadline = None if result["timeout"] is None else t + result["timeout"] / 1000.0
+        if deadline is not None:
+            self._time(deadline)            # a trace error when it cannot be written
         hold = _Hold(
             hold_id=f"h-{index}", index=index, message=dict(m), time=t,
             approver=result["escalate_to"], deadline=deadline,
@@ -982,6 +1044,7 @@ class AgentsRuntime:
     def _line(self, line: Line, first: bool, last: bool) -> None:
         o = line.obs
         t = o.t
+        self._lineno = line.lineno
         self._snapshot = o.values
         self._expire(t)
         amendment = self._prepare_amendment(o.amend, t) if o.amend else None

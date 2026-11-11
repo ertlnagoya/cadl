@@ -1,0 +1,58 @@
+sos:
+  name: "Y2"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - { id: OP, role: "approver", agent: { kind: human } }
+    - { id: "W[1..3]", role: "workers", agent: { kind: llm_agent } }
+    - { id: "SUP[1..2]", role: "supervisors", agent: { kind: human } }
+    - { id: AG, role: "agent", agent: { kind: llm_agent } }
+    - { id: ADMIN, role: "admin, not a party", agent: { kind: human } }
+    - { id: EXT, role: "external service, not a party", agent: { kind: service } }
+    - { id: TOOL, role: "tool", agent: { kind: tool_server, tools: [act, read, xx] } }
+  contracts:
+    - id: C
+      parties: [OP, "W[i]", "SUP[*]", AG, TOOL]
+      enforcement: {}
+      counts_as:
+        - { when: "OP -> W[i] : approve", creates: approval }
+        - { when: "OP -> AG : approve", creates: approval }
+      norms:
+        - id: w_no_act
+          kind: prohibition
+          bearer: "W[i]"
+          content: "W[i] -> TOOL : act"
+          on_denied: { escalate_to: OP, timeout: 10min }
+        - id: no_act
+          kind: prohibition
+          bearer: AG
+          until: "SUP[k] -> AG : lift"
+          content: "AG -> TOOL : act"
+          on_denied: { escalate_to: OP, timeout: 10min }
+        - id: may_read
+          kind: permission
+          bearer: AG
+          trigger: "SUP[k] -> AG : enable"
+          content: "AG -> TOOL : read"
+        - id: freeze
+          kind: prohibition
+          bearer: AG
+          trigger: "ADMIN -> AG : freeze"
+          content: "AG -> TOOL : read"
+        - { id: may_act, kind: permission, bearer: AG, content: "AG -> TOOL : act" }
+        - id: may_x
+          kind: permission
+          bearer: AG
+          until: "ADMIN -> AG : stop"
+          content: "AG -> TOOL : xx"
+        - id: must
+          kind: obligation
+          bearer: AG
+          trigger: "OP -> AG : go"
+          deadline: 10s
+          content: "AG -> EXT : report"
+        - id: no_leak
+          kind: prohibition
+          bearer: AG
+          content: "AG -> EXT : leak"

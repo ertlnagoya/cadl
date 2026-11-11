@@ -1286,6 +1286,50 @@ def release_is_sound(policy: dict, rel: dict) -> bool:
     return decide(policy, inp)["reason"] != "undeclared_tool"
 
 
+def oracle_trace(rng, spec: dict, n: int) -> list[dict]:
+    """The trace generator of the reviewer's stress run (stress2.py)."""
+    t, lines, nh, live, made = 0, [], 0, [], 0
+    host = spec.get("host", {})
+    for k in range(n):
+        t += rng.choice([0, 0, 1, 1, 2, 5, 30, 100, 250, 301, 599, 600, 601])
+        if rng.random() < .1:
+            t += rng.random()
+        line, entries = {"t": t}, []
+        if host and (k == 0 or rng.random() < .12) and made < 6:
+            cid = rng.choice(sorted(host))
+            made += 1
+            entries.append({"contract": cid, "instance": f"i{made}",
+                            "bindings": rng.choice(host[cid])})
+            live.append((cid, f"i{made}", k))
+        older = [x for x in live if x[2] < k]
+        if older and rng.random() < .07:
+            x = rng.choice(older)
+            live.remove(x)
+            entries.append({"contract": x[0], "instance": x[1], "end": True})
+        if entries:
+            line["instances"] = entries
+        msgs = []
+        for _ in range(rng.choice([1, 1, 1, 2, 3])):
+            if rng.random() < spec.get("p_script", .65):
+                sender, receiver, name = rng.choice(spec["likely"])
+            else:
+                sender, receiver = rng.choice(spec["actors"]), rng.choice(spec["actors"])
+                name = rng.choice(spec["names"])
+            msg_ = {"from": sender, "to": receiver, "name": name}
+            if name in ("approve", "reject", "ok"):
+                x = rng.random()
+                if x < .78 and nh:
+                    msg_["args"] = [f"h-{rng.randint(max(1, nh - 3), nh + 1)}"]
+                elif x > .9:
+                    msg_["args"] = [rng.choice([1, None, "h-0", "H-1", ["h-1"]])]
+            msgs.append(msg_)
+            nh += 1 if rng.random() < .12 else 0
+        line["messages"] = msgs
+        lines.append(line)
+    lines.append({"t": t + 1, "end": False})
+    return lines
+
+
 class TestRandomTraces:
     def test_invariants(self):
         seen, releases = set(), {True: 0, False: 0}
@@ -1359,24 +1403,35 @@ class TestRandomTraces:
 
     def test_runtime_agrees_with_an_independent_model(self):
         # tests/agents_oracle.py reads the YAML itself and shares no code
-        # with cadl. Default instance, no bindings; the senders include
-        # actors outside the declared sets and undeclared actors.
+        # with cadl. The traces and the vocabularies are those of the
+        # reviewer's stress run: host-created instances with different or
+        # no bindings, actors outside the declared sets, undeclared actors,
+        # malformed hold ids. y2 and y3 do not pass `cadl check` (G-17,
+        # G-18): on them the runtime is compared as a host that skips the
+        # check would run it.
+        import random
         from .agents_oracle import Model
+        specs = json.loads((REVIEW / "stress_specs.json").read_text())
         total, kinds = 0, set()
-        files = [EXAMPLE, CHANGE, REVIEW / "x2.cadl", REVIEW / "x3.cadl"]
-        for k, path in enumerate(files):
+        for name, spec in specs.items():
+            path = {"TG": EXAMPLE, "CC": CHANGE}.get(name, REVIEW / spec["path"])
             sos = parse_file(path)
-            for seed in range(8):
-                rows = random_rows(sos, 3000 + 100 * k + seed, 150)
-                lines = aim(sos, trace(*rows, (rows[-1][0] + 1, None, {"end": False})),
-                            seed)
-                r = run(sos, parse_run_trace(lines))
-                model = Model(path.read_text())
-                for line in map(json.loads, lines):
+            for seed in range(12):
+                lines = oracle_trace(random.Random(seed), spec, 45)
+                r = run(sos, parse_run_trace([json.dumps(x) for x in lines]))
+                model = Model(path.read_text(), host=tuple(spec.get("host", {})))
+                for line in lines:
+                    t = line["t"]
+                    model.tick(t)
+                    for e in line.get("instances", []):
+                        if not e.get("end"):
+                            model.start(e["contract"], e["instance"], e.get("bindings", {}))
                     for msg_ in line.get("messages", []):
                         model.message(msg_["from"], msg_["to"], msg_["name"],
-                                      msg_.get("args", []), line["t"])
-                model.tick(rows[-1][0] + 1)
+                                      msg_.get("args", []), t)
+                    for e in line.get("instances", []):
+                        if e.get("end"):
+                            model.end(e["contract"], e["instance"], t)
                 got = []
                 for a in r["audit"]:
                     if "decision" not in a:
@@ -1388,11 +1443,13 @@ class TestRandomTraces:
                         rec += (tuple(map(tuple, a["provenance"])),)
                     got.append(rec)
                     kinds.add((a["decision"], a["reason"], a["outcome"]))
-                assert got == [tuple(x) for x in model.out], (path.name, seed)
+                assert got == [tuple(x) for x in model.out], (name, seed)
                 total += len(got)
-        assert total >= 4800
-        assert {("deny", "default", "approved"), ("allow", "approved", "approved"),
-                ("deny", "rejected", "rejected"), ("deny", "expired", "expired")} <= kinds
+        assert total >= 7000, total
+        assert {("deny", "default", "approved"),
+                ("allow", "approved", "approved"), ("deny", "rejected", "rejected"),
+                ("deny", "expired", "expired"), ("deny", "cancelled", "cancelled"),
+                ("deny", "no_instance", None)} <= kinds, kinds
 
     def test_runs_are_reproducible(self):
         sos = parse(RICH)
@@ -1615,6 +1672,9 @@ class TestActorReferencesInEvents:
 
 
 class TestApproverMessageIsGoverned:
+    """C4 of the first review, now part of G-17: the message of a rule that
+    creates `approval` or `rejection` goes from a party to a party."""
+
     def test_c4_receiver_of_an_approval_rule_must_be_a_party(self):
         from .test_agents_extension import check, with_rule
         res = check(
@@ -1623,8 +1683,9 @@ class TestApproverMessageIsGoverned:
               - { when: "OP -> X : approve", creates: approval }
             """,
             norms(proh("no_wipe", "AG", "AG -> T : wipe", "on_denied: { escalate_to: OP }")))
-        errors = with_rule(res.errors, "G-9")
-        assert len(errors) == 1 and "receiver 'X'" in errors[0] and "not a party" in errors[0]
+        errors = with_rule(res.errors, "G-17")
+        assert len(errors) == 1 and "receiver 'X'" in errors[0]
+        assert "not covered by the parties" in errors[0]
 
     def test_c4_member_outside_an_indexed_party(self):
         from .test_agents_extension import check, with_rule
@@ -1634,9 +1695,9 @@ class TestApproverMessageIsGoverned:
               - { when: "OP -> R[3] : approve", creates: approval }
             """,
             norms(proh("no_wipe", "AG", "AG -> T : wipe", "on_denied: { escalate_to: OP }")))
-        assert not with_rule(check(*blocks).errors, "G-9")
+        assert not with_rule(check(*blocks).errors, "G-17")
         res = check(*blocks, parties='[OP, SUP, AG, SUB, T, "R[1..2]"]')
-        assert len(with_rule(res.errors, "G-9")) == 1
+        assert len(with_rule(res.errors, "G-17")) == 1
 
 
 class TestTraceValues:
@@ -1651,7 +1712,7 @@ class TestTraceValues:
         ('{"t": 1e999, %s}', "not JSON"),
         ('{"t": true, %s}', "must be a number"),
         ('{"t": 1e18, %s}', "at most"),
-        ('{"t": -1e11, %s}', "at most"),
+        ('{"t": 9.1e15, %s}', "at most"),
         ('{"t": 1, "values": {"x": NaN}, %s}', "not JSON"),
         ('{"t": 1, "messages": [{"from": "PLAN NER", "to": "FILES", "name": "delete_file"}]}',
          "concrete actor"),
@@ -1673,8 +1734,8 @@ class TestTraceValues:
             parse_trace(lines)
 
     def test_epoch_that_overflows(self):
-        with pytest.raises(TraceError, match="representable"):
-            parse_run_trace(['{"t": 9e9, "epoch": "9990-01-01T00:00:00Z"}'])
+        with pytest.raises(TraceError, match="line 2: .*ISO 8601 time stamp"):
+            parse_run_trace(['{"t": 0, "epoch": "9990-01-01T00:00:00Z"}', '{"t": 9e9}'])
 
     def test_d4_failed_run_writes_no_audit_file(self, capsys, tmp_path):
         bad = tmp_path / "nan.jsonl"
@@ -1768,14 +1829,282 @@ class TestGovernedObservations:
         # R[3] is a member of the declared set R[1..3] and matches `R[*]`,
         # but the parties are R[1..2]: the contract does not govern the
         # message, so it is ungoverned and no observation for the contract.
-        r = replay(C5_SOURCE, trace(
+        # `cadl check` rejects such a file (G-17); the runtime is run on it
+        # without the check, as a host that skips the check would.
+        errors = [str(e) for e in type_check(parse(C5_SOURCE)).errors]
+        assert len(errors) == 2 and all("(G-17)" in e for e in errors)
+        r = run(parse(C5_SOURCE), parse_run_trace(trace(
             (0, m("R[3]", "AG", "lock")), (1, m("AG", "T", "read")),
             (2, m("R[2]", "AG", "lock")), (3, m("AG", "T", "read")),
             (4, m("X", "AG", "unlock")), (5, m("AG", "T", "read")),
-            (6, None, {"end": False})))
+            (6, None, {"end": False}))))
         assert [x[2:4] for x in decisions(r)] == [
             ("allow", "ungoverned"), ("allow", "permission"),
             ("allow", "default"), ("deny", "prohibition"),
             # X is declared but no party: its `unlock` is not observed either.
             ("allow", "ungoverned"), ("deny", "prohibition")]
         assert norm_states(r)["locked"][0] == "active"
+
+
+# === Findings of the second review ==============================================================
+
+def unchecked(name: str):
+    """A reproduction that `cadl check` now rejects, as a host that skips
+    the check would load it."""
+    return parse_file(REVIEW / name)
+
+
+def rule_errors(sos, rule: str) -> list[str]:
+    return [str(e) for e in type_check(sos).errors if f"({rule})" in str(e)]
+
+
+class TestEventsAreCoveredByTheParties:
+    """N1, rule G-17: with governed observations (G.5) a message event that
+    a non-party sends or receives could never occur, silently."""
+
+    def test_y2_non_party_in_trigger_until_and_content(self):
+        errors = rule_errors(unchecked("y2.cadl"), "G-17")
+        assert len(errors) == 4
+        for part in ("sender 'ADMIN' of the trigger: of norm 'freeze'",
+                     "sender 'ADMIN' of the until: of norm 'may_x'",
+                     "receiver 'EXT' of the content: of norm 'must'",
+                     "receiver 'EXT' of the content: of norm 'no_leak'"):
+            assert any(part in e for e in errors), part
+
+    def test_y3_member_outside_the_party_range(self):
+        # parties: OPS[1..2]; the set is declared as OPS[1..3].
+        errors = rule_errors(unchecked("y3.cadl"), "G-17")
+        assert len(errors) == 2
+        assert any("'OPS[*]' of the trigger: of norm 'q_read'" in e for e in errors)
+        assert any("'OPS[1..3]' of the until: of norm 'no_act'" in e for e in errors)
+
+    def test_what_the_rule_prevents_at_run_time(self):
+        # The last scenario of u2.py on the unchecked file: the non-party
+        # ADMIN cannot freeze, and `stop` does not end may_x.
+        r = run(unchecked("y2.cadl"), parse_run_trace(trace(
+            (0, None), (1, m("ADMIN", "AG", "freeze")), (2, m("AG", "TOOL", "xx")),
+            (3, m("ADMIN", "AG", "stop")), (4, m("AG", "TOOL", "xx")),
+            (5, None, {"end": False}))))
+        assert [x[2:4] for x in decisions(r)] == [
+            ("allow", "ungoverned"), ("allow", "permission"),
+            ("allow", "ungoverned"), ("allow", "permission")]
+        assert norm_states(r)["freeze"][0] == "inactive"
+
+    @pytest.mark.parametrize("block, count", [
+        ('counts_as:\n  - { when: "X -> AG : note", creates: noted }\n', 1),
+        ('counts_as:\n  - { when: "OP -> R[3] : note", creates: noted }\n', 0),
+    ])
+    def test_counts_as_rules(self, block, count):
+        from .test_agents_extension import check, with_rule
+        assert len(with_rule(check(block).errors, "G-17")) == count
+
+    def test_delegation_until_and_ranges(self):
+        from .test_agents_extension import check, with_rule
+        blocks = (norms(perm("p", "OP", "OP -> T : read")),
+                  'delegations:\n  - { norm: p, to: [AG], grant: g, until: "%s -> OP : end" }\n')
+        def errors(sender, **kw):
+            return with_rule(check(blocks[0], blocks[1] % sender, **kw).errors, "G-17")
+        assert len(errors("X")) == 1 and not errors("SUP") and not errors("R[2]")
+        two = '[OP, SUP, AG, SUB, T, "R[1..2]"]'
+        assert not errors("R[1..2]", parties=two) and not errors("R[2]", parties=two)
+        assert len(errors("R[1..3]", parties=two)) == 1
+        assert len(errors("R[*]", parties=two)) == 1 and len(errors("R[3]", parties=two)) == 1
+        # A party that is one member covers a range of that member only.
+        one = '[OP, SUP, AG, SUB, T, "R[2]"]'
+        assert not errors("R[2..2]", parties=one) and len(errors("R[*]", parties=one)) == 1
+
+    def test_fallback_to_a_non_party_is_not_an_event(self):
+        # G-10 asks for a declared receiver only: a fallback is data for the
+        # sender; a message to a non-party is ungoverned and allowed.
+        from .test_agents_extension import check, with_rule
+        res = check(APPROVAL_RULES, norms(proh(
+            "no_wipe", "AG", "AG -> T : wipe",
+            'on_denied: { escalate_to: OP, fallback: "AG -> X : ask" }')))
+        assert not with_rule(res.errors, "G-17") and res.ok
+
+
+APPROVAL_RULES = """
+counts_as:
+  - { when: "OP -> AG : approve", creates: approval }
+"""
+
+
+class TestUnboundIndexInEvents:
+    """N2: an index that the contract instance does not bind."""
+
+    def test_g18_index_that_no_party_binds(self):
+        errors = rule_errors(unchecked("y2.cadl"), "G-18")
+        assert len(errors) == 1 and "'k'" in errors[0] and "may_read" in errors[0]
+        assert len(rule_errors(unchecked("y2_u.cadl"), "G-18")) == 2
+        # `W[i]` is a party: the index i is bound by the contract instance.
+        assert not any("'i'" in e for e in errors)
+        assert not rule_errors(review("x1.cadl"), "G-18")
+
+    def test_u1_unbound_index_does_not_activate_a_permission(self):
+        r = run(unchecked("y2.cadl"), parse_run_trace(trace(
+            (0, None), (1, m("SUP[2]", "AG", "enable")), (2, m("AG", "TOOL", "read")),
+            (3, None, {"end": False}))))
+        assert decisions(r)[-1][2:4] == ("deny", "default")
+        assert norm_states(r)["may_read"][0] == "inactive"
+        assert any("'k'" in w and "fail-closed" in w for w in r["warnings"])
+
+    def test_u4_unbound_index_does_not_lift_a_prohibition(self):
+        r = run(unchecked("y2_u.cadl"), parse_run_trace(trace(
+            (0, None, {"instances": [dict(contract="C", instance="a", bindings={"i": 1})]}),
+            (1, m("AG", "TOOL", "act")), (2, m("SUP[2]", "AG", "lift")),
+            (3, m("AG", "TOOL", "act")), (4, None, {"end": False}))))
+        assert [x[2] for x in decisions(r)] == ["escalate", "allow", "escalate"]
+
+    def test_bound_index_works_as_before(self):
+        r = run(unchecked("y2_u.cadl"), parse_run_trace(trace(
+            (0, None, {"instances": [dict(contract="C", instance="a",
+                                          bindings={"i": 1, "k": 2})]}),
+            (1, m("SUP[1]", "AG", "lift")), (2, m("AG", "TOOL", "act")),
+            (3, m("SUP[2]", "AG", "lift")), (4, m("AG", "TOOL", "act")),
+            (5, m("SUP[2]", "AG", "enable")), (6, m("AG", "TOOL", "read")),
+            (7, None, {"end": False}))))
+        assert [x[2:4] for x in decisions(r) if x[1].startswith("AG>TOOL")] == [
+            ("escalate", "prohibition"), ("allow", "permission"), ("allow", "permission")]
+
+    FAIL_CLOSED = source(norms(
+        perm("p_read", "AG", "AG -> T : read", 'until: "R[k] -> AG : stop"'),
+        proh("no_write", "AG", "AG -> T : write", 'trigger: "R[k] -> AG : lock"'),
+        perm("p_write", "AG", "AG -> T : write"),
+        perm("p_op", "OP", "OP -> T : read"),
+    ), """
+    delegations:
+      - { norm: p_op, to: [SUB], grant: g, until: "R[k] -> OP : end" }
+    """)
+
+    def test_unknown_ends_a_permission_and_activates_a_prohibition(self):
+        # G.5: unknown is fail-closed in both directions.
+        sos = parse(self.FAIL_CLOSED)
+        assert len(rule_errors(sos, "G-18")) == 3
+        r = run(sos, parse_run_trace(trace(
+            (0, [m("AG", "T", "read"), m("AG", "T", "write"), m("OP", "SUB", "g"),
+                 m("SUB", "T", "read")]),
+            (1, [m("R[3]", "AG", "stop"), m("R[3]", "AG", "lock"), m("R[3]", "OP", "end")]),
+            (2, [m("AG", "T", "read"), m("AG", "T", "write"), m("SUB", "T", "read")]),
+            (3, None, {"end": False}))))
+        tool = [x[2:4] for x in decisions(r) if ">T:" in x[1]]
+        assert tool == [("allow", "permission")] * 3 + [
+            ("deny", "default"), ("deny", "prohibition"), ("deny", "default")]
+        assert (1, "R[3]>OP:end", "delegation_end", "until") in events(r)
+
+    def test_norms_eval_keeps_f3_for_contracts_that_are_not_enforced(self):
+        from cadl.norms_eval import evaluate, parse_trace
+        sos = parse(source(norms(perm("p_read", "AG", "AG -> T : read",
+                                      'until: "R[k] -> AG : stop"')), enforcement=None))
+        r = evaluate(sos, parse_trace(trace((0, None), (1, m("R[3]", "AG", "stop")),
+                                            (2, None, {"end": False}))), "C")
+        states = {n["id"]: n["state"] for n in r["norms"]}
+        assert states["p_read"] == "discharged"       # any member, with a warning
+
+
+SYMBOLIC = """
+sos:
+  name: Sym
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - { id: OP, role: o, agent: { kind: human } }
+    - { id: "R[1..N]", role: r, agent: { kind: llm_agent } }
+    - { id: T, role: t, agent: { kind: tool_server, tools: [read] } }
+  contracts:
+    - id: C
+      parties: [OP, "R[*]", T]
+      enforcement: {}
+      norms:
+        - { id: may_read, kind: permission, bearer: "R[1]", trigger: "R[1..N] -> OP : ready", content: "R[1] -> T : read" }
+        - { id: two_read, kind: permission, bearer: "R[2]", content: "R[2] -> T : read" }
+"""
+
+
+class TestSymbolicUpperBound:
+    """N3: `R[1..N]` has every index from the lower bound on, not R[0]."""
+
+    def test_is_member(self):
+        from cadl.agents import is_member, parse_concrete_actor
+        policy = build_policy(parse(SYMBOLIC))
+        member = {a: is_member(policy, "R", parse_concrete_actor(a))
+                  for a in ("R[0]", "R[1]", "R[77]", "R")}
+        assert member == {"R[0]": False, "R[1]": True, "R[77]": True, "R": False}
+
+    def test_runtime_and_generated_rego(self, tmp_path):
+        sos = parse(SYMBOLIC)
+        assert type_check(sos).ok
+        r = run(sos, parse_run_trace(trace(
+            (0, [m("R[0]", "OP", "ready"), m("R[0]", "T", "read"), m("R[2]", "T", "read"),
+                 m("R[0]", "OP", "hello"), m("R[5]", "OP", "hello")]),
+            (1, None, {"end": False}))))
+        assert [x[2:4] for x in decisions(r)] == [
+            ("allow", "ungoverned"), ("deny", "default"), ("allow", "permission"),
+            ("allow", "ungoverned"), ("allow", "default")]
+        assert norm_states(r)["may_read"][0] == "inactive"
+        if OPA is None:
+            pytest.skip("the opa binary is not on PATH")
+        generate(sos, tmp_path, target="agent-rego")
+        f = tmp_path / "inputs.json"
+        f.write_text(json.dumps([s["input"] for s in r["steps"]]))
+        proc = subprocess.run(
+            [OPA, "eval", "--format", "json", "--data", str(tmp_path / "agent_policy.rego"),
+             "--input", str(f),
+             "[r | x := input[_]; r := data.cadl.agent_policy.result with input as x]"],
+            capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        values = json.loads(proc.stdout)["result"][0]["expressions"][0]["value"]
+        assert values == [s["result"] for s in r["steps"]]
+
+    def test_u3_grant_to_a_non_member(self):
+        r = run(unchecked("y3.cadl"), parse_run_trace(trace(
+            (0, [m("R[1]", "R[0]", "g"), m("R[0]", "TOOL", "act"), m("R[1]", "R[2]", "g"),
+                 m("R[2]", "TOOL", "act")]), (1, None, {"end": False}))))
+        assert [x[2:4] for x in decisions(r)] == [
+            ("allow", "ungoverned"), ("deny", "default"), ("allow", "default"),
+            ("allow", "permission")]
+
+
+class TestTimeBase:
+    """N4: a trace may use epoch milliseconds; only with `epoch` does a
+    time have to be an ISO 8601 instant."""
+
+    def test_epoch_milliseconds_without_epoch(self):
+        base = 1700000000000
+        r = replay(parse_file(EXAMPLE), trace(
+            (base, m("PLANNER", "FILES", "delete_file")),
+            (base + 5, m("OPERATOR", "PLANNER", "approve", "h-1")),
+            (base + 6, None, {"end": False})))
+        assert decisions(r)[-1][:4] == (base + 5, "PLANNER>FILES:delete_file", "allow",
+                                        "approved")
+        assert r["holds"][0]["deadline"] == base + 600
+
+    def test_largest_time(self):
+        parse_run_trace(['{"t": %d}' % 2 ** 53])
+        with pytest.raises(TraceError, match="2\\*\\*53"):
+            parse_run_trace(['{"t": %d}' % (2 ** 53 + 2)])
+
+    def test_with_epoch_every_time_and_deadline_is_an_instant(self):
+        late = '"epoch": "9999-12-31T23:55:00Z"'
+        call = '"messages": [{"from": "PLANNER", "to": "FILES", "name": "delete_file"}]'
+        with pytest.raises(TraceError, match="line 2: .*ISO 8601"):
+            parse_run_trace(['{"t": 0, %s}' % late, '{"t": 1700000000000}'])
+        # The time is an instant, the deadline of the hold (10 min later) is not.
+        with pytest.raises(TraceError, match="line 2: .*deadline of a hold"):
+            replay(parse_file(EXAMPLE), ['{"t": 0, %s}' % late, '{"t": 1, %s}' % call,
+                                         '{"t": 2, "end": false}'])
+
+    def test_norms_eval_on_a_trace_in_milliseconds(self):
+        from cadl.norms_eval import evaluate_files
+        cadl = ROOT / "examples" / "norms_robot_delivery.cadl"
+        ms = evaluate_files(cadl, REVIEW / "ms_ne.jsonl")
+        ref = evaluate_files(cadl, TRACES / "norms_robot_delivery_a_fulfilled.jsonl")
+        assert [(n["id"], n["state"], n["verdict"]) for n in ms["norms"]] == \
+            [(n["id"], n["state"], n["verdict"]) for n in ref["norms"]]
+        assert ms["ok"] and ms["instance"]["start"] == 1700000000000.0
+
+    def test_names_are_not_canonicalised(self, capsys):
+        status = main(["norms-eval", str(ROOT / "examples" / "norms_robot_delivery.cadl"),
+                       "--trace", str(REVIEW / "ws_ne.jsonl")])
+        err = capsys.readouterr().err
+        assert status == 2 and "ROBOT[ 2 ]" in err and "concrete actor" in err
