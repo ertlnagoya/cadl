@@ -102,6 +102,15 @@ class _Model:
 # >>> part 2
 # === The online monitor =====================================================
 
+def _after(x: Any) -> float:
+    """The smallest float whose decimal value (as Python writes it) is
+    later than the exact time x."""
+    c = float(x)
+    while Fraction(repr(c)) <= x:
+        c = math.nextafter(c, math.inf)
+    return c
+
+
 class ObservationError(MonitorError, NormsEvalError):
     """An observation was refused for a reason other than its form (for
     that, see `TraceError`): an amendment that cannot be applied. The
@@ -305,15 +314,14 @@ class NormsMonitor:
         or the window of an active prohibition is over, or None. This is
         the deadline itself: an observation at exactly this time is still
         in time, and the monitor judges the deadline at the first
-        observation after it (more than 1e-9 s after it, the tolerance of
-        all comparisons of times). To know when to observe, use
-        `next_check`."""
+        observation after it (times are compared exactly). To know when to
+        observe, use `next_check`."""
         eng = self._started()
         if eng.ended_at is not None:
             return None
         t = self._trace.observations[-1].t
-        due = [t + max(x.deadline - x.elapsed(t), 0.0) for x in self._timed(eng, t)]
-        return min(due) if due else None
+        due = [t + max(x.deadline - x.elapsed(t), 0) for x in self._timed(eng, t)]
+        return float(min(due)) if due else None
 
     def next_check(self) -> float | None:
         """The earliest time stamp at which an observation is certain to
@@ -325,11 +333,10 @@ class NormsMonitor:
         after the end.
 
         A host with nothing else to report sends ``{"t": m.next_check()}``
-        when that time has come. The time is later than the deadline or
-        the end of the interval by a little more than the tolerance of
-        1e-9 s (and by at least one step of the floating-point numbers at
-        that time), because an observation at the deadline itself is still
-        in time. For nested temporal operators it is the time at which
+        when that time has come. It is the smallest float whose decimal
+        value is later than the deadline or the end of the interval,
+        because an observation at the deadline itself is still in time
+        (times are compared exactly). For nested temporal operators it is the time at which
         the outermost one is decided. A norm without deadline whose
         content has a temporal operator is evaluated at every observation,
         so each observation gives it a new time to check."""
@@ -340,12 +347,7 @@ class NormsMonitor:
         t = obs[-1].t
         times = []
         for x in self._timed(eng, t):
-            c = t + max(x.deadline - x.elapsed(t), 0.0) + 2 * _EPS
-            for _ in range(64):
-                if x.elapsed(c) > x.deadline + _EPS:
-                    break
-                c = math.nextafter(c, math.inf)
-            times.append(c)
+            times.append(_after(t + max(x.deadline - x.elapsed(t), 0)))
         for x in eng.norms:
             if not x.frozen and x.state == "active" and x.content.kind == "predicate":
                 times.extend(self._decided_after(eng, obs[k].t, x.content.expr)
@@ -357,7 +359,7 @@ class NormsMonitor:
                     times.append(self._decided_after(eng, obs[item["start"]].t, item["expr"]))
         if not times:
             return None
-        return max(min(times), math.nextafter(t, math.inf))
+        return max(min(times), _after(t))
 
     # --- internals ----------------------------------------------------------------
 
@@ -373,7 +375,7 @@ class NormsMonitor:
         return [x for x in eng.norms
                 if x.state == "active" and not x.frozen and x.deadline is not None
                 and x.d.kind in ("obligation", "prohibition")
-                and x.elapsed(t) <= x.deadline + _EPS]
+                and x.elapsed(t) <= x.deadline]
 
     @classmethod
     def _span(cls, eng: Any, expr: Any) -> tuple:
@@ -391,17 +393,14 @@ class NormsMonitor:
             parts = [expr.operand]
         elif isinstance(expr, QuantifiedExpr):
             parts = [expr.predicate]
-        spans = [cls._span(eng, p) for p in parts] or [(0.0, 0)]
+        spans = [cls._span(eng, p) for p in parts] or [(0, 0)]
         return max(s[0] for s in spans), max(s[1] for s in spans)
 
     @classmethod
     def _decided_after(cls, eng: Any, start: float, expr: Any) -> float:
         """A time stamp after every interval of `expr` evaluated at `start`."""
-        span, depth = cls._span(eng, expr)
-        c = start + span + (depth + 1) * _EPS
-        for _ in range(4):                      # rounding of the sums of times
-            c = math.nextafter(c, math.inf)
-        return c
+        span, _ = cls._span(eng, expr)
+        return _after(start + span)
 
     def _prepare(self, eng: Any, n: int) -> Any:
         """The engine ready for observation n, which is the last of the
@@ -472,7 +471,8 @@ class NormsMonitor:
                 marks[(key, id(item))] = self._item_mark(key, item)
         return marks
 
-    def _changes(self, before: dict, t: float) -> list:
+    def _changes(self, before: dict, t: Any) -> list:
+        t = float(t)
         eng = self._engine
         out = []
         for x in eng.norms:

@@ -185,7 +185,8 @@ class TestGeneration:
     def test_solidity_refuses_what_its_fixed_point_cannot_hold(self, content, match):
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
                      f"content: \"{content}\"}}\n")
-        generate_norms_monitor_rego(sos, sos.contracts[0])          # OPA monitors it
+        if "/" not in content:
+            generate_norms_monitor_rego(sos, sos.contracts[0])      # OPA monitors it
         with pytest.raises(NormsTargetUnsupported, match=match):
             generate_norms_monitor_sol(sos, sos.contracts[0])
 
@@ -423,7 +424,7 @@ class TestRegoStep:
         late = S.opa_step(robot_rego, PKG, {"state": f["state"], "observation": {"t": 5}},
                           tmp_path)
         assert late["changes"] == [] and late["state"]["ignored"] == 1
-        assert late["state"]["t"] == 5
+        assert late["state"]["t"] == {"$q": [5, 0]}           # exact: 5 / 10^0
         none = S.opa_step(robot_rego, PKG, {"finish": True}, tmp_path)
         assert "no observation" in none["error"]
 
@@ -738,3 +739,54 @@ def test_evm_refuses_a_temporal_name_that_becomes_known_late(tmp_path):
     assert "error" not in raw[0][0] and "error" in raw[0][1]
     got = S.sol_results(raw[1:], [given], [n.id for n in contract.norms])
     assert S.compare(refs, got) == []
+
+
+# === Exact numbers and times (F.5) ===================================================
+
+from tests.test_norms_eval import _EXACT   # noqa: E402
+
+_M = '"messages": [{"from": "A", "to": "B", "name": "%s"}]'
+EXACT_TRACES = [
+    ['{"t": 0, "values": {"A.x": 0.1, "A.y": 0.2}}', '{"t": 1, "end": true}'],
+    ['{"t": 1700000000.1, %s}' % (_M % "req"),
+     '{"t": 1700000000.2, "values": {"A.z": 1}, %s}' % (_M % "ack")],
+    ['{"t": 1700000000.1, %s}' % (_M % "req"),
+     '{"t": 1700000000.200001, "values": {"A.z": 1}, %s}' % (_M % "ack")],
+    ['{"t": 1700000000.123456, "values": {"A.x": 0.000001, "A.y": 0.299999}}',
+     '{"t": 1700000000.223456, "values": {"A.z": 1}}', '{"t": 1700000000.223457}'],
+]
+
+
+@needs_opa
+def test_opa_numbers_and_times_are_exact(tmp_path):
+    """As norms-eval: 0.1 + 0.2 == 0.3, and epoch seconds with fractions
+    are compared exactly, also with more digits than a float holds."""
+    sos = parse(_EXACT)
+    traces = EXACT_TRACES + [[
+        '{"t": 1700000000.1, %s}' % (_M % "req"),
+        '{"t": 1700000000.2000001, %s}' % (_M % "ack")]]
+    refs = [S.reference(sos, l) for l in traces]
+    assert [r["steps"][-1]["norms"]["o"][0] for r in refs] == [
+        "discharged", "fulfilled", "violated", "discharged", "violated"]
+    assert refs[0]["steps"][0]["guarantee"][0] == "pending"
+    assert refs[0]["steps"][-1]["guarantee"][0] == "fulfilled"
+    got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]),
+                    monitor_package("C"), traces, refs, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+@needs_evm
+def test_evm_numbers_and_times_are_exact(tmp_path):
+    """With at most six decimals the Solidity monitor agrees too."""
+    refs, got = _evm(parse(_EXACT), EXACT_TRACES, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+def test_rego_refuses_division():
+    sos = _small("      norms:\n        - {id: n, kind: prohibition, bearer: A, "
+                 "content: \"A.x / 2 > 3\"}\n")
+    with pytest.raises(NormsTargetUnsupported, match="the operator /"):
+        generate_norms_monitor_rego(sos, sos.contracts[0])
+    sos = _small("      guarantee:\n        - \"A.x / 2 > 3\"\n        - \"A.x > 3\"\n")
+    [m] = norms_monitors(sos, "opa")
+    assert m["text"] is not None and [p for _, p, _, _ in m["left_out"]] == [1]

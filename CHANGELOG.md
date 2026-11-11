@@ -8,6 +8,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Numbers and times are exact (Appendix F, F.5). `cadl norms-eval`, the
+  generated `norms_monitor.py` and `cadl agents-run` read a number of a
+  trace as the decimal number it is written as (a float of the API as
+  the decimal Python writes for it), compare times without the
+  tolerance of 1e-9 s, and compute `+`, `-`, `*`, `/` and `avg` with
+  rational numbers: `0.1 + 0.2 == 0.3` holds, and epoch seconds with
+  milliseconds or microseconds compare exactly. The JSON results still
+  write times and numbers as floats. A verdict changes only for a time
+  within 1e-9 s of a deadline or of the end of a window, or within the
+  spacing of the floats at that time (about 2.4e-7 s near epoch
+  seconds), and for arithmetic whose float result was rounded; the
+  example traces, the traces of the test suite and 1,800 random traces
+  give the same verdicts as in 0.3.25. There is no switch back. The
+  Rego monitor now computes with exact decimals too (its state keeps
+  numbers and times as `{"$q": [n, k]}`) and refuses `/`; the Solidity
+  monitor is unchanged. With them, the three monitors agree with
+  `cadl norms-eval` on every input they accept.
 - CI runs the EVM tests of the Solidity norms monitor
   (`tests/test_norms_monitor_targets.py`) in the Python 3.12 job: it
   builds a venv with eth-tester and py-evm, gets solc 0.8.24 with

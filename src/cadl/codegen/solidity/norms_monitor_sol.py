@@ -23,13 +23,15 @@ IR refuses (quantifiers, aggregates, wildcard references).
 from __future__ import annotations
 
 import re
-from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from ...ast_nodes import ContractDef, SoSDefinition
 from ..emitter import sanitize_id
-from ..norms_ir import EFFECT_KINDS, NormsTargetUnsupported, build_ir, check_contract_id
+from ..norms_ir import (
+    EFFECT_KINDS, NormsTargetUnsupported, apply_limits, build_ir, check_contract_id,
+)
 
 BASE = Path(__file__).with_name("norms_monitor_base.sol")
 SCALE = 10 ** 6
@@ -70,15 +72,16 @@ def _s(text: Any) -> str:
 
 def scaled(value: Any, where: str) -> int:
     """A number as an int256 times SCALE; refuses what the fixed point cannot hold."""
-    d = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
-    v = d * SCALE
-    if v != v.to_integral_value():
+    if isinstance(value, float):
+        value = Fraction(repr(value))
+    v = Fraction(value) * SCALE
+    if v.denominator != 1:
         raise NormsTargetUnsupported([
-            f"{where}: the number {value!r} has more than 6 decimals (the Solidity "
+            f"{where}: the number {float(value)!r} has more than 6 decimals (the Solidity "
             f"monitor uses fixed-point numbers with 6 decimals)"])
     v = int(v)
     if not -_INT256 < v < _INT256:
-        raise NormsTargetUnsupported([f"{where}: the number {value!r} is too large"])
+        raise NormsTargetUnsupported([f"{where}: the number {float(value)!r} is too large"])
     return v
 
 
@@ -138,7 +141,7 @@ def _problem(nodes: list[dict], root: int) -> str | None:
             return ("a temporal operator inside another one (the Solidity monitor scans "
                     "each window once, which needs an operand without a temporal operator)")
         try:
-            if nd["op"] == "lit" and isinstance(nd["v"], (int, float)) \
+            if nd["op"] == "lit" and isinstance(nd["v"], (int, float, Fraction)) \
                     and not isinstance(nd["v"], bool):
                 scaled(nd["v"], "a literal")
             if nd["op"] in ("within", "throughout", "until"):
@@ -184,43 +187,7 @@ def solidity_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
     """`build_ir` with what the Solidity monitor cannot evaluate on top:
     a guarantee item is marked unsupported (left out), anything else
     refuses the contract."""
-    ir = build_ir(sos, contract)
-    nodes = ir["exprs"]
-    reasons = []
-
-    def roots_of(term: dict | None) -> list[int]:
-        if not term or term.get("error"):
-            return []
-        if term["kind"] == "predicate":
-            return [term["expr"]]
-        if term["kind"] == "message":
-            return list(term["args"] or [])
-        return []
-
-    for nd in ir["norms"]:
-        for key in ("trigger", "until", "content"):
-            for r in roots_of(nd.get(key)):
-                why = _problem(nodes, r)
-                if why:
-                    reasons.append(f"norm '{nd['id']}', {key}: {why}")
-    for rule in ir["rules"]:
-        for key in ("when", "if"):
-            for r in roots_of(rule.get(key)):
-                why = _problem(nodes, r)
-                if why:
-                    reasons.append(f"counts_as rule creating '{rule['creates']}', {key}: {why}")
-    for key in ("assume", "guarantee"):
-        for pos, it in enumerate(ir["items"][key], start=1):
-            if it["expr"] is None or it.get("unsupported"):
-                continue
-            why = _problem(nodes, it["expr"])
-            if why and key == "assume":
-                reasons.append(f"assume item {pos}: {why}")
-            elif why:
-                it["unsupported"] = why
-    if reasons:
-        raise NormsTargetUnsupported(reasons)
-    return ir
+    return apply_limits(build_ir(sos, contract), _problem)
 
 
 def _node_lines(nodes: list[dict], skip: set) -> list[str]:
@@ -239,7 +206,7 @@ def _node_lines(nodes: list[dict], skip: set) -> list[str]:
             v = nd["v"]
             if isinstance(v, bool):
                 lk, ln = 2, int(v)
-            elif isinstance(v, (int, float)):
+            elif isinstance(v, (int, float, Fraction)):
                 lk, ln = 3, scaled(v, where)
             else:
                 lk, ls = 4, _s(v)

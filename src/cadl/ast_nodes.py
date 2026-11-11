@@ -50,6 +50,9 @@ class IntLiteral:
 class FloatLiteral:
     value: float
     loc: SourceLocation | None = None
+    # The literal as written ("0.1"), for exact arithmetic (norms 0.1, F.5);
+    # None when the node was not parsed from text.
+    text: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass

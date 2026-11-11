@@ -289,13 +289,16 @@ def run_opa(rego_text: str, package: str, traces: list, refs: list, tmp: Path,
     steps = steps or MAX_STEPS
     inputs = []
     for lines, ref in zip(traces, refs):
-        recs = records(lines)
+        recs = [line for line in lines if line.strip()]
         assert len(recs) <= steps
-        inputs.append({"obs": recs, "q": ref.get("quantities", []), "finish": finishes(lines)})
+        # the lines as written: their numbers reach OPA with all their digits
+        inputs.append('{"obs": [%s], "q": %s, "finish": %s}' % (
+            ", ".join(recs), json.dumps(ref.get("quantities", [])),
+            json.dumps(finishes(lines))))
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / "monitor.rego").write_text(rego_text, encoding="utf-8")
     (tmp / "driver.rego").write_text(opa_driver(package, steps), encoding="utf-8")
-    (tmp / "input.json").write_text(json.dumps({"traces": inputs}), encoding="utf-8")
+    (tmp / "input.json").write_text('{"traces": [%s]}' % ", ".join(inputs), encoding="utf-8")
     proc = subprocess.run(
         [opa_binary(), "eval", "-d", str(tmp / "monitor.rego"), "-d", str(tmp / "driver.rego"),
          "-i", str(tmp / "input.json"), "--format", "json", "data.driver.results"],

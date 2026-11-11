@@ -65,13 +65,13 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from . import agents as G
 from .ast_nodes import ActorRef, SoSDefinition
 from .norms_eval import (
-    _EPS,
     UNKNOWN,
     NormsEvalError,
     Observation,
@@ -266,7 +266,7 @@ def _check_epoch_range(epoch: datetime | None, t: float, lineno: int) -> None:
     if epoch is None:
         return
     try:
-        epoch + timedelta(seconds=t)
+        epoch + timedelta(seconds=float(t))
     except OverflowError:
         raise TraceError(f"line {lineno}: t={_fmt_t(t)} seconds after 'epoch' "
                          f"is not a time that an ISO 8601 time stamp can "
@@ -622,7 +622,7 @@ class _BoundaryEngine(_Engine):
         if state == "violated" and norm.d.kind == "prohibition":
             remaining = None
             if norm.deadline is not None:
-                remaining = max(0.0, norm.deadline - norm.elapsed(t))
+                remaining = max(0, norm.deadline - norm.elapsed(t))
             self.kept[norm.d.id] = {"on": True, "suspended": False, "since": t,
                                     "remaining": remaining, "from": n}
         elif state == "violated" and norm.d.kind == "obligation":
@@ -667,7 +667,7 @@ class _BoundaryEngine(_Engine):
                     if nid in eff.discharge:
                         k["on"] = False
                 if (k["on"] and not k["suspended"] and k["remaining"] is not None
-                        and t - k["since"] > k["remaining"] + _EPS):
+                        and t - k["since"] > k["remaining"]):
                     k["on"] = False             # the window would have closed
             norm = self.by_id.get(nid)
             if (k["on"] and norm is not None and norm.until is not None
@@ -857,7 +857,7 @@ class AgentsRuntime:
             trace = self._reader.trace
         self.trace = trace
         self._started = False
-        self._last_t = 0.0
+        self._last_t: Any = 0
         self._closed = False
         self._failed: str | None = None
         self.versions = versions or {}
@@ -916,9 +916,9 @@ class AgentsRuntime:
     def _time(self, t: float) -> Any:
         """A time of the trace as the audit log writes it."""
         if self.trace.epoch is None:
-            return int(t) if float(t).is_integer() else t
+            return int(t) if float(t).is_integer() else float(t)
         try:
-            at = (self.trace.epoch + timedelta(seconds=t)).astimezone(timezone.utc)
+            at = (self.trace.epoch + timedelta(seconds=float(t))).astimezone(timezone.utc)
         except OverflowError:
             raise TraceError(
                 f"line {self._lineno}: t={_fmt_t(t)} seconds after 'epoch' (a time of "
@@ -1318,7 +1318,7 @@ class AgentsRuntime:
     def _hold(self, m: dict, t: float, inp: dict, result: dict) -> _Hold:
         applying = G.applying_prohibitions(self.policy, inp)
         index = len(self.holds) + 1
-        deadline = None if result["timeout"] is None else t + result["timeout"] / 1000.0
+        deadline = None if result["timeout"] is None else t + Fraction(result["timeout"], 1000)
         if deadline is not None:
             self._time(deadline)            # a trace error when it cannot be written
         hold = _Hold(
@@ -1349,7 +1349,7 @@ class AgentsRuntime:
         Holds that expire together are closed in the order of their
         deadlines, so the times of the log do not decrease."""
         due = [h for h in self.holds if h.state == "held" and h.deadline is not None
-               and t > h.deadline + _EPS]
+               and t > h.deadline]
         for hold in sorted(due, key=lambda h: (h.deadline, h.index)):
             self._close(hold, "expired", hold.deadline)
 
@@ -1483,7 +1483,7 @@ class AgentsRuntime:
                 continue
             if b["hold"] is not None and b["hold"].released:
                 continue
-            if not norm.activated_at - _EPS <= b["t"] <= due + _EPS:
+            if not norm.activated_at <= b["t"] <= due:
                 continue
             sender, receiver = self._actors(m)
             if sender and receiver and G.kleene_and(
@@ -1676,7 +1676,9 @@ class AgentsRuntime:
         when `t` is None): the contract instances that are still running
         end, as at the last line of a trace. Returns what `observe` does."""
         if t is None:
-            t = self._last_t
+            # the exact time of the last line, written as a float: the
+            # decimal it was written as (repr) is read back exactly
+            t = self._last_t if isinstance(self._last_t, int) else float(self._last_t)
         out = self._online({"t": t}, last=True)
         self._closed = True
         return out

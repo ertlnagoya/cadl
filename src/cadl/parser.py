@@ -107,7 +107,7 @@ class ExprTransformer(Transformer):
         if value in (float("inf"), float("-inf")):
             # 1e999: no finite value; an expression with it is not one
             raise ValueError(f"the number {items[0]} is too large")
-        return FloatLiteral(value=value)
+        return FloatLiteral(value=value, text=str(items[0]))
 
     def int_lit(self, items):
         return IntLiteral(value=int(items[0]))
@@ -221,7 +221,8 @@ class ExprTransformer(Transformer):
         if isinstance(operand, IntLiteral):
             return IntLiteral(value=-operand.value)
         if isinstance(operand, FloatLiteral):
-            return FloatLiteral(value=-operand.value)
+            text = None if operand.text is None else "-" + operand.text
+            return FloatLiteral(value=-operand.value, text=text)
         return BinaryOp(op="-", left=IntLiteral(value=0), right=operand)
 
     def quantified_expr(self, items):

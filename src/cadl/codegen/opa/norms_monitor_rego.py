@@ -27,11 +27,14 @@ The file consists of
 from __future__ import annotations
 
 import json
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from ...ast_nodes import ContractDef, SoSDefinition
-from ..norms_ir import NormsTargetUnsupported, build_ir, check_contract_id
+from ..norms_ir import (
+    NormsTargetUnsupported, apply_limits, build_ir, check_contract_id, decimal_parts, subtree,
+)
 
 LIBRARY = Path(__file__).with_name("norms_monitor_lib.rego")
 
@@ -44,6 +47,33 @@ def monitor_filename(contract_id: str) -> str:
 def monitor_package(contract_id: str) -> str:
     from ..emitter import snake_case
     return f"cadl.norms_monitor.{snake_case(contract_id)}"
+
+
+def _q(value: Any) -> dict:
+    """An exact decimal number as the Rego library writes it."""
+    n, k = decimal_parts(value)
+    return {"$q": [n, k]}
+
+
+def _problem(nodes: list[dict], root: int) -> str | None:
+    """What the Rego monitor does not evaluate: division, whose result is
+    not always a decimal number (the monitor computes exactly)."""
+    for k in subtree(nodes, root):
+        if nodes[k]["op"] == "bin" and nodes[k]["o"] == "/":
+            return ("the operator / (the Rego monitor computes with exact decimal numbers, "
+                    "and a quotient is not always one)")
+    return None
+
+
+def rego_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
+    """`build_ir` with what the Rego monitor cannot evaluate on top."""
+    return apply_limits(build_ir(sos, contract), _problem)
+
+
+def _num(value: Any) -> Any:
+    if isinstance(value, bool) or not isinstance(value, (int, float, Fraction)):
+        return value
+    return _q(value)
 
 
 def _lit(value: Any) -> str:
@@ -66,6 +96,8 @@ def rego_model(ir: dict) -> dict:
     norms = []
     for nd in ir["norms"]:
         entry = {k: v for k, v in nd.items() if k not in ("trigger", "until", "content")}
+        if entry["deadline"] is not None:
+            entry["deadline"] = _q(entry["deadline"])
         for key in ("trigger", "until", "content"):
             entry[key] = term(nd[key])
         norms.append(entry)
@@ -88,7 +120,7 @@ def _expr_functions(nodes: list[dict]) -> list[str]:
         def x(i: int, at: str = "p") -> str:
             return f"x{i}({at})"
         if op == "lit":
-            body, arg = _lit(node["v"]), "_"
+            body, arg = _lit(_num(node["v"])), "_"
         elif op == "name":
             body, arg = f"name_val({_lit(node['n'])}, p)", "p"
         elif op == "sym":
@@ -107,13 +139,13 @@ def _expr_functions(nodes: list[dict]) -> list[str]:
             items = ", ".join(x(i) for i in node["items"])
             body, arg = f"in3({x(node['l'])}, [{items}])", "p"
         elif op in ("within", "throughout"):
-            d = _lit(node["d"])
+            d = _lit(_q(node["d"]))
             dec = "true" if op == "within" else "false"
             body = (f"temporal([truth({x(node['x'], 'j')}) | some j in window(p, {d})], "
                     f"over_v(p, {d}), {dec})")
             arg = "p"
         elif op == "until":
-            d = _lit(node["d"])
+            d = _lit(_q(node["d"]))
             body = (f"until3([truth({x(node['q'], 'j')}) | some j in window(p, {d})], "
                     f"[truth({x(node['p'], 'j')}) | some j in window(p, {d})], over_v(p, {d}))")
             arg = "p"
@@ -127,7 +159,7 @@ def generate_norms_monitor_rego(sos: SoSDefinition, contract: ContractDef) -> st
     """The Rego text of the monitor of one contract. Raises
     `NormsTargetUnsupported` for a contract that cannot be monitored."""
     check_contract_id(contract.id)
-    ir = build_ir(sos, contract)
+    ir = rego_ir(sos, contract)
     model = rego_model(ir)
     nodes = ir["exprs"]
     lines = [
@@ -187,4 +219,5 @@ def generate_norms_monitor_rego(sos: SoSDefinition, contract: ContractDef) -> st
     return "\n".join(lines)
 
 
-__all__ = ["generate_norms_monitor_rego", "monitor_filename", "monitor_package", "rego_model"]
+__all__ = ["generate_norms_monitor_rego", "monitor_filename", "monitor_package", "rego_ir",
+           "rego_model"]

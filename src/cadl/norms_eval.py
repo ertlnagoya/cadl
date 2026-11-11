@@ -52,6 +52,8 @@ import json
 import math
 import re
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -98,8 +100,11 @@ def _parse_actor(text: str) -> ActorRef:
 
 
 # >>> monitor-runtime
-_EPS = 1e-9
-_UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "min": 60.0, "h": 3600.0}
+# Numbers are exact (F.5): a number of a trace is the decimal value it is
+# written as, a time is compared without tolerance, and arithmetic is on
+# rational numbers (`Fraction`). Results are written as floats.
+_UNIT_SECONDS = {"ms": Fraction(1, 1000), "s": 1, "min": 60, "h": 3600}
+_NUMBER = (int, float, Fraction)
 _MESSAGE_EVENT_RE = re.compile(r"^(.+?)\s*->\s*(.+?)\s*:\s*(.+)$")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 _ACTOR_RE = re.compile(r"^([A-Za-z_]\w*)(?:\[(.*)\])?$")
@@ -176,11 +181,82 @@ def _not_json_number(text: str):
     raise ValueError(f"{text} is not a JSON number")
 
 
+class _Written(float):
+    """A JSON number with a fraction or an exponent: a float that keeps the
+    text it was written as, which `_exact` reads exactly."""
+    __slots__ = ("text",)
+
+
 def _finite(text: str) -> float:
-    value = float(text)
+    value = _Written(text)
     if not math.isfinite(value):
         raise ValueError(f"{text} is not a finite number")
+    value.text = text
     return value
+
+
+def _exact(v: Any) -> Any:
+    """A value with its numbers exact: a float is the decimal number that
+    Python writes for it (the one it was written as), a Decimal its value."""
+    if isinstance(v, bool) or v is None or isinstance(v, (int, str, Fraction)):
+        return v
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return v
+        text = getattr(v, "text", None)
+        return Fraction(Decimal(text)) if text is not None else Fraction(repr(v))
+    if isinstance(v, Decimal):
+        return Fraction(v)
+    if isinstance(v, dict):
+        return {k: _exact(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_exact(x) for x in v]
+    return v
+
+
+def _plain(v: Any) -> Any:
+    """A result with its exact numbers written as floats (JSON)."""
+    if isinstance(v, Fraction):
+        return float(v)
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_plain(x) for x in v]
+    if isinstance(v, tuple):
+        return tuple(_plain(x) for x in v)
+    return v
+
+
+def _literal_number(expr: Any) -> Fraction:
+    """A number literal of a predicate exactly as written."""
+    text = getattr(expr, "text", None)
+    if text is not None:
+        try:
+            return Fraction(Decimal(text))
+        except (ArithmeticError, ValueError):
+            pass
+    return _exact(float(expr.value))
+
+
+def _duration(expr: Any) -> Any:
+    return _exact(expr.value) * _UNIT_SECONDS.get(expr.unit, 1)
+
+
+def _integral(v: Any) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return True
+    if isinstance(v, Fraction):
+        return v.denominator == 1
+    return isinstance(v, float) and v.is_integer()
+
+
+def _show(v: Any) -> str:
+    """A value for a message: an exact number as Python writes a float."""
+    if isinstance(v, Fraction):
+        return repr(int(v)) if v.denominator == 1 else repr(float(v))
+    return repr(v)
 
 
 _LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
@@ -317,7 +393,7 @@ def _interval_decides(op: str, lo: Any, hi: Any, b: Any, integral: bool) -> Any:
     `integral`, v ranges over the integers): True when it holds for all,
     False when for none, None otherwise."""
     if op in ("==", "!="):
-        inside = lo <= b <= hi and (not integral or float(b).is_integer())
+        inside = lo <= b <= hi and (not integral or _integral(b))
         if lo == hi == b:
             equal = True
         elif not inside:
@@ -664,15 +740,16 @@ class _TraceReader:
         unknown = sorted(set(rec) - _TRACE_KEYS)
         if unknown:
             raise TraceError(f"{where}: unknown key(s) {', '.join(unknown)}")
-        t = rec.get("t")
-        if isinstance(t, bool) or not isinstance(t, (int, float)):
+        t = _exact(rec.get("t"))
+        if isinstance(t, bool) or not isinstance(t, (int, Fraction)):
             raise TraceError(f"{where}: 't' must be a number (seconds)")
         if abs(t) > MAX_T or not math.isfinite(t):
             raise TraceError(f"{where}: 't' must be a finite number of at most "
                              f"2**53 in absolute value")
         prev_t = self.prev_t
         if prev_t is not None and t < prev_t:
-            raise TraceError(f"{where}: time {t:g} is before the previous observation ({prev_t:g})")
+            raise TraceError(f"{where}: time {_fmt_t(t)} is before the previous observation "
+                             f"({_fmt_t(prev_t)})")
         first = not trace.observations
         for key in ("bindings", "request"):
             if key in rec:
@@ -705,7 +782,7 @@ class _TraceReader:
             if not isinstance(args, list):
                 raise TraceError(f"{where}: 'args' of a message must be a list")
             msgs.append({"from": _canon_actor(m["from"]), "to": _canon_actor(m["to"]),
-                         "name": m["name"].strip(), "args": args})
+                         "name": m["name"].strip(), "args": _exact(args)})
         if "state" in rec and not isinstance(rec["state"], str):
             raise TraceError(f"{where}: 'state' must be a string")
         end = rec.get("end")
@@ -718,14 +795,14 @@ class _TraceReader:
         self.prev_t = t
         for key in ("bindings", "request"):
             if key in rec:
-                setattr(trace, key, rec[key])
+                setattr(trace, key, _exact(rec[key]))
         for k, v in values.items():
-            self.snapshot[_canon_actor(k)] = v
+            self.snapshot[_canon_actor(k)] = _exact(v)
         before = self.state
         if "state" in rec:
             self.state = rec["state"]
         obs = Observation(
-            t=float(t), values=dict(self.snapshot), messages=msgs,
+            t=Fraction(t), values=dict(self.snapshot), messages=msgs,
             state=before, state_after=self.state, end=end, amend=amend,
         )
         trace.observations.append(obs)
@@ -758,8 +835,8 @@ def load_trace(path) -> Trace:
         return parse_trace(f, path=str(path))
 
 
-def _fmt_t(t: float | None) -> str:
-    return "-" if t is None else f"{t:g}"
+def _fmt_t(t: Any) -> str:
+    return "-" if t is None else f"{float(t):g}"
 
 
 def _fmt_d(ms: int | None) -> str:
@@ -936,8 +1013,10 @@ class _Evaluator:
         v = self.value(idx, k, k)
         if v is UNKNOWN or v is UNDECIDED:
             return f"{ref.name}[?]", False
-        if isinstance(v, float) and v.is_integer():
+        if _integral(v):
             v = int(v)
+        elif isinstance(v, Fraction):
+            v = float(v)
         return f"{ref.name}[{v}]", True
 
     def _lookup(self, key: str, k: int, stripped: str | None = None) -> Any:
@@ -968,10 +1047,12 @@ class _Evaluator:
 
     def value(self, expr: Any, k: int, n: int) -> Any:
         """The value of `expr` at observation k, given observations 0..n."""
-        if isinstance(expr, (IntLiteral, FloatLiteral, BoolLiteral, StringLiteral)):
+        if isinstance(expr, FloatLiteral):
+            return _literal_number(expr)
+        if isinstance(expr, (IntLiteral, BoolLiteral, StringLiteral)):
             return expr.value
         if isinstance(expr, DurationLiteral):
-            return expr.value * _UNIT_SECONDS.get(expr.unit, 1.0)
+            return _duration(expr)
         if isinstance(expr, ActorRef):
             if expr.index is None:
                 return self._name(expr.name, k)
@@ -1029,9 +1110,9 @@ class _Evaluator:
             return v
         if isinstance(v, _Sym):
             return self._no_value(v)
-        if isinstance(v, (int, float)):
+        if isinstance(v, _NUMBER):
             return bool(v)
-        self.warn(f"the value {v!r} is used as a condition but is not a boolean")
+        self.warn(f"the value {_show(v)} is used as a condition but is not a boolean")
         return UNKNOWN
 
     def _binary(self, expr: BinaryOp, k: int, n: int) -> Any:
@@ -1103,9 +1184,9 @@ class _Evaluator:
             if op == "*":
                 return left * right
             if op == "/":
-                return left / right
+                return Fraction(left) / right
         except (TypeError, ZeroDivisionError):
-            self.warn(f"'{op}' cannot be applied to {left!r} and {right!r}; the predicate does not hold")
+            self.warn(f"'{op}' cannot be applied to {_show(left)} and {_show(right)}; the predicate does not hold")
             return UNKNOWN
         raise _NotEvaluable(f"the operator {op} is not evaluable")
 
@@ -1138,7 +1219,7 @@ class _Evaluator:
         if start < 0:
             for group, var in self.bound_refs:
                 v = self.bindings.get(var)
-                if isinstance(v, float) and v.is_integer():
+                if _integral(v):
                     v = int(v)
                 if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
                     found.setdefault(group, set()).add(v)
@@ -1162,12 +1243,12 @@ class _Evaluator:
             v = self._name(name, k)
         finally:
             self._scope = scope
-        if isinstance(v, float) and v.is_integer():
+        if _integral(v):
             v = int(v)
         if isinstance(v, int) and not isinstance(v, bool):
             return v
         if not isinstance(v, (_Marker, _Sym)):
-            self.warn(f"the bound '{name}' has the value {v!r}, which is not an integer; "
+            self.warn(f"the bound '{name}' has the value {_show(v)}, which is not an integer; "
                       f"it is treated as a bound without a value")
         return None
 
@@ -1309,15 +1390,15 @@ class _Evaluator:
             v = self._with(comp.variable, (group, index),
                            lambda: self.value(comp.element, k, n))
             if name == "count":
-                if not isinstance(v, (_Marker, bool, int, float)) or isinstance(v, _Sym):
+                if not isinstance(v, (_Marker, bool) + _NUMBER) or isinstance(v, _Sym):
                     invalid = True
                 v = self.truth(v, comp.element)
             elif isinstance(v, _Sym):
                 invalid = True
                 v = self._no_value(v)
             elif not isinstance(v, _Marker) and (isinstance(v, bool)
-                                                  or not isinstance(v, (int, float))):
-                self.warn(f"{name}() of the value {v!r}, which is not a number; "
+                                                  or not isinstance(v, _NUMBER)):
+                self.warn(f"{name}() of the value {_show(v)}, which is not a number; "
                           f"the predicate does not hold")
                 invalid = True
                 v = UNKNOWN
@@ -1357,7 +1438,7 @@ class _Evaluator:
             return min(vals)
         if name == "max":
             return max(vals)
-        return sum(vals) / len(vals)
+        return Fraction(sum(vals)) / len(vals)
 
     def _monotone(self, expr: BinaryOp, k: int, n: int) -> Any:
         """A comparison of `count`, `min` or `max` of a comprehension with
@@ -1381,7 +1462,7 @@ class _Evaluator:
         if group is None and not closed:
             return None                     # a range whose bound has no value
         b = self.value(other, k, n)
-        if isinstance(b, bool) or not isinstance(b, (int, float)):
+        if isinstance(b, bool) or not isinstance(b, _NUMBER):
             return None
         vals, markers, invalid = self._elements(call.name, comp, group, members, k, n)
         if invalid or any(m is UNDECIDED for m in markers) or (closed and not markers):
@@ -1402,7 +1483,7 @@ class _Evaluator:
     def _window(self, k: int, n: int, d: float) -> tuple[range, bool]:
         """The observations of [t_k, t_k + d] among 0..n, and whether the
         interval is known to be over (an observation after it exists)."""
-        limit = self.obs[k].t + d + _EPS
+        limit = self.obs[k].t + d
         j = k
         while j <= n and self.obs[j].t <= limit:
             j += 1
@@ -1583,7 +1664,7 @@ class _NormInst:
         self.trigger = _Term(d.trigger, events, ev) if d.trigger else None
         self.until = _Term(d.until, events, ev) if d.until else None
         self.content = _Term(d.content, events, ev, temporal=True)
-        self.deadline = None if d.deadline_ms is None else d.deadline_ms / 1000.0
+        self.deadline = None if d.deadline_ms is None else _exact(d.deadline_ms) / Fraction(1000)
         self.frozen: str | None = None
         for key, term in (("trigger", self.trigger), ("until", self.until), ("content", self.content)):
             if term is not None and term.error and not self.frozen:
@@ -1591,7 +1672,7 @@ class _NormInst:
         self.activated_at: float | None = None
         self.activated_index: int | None = None
         self.active_since: float | None = None
-        self.elapsed_before = 0.0          # active time before the current stretch
+        self.elapsed_before: Any = 0       # active time before the current stretch
         self.judge_from = 0
         self.candidates: list[int] = []    # observations whose content is undecided
         self.time: float | None = None
@@ -1834,7 +1915,7 @@ class _Engine:
                                    f"to {_fmt_d(nd.deadline_ms)}")
                 elapsed = inst.elapsed(t)
                 if (nd.kind == "obligation" and inst.deadline is not None and not inst.frozen
-                        and elapsed > inst.deadline + _EPS):
+                        and elapsed > inst.deadline):
                     why = (f"the elapsed time of {_fmt_t(elapsed)}s exceeds the new deadline "
                            f"of {_fmt_t(inst.deadline)}s")
                     self._set(inst, n, "violated", f"amendment: {why}", log=False)
@@ -1866,7 +1947,7 @@ class _Engine:
             else:
                 effect(o.d.id, "transform", state, "discharged", f"transformed to {target}")
                 timed = x.d.kind in ("obligation", "prohibition")
-                x.elapsed_before = elapsed if timed else 0.0
+                x.elapsed_before = elapsed if timed else 0
                 self._set(x, n, "active", f"amendment: transformed from {o.d.id}", log=False)
                 note = f" with {_fmt_t(elapsed)}s already elapsed" if timed else ""
                 effect(target, "activated", "inactive", "active",
@@ -2102,7 +2183,7 @@ class _Engine:
             kind = norm.d.kind
             if norm.state == "active" and kind in ("obligation", "prohibition"):
                 elapsed = norm.elapsed(t)
-                open_ = norm.deadline is None or elapsed <= norm.deadline + _EPS
+                open_ = norm.deadline is None or elapsed <= norm.deadline
                 if open_:
                     norm.candidates.append(n)
                 hit = None
@@ -2198,7 +2279,7 @@ class _Engine:
                 if norm.deadline is None:
                     self._set(norm, n, "violated", f"{why} without the content")
                     late.append(norm)
-                elif norm.elapsed(t) <= norm.deadline + _EPS:
+                elif norm.elapsed(t) <= norm.deadline:
                     self._set(norm, n, "discharged", f"{why} before the deadline")
                 else:
                     self._set(norm, n, "violated", f"{why} after the deadline without the content")
@@ -2276,7 +2357,7 @@ class _Engine:
         } for i in self.items["guarantee"]]
         failed = ([n["id"] for n in norms if n["verdict"] == "violated"]
                   + [f"guarantee {g['index']}" for g in guarantees if g["verdict"] == "violated"])
-        return {
+        return _plain({
             "contract": self.contract.id,
             "norms_version": "0.1",
             "trace": self.trace.path,
@@ -2300,7 +2381,7 @@ class _Engine:
             "warnings": self.warnings,
             "violated": failed,
             "ok": not failed,
-        }
+        })
 
 
 def select_contract(sos: SoSDefinition, contract_id: str | None = None,

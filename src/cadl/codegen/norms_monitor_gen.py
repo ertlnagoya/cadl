@@ -139,6 +139,8 @@ import math
 import re
 import sys
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any, Iterator, Union
 '''
 

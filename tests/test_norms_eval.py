@@ -1544,3 +1544,69 @@ class TestSymbolicUpperBound:
         assert trace.observations[1].t == 1700000000001.5
         with pytest.raises(TraceError, match="at most"):
             parse_trace(['{"t": 9007199254740994}'])
+
+
+# === Exact numbers and times (F.5) ===============================================
+
+_EXACT = """\
+sos:
+  name: Exact
+  extensions:
+    - norms: 0.1
+  actors:
+    - {id: A, role: a}
+    - {id: B, role: b}
+  contracts:
+    - id: C
+      parties: [A, B]
+      guarantee:
+        - "A.x + A.y == 0.3"
+        - "within(100ms, A.z == 1)"
+      norms:
+        - id: o
+          kind: obligation
+          bearer: A
+          trigger: "A -> B : req"
+          content: "A -> B : ack"
+          deadline: 100ms
+"""
+
+
+class TestExactNumbers:
+    """A number of a trace is the decimal it is written as, times are
+    compared without tolerance, and arithmetic is exact: 0.1 + 0.2 == 0.3,
+    and epoch seconds with milliseconds compare exactly."""
+
+    def _run(self, *records):
+        return evaluate(parse(_EXACT), parse_trace([json.dumps(r) for r in records]))
+
+    def test_sum_of_decimals(self):
+        r = self._run({"t": 0, "values": {"A.x": 0.1, "A.y": 0.2}}, {"t": 1, "end": True})
+        assert r["guarantees"][0]["verdict"] == "fulfilled"
+
+    def test_epoch_milliseconds_at_the_deadline_are_in_time(self):
+        msg = {"from": "A", "to": "B"}
+        r = self._run({"t": 1700000000.1, "messages": [dict(msg, name="req")]},
+                      {"t": 1700000000.2, "values": {"A.z": 1},
+                       "messages": [dict(msg, name="ack")]})
+        assert [n["state"] for n in r["norms"]] == ["fulfilled"]
+        assert r["guarantees"][1]["verdict"] == "fulfilled"
+        assert r["norms"][0]["time"] == 1700000000.2       # written as a float
+
+    def test_one_microsecond_after_the_deadline_is_late(self):
+        """Written in the trace with more digits than a float near 1.7e9
+        holds (its spacing there is 2.4e-7 s)."""
+        m = '"messages": [{"from": "A", "to": "B", "name": "%s"}]'
+        lines = ['{"t": 1700000000.1, %s}' % (m % "req"),
+                 '{"t": 1700000000.2000001, %s}' % (m % "ack")]
+        r = evaluate(parse(_EXACT), parse_trace(lines))
+        assert [n["state"] for n in r["norms"]] == ["violated"]
+        lines[1] = lines[1].replace("2000001", "2000000")
+        r = evaluate(parse(_EXACT), parse_trace(lines))
+        assert [n["state"] for n in r["norms"]] == ["fulfilled"]
+
+    def test_digits_beyond_a_float_are_kept(self):
+        lines = ['{"t": 0, "values": {"A.x": 0.10000000000000000001, "A.y": 0.2}}',
+                 '{"t": 1, "end": true}']
+        r = evaluate(parse(_EXACT), parse_trace(lines))
+        assert r["guarantees"][0]["verdict"] == "violated"

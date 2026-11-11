@@ -86,7 +86,7 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
     ir_of = build_ir
     if target == "opa":
         from .opa.norms_monitor_rego import generate_norms_monitor_rego as gen
-        from .opa.norms_monitor_rego import monitor_filename
+        from .opa.norms_monitor_rego import monitor_filename, rego_ir as ir_of
     else:
         from .solidity.norms_monitor_sol import generate_norms_monitor_sol as gen
         from .solidity.norms_monitor_sol import monitor_name, solidity_ir as ir_of
