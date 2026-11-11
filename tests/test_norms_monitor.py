@@ -38,6 +38,8 @@ EXAMPLE = EXAMPLES / "norms_robot_delivery.cadl"
 V1 = EXAMPLES / "norms_amendment_v1.cadl"
 V2 = EXAMPLES / "norms_amendment_v2.cadl"
 RICH = Path(__file__).parent / "data" / "norms_monitor_rich.cadl"
+QUANT = Path(__file__).parent / "data" / "norms_monitor_quant.cadl"
+QUANT_V2 = Path(__file__).parent / "data" / "norms_monitor_quant_v2.cadl"
 
 # Runs in a process started with -I -S: no site-packages, no PYTHONPATH, no
 # current directory, so cadl (and lark, yaml, z3) cannot be imported.
@@ -505,6 +507,24 @@ _RICH = {
 }
 
 
+# Quantifiers over S[1..N]: members named late or never, N given late or never.
+_QUANT = {
+    "bindings": {"i": 2},
+    "messages": [
+        ("D", "S[1]", "assign", None), ("D", "S[2]", "assign", None),
+        ("D", "S[5]", "assign", None), ("S[2]", "D", "ack", None),
+        ("S[5]", "D", "ack", None), ("D", "S[2]", "release", None),
+    ],
+    "values": {
+        "D.up": [True, True, True, False],
+        "S[1].job": [0, 7, 7, None], "S[2].job": [0, 0, 7, None],
+        "S[3].job": [0, 7], "S[5].job": [0, 7], "S[2].load": [1, 5, 9, None],
+        "S[3].load": [1, 5, 9], "N": [3, 5, 6, None],
+    },
+    "states": ["Open", "Open", "Closed"],
+}
+
+
 def _random_trace(rng: random.Random, vocab: dict, amend: str | None = None) -> list:
     """One trace: random messages in random order, time steps around the
     deadlines, values that appear late or become null, state changes, and
@@ -582,6 +602,8 @@ RANDOM_SETS = [
     ("robot_delivery", EXAMPLE, _ROBOT, None, 400, 20261111),
     ("amendment", V1, _ROBOT, V2, 400, 20261112),
     ("rich", RICH, _RICH, None, 700, 20261113),
+    ("quantifiers", QUANT, _QUANT, None, 300, 20261115),
+    ("quantifiers_amended", QUANT, _QUANT, QUANT_V2, 200, 20261116),
 ]
 
 

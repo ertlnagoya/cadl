@@ -8,7 +8,7 @@ Checks performed (per spec §6.2.2):
    them with the actual message exchanges is planned, not implemented)
 5. Institutional parameter range constraints (0 <= alpha, beta, lambda <= 1)
 6. SoS-DSL static semantics, rules L-1 to M-3 (Appendix E §E.4)
-7. Norms static semantics, rules N-1 to N-12 (Appendix F §F.7), when the
+7. Norms static semantics, rules N-1 to N-14 (Appendix F §F.7), when the
    file declares `norms: 0.1`
 8. Agent governance static semantics, rules G-1 to G-19 (Appendix G §G.9),
    when the file declares `agents: 0.1` (which requires `norms: 0.1`)
@@ -106,6 +106,150 @@ class TypeCheckResult:
         self.infos.append(TypeError(message=message, loc=loc, severity="info"))
 
 
+def _trigger_is_content(contract: ContractDef, norm, actors: dict | None = None) -> bool:
+    """N-13 (best effort): whether every occurrence of the message-event
+    trigger of a norm is also an occurrence of its content: a message
+    event with the same name, arguments equal by value when the content
+    has any, and actor references that match every actor those of the
+    trigger match; or an institutional event that a `counts_as:` rule
+    without `if:` creates from such a message. `actors` maps a set name to
+    its integer bounds (lo, hi), or None for a symbolic bound."""
+    from .agents import parse_message_event
+    events = {r.creates for r in contract.counts_as if r.creates}
+    if not norm.trigger or norm.trigger.strip() in events:
+        return False
+    try:
+        trig = parse_message_event(norm.trigger)
+    except Exception:
+        return False
+    if trig is None or trig.name is None:
+        return False
+    content = norm.content.strip()
+    if content in events:
+        whens = [r.when for r in contract.counts_as
+                 if r.creates == content and not r.if_ and r.when]
+    else:
+        whens = [content]
+    for text in whens:
+        try:
+            cont = parse_message_event(text)
+        except Exception:
+            continue
+        if cont is not None and _covers(trig, cont, actors or {}):
+            return True
+    return False
+
+
+def _covers(trig, cont, actors: dict) -> bool:
+    if cont.name is None or trig.name != cont.name:
+        return False
+    if cont.has_args and _message_args(cont.text) != _message_args(trig.text):
+        return False
+    for t, c in ((trig.sender, cont.sender), (trig.receiver, cont.receiver)):
+        if not _ref_covers(c, t, actors):
+            return False
+    return True
+
+
+def _ref_covers(c: dict, t: dict, actors: dict) -> bool:
+    """Whether the reference `c` matches every actor that `t` matches."""
+    if c["name"] != t["name"]:
+        return False
+    if c["kind"] == "plain" or t["kind"] == "plain":
+        return c["kind"] == t["kind"]
+    if c["kind"] == "all":
+        return True
+    if c["kind"] == "var":
+        return t["kind"] == "var" and c["var"] == t["var"]
+    bounds = actors.get(t["name"])
+    if t["kind"] == "index":
+        lo = hi = t["index"]
+    elif t["kind"] == "range":
+        lo, hi = t["lo"], t["hi"]
+    elif bounds is not None:            # A[i] or A[*]: the whole declared set
+        lo, hi = bounds
+    else:
+        return False
+    if c["kind"] == "index":
+        return lo == hi == c["index"]
+    return c["lo"] <= lo and hi <= c["hi"]
+
+
+def _message_args(text: str):
+    """The arguments of a message event: their values when they are
+    literals (so `go(1)` equals `go(1.0)`), else their text."""
+    raw = text.split(":", 1)[1] if ":" in text else ""
+    try:
+        from .parser import parse_expr
+        call = parse_expr(raw.strip())
+        if isinstance(call, FunctionCall):
+            vals = []
+            for a in call.args:
+                v = getattr(a, "value", None)
+                if v is None or isinstance(a, DurationLiteral):
+                    raise ValueError
+                vals.append(("b", v) if isinstance(v, bool) else ("v", v))
+            return tuple(vals)
+    except Exception:
+        pass
+    return re.sub(r"\s+", "", raw)
+
+
+def _symbolic_bound_shadows(sos: SoSDefinition, contract: ContractDef) -> list:
+    """(variable, where) of the quantifiers and comprehensions of a
+    contract whose variable has the name of a symbolic bound of a
+    declared set (N-14)."""
+    from .ast_nodes import StringLiteral
+    from .parser import parse_rule
+    names = set()
+    for a in sos.actors:
+        if isinstance(a.id.index, RangeExpr):
+            for b in (a.id.index.start, a.id.index.end):
+                if isinstance(b, str):
+                    names.add(b)
+    if not names:
+        return []
+    exprs = []
+    for d in contract.norms:
+        for key in ("trigger", "until", "content"):
+            text = getattr(d, key)
+            if text and "->" not in text:
+                exprs.append((f"{key}: of norm '{d.id}'", text))
+    for r in contract.counts_as:
+        for key, text in (("when", r.when), ("if", r.if_)):
+            if text and "->" not in text:
+                exprs.append((f"{key}: of the counts_as rule creating '{r.creates}'", text))
+    for key in ("assume", "guarantee"):
+        for e in getattr(contract, key):
+            exprs.append((f"{key}: item", e))
+    out = []
+
+    def walk(node, where):
+        if isinstance(node, (QuantifiedExpr, Comprehension)) and node.variable in names:
+            out.append((node.variable, where))
+        if isinstance(node, list):
+            for x in node:
+                walk(x, where)
+        elif hasattr(node, "__dataclass_fields__"):
+            for f in node.__dataclass_fields__:
+                if f != "loc":
+                    walk(getattr(node, f), where)
+
+    for where, e in exprs:
+        if isinstance(e, str):
+            try:
+                e = parse_rule(e)
+            except Exception:
+                continue
+        elif isinstance(e, StringLiteral):
+            try:
+                e = parse_rule(e.value)
+            except Exception:
+                continue
+        walk(e, where)
+    return out
+
+
 class TypeChecker:
     """Performs semantic validation on a CADL AST."""
 
@@ -127,6 +271,7 @@ class TypeChecker:
         from .norms import norms_declared
         self.result = TypeCheckResult()
         self.norms_declared = norms_declared(sos)
+        self._norms_sos = sos
         self._check_agents_declaration(sos)
         self._collect_definitions(sos)
         self._check_actors(sos)
@@ -986,6 +1131,33 @@ class TypeChecker:
                         f"the two conflict (N-12)",
                         perm.loc,
                     )
+
+        # N-13: a prohibition that its own trigger violates.
+        sos = getattr(self, "_norms_sos", None)
+        bounds = {}
+        for a in (sos.actors if sos is not None else []):
+            idx = a.id.index
+            if isinstance(idx, RangeExpr) and isinstance(idx.start, int) \
+                    and isinstance(idx.end, int):
+                bounds[a.id.name] = (idx.start, idx.end)
+        for proh in contract.norms:
+            if proh.kind == "prohibition" and _trigger_is_content(contract, proh, bounds):
+                self.result.add_warning(
+                    f"The trigger: of the prohibition '{proh.id}' of {ctx} is also an "
+                    f"occurrence of its content:, so the prohibition is violated at the "
+                    f"observation that activates it (N-13)",
+                    proh.loc,
+                )
+
+        # N-14: a variable that has the name of a symbolic bound.
+        if sos is not None:
+            for var, where in _symbolic_bound_shadows(sos, contract):
+                self.result.add_warning(
+                    f"The variable '{var}' of a quantifier or comprehension in the {where} "
+                    f"of {ctx} has the name of a symbolic bound of a declared set; the "
+                    f"bound keeps its own value inside the quantifier (N-14)",
+                    contract.loc,
+                )
 
     # --- Agent governance extension (Appendix G, G.9) ---
 

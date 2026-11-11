@@ -389,6 +389,8 @@ class NormsMonitor:
             parts = [expr.left, expr.right]
         elif isinstance(expr, UnaryOp):
             parts = [expr.operand]
+        elif isinstance(expr, QuantifiedExpr):
+            parts = [expr.predicate]
         spans = [cls._span(eng, p) for p in parts] or [(0.0, 0)]
         return max(s[0] for s in spans), max(s[1] for s in spans)
 

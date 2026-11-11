@@ -7,6 +7,41 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Quantified predicates and aggregates in the dynamic semantics of the
+  norms extension (Appendix F, F.5, "Quantifiers and aggregates"):
+  `cadl norms-eval`, the generated `norms_monitor.py` and `cadl
+  agents-run` evaluate `exists x in D: p`, `for all x in D: p` and
+  `sum` / `count` / `min` / `max` / `avg` of a comprehension. Up to
+  0.3.22 a norm that used one was reported as not evaluable and never
+  judged. The domain is a declared set (`A`, `A[*]`, `A[lo..hi]`, for a
+  comprehension also `lo..hi`), and the variable is the index of a
+  member. With integer bounds the domain is closed (Kleene's logic). A
+  symbolic bound has a value when the instance binds it or it is a
+  quantity with an integer value at that observation; otherwise the
+  domain is open, its known members are those the instance has named so
+  far, `exists` is true only by a known witness, `for all` false only by
+  a known counterexample, and every other value and every aggregate is
+  undefined. The value at an observation depends only on the prefix up
+  to it. In the agent runtime an undefined quantified `trigger:` or
+  `until:` is missing data (G.5); the limit of G.13 that a prohibition
+  with a quantified trigger always applies is gone for quantifiers. A
+  wildcard or range reference outside a domain (`ROBOT[*].battery > 10`)
+  is still not evaluated. A closed domain is enumerated up to 10 000
+  members (`MAX_DOMAIN`); a larger one, which a single value of `N` in a
+  trace could ask for, is evaluated as an open domain with a warning. A
+  domain stays open while a member beyond the value of its bound has
+  been named (F.3 makes it a member). A quantifier variable never hides
+  a declared symbolic bound, and a reference such as `R[j+1]` with an
+  index outside the set is undefined.
+- `examples/norms_no_double_assignment.cadl` with three traces: the same
+  delivery must not be assigned to two robots at once.
+- `cadl check` warns about a prohibition whose message `trigger:` is
+  also an occurrence of its message `content:`, which violates it at the
+  observation that activates it (N-13; also through an institutional
+  event that a counts_as rule creates from the trigger message, and
+  with arguments compared by value), and about a quantifier or
+  comprehension variable named like a symbolic bound of a declared set
+  (N-14).
 - **Strategic model extension (`games` 0.1, Appendix I).** A file that
   declares `stochastic: 0.1` and `games: 0.1` may give its `model:` block
   `kind: smg`: a turn-based stochastic game on the model of Appendix H,
