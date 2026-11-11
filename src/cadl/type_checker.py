@@ -10,7 +10,7 @@ Checks performed (per spec §6.2.2):
 6. SoS-DSL static semantics, rules L-1 to M-3 (Appendix E §E.4)
 7. Norms static semantics, rules N-1 to N-12 (Appendix F §F.7), when the
    file declares `norms: 0.1`
-8. Agent governance static semantics, rules G-1 to G-16 (Appendix G §G.9),
+8. Agent governance static semantics, rules G-1 to G-19 (Appendix G §G.9),
    when the file declares `agents: 0.1` (which requires `norms: 0.1`)
 9. Stochastic model static semantics, rules S-1 to S-15 (Appendix H §H.10),
    when the file declares `stochastic: 0.1`
@@ -109,6 +109,7 @@ class TypeChecker:
     def __init__(self) -> None:
         self.result = TypeCheckResult()
         self.actor_names: set[str] = set()
+        self.sos_actors: list = []
         self.contract_ids: set[str] = set()
         self.protocol_ids: set[str] = set()
         self.norms_declared = False
@@ -1003,6 +1004,7 @@ class TypeChecker:
     def _check_agent_actors(self, sos: SoSDefinition) -> None:
         """G-2 and G-3: the `agent:` binding of an actor."""
         from .agents import AGENT_KINDS, is_hyphen_name
+        self.sos_actors = list(sos.actors)
         self.agent_kinds = {
             a.id.name: a.agent.kind for a in sos.actors if a.agent is not None
         }
@@ -1110,7 +1112,7 @@ class TypeChecker:
                 )
 
     def _check_agent_contract(self, contract: ContractDef, ctx: str) -> None:
-        """G-4 to G-16 for one contract."""
+        """G-4 to G-19 for one contract."""
         from .agents import (
             ENFORCEMENT_DEFAULTS, ENFORCEMENT_POINTS, HOLD_EVENTS,
             norm_message, parse_message_event, parse_ref, ref_text,
@@ -1356,6 +1358,7 @@ class TypeChecker:
 
         if not enforced:
             return
+        self._check_event_parties(contract, ctx, events)
         permissions = [c for c in covering if c[0] == "permission"]
         prohibitions = [c for c in covering if c[0] == "prohibition"]
 
@@ -1423,6 +1426,145 @@ class TypeChecker:
                         f"'{m.text}', the when: of the rule that creates "
                         f"'{rule.creates}', so it would be denied (G-16)", loc,
                     )
+
+    def _check_event_parties(self, contract: ContractDef, ctx: str, events: set[str]) -> None:
+        """G-17 and G-18: an instance of an enforced contract observes a
+        message only when the contract governs it (G.5), so a message event
+        of the contract that a non-party could send or receive would never
+        occur; and an index that no party binds has no value the file
+        accounts for."""
+        from .agents import (
+            _actor_entry,
+            _party_ref,
+            parse_message_event,
+            parse_ref,
+            ref_covered,
+        )
+        try:
+            parties = [_party_ref(p) for p in contract.parties]
+        except Exception:
+            return
+        bound = {p["var"] for p in parties if p["kind"] == "var"}
+        actors = {a.id.name: _actor_entry(a) for a in self.sos_actors}
+
+        def unbound(ref: dict, what: str, loc) -> None:
+            """G-18: every index variable is the index of a party."""
+            if ref["kind"] == "var" and ref["var"] not in bound:
+                self.result.add_error(
+                    f"The index '{ref['var']}' of {what} in {ctx} is not bound by a "
+                    f"party of the contract (no party is written with [{ref['var']}]); "
+                    f"a contract instance binds only the indices of its parties (G-18)",
+                    loc,
+                )
+
+        def outside(ref: dict):
+            """A literal index or a range that leaves the declared set."""
+            decl = actors[ref["name"]]
+            if not decl["indexed"] or ref["kind"] not in ("index", "range"):
+                return False
+            lo = ref["index"] if ref["kind"] == "index" else ref["lo"]
+            hi = ref["index"] if ref["kind"] == "index" else ref["hi"]
+            return (decl["lo"] is not None and lo < decl["lo"]) or (
+                decl["bounded"] and hi > decl["hi"])
+
+        items = []      # where, text, location
+        for n in contract.norms:
+            for key in ("trigger", "until", "content"):
+                text = getattr(n, key)
+                if text and text.strip() not in events:
+                    items.append((f"{key}: of norm '{n.id}'", text, n.loc))
+            od = n.on_denied
+            texts = [("bearer:", n.bearer), ("counterparty:", n.counterparty),
+                     ("on_denied.escalate_to:", od.escalate_to if od else None),
+                     ("on_denied.notify:", od.notify if od else None)]
+            for key, text in texts:
+                if not text:
+                    continue
+                try:
+                    ref = parse_ref(text)
+                except Exception:
+                    continue
+                unbound(ref, f"'{ref['text']}', the {key} of norm '{n.id}'", n.loc)
+            fb = None
+            if od is not None and od.fallback:
+                try:
+                    fb = parse_message_event(od.fallback)
+                except Exception:
+                    fb = None
+            if fb is not None:
+                for ref in (fb.sender, fb.receiver):
+                    unbound(ref, f"'{ref['text']}' in on_denied.fallback: of norm "
+                                 f"'{n.id}'", n.loc)
+        for r in contract.counts_as:
+            items.append((f"when: of the counts_as rule that creates '{r.creates}'",
+                          r.when, r.loc))
+        for d in contract.delegations:
+            if d.until and d.until.strip() not in events:
+                items.append((f"until: of the delegation of '{d.norm}'", d.until, d.loc))
+        # G-19 (SHOULD): an event that a rule creates under an `if:` and that
+        # blocks. The message of the rule is a one-off: when it arrives
+        # while the `if:` has no value, the event is never created.
+        conditional = {r.creates for r in contract.counts_as if r.creates and r.if_}
+        for n in contract.norms:
+            for kind, key in (("prohibition", "trigger"), ("permission", "until")):
+                text = getattr(n, key)
+                if n.kind == kind and text and text.strip() in conditional:
+                    self.result.add_warning(
+                        f"The {key}: of the {kind} '{n.id}' in {ctx} is the institutional "
+                        f"event '{text.strip()}', which a counts_as rule creates only if "
+                        f"its if: holds; when the if: has no value at that moment the "
+                        f"event is not created and the boundary does not block (G-19)",
+                        n.loc,
+                    )
+
+        # G-18 for every expression of the contract: a free variable that is
+        # used as or inside an index, in a predicate or in the arguments of
+        # a message event, and that no party binds. A quantifier or a
+        # comprehension of the expression binds its own variable.
+        from .agents import contract_expressions, predicate_index_vars
+        for where, expr, is_predicate in contract_expressions(contract):
+            what = "predicate" if is_predicate else "arguments"
+            for var in sorted(predicate_index_vars(expr) - bound):
+                self.result.add_error(
+                    f"The index variable '{var}' in the {what} of the {where} in {ctx} "
+                    f"is not bound by a party of the contract (no party is written "
+                    f"with [{var}]), by a quantifier or by a comprehension; a contract "
+                    f"instance binds only the indices of its parties (G-18)",
+                    contract.loc,
+                )
+
+        for where, text, loc in items:
+            try:
+                m = parse_message_event(text)
+            except Exception:
+                m = None
+            if m is None:
+                continue
+            to_party_tool = (ref_covered(m.receiver, parties, actors)
+                             and self.agent_kinds.get(m.receiver["name"]) == "tool_server")
+            for role, ref in (("sender", m.sender), ("receiver", m.receiver)):
+                if ref["name"] not in actors:
+                    continue                    # reported by N-9
+                if outside(ref):
+                    self.result.add_error(
+                        f"The {role} '{ref['text']}' of the {where} in {ctx} names "
+                        f"actors outside the declared set '{ref['name']}'; for them "
+                        f"this message event could never occur (G-17)", loc,
+                    )
+                elif not ref_covered(ref, parties, actors):
+                    why = ("a tool call of an actor that is not a party is governed and "
+                           "is decided by the default and by the norms written for "
+                           "parties; a contract cannot make it the event of a norm"
+                           if role == "sender" and to_party_tool else
+                           "an enforced contract observes only the messages it governs, "
+                           "so this message event could never occur")
+                    self.result.add_error(
+                        f"The {role} '{ref['text']}' of the {where} in {ctx} is not "
+                        f"covered by one reference in the parties of the contract; "
+                        f"{why} (G-17)", loc,
+                    )
+                else:
+                    unbound(ref, f"the {role} '{ref['text']}' of the {where}", loc)
 
     def _check_delegations(
         self, contract: ContractDef, ctx: str, events: set[str], norm_ids: set[str],

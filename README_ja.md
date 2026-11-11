@@ -156,8 +156,10 @@ cadl codegen examples/robot_delivery.cadl --target opa -o /tmp/rego_out
 cadl codegen examples/sos_dsl_robot_delivery.cadl --target unity-csharp -o /tmp/unity_out
 
 # エージェントガバナンス拡張（agents 0.1）：境界で1通のメッセージを判定し、
+# 記録済みのメッセージ列を再生し（保留、委任、監査記録）、
 # 境界ポリシーをRegoまたはCedarとして生成
 cadl agents-decide examples/agents_tool_governance.cadl --input examples/agents_inputs/delete_file.json
+cadl agents-run examples/agents_tool_governance.cadl --trace examples/traces/agents_tool_governance_a_approved.jsonl
 cadl codegen examples/agents_tool_governance.cadl --target agent-rego -o /tmp/agent_rego
 cadl codegen examples/agents_tool_governance.cadl --target agent-cedar -o /tmp/agent_cedar
 
@@ -288,7 +290,98 @@ notify:      OPERATOR
 
 入力はJSONオブジェクトで、`message`（`from`・`to`・`name`）と、省略可能な `now`、`instances`（動作中の契約インスタンスごとの `bindings`、静的でない規範の発効フラグ `in_force`、有効な派生インスタンス `derived` とそのチェーン）を持ちます。`examples/agents_inputs/` に付録のサンプル呼び出しがあります。終了ステータスは `allow` が0、`deny` が1、`escalate` が3、使い方の誤りが2です。執行対象の契約の当事者であるツールサーバ宛てのメッセージは、送信者が誰であっても統治されます。当事者でないアクターや未定義のアクターからのツール呼び出しは、ツールの既定によって拒否されます。照合は3値で、不明はフェイルクローズに解決します。不明な禁止は適用され、不明な許可は適用されません。
 
-このコマンドは状態を持ちません。保留とその解放・期限切れ（G.6）、付与・チェーン・取り消し（G.7）、監査記録（G.8）は実装していません。これらの状態はホスト側のランタイムが保持し、発効フラグと有効な派生インスタンスを入力として渡します。
+このコマンドは状態を持ちません。発効フラグと有効な派生インスタンスは入力として渡します。その状態を保持し、記録済みトレースの各メッセージに同じ判定関数を適用するのが、次の `cadl agents-run` です。
+
+#### 記録済みトレースに対するランタイム
+
+`cadl agents-run` は付録（G.5〜G.8）のランタイムの参照実装です。記録済みのメッセージ列を、ファイル中のすべての執行対象の契約にわたる一つの論理的な判定点に通して再生し、各メッセージの判定、保留とその終わり方、委任の状態、監査記録を計算します。決定的でオフラインです。エージェントもツールも実行せず、時計はトレースの `t` だけです。
+
+```bash
+cadl agents-run examples/agents_tool_governance.cadl \
+    --trace examples/traces/agents_tool_governance_a_approved.jsonl
+cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl]
+```
+
+ランタイムは、トレースの順に、メッセージごとに次のことを行います。(a) 状態を導きます。静的でない規範の発効フラグは `cadl norms-eval` の判定エンジンから、有効な派生インスタンスはそれまでに見た付与と取り消しから、動作中の契約インスタンスとその束縛はトレースから得ます。(b) その状態から組み立てたポリシー入力に `cadl agents-decide` の判定関数を適用します。(c) 判定を適用します。許可したメッセージは、それを統治する契約のインスタンスにとって規範エンジンの観測になり、拒否したメッセージは観測になりません。`escalate` は保留を作ります（作った順に `h-1`、`h-2`、…）。(d) 監査記録を追記します。保留が終わるのは、承認者のメッセージが `counts_as:` 規則を通じて `approval` か `rejection` を作ったとき（保留のidは最初の引数。`approve("h-1")`）、タイムアウトが過ぎたとき、根拠の契約インスタンスが終了したか、その契約が改正されたときです。承認されたメッセージは、承認の時刻にもう一度判定し、拒否するものがなければ次の観測として解放します。解放したメッセージは、保留の根拠になった禁止に違反しません。この2回目の判定で、承認が許可と根拠の代わりになるのは、根拠の契約インスタンスの中だけです。それ以外で適用される禁止、終了した根拠の契約インスタンス、メッセージをもう許可しなくなった別の統治契約（委任の取り消し、インスタンスの終了、改正）は、解放を拒否します。ファイルは `norms: 0.1` と `agents: 0.1` を宣言し、`cadl check` に通る必要があります。終了ステータスは、判定の内容にかかわらずトレースを再生できれば0、使い方の誤りは2です。
+
+**トレース。** `cadl norms-eval` のJSON Lines形式（`t`、`bindings`、`request`、`values`、`messages`、`state`、`amend`、`end`。[トレースに対する規範の判定](#トレースに対する規範の判定)を参照）を、一つの契約インスタンスではなく判定点の全体について読み、キーを二つ追加します。
+
+```json
+{"t": 0, "quantities": [], "epoch": "2026-11-10T09:00:00Z", "messages": [{"from": "OPERATOR", "to": "PLANNER", "name": "grant_read"}]}
+{"t": 180, "messages": [{"from": "PLANNER", "to": "FILES", "name": "delete_file"}]}
+{"t": 220, "messages": [{"from": "OPERATOR", "to": "PLANNER", "name": "approve", "args": ["h-1"]}]}
+```
+
+| キー | 意味 |
+|---|---|
+| `epoch` | 先頭行のみ：`t = 0` の時刻（ISO 8601のタイムスタンプ）。指定すると、監査記録の時刻とポリシー入力の `now` はタイムスタンプになります。指定しなければ `t` の数値です |
+| `quantities` | 先頭行のみ：実行の量の名前のリスト（`["limit", "target"]`）。指定すると、ちょうどこれらの裸の名前が最初から量になります。値を持つ前にそれを読む述語は未定義です。指定しなければ、裸の名前は、値を与える最初の行から量になり、それより前は記号的な値です。これにより、どの判定も後の行に依存しません。そのような名前が、メッセージを判定した後で最初の値を得たとき、警告を出します。このキーを指定する書き方を推奨します。同梱の例のように、述語に裸の名前がない契約では `[]` を指定します。トレースは、先頭行で `values` の初期値も与えるべきです。禁止の `trigger:` や許可の `until:` が読む量に値がない間、メッセージは拒否またはエスカレーションされます（「読み方」を参照） |
+| `host_instances` | 先頭行のみ：ホストがインスタンスを作る契約のidのリスト。最初のインスタンスが後の行で作られる場合に使います（`["DELIVERY"]`）。契約がホストの作るインスタンスを持つかどうかは、先頭行で決まります |
+| `instances` | ホストが作る契約インスタンス。各項目は `contract` と `instance` を持ち、`bindings`、`request`、`state`、`"end": true` を持てます。新しいインスタンスを名指す項目は、その行でインスタンスを作ります。後の項目は、そのライフサイクルの `state` を設定するか、インスタンスを終了させます。先頭行が、ここで `default` 以外のインスタンスを名指さず、`host_instances` にも挙げない契約は、先頭行から最後まで、先頭行の `bindings` と `request` を持つ唯一のインスタンス `default` を持ちます。そのような契約のインスタンスを作る後の項目は、トレースの誤りです。どのインスタンスも、その契約の当事者の添字変数を束縛する必要があります（当事者 `ROBOT[i]` に対して `"bindings": {"i": 2}`）。そうでなければトレースを拒否します |
+| `t` | 絶対値が2**53以下の有限の数。エポック秒もエポックミリ秒も収まります。`NaN`、`Infinity`、それより大きい値はトレースの誤りです。`cadl norms-eval` でも同じです。ファイルの期間（`timeout:`、`deadline:`）は秒の単位で数えます。`epoch` を指定したときは、トレースのすべての時刻と保留のすべての期限が、ISO 8601のタイムスタンプで表せる時点でなければなりません。そうでなければ、行番号を示してトレースを拒否します |
+| `messages` | 書いた順に一つずつ判定します。`from` と `to` は具体的なアクター（`PLANNER`、`ROBOT[2]`）、`name` は識別子で、余分な空白なしで書きます（`"PLAN NER"` はトレースの誤りです） |
+| `state` | `lifecycle:` を持つ契約の動作中のすべてのインスタンスに適用します。`instances` の項目は一つのインスタンスに設定します。終端状態はインスタンスを終了させます |
+| `amend` | ファイルの新しい版。定義が変わった執行対象の契約を `cadl norms-eval` と同じように改正し、その契約の保留を取り消し、派生インスタンスを新しい版に照らして調べます（G.7）。執行対象の契約の集合は変えられません |
+| `end` | `true` は動作中のすべてのインスタンスを終了させます。最後の行も、`"end": false` と書かないかぎり同じです（その場合、保留中の保留は `held` のまま残ります）。その後の行のメッセージも判定し、記録します。終了したインスタンスは戻らないので、その契約のツール呼び出しは `no_instance` で拒否されます |
+
+一つの行は次の順に処理します。期限が `t` より前の保留を期限切れにします。インスタンスを作ります。行の時刻と `values`（および `amend`）を、メッセージを持たない一つの観測として処理します。これにより、過ぎた期限や期間を、メッセージを判定する前に確定させます。各メッセージを判定し、許可したメッセージを一つの観測にします。`state` の変更と `end` は、メッセージを持たない最後の観測になります。
+
+**出力。** テキストの報告は、監査ログ、保留、派生インスタンス、各契約インスタンスの規範の最終状態を示します。`--format json` は一つのオブジェクトを出力します。
+
+| キー | 内容 |
+|---|---|
+| `file`、`trace`、`agents_version`、`contracts` | 再生した対象と、執行対象の契約 |
+| `summary` | `messages`、`allow`、`deny`、`escalate`（メッセージの判定の件数）、`holds`（最終状態と `held` ごとの件数）、`released`、`audit_records` |
+| `audit[]` | 監査ログ（後述） |
+| `steps[]` | トレースのメッセージごと：`time`、`message`（`args` を含む）、`input`（ランタイムが組み立てたポリシー入力。`agents-decide` の入力と同じ形式）、`result`、`hold_id` |
+| `releases[]` | 承認された保留ごと：`time`、`hold_id`、`message`、`input`（承認の時点のポリシー入力）、`grounds`（`contract`、`norm`、`instance`）、`released` |
+| `holds[]` | `hold_id`、`state`（`held`、`approved`、`rejected`、`expired`、`cancelled`）、`message`、`time`、`approver`、`deadline`、`contracts`、`norms`、`closed`、`released`（メッセージが効果を生じたか） |
+| `delegations[]` | すべての派生インスタンス：`contract`、`instance`、`norm`、`holder`、`chain`、`state`（`active`、`discharged`）、`valid`、`granted`、`ended`、`end_reason` |
+| `instances[]` | 契約インスタンスごと：`contract`、`instance`、`bindings`、`running`、`start`、`end`、`state` と、規範エンジンによる `norms[]`（`norms-eval` と同じ項目に `in_force` を追加）、`violations[]`、`institutional_events[]`、`unauthorised[]`、`ok` |
+| `amendments[]`、`warnings[]` | 適用した改正（`time`、`file`、`contracts`）と警告 |
+
+**監査ログ。** `--audit OUT.jsonl` は、判定点が書いた順に、記録をJSON Linesとして出力します。同じファイルとトレースからは、常に同じバイト列が得られます。*判定の記録*はG.8の監査記録です。判定の結果（`decision`、`reason`、`contracts`、`norms`、`provenance`、`escalate_to`、`timeout`、`fallback`、`notify`）に、`time`、`message`（`from`、`to`、`name`）、`instances`（統治する契約の動作中のインスタンス。閉じる記録では、動作中かどうかにかかわらず、保留の根拠の契約インスタンス）、`hold_id`、`outcome` を加えたものです。`escalate` は同じ `hold_id` を持つ二つの記録になります。判定の記録と、保留を閉じる記録です。閉じる記録の `outcome` は保留の最終状態で、理由は `approved`、`rejected`、`expired`（`time` は期限）、`cancelled` のいずれか、または2回目の判定が拒否したときの拒否の理由です。*事象の記録*は `decision` の代わりに `event` を持ち、フィールドは `time`、`event`、`message`、`instances`、`norm`、`chain`、`holders`、`hold_id`、`reason` です。
+
+| `event` | 書くとき | `reason` |
+|---|---|---|
+| `grant` | 付与のメッセージを観測し、G.7の条件1〜4が成り立つとき。`chain` と `holders` は新しい派生インスタンスを示します | `null`。条件5により何もしない場合は `holder_exists` |
+| `revoke` | 取り消しのメッセージを観測したとき。`holders` は解除された保持者です | `null`、または `no_effect` |
+| `unauthorised_grant` | 付与のメッセージが条件1〜4のいずれかを満たさないとき | 最初に満たさなかった条件：`no_authority`、`not_in_to`、`in_chain`、`max_depth` |
+| `delegation_end` | 派生インスタンスが、取り消しのメッセージ以外の原因で終わったとき。インスタンスごとに一つの記録で、その `chain` と保持者を示します | `until`、`original_discharged`、`instance_end`、`amendment` |
+| `instance_start`、`instance_end` | 契約インスタンスが開始または終了したとき（`message` は `null`） | `null`。終了では `end` または `terminal_state` |
+| `amendment` | 新しい版が発効したとき。`instances` は、改正された契約の動作中のインスタンスです | トレースに書かれた新しい版の名前 |
+| `unauthorised_approval`、`unauthorised_rejection` | `approval` または `rejection` がどの保留も変えなかったとき | `unknown_hold`、`not_held`、`not_approver`、`other_instance`（根拠の契約インスタンスで作られていない） |
+| `unauthorised_act` | 規範エンジンが権限のない行為（F.5の7）を記録したとき | `no_power` |
+
+```json
+{"time": "2026-11-10T09:03:00Z", "message": {"from": "PLANNER", "to": "FILES", "name": "delete_file"}, "instances": [{"contract": "ASSISTED_REPORTING", "instance": "default"}], "decision": "escalate", "reason": "prohibition", "contracts": ["ASSISTED_REPORTING"], "norms": ["ASSISTED_REPORTING.no_delete"], "provenance": [], "escalate_to": "OPERATOR", "timeout": 600000, "fallback": ["PLANNER -> TICKETS : create_ticket"], "notify": ["OPERATOR"], "hold_id": "h-1", "outcome": null}
+{"time": "2026-11-10T09:03:40Z", "message": {"from": "PLANNER", "to": "FILES", "name": "delete_file"}, "instances": [{"contract": "ASSISTED_REPORTING", "instance": "default"}], "decision": "allow", "reason": "approved", "contracts": ["ASSISTED_REPORTING"], "norms": ["ASSISTED_REPORTING.no_delete"], "provenance": [], "escalate_to": "OPERATOR", "timeout": null, "fallback": [], "notify": [], "hold_id": "h-1", "outcome": "approved"}
+```
+
+監査ファイルは、トレースの全体を再生した後にだけ書きます。実行が失敗したときはファイルを書かず、エラーメッセージにその旨を示します。規範の発効フラグの変化には、それ自体の記録はありません。記録されたメッセージ、時刻、トレースの `values` から導けます。ログに完全性の保護（ハッシュの連鎖や署名）はありません。G.8はそれを求めていません。
+
+**読み方。** G.5〜G.8が選択の余地を残す箇所は、次のように読みます。
+
+- メッセージは、それを統治する執行対象の契約のインスタンスにとってだけ観測になります（G.5）。どの執行対象の契約も統治しないメッセージは `ungoverned` として許可され、どの契約の観測にもなりません。
+- 拒否または保留されたメッセージは観測になりません。規範エンジンはそのメッセージを見ないので、規範を発動させず、制度的事象を作らず、義務を履行させず、禁止に違反せず、付与・取り消し・承認・却下にもなりません。時間は進みます。どの行も、まずメッセージ抜きで観測します。
+- 行の時刻は、その行のメッセージを判定する前に観測します。したがって、その時刻のメッセージを判定するとき、期間が閉じた禁止はもう適用されず、期限が過ぎた義務はすでに `violated` です。
+- どの契約インスタンスも、その契約の当事者の添字変数を束縛します。インスタンス `default` は先頭行の `bindings` で、ホストが作るインスタンスはその項目の `bindings` で束縛します。束縛のないインスタンスと、当事者が名指す集合の要素の添字でない値を束縛するインスタンスは、トレースの誤りであり、契約、インスタンス、変数、値を示して拒否します。どの当事者も持たない変数の束縛は、警告を出して無視します。G-18とあわせて、`cadl agents-run` では、執行対象の契約の添字が束縛されないままになることはありません。
+- どの判定も、その時点までの行だけに依存します。トレースの接頭部分に対する判定は、トレースの全体に対する最初の判定と同じです。述語の中の裸の名前（`AG.mode == locked`）の読み方については、ランタイムは `cadl norms-eval` のように先を見ません。`quantities` がその名前を挙げないかぎり、`locked` は、ある行が値を与えるまで記号的な値です。インスタンスの終了より後のものは、その判定を変えません。
+- データの欠落は不明として扱い、固定はしません。未発効の禁止の述語 `trigger:` が、読む量に値がないために未定義である間、その禁止は適用されます。発効中の許可の述語 `until:` が未定義である間、その許可は適用されません。規範の状態は `cadl norms-eval` と同じです（未定義の述語は起こりません）。ポリシー入力の発効フラグを省くだけで、値が得られれば、フラグはただちに状態に従うものに戻ります。その `trigger:` や `until:` が、`counts_as:` ルールが述語の `when:` から作る制度的事象であり、そのルールの `when:` または `if:` が未定義である間も同じです。規範ごとに1回、その量を示して警告を出します。不明なフラグによる拒否も、理由はほかと同じ `prohibition` です。そのとき、`steps[].input` の `in_force` にそのフラグはありません。対象にならないものが二つあります。メッセージの `when:` と `if:` を持つルールは、そのメッセージの時点で事象を作るか、決して作らないかのどちらかです。`if:` に値がない間に届いたメッセージは何も作りません（そのような事象が禁止を発動させるか許可を終わらせる場合、`cadl check` が警告し（G-19）、実行時にも警告します）。また、述語の `trigger:` に値がない義務は発動されないので、その修復である禁止は生じません。許可の `until:` が未定義である間に送った付与は `unauthorised_grant` / `no_authority` になり、送り直す必要があります。
+- 束縛は、契約の中でその変数が添字として用いられるすべての宣言済みの集合（当事者 `W[i]` のほかにイベントの `SUP[i]` など）の要素の添字でなければなりません。
+- 限量子またはワイルドカード参照（`W[*].alarm`）を含む述語は、`cadl norms-eval` と同じく評価しません。`trigger:`・`until:`・`content:` がそのような述語である規範は判定されず、発効フラグは実行の全体で不明です。そのような禁止は常に適用され、そのような許可は決して適用されません。
+- 後の行のトレースの誤りは、何かを表示したり書いたりする前に報告します。それより前の行は、メモリ上で判定しただけです。
+- `cadl.agents_runtime.run` と `run_files` は、`cadl check` のエラーがあるファイル、またはそのようなファイルへの改正を拒否します。`run(..., check=False)` は、この検査と束縛の検査を止めます。これは安全でなく、次の項目のテストのためのものです。
+- 多層防御（`check=False` でだけ到達します）：束縛されていない添字に依存する発生や述語は不明であり、不明な発生は、メッセージを通す効果を決して持たず（許可を発動も再開もさせず、禁止を終了・停止・解除させず、制度的事象を作らず、権能を行使させず、義務を履行させません）、止める効果を常に持ちます（禁止を発動させ、許可と派生インスタンスを終わらせます）。
+- 保留の根拠は、契約インスタンスごとに保持します。`approval` または `rejection` が保留を閉じるのは、根拠の契約インスタンスで作られたときだけです。一つあれば足ります。同じメッセージが複数のインスタンスで事象を作っても、1回と数えます。
+- 理由が `rejected`、`expired`、`cancelled` の閉じる記録は、保留の `contracts`、`norms`、`escalate_to`、`fallback`、`notify` を保ちます。`timeout` は、どの閉じる記録でも `null` です。承認されたメッセージを2回目の判定が拒否したとき、記録はその拒否の結果を持ち、`outcome` は `approved` です。
+- 承認されたメッセージの2回目の判定が新しい保留を作ることはありません。エスカレーションになるはずの契約は拒否します。その記録は、拒否するすべての契約と、理由 `no_instance`、`prohibition`、`default` のうち最初のものを示します。
+- 委任の `until:` は、それが起こった時点で `active` の派生インスタンスを終わらせます。その後の付与は新しいインスタンスを作ります。
+- 違反した義務が `excused` になるのは、発動から期限（期限がなければ違反）までの間に、担い手による内容に一致するメッセージが、その義務の契約によって拒否されたか、その契約の根拠で保留されて解放されなかったときです。一致は境界での照合（送信者、受信者、名前）によります。
+- 違反の後も、禁止の期間の時計は、停止中は止まります。違反の前と同じです。
+- 改正は、二つの版で定義が異なる執行対象の契約に適用します。
+
+`examples/traces/` には `examples/agents_tool_governance.cadl` 用のトレースが三つあります。G.12の三つの呼び出し、すなわち委任の連鎖を通じた呼び出し、承認されるエスカレーション、取り消しの後の拒否（a）、却下と代替メッセージ、終了時に取り消される保留（b）、未宣言のツール、タイムアウト、遅れた承認（c）です。`examples/agents_change_control.cadl` は、トリガから `until:` までの間だけ発効する禁止と、`max_depth: 1` と `until:` を持つ委任の例です。そのトレースは、凍結中の承認・却下・期限切れ（a）と、深さの制限と委任の終了（b）を示します。
 
 ### 運用モード遷移の分析
 
@@ -414,11 +507,11 @@ cadl norms-eval FILE --trace TRACE [--contract ID] [--format text|json]
 
 | キー | 意味 |
 |---|---|
-| `t` | 秒単位の時刻（必須）。述語の `now` |
+| `t` | 絶対値が2**53以下の有限の数で、秒単位の時刻（必須）。述語の `now` |
 | `bindings` | 先頭行のみ。インスタンスが束縛する添字（`ROBOT[i]` を `ROBOT[2]` と読む） |
 | `request` | 先頭行のみ。`request` のフィールド |
 | `values` | スナップショットの更新。キーは述語に書く名前（`ROBOT[2].battery`、`delivery_time`）。値は変更されるまで保たれる |
-| `messages` | この観測で送られたメッセージ。`from`、`to`、`name`、省略可能な `args`。メッセージイベントは送信者・受信者・名前で照合し、CADL側に引数があれば（`ack(accepted)`）`args` と一致する必要がある |
+| `messages` | この観測で送られたメッセージ。`from`、`to`、`name`、省略可能な `args`。メッセージイベントは送信者・受信者・名前で照合し、CADL側に引数があれば（`ack(accepted)`）`args` と一致する必要がある。`from` と `to` は具体的なアクター（`DISPATCHER`、`ROBOT[2]`）、`name` は識別子で、余分な空白なしで書きます。アクター参照はF.3のとおりに照合します。`ROBOT[1..2]` は `ROBOT[1]` と `ROBOT[2]` だけに、`ROBOT[*]` と束縛のない `ROBOT[i]` は宣言された集合の要素だけに一致し、宣言されていないアクターには決して一致しません |
 | `state` | この観測の後の、インスタンスのライフサイクル状態。変更されるまで保たれ、初期値は `lifecycle.initial`。ある観測の述語は、その観測の前の状態を読む（F.5の手順6が最後であるため） |
 | `amend` | CADLファイルの新しい版のパス（トレースファイルからの相対）。この観測で契約を改正する（後述） |
 | `end` | `true` はこの観測でインスタンスを終了する。最初の終端状態でも終了し、どちらもなければ最終行で終了する。最終行が `"end": false` のときは、トレースを途中までの記録とみなし、清算しない |
@@ -511,7 +604,7 @@ cadl model-check examples/stochastic_robot_delivery.cadl --regime-map best_for_d
 11. **規範拡張の静的意味論**（付録F、F.7。`norms: 0.1` を宣言したファイルのみ） — 規範のidが識別子であり、契約内で重複せず、`creates:` が名付ける制度的事象と異なること（N-1）。`kind:` が `obligation` / `permission` / `prohibition` / `power` のいずれかであること（N-2）。`bearer:` と `counterparty:` がワイルドカードや範囲を含まない定義済みのアクターであること（N-3）。`deadline:` が期間であり、`deadline:` と `on_violation:` は義務と禁止にだけ書けること（N-4）。`effects:` は権能にだけ書け、権能には一つ以上必要で、契約内のほかの規範を名指すこと（N-5）。`reparation:` がトリガのない義務か禁止であり、`reparation:` をたどって循環しないこと（N-6）。`on_violation.transition` が契約の `lifecycle:` の状態であること（N-7）。メッセージイベントのアクターが定義済みであり、権能はメッセージから作られる制度的事象か担い手が送るメッセージで行使されること（N-9）。`within(d, p)`・`throughout(d, p)`・`until(p, q, d)` の `d` が0より大きい期間リテラルであり、`assume:`・`guarantee:`・規範の `content:` にだけ現れること（N-10）。`on_amendment: {transform: X}` が識別子を名指すこと（N-11）。警告：`trigger:` / `until:` / `content:` 全体として使われた規範のid（N-8）、担い手と内容が同じ許可と禁止（N-12）、契約の当事者でない担い手・相手方（N-3）、担い手以外が送るメッセージを内容とする義務・禁止（N-9）。宣言がない場合、`norms:` と `counts_as:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換もしません
 12. **確率モデル拡張の静的意味論**（付録H、H.10。`stochastic: 0.1` を宣言したファイルのみ） — `model:` に `variables:` と `commands:` があり、`kind:` が `dtmc` であること（S-1）。id・ラベル名・列挙リテラル・アクションラベルが識別子であり、キーワードでなく、それぞれの名前空間で一度だけ宣言されること、ラベル名が `init`・`deadlock` でないこと、列挙リテラルの出力名 `x_L` が宣言済みのどの名前とも、また互いにも異なること（S-2）。`from:` が定義済みの契約の `alpha`・`beta`・`lambda`、または `context.environment` の数値の項目を指すこと（S-3）。`range:` が `[lo, hi]` であり、契約に束縛したパラメータ以外では必須で、すべての値がその範囲に入ること（S-4）。変数の型が `bool`・`"[lo..hi]"`・`"{A, B}"` のいずれかで、`init:` が定義域の値であること（S-5）。状態述語が文法に従い、型が正しいこと（S-6）。更新が宣言済みの変数にその型の値を代入し、ガードが真になるすべての状態で値が定義域に収まること（S-7）。確率が数値・パラメータの式・`rest` のいずれかで、`rest` はコマンドごとに一つ以下、合計がちょうど1であること（S-8）。どの設計のどの状態でも、有効なコマンドが一つ以下であること（S-9）。`model.regimes:` と `when:` がファイルの運用モードを指し、`transitions:` があること（S-10）。すべてのパラメータがすべての設計で固定値を持ち、そこで確率が `[0, 1]` に入り報酬が負でないこと（S-11）。報酬構造に項目があり、その `action:` がコマンドのアクションラベルであり、`value:` が運用モードマップの開いたパラメータを含まないこと（S-12）。性質が性質の文法に従い、`R` は歩数の上限のない `F` にだけ使い、しきい値が範囲内であること（S-13）。運用モードマップが、1〜4個の開いたパラメータ、2個以上の運用モード、問い合わせである目的関数一つ、しきい値性質である制約、`(0, 1)` の分解能を持ち、領域の頂点で各設計が適切に定義されること（S-14）。S-7とS-9は状態空間を列挙して判定します（200 000状態まで）。警告：出所が同じ二つのパラメータ（S-3）、`model.regimes:` に項目のない運用モード（S-10）。情報：将来の版のために予約されたキーと値（S-15）。宣言がない場合、`model:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換も出力もしません
 
-12. **エージェントガバナンス拡張の静的意味論**（付録G、G.9。`agents: 0.1` を宣言したファイルのみ） — ファイルが `norms: 0.1` も宣言していること（G-1）。`agent:` の `kind:` が `llm_agent` / `tool_server` / `human` / `service` のいずれかで、`protocol:` が名前であること（G-2）。`tools:` はツールサーバにだけ書け、ツールサーバには一つ以上必要で、ツール名が重複しない識別子であること（G-3）。受信者がツールサーバであるメッセージイベントがそのツールを名指すこと（G-4。プロトコルのステップでは警告）。`enforcement.default` が `deny` か `allow`、`enforcement.point` が `caller` / `receiver` / `gateway` のいずれかであること（G-5）。執行対象の契約では、許可・禁止の内容であるメッセージの送信者が担い手であること（G-6）。`on_denied:` は執行対象の契約の、メッセージを内容とする禁止にだけ書け、キーが一つ以上あり、`timeout:` が0より大きい期間で `escalate_to:` を伴うこと（G-7）。`escalate_to:` と `notify:` が定義済みの単一のアクターを名指し、`escalate_to:` が担い手以外の当事者であること（G-8）。`escalate_to: A` を持つ契約に、`A` のメッセージから `approval` を作る `counts_as:` ルールがあり、執行対象の契約では `approval` と `rejection` が予約されていること（G-9）。`fallback:` が、担い手から定義済みのアクターへの、禁止されたメッセージとは異なるメッセージイベントであること（G-10）。`delegations:` は執行対象の契約にだけ書け、各項目が、担い手に束縛される添字のない、メッセージを内容とする許可を一つ名指すこと（G-11）。`to:` にツールサーバ以外の定義済みのアクターを並べ、`max_depth:` が1以上であること（G-12）。`grant:` と `revoke:` が識別子で、互いに異なり、`approval`・`rejection` や当事者のツールとも異なること（G-13）。警告：`timeout:` のない `escalate_to:`（G-7）、`human` でない承認者（G-8）、`rejection` のルールがないこと（G-9）、`to:` に含まれる担い手（G-12）、内容がメッセージイベントでない、または引数を持つ許可・禁止（G-14）、`default: allow` で開いたままのツールと、執行対象の契約の当事者でないツールサーバ（G-15）、契約が必要としながら自ら拒否するメッセージ（G-16）。宣言がない場合、`agent:`・`enforcement:`・`delegations:`・`on_denied:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換もしません
+12. **エージェントガバナンス拡張の静的意味論**（付録G、G.9。`agents: 0.1` を宣言したファイルのみ） — ファイルが `norms: 0.1` も宣言していること（G-1）。`agent:` の `kind:` が `llm_agent` / `tool_server` / `human` / `service` のいずれかで、`protocol:` が名前であること（G-2）。`tools:` はツールサーバにだけ書け、ツールサーバには一つ以上必要で、ツール名が重複しない識別子であること（G-3）。受信者がツールサーバであるメッセージイベントがそのツールを名指すこと（G-4。プロトコルのステップでは警告）。`enforcement.default` が `deny` か `allow`、`enforcement.point` が `caller` / `receiver` / `gateway` のいずれかであること（G-5）。執行対象の契約では、許可・禁止の内容であるメッセージの送信者が担い手であること（G-6）。`on_denied:` は執行対象の契約の、メッセージを内容とする禁止にだけ書け、キーが一つ以上あり、`timeout:` が0より大きい期間で `escalate_to:` を伴うこと（G-7）。`escalate_to:` と `notify:` が定義済みの単一のアクターを名指し、`escalate_to:` が担い手以外の当事者であること（G-8）。`escalate_to: A` を持つ契約に、`A` のメッセージから `approval` を作る `counts_as:` ルールがあり、執行対象の契約では `approval` と `rejection` が予約されていること（G-9）。`fallback:` が、担い手から定義済みのアクターへの、禁止されたメッセージとは異なるメッセージイベントであること（G-10）。`delegations:` は執行対象の契約にだけ書け、各項目が、担い手に束縛される添字のない、メッセージを内容とする許可を一つ名指すこと（G-11）。`to:` にツールサーバ以外の定義済みのアクターを並べ、`max_depth:` が1以上であること（G-12）。`grant:` と `revoke:` が識別子で、互いに異なり、`approval`・`rejection` や当事者のツールとも異なること（G-13）、執行対象の契約では、すべてのメッセージイベント（規範の `trigger:`・`until:`・`content:`、`counts_as:` ルールの `when:`、委任の `until:`）の送信者と受信者が当事者の一つの参照に含まれ（契約は自分が統治するメッセージだけを観測するため）、宣言された要素だけを名指すこと（G-17）、契約のすべての添字変数（担い手、相手方、`escalate_to:`、`notify:`、`fallback:`、メッセージイベントの送信者・受信者・引数、述語。`ROBOT[j+1]` のような添字の式の中も含む）が、当事者（当事者 `ROBOT[i]` の `i`）、限量子、または内包表記によって束縛されていること（G-18）。警告：`if:` のもとで作られる制度的事象が、禁止のトリガまたは許可の `until:` であること（G-19）、`timeout:` のない `escalate_to:`（G-7）、`human` でない承認者（G-8）、`rejection` のルールがないこと（G-9）、`to:` に含まれる担い手（G-12）、内容がメッセージイベントでない、または引数を持つ許可・禁止（G-14）、`default: allow` で開いたままのツールと、執行対象の契約の当事者でないツールサーバ（G-15）、契約が必要としながら自ら拒否するメッセージ（G-16）。宣言がない場合、`agent:`・`enforcement:`・`delegations:`・`on_denied:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換もしません
 
 このほか、検査を失敗させずに次を報告します。`cadl codegen` が出力できない `codegen:` のターゲット（警告）、未知の拡張名、`motivation:` ブロック（情報）。`motivation:` ブロックは解釈しませんが、保持して `cadl sim-ir` の出力に引き渡します。
 
@@ -558,7 +651,8 @@ IR JSON と Unity C# ツリーが生成され、後者が [cadl-raspimouse-simul
 | `raspimouse_c_sos.cadl` | Raspimouse群ロボット（C-SoS） | 協調型 | ローカルDirectionDijkstra＋中央検証、離散時間同期 |
 | `raspimouse_mcp_sos.cadl` | Raspimouse群ロボット（MCP-SoS） | 認知型 | MCPツールによるLLM制御、Static/Dynamicパスモード、3つの運用モード |
 | `sos_dsl_robot_delivery.cadl` | SoS-DSL拡張を使ったロボット配送 | 認知型 | 契約ライフサイクル（7状態）、3つのモニタ。ハンズオン講座で使うサンプル |
-| `agents_tool_governance.cadl` | LLMプランナ、サブエージェント、2つのツールサーバ（agents 0.1） | — | 執行対象の契約、人へのエスカレーション、来歴つきの委任。サンプル入力は `agents_inputs/` |
+| `agents_tool_governance.cadl` | LLMプランナ、サブエージェント、2つのツールサーバ（agents 0.1） | — | 執行対象の契約、人へのエスカレーション、来歴つきの委任。サンプル入力は `agents_inputs/`、`cadl agents-run` 用のトレースは `traces/` |
+| `agents_change_control.cadl` | 所有者、リードエージェント、2つのワーカー、リポジトリ（agents 0.1） | — | トリガから `until:` までの間だけ発効する禁止、`max_depth: 1` と `until:` を持つ委任。`cadl agents-run` 用のトレースは `traces/` |
 
 ### デモスクリプト
 
@@ -593,6 +687,7 @@ src/cadl/
   iec62853.py          IEC 62853を参考にした要約
   unparse.py           式ASTをCADLのソーステキストに戻す
   norms_eval.py        記録済みトレースに対する規範拡張の判定
+  agents_runtime.py    エージェントガバナンス拡張のランタイム：トレース上の判定、保留、委任、監査記録
   norms_diff.py        改正が規範に及ぼす効果（二つの版の比較）
   cli.py               コマンドラインインタフェース
   codegen/
@@ -662,7 +757,8 @@ tests/
   test_conformance_checks.py      識別子の規則、共有の項目、codegenのターゲット、拡張
   test_codegen_deterministic.py   生成コードが実行ごとに同一であること
   test_keyword_boundaries.py      キーワードが長い名前から切り出されないこと
-  test_agents_extension.py        エージェントガバナンス拡張：G-1〜G-16、判定、agent-rego / agent-cedar
+  test_agents_extension.py        エージェントガバナンス拡張：G-1〜G-19、判定、agent-rego / agent-cedar
+  test_agents_runtime.py          エージェントガバナンス拡張のランタイム（`cadl agents-run`）：保留、委任、監査記録
 
 examples/
   robot_delivery.cadl        ロボット配送SoS（認知型）
@@ -701,7 +797,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | シミュレータIR・設定生成（Python, Unity, Go） | 利用可能 |
 | SoS-DSL拡張（`lifecycle:` / `monitors:`）とUnity C#生成 | 利用可能 |
 | 規範拡張：静的検査と、記録済みトレースに対する判定と改正（`cadl norms-eval`、`cadl norms-diff`） | 利用可能 |
-| エージェントガバナンス拡張（agents 0.1）：検査、判定関数、Rego / Cedarの境界ポリシー | 利用可能（保留・委任・監査の状態を持つランタイムは未実装） |
+| エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、監査記録。`cadl agents-run`）、Rego / Cedarの境界ポリシー | 利用可能（ランタイムはオフラインの参照実装で、トレースを再生するだけであり、プロトコルには接続しない） |
 | 検証メソッド `model_check` / `simulation` / `proof` | 未対応（未対応である旨を明示的に報告） |
 
 ## 関連プロジェクト

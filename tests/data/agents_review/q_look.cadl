@@ -1,0 +1,16 @@
+sos:
+  name: "QL"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - { id: OP, role: "operator", agent: { kind: human } }
+    - { id: AG, role: "agent", agent: { kind: llm_agent } }
+    - { id: TOOL, role: "tool", agent: { kind: tool_server, tools: [act, read] } }
+  contracts:
+    - id: C
+      parties: [OP, AG, TOOL]
+      enforcement: {}
+      norms:
+        - { id: may_act, kind: permission, bearer: AG, content: "AG -> TOOL : act" }
+        - { id: stop_act, kind: prohibition, bearer: AG, trigger: "AG.mode == locked", content: "AG -> TOOL : act" }

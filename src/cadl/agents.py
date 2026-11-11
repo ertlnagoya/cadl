@@ -13,8 +13,10 @@ reference decision function:
 
 The decision function is stateless. Holds, release and expiry (G.6), the
 bookkeeping of grants, chains and revocations (G.7) and audit records
-(G.8) belong to a host runtime; the in-force flags of the norms that are
-not static and the valid derived instances come in through the input.
+(G.8) belong to a runtime; the in-force flags of the norms that are not
+static and the valid derived instances come in through the input.
+:mod:`cadl.agents_runtime` is the reference runtime: it replays a recorded
+trace and calls :func:`decide` for every message.
 """
 
 from __future__ import annotations
@@ -181,6 +183,223 @@ def is_static(contract: ContractDef, norm: NormDef) -> bool:
     return all(r["kind"] != "var" for r in refs)
 
 
+def index_uses(expr: Any) -> set[tuple]:
+    """The free variables of a parsed expression that are used as an index
+    or inside an index expression, as pairs (set, variable): the set is the
+    actor name when the variable is the whole index (`W[j]` gives
+    ``("W", "j")``) and None when it stands inside an index expression
+    (`W[j+1]` gives ``(None, "j")``). A variable is not free when a
+    quantifier (`exists j in W: ...`) or a comprehension
+    (`sum(W[j].load for j in W)`) of the expression binds it."""
+    import dataclasses
+    from .ast_nodes import ActorRef, Comprehension, MemberAccess, QuantifiedExpr, RangeExpr
+    found: set[tuple] = set()
+
+    def is_var(name: Any, bound: frozenset) -> bool:
+        # `now` and `state` are reserved names with a value of their own
+        # (E.4), not variables: `W[now]` reads the time as an index.
+        return isinstance(name, str) and name != "*" and not name.isdigit() \
+            and name not in bound and name not in ("now", "state")
+
+    def index_of(ref: ActorRef, bound: frozenset) -> None:
+        index = ref.index
+        if isinstance(index, ActorRef) and index.index is None:
+            index = index.name
+        if isinstance(index, str):
+            if is_var(index, bound):
+                found.add((ref.name, index))
+        elif index is not None and not isinstance(index, (int, RangeExpr)):
+            walk(index, bound, True)
+
+    def walk(node: Any, bound: frozenset, inside: bool) -> None:
+        if isinstance(node, QuantifiedExpr):
+            walk(node.domain, bound, inside)
+            walk(node.predicate, bound | {node.variable}, inside)
+        elif isinstance(node, Comprehension):
+            walk(node.domain, bound, inside)
+            walk(node.element, bound | {node.variable}, inside)
+        elif isinstance(node, MemberAccess):
+            if isinstance(node.obj, ActorRef):
+                index_of(node.obj, bound)       # `A.x`: A is no variable
+            else:
+                walk(node.obj, bound, inside)
+        elif isinstance(node, ActorRef):
+            if node.index is None:
+                if inside and is_var(node.name, bound):
+                    found.add((None, node.name))
+            else:
+                index_of(node, bound)
+        elif dataclasses.is_dataclass(node) and not isinstance(node, type):
+            for f in dataclasses.fields(node):
+                if f.name != "loc":
+                    walk(getattr(node, f.name), bound, inside)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item, bound, inside)
+
+    walk(expr, frozenset(), False)
+    return found
+
+
+def predicate_index_vars(expr: Any) -> set[str]:
+    """The free index variables of a parsed expression (see `index_uses`)."""
+    return {var for _, var in index_uses(expr)}
+
+
+def bare_names(expr: Any) -> set[str]:
+    """The names that a parsed predicate uses as a value (`locked` in
+    `AG.mode == locked`): a quantity when the trace gives it a value, a
+    symbolic value otherwise (F.5)."""
+    import dataclasses
+    from .ast_nodes import ActorRef, MemberAccess
+    found: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, MemberAccess):
+            return
+        if isinstance(node, ActorRef):
+            if node.index is None:
+                found.add(node.name)
+            return
+        if dataclasses.is_dataclass(node) and not isinstance(node, type):
+            for f in dataclasses.fields(node):
+                if f.name != "loc":
+                    walk(getattr(node, f.name))
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    walk(expr)
+    return found
+
+
+def message_args(text: str | None) -> list:
+    """The parsed arguments of a message event (`lock(W[j].level)`)."""
+    from .ast_nodes import FunctionCall
+    from .parser import parse_expr
+    m = _MESSAGE_EVENT_RE.match(text.strip()) if text and "->" in text else None
+    if not m:
+        return []
+    try:
+        call = parse_expr(m.group(3).strip())
+    except Exception:
+        return []
+    return list(call.args) if isinstance(call, FunctionCall) else []
+
+
+def contract_expressions(contract: ContractDef) -> list[tuple]:
+    """Every expression of a contract that the norms engine or the decision
+    function evaluates, parsed, as (where, expression, is predicate): the
+    predicates and the arguments of the message events of `trigger:`,
+    `until:` and `content:` of the norms, of `when:` and `if:` of the
+    `counts_as:` rules and of `until:` of the delegations, and the
+    `assume:` and `guarantee:` items."""
+    from .ast_nodes import StringLiteral
+    from .parser import parse_rule
+    events = {r.creates for r in contract.counts_as if r.creates}
+    texts = []
+    for n in contract.norms:
+        texts += [(f"{key}: of norm '{n.id}'", getattr(n, key))
+                  for key in ("trigger", "until", "content")]
+    for r in contract.counts_as:
+        texts.append((f"when: of the counts_as rule that creates '{r.creates}'", r.when))
+        texts.append((f"if: of the counts_as rule that creates '{r.creates}'", r.if_))
+    for d in contract.delegations:
+        texts.append((f"until: of the delegation of '{d.norm}'", d.until))
+    for key, items in (("assume", contract.assume), ("guarantee", contract.guarantee)):
+        texts += [(f"{key}: item {pos}", item) for pos, item in enumerate(items, start=1)]
+    out = []
+    for where, text in texts:
+        if isinstance(text, StringLiteral):
+            text = text.value
+        if text is None or (isinstance(text, str) and (
+                not text.strip() or text.strip() in events)):
+            continue
+        if not isinstance(text, str):
+            out.append((where, text, True))
+        elif "->" in text and _MESSAGE_EVENT_RE.match(text.strip()):
+            out += [(where, arg, False) for arg in message_args(text)]
+        else:
+            try:
+                out.append((where, parse_rule(text), True))
+            except Exception:
+                pass
+    return out
+
+
+def contract_index_sets(contract: ContractDef) -> dict[str, set[str]]:
+    """For each index variable of a contract, the declared sets that it
+    indexes anywhere in the contract (`{"i": {"W", "SUP"}}`)."""
+    out: dict[str, set[str]] = {}
+
+    def add(ref: dict | None) -> None:
+        if ref is not None and ref["kind"] == "var":
+            out.setdefault(ref["var"], set()).add(ref["name"])
+
+    def ref_of(text: str | None) -> dict | None:
+        try:
+            return parse_ref(text) if text else None
+        except Exception:
+            return None
+
+    for p in contract.parties:
+        try:
+            add(_party_ref(p))
+        except Exception:
+            pass
+    events = []
+    for n in contract.norms:
+        od = n.on_denied
+        for text in (n.bearer, n.counterparty, od.escalate_to if od else None,
+                     od.notify if od else None):
+            add(ref_of(text))
+        events += [n.trigger, n.until, n.content, od.fallback if od else None]
+    events += [r.when for r in contract.counts_as] + [d.until for d in contract.delegations]
+    for text in events:
+        try:
+            m = parse_message_event(text)
+        except Exception:
+            m = None
+        if m is not None:
+            add(m.sender)
+            add(m.receiver)
+    for _, expr, _ in contract_expressions(contract):
+        for name, var in index_uses(expr):
+            if name is not None:
+                out.setdefault(var, set()).add(name)
+    return out
+
+
+def ref_covered(ref: dict, parties: list, actors: dict | None = None) -> bool:
+    """Whether every actor that an actor reference can name matches one of
+    the party references (as `parse_ref` data), as G.5 reads `parties:`:
+    a party `A[i]` or `A[*]` stands for every member of `A`. With the
+    declared `actors` (as in the boundary policy), a reference to a whole
+    set with integer bounds is read as the range of its declaration."""
+    decl = (actors or {}).get(ref["name"])
+    if ref["kind"] in ("all", "var") and decl and decl["bounded"]:
+        ref = dict(ref, kind="range", lo=decl["lo"], hi=decl["hi"])
+    for p in parties:
+        if p["name"] != ref["name"]:
+            continue
+        if p["kind"] == "plain" or ref["kind"] == "plain":
+            if p["kind"] == ref["kind"]:
+                return True
+        elif p["kind"] in ("all", "var"):
+            return True
+        elif p["kind"] == "index":
+            if ref["kind"] == "index" and ref["index"] == p["index"]:
+                return True
+            if ref["kind"] == "range" and ref["lo"] == ref["hi"] == p["index"]:
+                return True
+        elif ref["kind"] == "index":
+            if p["lo"] <= ref["index"] <= p["hi"]:
+                return True
+        elif ref["kind"] == "range" and p["lo"] <= ref["lo"] and ref["hi"] <= p["hi"]:
+            return True
+    return False
+
+
 # --- Boundary policy ----------------------------------------------------------
 
 def _actor_entry(actor: ActorDef) -> dict:
@@ -192,6 +411,8 @@ def _actor_entry(actor: ActorDef) -> dict:
     }
     if isinstance(index, RangeExpr) and isinstance(index.end, int):
         entry.update(bounded=True, lo=index.start, hi=index.end)
+    elif isinstance(index, RangeExpr) and isinstance(index.start, int):
+        entry["lo"] = index.start       # symbolic upper bound: `A[1..N]`
     if actor.agent is not None:
         entry["kind"] = actor.agent.kind or None
         entry["tools"] = list(actor.agent.tools)
@@ -306,7 +527,8 @@ def is_member(policy: dict, name: str, actor: dict) -> bool:
         return False
     if decl["bounded"]:
         return decl["lo"] <= actor["index"] <= decl["hi"]
-    return True
+    # A symbolic upper bound: every index from the lower bound on (G.4).
+    return decl["lo"] is None or actor["index"] >= decl["lo"]
 
 
 def ref_match(policy: dict, ref: dict, actor: dict, bindings: dict):
@@ -385,8 +607,8 @@ def _check_input(inp) -> tuple[dict, dict, str, list | None]:
                     and all(isinstance(a, str) for a in d["chain"])):
                 raise AgentsInputError(
                     f"each entry of {where}.derived needs norm, holder and chain")
-        out.append({"contract": entry["contract"], "bindings": bindings,
-                    "in_force": in_force, "derived": derived})
+        out.append({"contract": entry["contract"], "instance": entry.get("instance"),
+                    "bindings": bindings, "in_force": in_force, "derived": derived})
     return actors[0], actors[1], name, out
 
 
@@ -483,6 +705,75 @@ def _unique(items) -> list:
     return out
 
 
+def message_kind(policy: dict, receiver: dict, name: str) -> str:
+    """G.4: ``tool_call``, ``undeclared_tool`` or ``ordinary``."""
+    decl = policy["actors"].get(receiver["name"])
+    if (decl is None or decl["kind"] != "tool_server"
+            or not is_member(policy, receiver["name"], receiver)):
+        return "ordinary"
+    return "tool_call" if name in decl["tools"] else "undeclared_tool"
+
+
+def governs(policy: dict, contract: dict, sender: dict, receiver: dict, name: str) -> bool:
+    """G.5: whether an enforced contract governs a message. A party
+    reference with an index bound by the contract instance is an unknown
+    match, which counts. A message to a tool server that is a party is
+    governed whatever its sender, also when the sender is not a party or
+    not a declared actor."""
+    def party(actor):
+        return any(ref_match(policy, ref, actor, {}) is not False
+                   for ref in contract["parties"])
+
+    to_tool_server = message_kind(policy, receiver, name) != "ordinary"
+    return party(receiver) and (to_tool_server or party(sender))
+
+
+def _running(contract: dict, instances: list | None) -> list:
+    """The running instances of a contract in a checked input. Without
+    `instances` in the input: one running instance, no index bound, no
+    derived instance (G.10)."""
+    if instances is None:
+        return [{"contract": contract["id"], "instance": None,
+                 "bindings": {}, "in_force": {}, "derived": []}]
+    return [i for i in instances if i["contract"] == contract["id"]]
+
+
+def _grounds(policy, contract, running, sender, receiver, name) -> list:
+    """Step 3.2: the prohibitions of a contract that apply to the message,
+    each with the running instances in which it applies. Unknown is
+    fail-closed: the prohibition applies."""
+    out = []
+    for n in contract["norms"]:
+        if n["kind"] != "prohibition":
+            continue
+        where = [i for i in running
+                 if _applies(policy, n, sender, receiver, name, i) is not False]
+        if where:
+            out.append((n, where))
+    return out
+
+
+def applying_prohibitions(policy: dict, inp: Any) -> list[dict]:
+    """The prohibitions that apply to the message of a policy input, over
+    all governing contracts and whatever the decision is: per prohibition
+    its contract, its norm entry of the policy, and the names of the
+    running instances in which it applies. In the order of declaration.
+
+    :func:`decide` lists the grounds of the determining contracts only; a
+    runtime needs all of them when it creates a hold and when it re-checks
+    a released message (G.6)."""
+    sender, receiver, name, instances = _check_input(inp)
+    out = []
+    for c in policy["contracts"]:
+        if not governs(policy, c, sender, receiver, name):
+            continue
+        for n, where in _grounds(policy, c, _running(c, instances),
+                                 sender, receiver, name):
+            out.append({"contract": c["id"], "norm": n,
+                        "instances": [i["instance"] for i in where]})
+    return out
+
+
 def decide(policy: dict, inp: Any) -> dict:
     """The decision function of G.5 for one message.
 
@@ -492,20 +783,13 @@ def decide(policy: dict, inp: Any) -> dict:
     """
     sender, receiver, name, instances = _check_input(inp)
 
-    decl = policy["actors"].get(receiver["name"])
-    tool_server = (decl is not None and decl["kind"] == "tool_server"
-                   and is_member(policy, receiver["name"], receiver))
-    tool_call = tool_server and name in decl["tools"]
+    kind = message_kind(policy, receiver, name)
+    tool_server = kind != "ordinary"
+    tool_call = kind == "tool_call"
 
-    # Step 1: ungoverned. A party reference with an index bound by the
-    # contract instance is an unknown match, which counts. A message to a
-    # tool server that is a party is governed whatever its sender, also
-    # when the sender is not a party or not a declared actor.
-    def party(c, actor):
-        return any(ref_match(policy, ref, actor, {}) is not False for ref in c["parties"])
-
+    # Step 1: ungoverned.
     governing = [c for c in policy["contracts"]
-                 if party(c, receiver) and (tool_server or party(c, sender))]
+                 if governs(policy, c, sender, receiver, name)]
     if not governing:
         return _result("allow", "ungoverned")
 
@@ -516,12 +800,7 @@ def decide(policy: dict, inp: Any) -> dict:
     # Step 3: each governing contract decides over its running instances.
     outcomes = []
     for c in governing:
-        if instances is None:
-            # No `instances` in the input: one running instance, no index
-            # bound, no derived instance (G.10).
-            running = [{"bindings": {}, "in_force": {}, "derived": []}]
-        else:
-            running = [i for i in instances if i["contract"] == c["id"]]
+        running = _running(c, instances)
         out = {"id": c["id"], "norms": [], "grounds": [], "provenance": [],
                "approvers": set()}
         outcomes.append(out)
@@ -533,13 +812,7 @@ def decide(policy: dict, inp: Any) -> dict:
             continue
         # 3.2 Prohibitions: unknown is fail-closed, the prohibition applies.
         escalable = True
-        for n in c["norms"]:
-            if n["kind"] != "prohibition":
-                continue
-            where = [i for i in running
-                     if _applies(policy, n, sender, receiver, name, i) is not False]
-            if not where:
-                continue
+        for n, where in _grounds(policy, c, running, sender, receiver, name):
             out["grounds"].append(n)
             for inst in where:
                 approver = _approver(n, inst)

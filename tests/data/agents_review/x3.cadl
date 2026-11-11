@@ -1,0 +1,57 @@
+sos:
+  name: "X3"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - id: OP
+      role: "approver"
+      agent: { kind: human }
+    - id: "SUP[1..3]"
+      role: "supervisors"
+      agent: { kind: human }
+    - id: AG
+      role: "agent"
+      agent: { kind: llm_agent }
+    - id: SUB
+      role: "sub agent"
+      agent: { kind: llm_agent }
+    - id: TOOL
+      role: "tool"
+      agent: { kind: tool_server, tools: [act, read, wipe] }
+  contracts:
+    - id: C
+      parties: [OP, "SUP[*]", AG, SUB, TOOL]
+      enforcement: {}
+      counts_as:
+        - { when: "OP -> AG : approve", creates: approval }
+        - { when: "OP -> AG : reject", creates: rejection }
+      norms:
+        - id: may_act
+          kind: permission
+          bearer: AG
+          content: "AG -> TOOL : act"
+        - id: may_read
+          kind: permission
+          bearer: AG
+          trigger: "SUP[1..2] -> AG : enable"
+          until: "SUP[1] -> AG : disable"
+          content: "AG -> TOOL : read"
+        - id: freeze
+          kind: prohibition
+          bearer: AG
+          trigger: "SUP[1] -> AG : freeze"
+          until: "SUP[1..2] -> AG : thaw"
+          content: "AG -> TOOL : act"
+          on_denied: { escalate_to: OP, timeout: 10min }
+        - id: no_wipe
+          kind: prohibition
+          bearer: AG
+          trigger: "OP -> AG : lock"
+          content: "AG -> TOOL : wipe"
+        - id: may_wipe
+          kind: permission
+          bearer: AG
+          content: "AG -> TOOL : wipe"
+      delegations:
+        - { norm: may_act, to: [SUB], grant: grant_act, revoke: revoke_act, until: "SUP[1..2] -> AG : endgrant" }

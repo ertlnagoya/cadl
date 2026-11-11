@@ -1432,3 +1432,115 @@ class TestCLI:
         assert proc.returncode == 2 and "line 2" in proc.stderr
         assert cli(str(EXAMPLE), "--trace", str(tmp_path / "none.jsonl")).returncode == 2
         assert cli(str(EXAMPLE)).returncode == 2
+
+
+# === Actor references in message events (F.3) ==================================
+
+class TestActorReferences:
+    """An actor reference in a trigger, an `until:`, a `counts_as` rule or a
+    content matches a concrete actor of the trace as F.3 says: a range only
+    its members, `R[*]` and an unbound `R[i]` only members of the declared
+    set, an undeclared actor never. Before this correction a range matched every
+    actor of that name, and `R[*]` also actors outside the declared set."""
+
+    def trigger(self, ref: str, sender: str) -> str:
+        r = run(f"""
+            norms:
+              - id: o
+                kind: obligation
+                bearer: D
+                trigger: "{ref} -> D : go"
+                deadline: 5s
+                content: "D -> R[1] : ack"
+            """, [{"t": 0}, {"t": 1, "messages": [msg(sender, "D", "go")]},
+                  {"t": 2, "end": False}])
+        return norm(r, "o")["state"]
+
+    @pytest.mark.parametrize("ref, sender, state", [
+        ("R[1..2]", "R[1]", "active"), ("R[1..2]", "R[2]", "active"),
+        ("R[1..2]", "R[3]", "inactive"), ("R[1..2]", "R[9]", "inactive"),
+        ("R[*]", "R[3]", "active"), ("R[*]", "R[9]", "inactive"),
+        ("R[*]", "R", "inactive"),
+        ("R[i]", "R[1]", "active"), ("R[i]", "R[2]", "inactive"),
+        ("R[2]", "R[2]", "active"), ("R[2]", "R[3]", "inactive"),
+        ("X", "X", "active"), ("X", "X[1]", "inactive"),
+    ])
+    def test_trigger(self, ref, sender, state):
+        assert self.trigger(ref, sender) == state
+
+    def test_unbound_index_matches_members_only(self):
+        blocks = """
+            norms:
+              - id: o
+                kind: obligation
+                bearer: D
+                trigger: "R[j] -> D : go"
+                deadline: 5s
+                content: "D -> R[1] : ack"
+            """
+        def state(sender):
+            sos = make_sos(blocks, check=False)
+            trace = parse_trace(json.dumps(o) for o in [
+                {"t": 0}, {"t": 1, "messages": [msg(sender, "D", "go")]},
+                {"t": 2, "end": False}])
+            return norm(evaluate(sos, trace), "o")["state"]
+        assert state("R[3]") == "active" and state("R[9]") == "inactive"
+
+    def test_until_and_counts_as_with_a_range(self):
+        blocks = """
+            counts_as:
+              - {{ when: "R[1..2] -> D : report", creates: reported }}
+            norms:
+              - id: p
+                kind: prohibition
+                bearer: D
+                until: "R[2..3] -> D : stop"
+                content: "D -> X : leak"
+            """.format()
+        def result(sender, name):
+            return run(blocks, [{"t": 0}, {"t": 1, "messages": [msg(sender, "D", name)]},
+                                {"t": 2, "end": False}])
+        assert norm(result("R[1]", "stop"), "p")["state"] == "active"
+        assert norm(result("R[3]", "stop"), "p")["state"] == "discharged"
+        assert len(result("R[2]", "report")["institutional_events"]) == 1
+        assert result("R[3]", "report")["institutional_events"] == []
+
+
+class TestTraceValues:
+    @pytest.mark.parametrize("line, text", [
+        ('{"t": NaN}', "not JSON"),
+        ('{"t": Infinity}', "not JSON"),
+        ('{"t": 1e999}', "not JSON"),
+        ('{"t": 1e16}', "at most"),
+        ('{"t": 1, "messages": [{"from": "D D", "to": "R[1]", "name": "x"}]}', "concrete actor"),
+        ('{"t": 1, "messages": [{"from": "D", "to": "R[ 1 ]", "name": "x"}]}', "concrete actor"),
+        ('{"t": 1, "messages": [{"from": "D", "to": "R[1]", "name": "x y"}]}', "message name"),
+    ])
+    def test_malformed_values_are_trace_errors(self, line, text):
+        with pytest.raises(TraceError, match=text):
+            parse_trace(['{"t": 0}', line])
+
+
+class TestSymbolicUpperBound:
+    """A set declared as `S[1..N]` has every index from 1 on, not `S[0]`
+    (z1.cadl is the reviewer's file)."""
+
+    def states(self, sender: str) -> dict:
+        from cadl.parser import parse_file
+        sos = parse_file(Path(__file__).parent / "data" / "agents_review" / "z1.cadl")
+        trace = parse_trace(json.dumps(o) for o in [
+            {"t": 0}, {"t": 1, "messages": [msg(sender, "P", "go")]}, {"t": 2, "end": False}])
+        result = evaluate(sos, trace)
+        return {n["id"]: n["state"] for n in result["norms"]}
+
+    def test_lower_bound_of_a_set_with_a_symbolic_upper_bound(self):
+        below, inside, far = self.states("S[0]"), self.states("S[2]"), self.states("S[50]")
+        assert (below["n_sym"], below["n_symr"], below["n_symi"]) == ("inactive",) * 3
+        assert (inside["n_sym"], inside["n_symr"], inside["n_symi"]) == ("active",) * 3
+        assert (far["n_sym"], far["n_symr"], far["n_symi"]) == ("active", "active", "inactive")
+
+    def test_time_in_epoch_milliseconds(self):
+        trace = parse_trace(['{"t": 1700000000000}', '{"t": 1700000000001.5}'])
+        assert trace.observations[1].t == 1700000000001.5
+        with pytest.raises(TraceError, match="at most"):
+            parse_trace(['{"t": 9007199254740994}'])

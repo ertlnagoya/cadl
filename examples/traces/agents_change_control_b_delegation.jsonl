@@ -1,0 +1,13 @@
+{"t": 0, "quantities": [], "messages": [{"from": "WORKER[1]", "to": "REPO", "name": "read_repo"}]}
+{"t": 1, "messages": [{"from": "OWNER", "to": "LEAD", "name": "grant_read"}]}
+{"t": 2, "messages": [{"from": "LEAD", "to": "WORKER[1]", "name": "grant_read"}]}
+{"t": 3, "messages": [{"from": "OWNER", "to": "WORKER[1]", "name": "grant_read"}]}
+{"t": 4, "messages": [{"from": "WORKER[1]", "to": "REPO", "name": "read_repo"}]}
+{"t": 5, "messages": [{"from": "WORKER[2]", "to": "REPO", "name": "read_repo"}]}
+{"t": 6, "messages": [{"from": "LEAD", "to": "WORKER[1]", "name": "revoke_read"}]}
+{"t": 7, "messages": [{"from": "WORKER[1]", "to": "REPO", "name": "read_repo"}]}
+{"t": 8, "messages": [{"from": "OWNER", "to": "LEAD", "name": "close_review"}]}
+{"t": 9, "messages": [{"from": "WORKER[1]", "to": "REPO", "name": "read_repo"}]}
+{"t": 10, "messages": [{"from": "LEAD", "to": "REPO", "name": "read_repo"}]}
+{"t": 11, "messages": [{"from": "OWNER", "to": "WORKER[1]", "name": "grant_read"}]}
+{"t": 12, "messages": [{"from": "WORKER[1]", "to": "REPO", "name": "read_repo"}]}

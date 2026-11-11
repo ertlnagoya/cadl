@@ -265,7 +265,17 @@ is_member(name, a) if {
 	in_bounds(d, a.index)
 }
 
-in_bounds(d, _) if not d.bounded
+in_bounds(d, _) if {
+	not d.bounded
+	d.lo == null
+}
+
+# A symbolic upper bound: every index from the lower bound on.
+in_bounds(d, i) if {
+	not d.bounded
+	d.lo != null
+	i >= d.lo
+}
 
 in_bounds(d, i) if {
 	d.bounded

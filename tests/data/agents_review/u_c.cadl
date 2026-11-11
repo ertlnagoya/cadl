@@ -1,0 +1,28 @@
+sos:
+  name: "UC"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - { id: OP, role: "operator", agent: { kind: human } }
+    - { id: AG, role: "agent", agent: { kind: llm_agent } }
+    - { id: SUB, role: "sub", agent: { kind: llm_agent } }
+    - { id: TOOL, role: "tool", agent: { kind: tool_server, tools: [act, read, wipe, xx, yy] } }
+  contracts:
+    - id: C
+      parties: [OP, AG, SUB, TOOL]
+      enforcement: {}
+      counts_as:
+        - { when: "OP -> AG : approve", creates: approval }
+        - { when: "level > limit", creates: alarm }
+        - { when: "OP -> AG : check", if: "level > limit", creates: checked_high }
+      norms:
+        - { id: may_act, kind: permission, bearer: AG, content: "AG -> TOOL : act" }
+        - { id: p_and, kind: prohibition, bearer: AG, trigger: "a > 1 AND b > 1", content: "AG -> TOOL : act", on_denied: { escalate_to: OP, timeout: 5min } }
+        - { id: may_read, kind: permission, bearer: AG, until: "a > 1 OR b > 1", content: "AG -> TOOL : read" }
+        - { id: may_wipe, kind: permission, bearer: AG, content: "AG -> TOOL : wipe" }
+        - { id: p_alarm, kind: prohibition, bearer: AG, trigger: alarm, content: "AG -> TOOL : wipe" }
+        - { id: may_xx, kind: permission, bearer: AG, until: checked_high, content: "AG -> TOOL : xx" }
+        - { id: may_yy, kind: permission, bearer: AG, until: "c > 1", content: "AG -> TOOL : yy" }
+      delegations:
+        - { norm: may_yy, to: [SUB], grant: g, revoke: r }
