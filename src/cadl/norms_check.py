@@ -86,7 +86,6 @@ MAX_ATOMS = 16
 _UNIT_MS = {"ms": 1, "s": 1000, "min": 60000, "h": 3600000}
 
 
-_ITEM2 = False
 AGGREGATES = ("sum", "count", "min", "max", "avg")
 
 
@@ -525,6 +524,12 @@ class Quantity:
     key: str
     consts: set = field(default_factory=set)    # literals compared with it
     reps: list = field(default_factory=list)    # one value per class
+    atoms: set = field(default_factory=set)     # (op, literal), ("in", literals), ("truth",)
+    raw: bool = False      # its value is used otherwise than in an atom
+
+
+class _Name(str):
+    """A name without a value used as a literal (a symbolic value)."""
 
 
 @dataclass
@@ -619,7 +624,16 @@ class Translator:
     # --- the instance -------------------------------------------------------
 
     def _setup_bindings(self, members: dict) -> None:
-        refs = _bound_refs(self.contract)
+        texts = [t for d in self.contract.norms
+                 for t in (d.bearer, d.counterparty, d.trigger, d.until, d.content) if t]
+        texts += [t for r in self.contract.counts_as for t in (r.when, r.if_) if t]
+        from .norms import item_text
+        texts += [item_text(e) for e in self.contract.assume]
+        # variables of quantifiers and comprehensions are not indices of the
+        # instance
+        bound_vars = set(re.findall(r"(?:exists|for\s+all|for)\s+([A-Za-z_]\w*)\s+in\b",
+                                    " ".join(texts)))
+        refs = {(s_, v) for s_, v in _bound_refs(self.contract) if v not in bound_vars}
         for set_name, var in sorted(refs):
             if var not in self.bindings and not var.isdigit():
                 decl = self.actors.get(set_name)
@@ -786,6 +800,10 @@ class Translator:
     # type of value (numbers, texts) into classes on which every
     # comparison of the predicate has the same value (F.12).
 
+    def _note(self, text: str) -> None:
+        if text not in self.notes:
+            self.notes.append(text)
+
     def _quantity(self, key: str) -> Quantity:
         q = self.quantities.get(key)
         if q is None:
@@ -860,6 +878,16 @@ class Translator:
             members = self.members.get(dom.name)
             if members is None:
                 raise _Refuse(f"{dom.name} is not a declared set of actors")
+            # the domain is the set as norms-eval sees it: its declared
+            # members when its bounds are integers, else the members of the
+            # instance (whose last index the trace binds); members beyond
+            # --members have no value in the model
+            decl = self.actors[dom.name]
+            if decl[2] is not None and decl[2] > members[-1]:
+                self._note(
+                    f"{dom.name}[{members[-1] + 1}..{decl[2]}] belong to the domain of a "
+                    f"quantifier or aggregate but not to the instance (--members): in the model "
+                    f"they have no value")
             if isinstance(dom.index, RangeExpr):
                 lo = self._index_values(dom.index.start, {})[0]
                 end = dom.index.end
@@ -904,9 +932,9 @@ class Translator:
                 raise _Refuse("'now' is not translated")
             if n == "state" and self.contract.lifecycle is not None:
                 raise _Refuse("'state' (the lifecycle state) is not translated")
-            return self._lit(n)                     # a name without a value
+            return self._lit(_Name(n))              # a name without a value
         if isinstance(e, ActorRef):
-            return self._lit(e.name)
+            return self._lit(_Name(e.name))
         if isinstance(e, MemberAccess):
             keys = self._member_keys(e, scope)
             for k in keys:
@@ -922,11 +950,15 @@ class Translator:
             left = self._shape(e.left, scope, info)
             items = [self._shape(a, scope, info) for a in e.right.args]
             for it in items:
-                self._compare(left, it, info)
+                self._compare(left, it, info, None)
+            if left[0] == "qty" and all(it[0] == "lit" for it in items):
+                vals = tuple(v for it in items for v in it[1])
+                for k in left[1]:
+                    info["atoms"].setdefault(k, set()).add(("in", vals))
             return ("bool",)
         if isinstance(e, BinaryOp) and e.op in ("==", "!=", "<", "<=", ">", ">="):
             self._compare(self._shape(e.left, scope, info), self._shape(e.right, scope, info),
-                          info)
+                          info, e.op)
             return ("bool",)
         if isinstance(e, BinaryOp) and e.op in ("+", "-", "*", "/"):
             a, b = self._shape(e.left, scope, info), self._shape(e.right, scope, info)
@@ -940,22 +972,23 @@ class Translator:
                         except Exception:
                             vals.append(None)
                 return ("arith-lit", tuple(vals))
+            info["raw"].update(self._keys(a) | self._keys(b))
             return ("num", self._keys(a) | self._keys(b))
         if isinstance(e, QuantifiedExpr):
-            if not _ITEM2:
-                raise _Refuse("a quantifier in a predicate is not translated")
             group, values = self._domain_values(e.domain, False)
             self._cond(e.predicate, {**scope, e.variable: (group, values)}, info)
             return ("bool",)
         if isinstance(e, FunctionCall) and e.name in AGGREGATES and len(e.args) == 1 \
                 and isinstance(e.args[0], Comprehension):
-            if not _ITEM2:
-                raise _Refuse(f"the aggregate {e.name}() is not translated")
             comp = e.args[0]
             group, values = self._domain_values(comp.domain, True)
             el = self._shape(comp.element, {**scope, comp.variable: (group, values)}, info)
             if e.name == "count":
+                if el[0] == "qty":
+                    for k in el[1]:
+                        info["atoms"].setdefault(k, set()).add(("truth",))
                 return ("count", len(values))
+            info["raw"].update(self._keys(el))
             if e.name in ("min", "max") and el[0] in ("qty", "lit"):
                 return ("minmax", self._keys(el)) if el[0] == "qty" else el
             return ("num", self._keys(el))
@@ -975,19 +1008,30 @@ class Translator:
         if s[0] in ("qty",):
             for k in s[1]:
                 info["consts"].setdefault(k, set()).add(0)       # truth: zero or not
+                info["atoms"].setdefault(k, set()).add(("truth",))
         elif s[0] in ("num", "minmax"):
             info["domain"].update(s[1])
 
-    def _compare(self, a: tuple, b: tuple, info: dict) -> None:
-        """Record what a comparison of two shapes needs."""
-        for x, y in ((a, b), (b, a)):
+    _FLIP = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "==", "!=": "!="}
+
+    def _compare(self, a: tuple, b: tuple, info: dict, op: str | None) -> None:
+        """Record what a comparison of two shapes needs: the literals compared
+        with a quantity, the comparisons themselves (atoms), and the
+        quantities that need a domain."""
+        for x, y, o in ((a, b, op), (b, a, self._FLIP.get(op))):
             if x[0] in ("qty", "minmax"):
                 if y[0] in ("lit", "arith-lit"):
                     for k in x[1]:
                         info["consts"].setdefault(k, set()).update(y[1])
+                        if x[0] == "qty" and o is not None:
+                            info["atoms"].setdefault(k, set()).update(
+                                (o, v) for v in y[1] if v is not None)
                 elif y[0] == "count":
                     for k in x[1]:
                         info["consts"].setdefault(k, set()).update(range(y[1] + 1))
+                        if x[0] == "qty" and o is not None:
+                            info["atoms"].setdefault(k, set()).update(
+                                (o, v) for v in range(y[1] + 1))
                 elif y[0] in ("qty", "minmax", "num"):
                     info["domain"].update(x[1])
                     info["domain"].update(y[1])
@@ -1000,12 +1044,16 @@ class Translator:
         key = repr(expr)
         if key in self._pred_index:
             return self._pred_index[key]
-        info: dict = {"consts": {}, "domain": set(), "keys": set()}
+        info: dict = {"consts": {}, "domain": set(), "keys": set(), "atoms": {}, "raw": set()}
         self._cond(expr, {}, info)
         if info["domain"]:
             self._needs_domain(info["domain"])
         for k, cs in info["consts"].items():
             self._quantity(k).consts.update(c for c in cs if c is not None)
+        for k, atoms in info["atoms"].items():
+            self._quantity(k).atoms.update(atoms)
+        for k in info["raw"] | info["domain"]:
+            self._quantity(k).raw = True
         self._pred_index[key] = len(self.preds)
         self.preds.append(Pred(expr=expr, text=_expr_text(expr), keys=frozenset(info["keys"])))
         return self._pred_index[key]
@@ -1303,17 +1351,55 @@ class Translator:
                     mid = (c + nxt) / 2
                     numbers.append(int(mid) if float(mid).is_integer() and mid not in cs else mid)
         numbers.append(cs[-1] + 1)
-        texts = sorted({c for c in q.consts if isinstance(c, str)})
+        texts = sorted({str(c) for c in q.consts if isinstance(c, str)})
         other = "OTHER"
         while other in texts:
             other += "_"
-        return [None, True, False] + numbers + texts + [other, []]
+        # plain values first, so that a witness shows them when they will do
+        reps = ([None] + sorted(numbers, key=lambda x: (abs(x), x)) + texts + [other]
+                + [True, False, []])
+        if q.raw:
+            return reps
+        # the quantity occurs only in comparisons with literals and as a
+        # condition: two values that give every such comparison the same
+        # value give every predicate the same value
+        atoms = sorted(q.atoms, key=repr)
+        exprs = [self._atom_expr(a) for a in atoms]
+        out, seen = [], set()
+        for v in reps:
+            sig = tuple(self._oracle(exprs, {"__Q.v": v}, keys=("__Q.v",)))
+            if sig not in seen:
+                seen.add(sig)
+                out.append(v)
+        return out
 
-    def _oracle(self, exprs: list, values: dict) -> list:
+    @staticmethod
+    def _lit_node(v: Any) -> Any:
+        if isinstance(v, bool):
+            return BoolLiteral(v)
+        if isinstance(v, int):
+            return IntLiteral(v)
+        if isinstance(v, float):
+            return FloatLiteral(v)
+        if isinstance(v, _Name):
+            return ActorRef(name=str(v))
+        return StringLiteral(v)
+
+    def _atom_expr(self, atom: tuple) -> Any:
+        q = MemberAccess(obj=ActorRef(name="__Q"), member="v")
+        if atom[0] == "truth":
+            return q
+        if atom[0] == "in":
+            return BinaryOp(op="==", left=q, right=FunctionCall(
+                name="__in__", args=[self._lit_node(v) for v in atom[1]]))
+        return BinaryOp(op=atom[0], left=q, right=self._lit_node(atom[1]))
+
+    def _oracle(self, exprs: list, values: dict, keys=None) -> list:
         """The values (T, F, U) of state predicates for one valuation of the
         quantities, computed by the evaluator of norms-eval."""
         from .norms_eval import UNKNOWN, _Evaluator
-        obs = Observation(t=0.0, values={k: values.get(k) for k in self.quantities},
+        keys = self.quantities if keys is None else keys
+        obs = Observation(t=0.0, values={k: values.get(k) for k in keys},
                           messages=[], state=None, state_after=None)
         trace = Trace(observations=[obs], bindings=self.bindings)
         ev = _Evaluator(trace, self.contract.lifecycle is not None, [])

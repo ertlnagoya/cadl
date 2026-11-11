@@ -230,6 +230,36 @@ norms:
 """
 
 
+# quantifiers over a set and over its members, a wildcard, an index
+# expression j+1, count compared with a literal and with a quantity, max
+QUANT = """\
+assume:
+  - "for all r in R: r.ok != false"
+counts_as:
+  - when: "exists j in R: R[j].alarm == true"
+    creates: alarm
+norms:
+  - id: stop_all
+    kind: obligation
+    bearer: D
+    trigger: alarm
+    content: "count(R[*].moving == false) >= 2"
+    deadline: 2s
+  - id: no_overload
+    kind: prohibition
+    bearer: D
+    content: "max(R[*].load) > 5"
+  - id: capacity
+    kind: prohibition
+    bearer: D
+    content: "R[1].cap < count(r.moving == true for r in R)"
+  - id: keep_one
+    kind: obligation
+    bearer: D
+    content: "within(2s, exists j in R: R[j].load == 0 AND R[j+1].load == 0)"
+"""
+
+
 def make_sos(body: str):
     sos = parse(HEAD + textwrap.indent(body, "      "))
     result = type_check(sos)
@@ -246,7 +276,7 @@ def model_of(name: str, **kw):
     key = (name, json.dumps(kw, sort_keys=True))
     if key not in _MODELS:
         texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS,
-                 "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES}
+                 "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES, "QUANT": QUANT}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
         _MODELS[key] = (sos, m, PrismModel(m.prism_text(), {"early_end": True}))
@@ -263,6 +293,8 @@ CASES = [
     ("EVENTS", {"bindings": ["i=1"], "members": ["R=2"]}),
     ("TYPES", {"bindings": ["i=1"]}),
     (str(EXAMPLES / "norms_check_value_types.cadl"), {"bindings": ["i=1"]}),
+    ("QUANT", {"members": ["R=2"]}),
+    (str(EXAMPLES / "norms_check_quantifiers.cadl"), {"members": ["ROBOT=2"]}),
 ]
 
 
@@ -283,12 +315,11 @@ class TestTranslation:
             "DISPATCHER -> ROBOT[2] : replan_command",
         ]
         reps = {q.key: q.reps for q in tr.quantities.values()}
-        # every JSON type: no value, the booleans, the numbers around the
-        # literals (and 0, and 1 next to a boolean literal), the texts, a list
-        assert reps == {
-            "ROBOT[2].battery": [None, True, False, -1, 0, 1, 10, 11, "OTHER", []],
-            "ROBOT[2].status": [None, True, False, -1, 0, 1, "InTransit", "OTHER", []],
-            "DISPATCHER.is_operational": [None, True, False, -1, 0, 0.5, 1, 2, "OTHER", []]}
+        # one value per class: a class holds the values of every JSON type
+        # on which each comparison with a literal has the same value
+        assert reps == {"ROBOT[2].battery": [None, 0, 10],
+                        "ROBOT[2].status": [None, "InTransit", "OTHER"],
+                        "DISPATCHER.is_operational": [None, 0, True]}
         # 2**4 message sets, 3 classes of the prohibition's content (true,
         # false, undefined) and 3 of the assumption
         assert len(tr.choices) == 16 * 3 * 3
@@ -308,7 +339,7 @@ class TestTranslation:
         _sos, m, _pm = model_of(str(DOUBLE), bindings=["i=1"])
         n = m.tr.by_id["no_double_assignment"]
         assert n.status == "untranslated"
-        assert "a quantifier in a predicate is not translated" in n.reason
+        assert "request fields are not translated" in n.reason
         assert m.tr.by_id["acknowledge"].status == "model"
 
     def test_dependants_of_untranslated_norms(self):
@@ -483,6 +514,33 @@ def test_until_predicate_is_a_rising_edge():
     assert not compare_path(m, pm, path)
     states = run_path(pm, path)
     assert states[7]["st_1_o_rep"] == ACTIVE
+
+
+def test_quantifiers_over_the_members():
+    """Quantifiers, aggregates and wildcards range over the members of the
+    instance; a member beyond --members of a set with integer bounds is in
+    the domain without a value, and the report says so."""
+    _sos, m, pm = model_of("QUANT", members=["R=2"])
+    tr = m.tr
+    assert {k for k in tr.quantities} == {f"R[{j}].{q}" for j in (1, 2)
+                                          for q in ("ok", "alarm", "moving", "load")} | {"R[1].cap"}
+    assert any("R[3..3] belong to the domain" in n for n in tr.notes)
+    assert not any("index j" in n for n in tr.notes)      # a quantifier variable
+    for p in all_paths(tr, 1):
+        assert not compare_path(m, pm, p), p
+
+
+@needs_prism
+def test_conflict_through_quantifiers():
+    sos, m, _pm = model_of(str(EXAMPLES / "norms_check_quantifiers.cadl"), members=["ROBOT=2"])
+    report = check(m, PRISM)
+    assert [c["norms"] for c in report["conflicts"]] == [["halt_fleet", "keep_patrol"]]
+    assert all(w["confirmed"] for c in report["conflicts"] for w in c["witnesses"])
+    for c in report["conflicts"]:
+        for w in c["witnesses"]:
+            r = evaluate(sos, parse_trace(w["trace"]))
+            states = {n["id"]: n["state"] for n in r["norms"]}
+            assert states[w["keeps"]] != "violated"
 
 
 def test_paths_cover_the_semantics():

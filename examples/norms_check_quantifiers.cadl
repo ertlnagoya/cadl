@@ -1,0 +1,57 @@
+# Norms Extension Demo: Quantifiers and Aggregates in Design-Time Checking (F.12)
+#
+# Norms over a fleet of robots whose size the check fixes with --members:
+# quantifiers, a wildcard reference (ROBOT[*].battery, shorthand for a
+# quantifier, F.5), and the aggregates count and max are expanded over the
+# members of the instance as cadl norms-eval evaluates them.
+#
+#   cadl norms-check examples/norms_check_quantifiers.cadl --members ROBOT=2
+#
+# The check finds that halt_fleet and keep_patrol are in conflict: after
+# an alarm every robot must have stopped within 2s, while keep_patrol
+# forbids that no robot is moving.
+
+sos:
+  name: "FleetSafety"
+  type: Acknowledged
+  version: "0.1.0"
+  description: "Fleet-wide safety norms of delivery robots."
+  extensions:
+    - norms: 0.1
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities: [monitor_fleet]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities: [follow_path, deliver]
+
+  contracts:
+    - id: FLEET_SAFETY
+      parties: [DISPATCHER, "ROBOT[*]"]
+      assume:
+        - "ROBOT[*].battery > 5"
+
+      counts_as:
+        - when: "exists j in ROBOT: ROBOT[j].alarm == true"
+          creates: alarm
+
+      norms:
+        - id: halt_fleet
+          kind: obligation
+          bearer: DISPATCHER
+          trigger: alarm
+          content: "for all r in ROBOT: r.moving == false"
+          deadline: 2s
+        - id: keep_patrol
+          kind: prohibition
+          bearer: DISPATCHER
+          content: "count(ROBOT[*].moving == true) == 0"
+        - id: no_overload
+          kind: prohibition
+          bearer: DISPATCHER
+          content: "max(r.load for r in ROBOT) > 50"

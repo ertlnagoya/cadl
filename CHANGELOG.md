@@ -19,6 +19,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   type of the literals is gone. Up to 0.3.25 such traces were not
   covered: a prohibition violated only by `true` was reported as never
   violated, and a conflict that a text value avoids was reported.
+- `cadl norms-check` translates quantifiers (`exists`, `for all`),
+  `count`, and `min` / `max` compared with a literal, of comprehensions,
+  and wildcard and range references in predicates (F.5), over the
+  members of the instance: a symbolic bound (`ROBOT[1..N]`) is bound to
+  the last member given by `--members`, so the domain is closed, and the
+  witness traces bind it too. A quantity used only in comparisons with
+  literals keeps one value per class of these comparisons, which keeps
+  the combinations of the members' quantities small; the report notes
+  members of a set with integer bounds that are outside the instance.
+  `examples/norms_check_quantifiers.cadl` shows a conflict between a
+  quantified obligation and a prohibition with `count`.
 
 ### Fixed
 
