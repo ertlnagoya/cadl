@@ -181,6 +181,10 @@ cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
 # ある版から次の版への改正が規範に及ぼす効果
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
 
+# 1つの契約インスタンスの規範を、すべての振る舞いについて設計時に検査（PATH上にPRISMが必要）：
+# 違反されうる規範、衝突、行使されない権能を、証拠のトレースとともに報告
+cadl norms-check examples/norms_check_conflict.cadl --bindings i=1 --export /tmp/norms-check
+
 # 根拠付け拡張：契約ごとの情報共有の導出指標、権限集中の導出指標、インセンティブ被覆率
 cadl norms-indices examples/grounding_robot_delivery.cadl
 cadl norms-indices examples/grounding_robot_delivery.cadl --format json
@@ -563,6 +567,23 @@ cadl norms-eval FILE --trace TRACE [--contract ID] [--format text|json]
 `examples/traces/` には `examples/norms_robot_delivery.cadl` 用のトレースが五つあります。すべての規範が履行される場合（a）、応答の不履行を障害報告で修復する場合（b）、両方とも不履行の場合（c）、配車係の停止により遅配が免責される場合（d）、再割当てにより義務が解除される場合（e）です。`norms_amendment_v1_to_v2.jsonl` は、`examples/norms_amendment_v1.cadl` のトレースで、障害報告の期限内に `examples/norms_amendment_v2.cadl` へ改正されます。
 
 `examples/norms_no_double_assignment.cadl` は、この契約に、ロボットについて限量した禁止を加えたものです。同じ配送を同時に2台のロボットに割り当ててはなりません（`exists j in ROBOT: exists k in ROBOT: j != k AND ROBOT[j].delivery == request.id AND ROBOT[k].delivery == request.id`）。トレースは、二重割当てがない場合（a、履行）、t=3に `ROBOT[3]` にも同じ配送が割り当てられる場合（b、t=3に違反）、同じロボットへの再割当て（c、履行）です。これらのトレースでは `N` に値がないので、定義域は開いています。名指された2台のロボットが配送を持てば内容は真になり、そうでない間は未定義で、違反にはなりません。
+### 規範の設計時の検査（モデル検査）
+
+`cadl norms-check FILE [--contract ID] [--bindings i=2] [--members ROBOT=2] [--step 1s] [--horizon N] [--export DIR] [--format text|json]` は、1つの契約インスタンスの規範をPRISM言語のマルコフ決定過程に変換し（付録F、F.12）、トレースがまだない段階で、インスタンスのすべての振る舞いについてPRISMに問います。環境は、各観測で、どのメッセージ事象が起こるか、各量の値のクラス（述語のリテラルが定義域を分けるクラスごとに1つの値と「値なし」）、インスタンスがそこで終わるかどうかを選びます。観測は `--step` ごと（既定は期限と区間の最大公約数）、最大で `--horizon` + 1個（既定は期限と区間から決めます）です。ステップごとに観測のあるトレースについて、モデルは厳密です。
+
+```bash
+cadl norms-check examples/norms_check_conflict.cadl --bindings i=1
+#  report_status / radio_silence: after 1 observation(s) keeping one violates the other
+#  apologise can be activated in a state from which every continuation violates it
+#  the power audit is never exercised
+```
+
+変換した規範ごとに、発効しうるか、違反されうるか、履行されうるか（インスタンスはどの観測でも終わりえます）、上限まで続くどのインスタンスでも違反されるか、発効するたびに守れるかを報告します。義務と禁止の組ごとに衝突するか（それぞれ単独ではまだ守れるのに、どの続きもどちらかに違反する状態に到達できるか）、権能ごとに行使されうるか、修復が発効しうるかも報告します。「可能」という答えには必ず証拠が付きます。証拠は `cadl norms-eval` の形式のトレースで、このコマンド自身が `cadl norms-eval` のエンジンで評価し、確認済みと示します（衝突には、それぞれの規範を守る2つの証拠があります）。`--export DIR` は、モデル（`<contract>.prism`）、性質（`-const early_end=true` で使う `<contract>_any.props` と、`early_end=false` で使う `<contract>_full.props`）、証拠（`witness_<norm>_<question>.jsonl`）を書き出します。JSONは `instance`、`model`、`norms[]`（問いごとに `answer` と、`trace`、`choices`、`confirmed` を持つ `witness`）、`conflicts[]`、`findings[]`、`unconfirmed[]`、`assumptions[]`、`rules[]`、`notes[]` を持ちます。
+
+変換するもの：メッセージ事象、counts-as規則、1つの量をリテラルと比べる述語（`==`、`!=`、`<`、`<=`、`>`、`>=`、`IN`、単独の真理値の量）と `AND`、`OR`、`NOT`、1つの `within` / `throughout` / `until` からなる内容、期限、`until:`、権能とその効果、修復、これらの形の `assume:` の項目。変換しないもの（理由を報告します）：限量子、集約、述語の中のワイルドカード参照、算術、2つの量の比較、`request`、`now`、`state`、改正、変換しない規範に依存するすべての規範。1,000を超える観測、16を超えるメッセージ事象、観測あたり8,192を超える選択は拒否します。終了ステータスは、指摘がなければ0（PATH上にPRISMがない場合も0です。報告は何も検査しなかったことを示し、`--export` はモデルを書き出します）、指摘（衝突、一度も発効しない規範やどのインスタンスでも違反される規範、守れない発効、行使されない権能）があれば1、使い方の誤りや拒否は2、証拠が `cadl norms-eval` で確認されなければ3（norms-checkの誤り）です。
+
+変換は `cadl norms-eval` と照合して試験しています。テストは、生成したPRISMのテキストを、それが使う部分を読む解釈器で、環境の選択のランダムな経路と網羅的な経路について実行し、各観測の後の各規範の状態、判定、権能の行使、修復の発効を比べます（`CADL_NORMS_CHECK_PATHS` でランダムな経路の数を増やせます）。解釈器はPRISMのシミュレータの経路と、PRISMの答えは到達可能な状態の上の明示的な不動点と比べています。
+
 ### 生成したPythonコードの規範モニタ
 
 `norms: 0.1` を宣言したファイルに対して、`cadl codegen -t python` は `norms_monitor.py` も出力します。一つの契約インスタンスをオンラインで監視するモニタです（付録F、F.5）。動作中のシステムが観測を一つずつ渡すと、規範の状態と四値の判定の変化を返します。`contracts.py` から外される、時相演算子を含む `assume:` / `guarantee:` の項目も判定します。
@@ -863,6 +884,7 @@ src/cadl/
   iec62853.py          IEC 62853を参考にした要約
   unparse.py           式ASTをCADLのソーステキストに戻す
   norms_eval.py        記録済みトレースに対する規範拡張の判定
+  norms_check.py       規範の設計時の検査：PRISMへの変換、問い、証拠
   agents_runtime.py    エージェントガバナンス拡張のランタイム：トレース上の判定、保留、委任、監査記録
   norms_diff.py        改正が規範に及ぼす効果（二つの版の比較）
   grounding.py         根拠付け拡張：導出指標、規則J-1からJ-9とJ-13
@@ -928,6 +950,7 @@ tests/
   test_expr_parser.py    式文法のテスト
   test_unparse.py        式の往復変換テスト
   test_norms_eval.py     トレースに対する規範の判定（`cadl norms-eval`）
+  test_norms_check.py    規範の設計時の検査と差分テスト（`cadl norms-check`）
   test_grounding_extension.py  根拠付け拡張：指標、規則、IR、`cadl norms-indices`
   test_grounding_sos.py  根拠付け拡張：すべての契約の上のSoSの量
   test_norms_wildcards.py 述語の中のワイルドカード参照と範囲参照（F.5）：書き換え、限量子の形との一致、N-15
@@ -981,7 +1004,8 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | シミュレータIR・設定生成（Python, Unity, Go） | 利用可能 |
 | SoS-DSL拡張（`lifecycle:` / `monitors:`）とUnity C#生成 | 利用可能 |
 | 規範拡張：静的検査と、記録済みトレースに対する判定と改正（`cadl norms-eval`、`cadl norms-diff`） | 利用可能 |
-| 規範拡張：生成したPythonパッケージのオンラインモニタ（`norms_monitor.py`） | 利用可能（Solidity・OPA・Unity C#は規範を監視しない。モデル検査器への変換は未実装） |
+| 規範拡張：生成したPythonパッケージのオンラインモニタ（`norms_monitor.py`） | 利用可能（Solidity・OPA・Unity C#は規範を監視しない） |
+| 規範拡張：PRISMによる1つの契約インスタンスの設計時の検査（`cadl norms-check`） | 利用可能（限量した述語、複数のインスタンス、改正は変換しない） |
 | 根拠付け拡張（grounding 0.1）の規範側：導出指標とインセンティブ被覆率（`cadl norms-indices`）、規則J-1からJ-9、IR、二つの版の比較（`cadl norms-diff` のJ-13） | 利用可能 |
 | 戦略モデル拡張（games 0.1）：均衡検査と保証付きの均衡マップ（`cadl game-check`）、付録Jの規範との結び付け（`sanction_of:` / `reward_of:`、J-10からJ-12、J-14） | 利用可能（PRISM-games向けの出力はPRISM-gamesで実行していない） |
 | エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、監査記録。`cadl agents-run`）、Rego / Cedarの境界ポリシー | 利用可能（ランタイムはオフラインの参照実装で、トレースを再生するだけであり、プロトコルには接続しない） |

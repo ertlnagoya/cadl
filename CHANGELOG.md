@@ -8,6 +8,35 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `cadl norms-check FILE [--contract ID] [--bindings i=n] [--members SET=n]
+  [--step DURATION] [--horizon N] [--export DIR] [--format text|json]`:
+  design-time checking of the norms of one contract instance by a model
+  checker (Appendix F, F.12; new module `cadl.norms_check`). The norms
+  are translated into an MDP in the PRISM language whose environment
+  chooses, at each observation (one every step, the greatest common
+  divisor of the durations by default), the message events, one class of
+  values per quantity (the classes that the literals of the predicates
+  cut the domain into, and no value) and the end of the instance; one
+  transition is the six steps of F.5. PRISM (`prism` on PATH, explicit
+  engine) answers per norm whether it can be activated, violated and
+  fulfilled, whether it is violated in every instance that runs to the
+  horizon, whether every activation can be kept, which pairs of
+  obligations and prohibitions are in conflict, whether each power can
+  be exercised and each reparation activated. Every "possible" answer
+  comes with a witness trace that the command evaluates with the engine
+  of `cadl norms-eval` (two for a conflict). `--export` writes the model,
+  the two property files and the witnesses. Predicates with
+  quantifiers, aggregates, arithmetic or two quantities, `request`,
+  `now`, `state` and amendments are not translated (the norm, and the
+  norms that depend on it, are reported with the reason). Without PRISM
+  the command reports that nothing was checked (exit status 0). Exit
+  status 1 on a finding, 2 on a usage error or refusal, 3 when a witness
+  is not confirmed. `examples/norms_check_conflict.cadl` shows a
+  conflict, a reparation that cannot be kept and a power that is never
+  exercised. The translation is tested differentially against
+  `cadl norms-eval` on random and exhaustive paths, with an interpreter
+  of the generated PRISM text that is itself compared with the PRISM
+  simulator.
 - Wildcard and range references in predicates (Appendix F, F.5,
   "Wildcard and range references"). `A[*]` or `A[lo..hi]` outside the
   domain of a quantifier or comprehension is now shorthand: in the

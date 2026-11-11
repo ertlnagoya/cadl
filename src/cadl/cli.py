@@ -135,6 +135,31 @@ def main(argv: list[str] | None = None) -> int:
     norms_cmd.add_argument("--format", choices=["text", "json"], default="text",
                            help="Output format (default: text)")
 
+    # norms-check command
+    nchk_cmd = subparsers.add_parser("norms-check",
+        help="Check the norms of one contract instance over all behaviours with a model "
+             "checker (Appendix F, F.12)")
+    nchk_cmd.add_argument("file", type=Path, help="CADL file that declares norms: 0.1")
+    nchk_cmd.add_argument("--contract", default=None, metavar="ID",
+                          help="Contract to check (default: the only one with norms)")
+    nchk_cmd.add_argument("--bindings", action="append", default=[], metavar="i=n",
+                          help="Bind an index of the instance (default: the lower bound of "
+                               "its set); may be repeated")
+    nchk_cmd.add_argument("--members", action="append", default=[], metavar="SET=n",
+                          help="Number of members of a set of actors in the instance "
+                               "(default: as declared, else up to the largest bound index)")
+    nchk_cmd.add_argument("--step", default=None, metavar="DURATION",
+                          help="Time between two observations, e.g. 1s or 500ms (default: the "
+                               "greatest common divisor of the durations of the contract)")
+    nchk_cmd.add_argument("--horizon", type=int, default=None, metavar="N",
+                          help="Last observation of an instance (default: from the deadlines "
+                               "and intervals of the norms)")
+    nchk_cmd.add_argument("--export", type=Path, default=None, metavar="DIR",
+                          help="Write the PRISM model, the properties and the witness traces "
+                               "to DIR")
+    nchk_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                          help="Output format (default: text)")
+
     # norms-diff command
     diff_cmd = subparsers.add_parser("norms-diff",
         help="Report what an amendment from OLD to NEW does to the norms (Appendix F, F.6)")
@@ -269,6 +294,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_agents_run(args)
     elif args.command == "norms-eval":
         return _cmd_norms_eval(args)
+    elif args.command == "norms-check":
+        return _cmd_norms_check(args)
     elif args.command == "norms-diff":
         return _cmd_norms_diff(args)
     elif args.command == "norms-indices":
@@ -871,6 +898,38 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
     else:
         print(format_text(result))
     return 0 if result["ok"] else 1
+
+
+def _cmd_norms_check(args: argparse.Namespace) -> int:
+    """Exit status: 0 when the questions were answered without a finding,
+    or when no model checker is on PATH (the model is still exported with
+    --export); 1 on a finding (a conflict, a norm never activated or
+    violated in every instance, an activation that cannot be kept, a power
+    never exercised); 2 on a usage error or a refusal; 3 when a witness is
+    not confirmed by norms-eval (an error of norms-check)."""
+    from .norms_check import check_file, format_text
+    from .norms_eval import NormsEvalError
+
+    try:
+        report = check_file(args.file, args.contract, args.bindings, args.members,
+                            args.step, args.horizon, args.export)
+    except NormsEvalError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        import json
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(format_text(report))
+    if not report.get("checked"):
+        print(f"norms-check: {report.get('skipped')}", file=sys.stderr)
+        return 0
+    if report["unconfirmed"]:
+        return 3
+    return 1 if report["findings"] else 0
 
 
 def _cmd_agents_run(args: argparse.Namespace) -> int:
