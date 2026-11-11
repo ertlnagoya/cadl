@@ -180,6 +180,7 @@ class TestGeneration:
     @pytest.mark.parametrize("content,match", [
         ("A.x * 2 > 3", "the operator \\*"), ("A.x / 2 > 3", "the operator /"),
         ("A.x > 0.0000001", "more than 6 decimals"),
+        ("within(5s, throughout(2s, A.x > 3))", "inside another"),
     ])
     def test_solidity_refuses_what_its_fixed_point_cannot_hold(self, content, match):
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
@@ -187,6 +188,32 @@ class TestGeneration:
         generate_norms_monitor_rego(sos, sos.contracts[0])          # OPA monitors it
         with pytest.raises(NormsTargetUnsupported, match=match):
             generate_norms_monitor_sol(sos, sos.contracts[0])
+
+    @pytest.mark.parametrize("item", ["A.x * 2 > 3", "within(5s, throughout(2s, A.x > 3))"])
+    def test_solidity_leaves_out_such_a_guarantee_item(self, item):
+        """As for OPA: a guarantee item that the Solidity monitor cannot
+        evaluate is left out, and the rest is monitored."""
+        sos = _small(f"      guarantee:\n        - \"{item}\"\n        - \"A.ok == true\"\n"
+                     "      norms:\n        - {id: n, kind: prohibition, bearer: A, "
+                     "content: \"A.x > 3\"}\n")
+        [m] = norms_monitors(sos, "solidity")
+        assert m["text"] is not None
+        assert [(k, p) for k, p, _, _ in m["left_out"]] == [("guarantee", 1)]
+        assert norms_monitors(sos, "opa")[0]["left_out"] == []      # OPA evaluates it
+
+    def test_solidity_refuses_a_monitor_above_the_initcode_limit(self):
+        """EIP-3860: a monitor whose creation code would exceed 49152 bytes
+        is not generated (the estimate is checked against solc below)."""
+        norms = "".join(
+            f"        - {{id: o{i}, kind: obligation, bearer: A, trigger: \"B -> A : req{i}\", "
+            f"content: \"A.x{i} >= {i} AND A.y{i} == true\", deadline: 5s}}\n"
+            for i in range(40))
+        sos = _small("      norms:\n" + norms)
+        generate_norms_monitor_rego(sos, sos.contracts[0])
+        with pytest.raises(NormsTargetUnsupported, match="EIP-3860"):
+            generate_norms_monitor_sol(sos, sos.contracts[0])
+        [m] = norms_monitors(sos, "solidity")
+        assert m["text"] is None and "too large" in m["reasons"][0]
 
     def test_rego_carries_the_contract_as_one_json_text(self):
         """No text of the .cadl file is Rego code: the model is one JSON
@@ -479,8 +506,10 @@ def test_opa_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
 @needs_solc
 def test_every_solidity_monitor_compiles_within_the_size_limit(tmp_path):
     """Every monitor generated from the examples and the test files
-    compiles, and its runtime code (and that of the two libraries) is
-    within the limit of EIP-170."""
+    compiles, its runtime code (and that of the two libraries) is within
+    the limit of EIP-170, and its creation code within that of EIP-3860
+    and below the estimate that `cadl codegen` checks."""
+    from cadl.codegen.solidity.norms_monitor_sol import estimated_initcode
     seen = 0
     for path in sorted(EXAMPLES.glob("*.cadl")) + [RICH]:
         sos = parse_file(path)
@@ -491,6 +520,9 @@ def test_every_solidity_monitor_compiles_within_the_size_limit(tmp_path):
             for name, c in compiled.items():
                 if c["bin"]:
                     assert c["runtime"] <= 24576, (path, name, c["runtime"])
+                    assert len(c["bin"]) // 2 <= 49152, (path, name)
+            init = len(compiled[f"Monitor.sol:{m['file'][:-4]}"]["bin"]) // 2
+            assert init <= estimated_initcode(m["text"]), (path, init)
             seen += 1
     assert seen >= 6
 
@@ -502,8 +534,12 @@ def _evm(sos, traces: list, tmp: Path, skip: set = frozenset()) -> tuple:
                                   monitor_name(contract.id), tmp)
     runs = [S.sol_run(l, r.get("quantities", [])) for l, r in zip(traces, refs)]
     raw = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", runs, tmp)
+    _RAW.append(raw)
     got = S.sol_results(raw, runs, [n.id for n in contract.norms], skip)
     return refs, got
+
+
+_RAW: list = []          # the last raw results of _evm, for the gas
 
 
 @needs_evm
@@ -546,3 +582,102 @@ def test_evm_refuses_a_malformed_observation(tmp_path):
     run["steps"] = [s for i, s in enumerate(run["steps"]) if i not in (2, 3)]
     got = S.sol_results([kept], [run], [n.id for n in contract.norms])
     assert S.compare(refs, got) == []
+
+
+# === Long traces ===================================================================
+
+def _long_trace(n: int) -> list:
+    """The robot example at one observation per second for n seconds: the
+    assumption throughout(300s, ...) stays open for 300 of them."""
+    lines = [json.dumps({"t": 0, "bindings": {"i": 2},
+                         "values": {"DISPATCHER.is_operational": True, "ROBOT[2].battery": 80,
+                                    "ROBOT[2].status": "Idle"}})]
+    for k in range(1, n):
+        rec: dict = {"t": k, "values": {"ROBOT[2].battery": 80 - (k % 60)}}
+        if k % 50 == 1:
+            rec["messages"] = [{"from": "DISPATCHER", "to": "ROBOT[2]",
+                                "name": "route_assignment"}]
+        if k % 50 == 3:
+            rec["messages"] = [{"from": "ROBOT[2]", "to": "DISPATCHER", "name": "ack",
+                                "args": ["accepted"]}]
+        lines.append(json.dumps(rec))
+    rec = json.loads(lines[-1])
+    rec["end"] = False
+    lines[-1] = json.dumps(rec)
+    return lines
+
+
+@needs_opa
+def test_opa_long_trace(tmp_path):
+    """Beyond the 16 observations of the other traces: 40, with the
+    buffer of the state kept small."""
+    sos = parse_file(EXAMPLE)
+    lines = _long_trace(40)
+    refs = [S.reference(sos, lines)]
+    got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]), PKG, [lines], refs,
+                    tmp_path, steps=40)
+    assert S.compare(refs, got) == []
+
+
+@needs_evm
+def test_evm_long_trace_has_bounded_gas(tmp_path):
+    """320 observations: each observation costs about the same, while the
+    300 s window of the assumption is open and after it (the windows are
+    scanned once and the values pruned)."""
+    sos = parse_file(EXAMPLE)
+    lines = _long_trace(320)
+    refs, got = _evm(sos, [lines], tmp_path)
+    assert S.compare(refs, got) == []
+    gas = [r["gas"] for r in _RAW[-1][0] if "gas" in r]
+    early = sum(gas[20:70]) / 50
+    late = sum(gas[-50:]) / 50
+    assert late < 1.25 * early, (early, late)
+    assert max(gas[1:]) < 1_500_000, max(gas[1:])
+
+
+@needs_evm
+def test_evm_only_the_reporter_records(tmp_path):
+    sos = parse_file(EXAMPLE)
+    lines = _lines({"t": 0, "bindings": {"i": 2}}, {"t": 1})
+    run = S.sol_run(lines, [])
+    run["steps"] = [dict(st, **{"as": 1}) for st in run["steps"]][:1] + run["steps"]
+    contract = sos.contracts[0]
+    compiled = S.compile_solidity(generate_norms_monitor_sol(sos, contract),
+                                  monitor_name(contract.id), tmp_path)
+    [raw] = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", [run], tmp_path)
+    assert "error" in raw[0]
+    assert all("error" not in r for r in raw[1:])
+
+
+@needs_evm
+def test_evm_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
+    """The traces of tests/test_norms_eval.py on the EVM, for each contract
+    the Solidity monitor supports."""
+    _memoize_parser(monkeypatch)
+    groups: dict = {}
+    for case in norms_eval_cases["cases"]:
+        if case["versions"] or any('"amend"' in l for l in case["lines"]):
+            continue
+        sos = pickle.loads(base64.b64decode(case["sos"]))
+        try:
+            contract = select_contract(sos, case["contract"])
+            text = generate_norms_monitor_sol(sos, contract)
+        except (NormsEvalError, NormsTargetUnsupported):
+            continue
+        groups.setdefault(text, (sos, contract, []))[2].append(case)
+    assert sum(len(g[2]) for g in groups.values()) >= 100
+    steps: list = []
+    from cadl.codegen.norms_ir import unsupported_items
+    from cadl.codegen.solidity.norms_monitor_sol import solidity_ir
+    for k, (text, (sos, contract, cases)) in enumerate(groups.items()):
+        # guarantee items the Solidity monitor leaves out (a nested temporal operator)
+        skip = {pos - 1 for key, pos, _, _ in unsupported_items(solidity_ir(sos, contract))
+                if key == "guarantee"}
+        refs = [S.reference(sos, c["lines"], c["contract"], skip=skip) for c in cases]
+        compiled = S.compile_solidity(text, monitor_name(contract.id), tmp_path / f"m{k}")
+        runs = [S.sol_run(c["lines"], r.get("quantities", [])) for c, r in zip(cases, refs)]
+        raw = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", runs,
+                        tmp_path / f"m{k}")
+        got = S.sol_results(raw, runs, [n.id for n in contract.norms], skip)
+        assert S.compare(refs, got, steps) == [], cases[0]["lines"]
+    assert len(steps) >= 300

@@ -13,8 +13,9 @@ with every predicate as a tree of plain dicts.
 
 What a target cannot monitor is reported as `NormsTargetUnsupported`
 with the reasons; the generator then leaves the contract without a
-monitor (or, for a guarantee item, leaves the item out), and says so. A
-construct is never monitored in a way that differs from norms-eval.
+monitor (or, for a guarantee item, leaves the item out), and says so.
+Where the monitors still differ from norms-eval (arithmetic, times,
+the inputs they refuse) is listed in Appendix D, D.5.
 
 The tree of a predicate is a list of nodes; a node refers to its
 children by their position in the list:

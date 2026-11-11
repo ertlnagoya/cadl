@@ -22,6 +22,7 @@ IR refuses (quantifiers, aggregates, wildcard references).
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,21 @@ _BOPS = {"==": 0, "!=": 1, "<": 2, "<=": 3, ">": 4, ">=": 5, "+": 6, "-": 7}
 _KINDS = {"obligation": 0, "permission": 1, "prohibition": 2, "power": 3}
 _TERMS = {"event": 1, "message": 2, "predicate": 3}
 _INT256 = 2 ** 255
+
+
+# EIP-3860: the creation code of a contract is at most 49152 bytes.
+INITCODE_LIMIT = 49152
+
+
+def estimated_initcode(text: str) -> int:
+    """An upper estimate of the creation code of the generated contract
+    (solc 0.8, optimizer with 1 run): the runtime code and the constructor,
+    which grows with its statements and its texts. Fitted to compiled
+    monitors (2.6 to 12 x 10^4 bytes) and kept above each of them."""
+    ctor = text.split("is CadlNormsMonitorBase {", 1)[1]
+    statements = sum(1 for line in ctor.splitlines() if line.strip().endswith(";"))
+    texts = sum(len(h) // 2 for h in re.findall(r'hex"([0-9a-f]*)"', ctor))
+    return 25500 + 72 * statements + int(1.3 * texts)
 
 
 def monitor_name(contract_id: str) -> str:
@@ -82,10 +98,104 @@ def _pat_args(p: dict) -> str:
     return f'{_s(p["name"])}, {ik}, {text}, false, 0, 0'
 
 
-def _node_lines(nodes: list[dict]) -> list[str]:
+def _children(node: dict) -> list[int]:
+    op = node["op"]
+    if op in ("not", "within", "throughout"):
+        return [node["x"]]
+    if op in ("and", "or", "bin"):
+        return [node["l"], node["r"]]
+    if op == "in":
+        return [node["l"], *node["items"]]
+    if op == "until":
+        return [node["p"], node["q"]]
+    return []
+
+
+def _subtree(nodes: list[dict], root: int) -> list[int]:
+    out, todo = [], [root]
+    while todo:
+        k = todo.pop()
+        out.append(k)
+        todo.extend(_children(nodes[k]))
+    return out
+
+
+def _temporal_inside(nodes: list[dict], root: int) -> bool:
+    return any(nodes[k]["op"] in ("within", "throughout", "until") for k in _subtree(nodes, root))
+
+
+def _problem(nodes: list[dict], root: int) -> str | None:
+    """Why the Solidity monitor cannot evaluate a predicate, or None."""
+    for k in _subtree(nodes, root):
+        nd = nodes[k]
+        if nd["op"] == "bin" and nd["o"] not in _BOPS:
+            return (f"the operator {nd['o']} (the Solidity monitor uses fixed-point numbers "
+                    f"and supports + and - only)")
+        if nd["op"] in ("within", "throughout", "until") and any(
+                _temporal_inside(nodes, c) for c in _children(nd)):
+            return ("a temporal operator inside another one (the Solidity monitor scans "
+                    "each window once, which needs an operand without a temporal operator)")
+        try:
+            if nd["op"] == "lit" and isinstance(nd["v"], (int, float)) \
+                    and not isinstance(nd["v"], bool):
+                scaled(nd["v"], "a literal")
+            if nd["op"] in ("within", "throughout", "until"):
+                scaled(nd["d"], "a duration")
+        except NormsTargetUnsupported as e:
+            return e.reasons[0]
+    return None
+
+
+def solidity_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
+    """`build_ir` with what the Solidity monitor cannot evaluate on top:
+    a guarantee item is marked unsupported (left out), anything else
+    refuses the contract."""
+    ir = build_ir(sos, contract)
+    nodes = ir["exprs"]
+    reasons = []
+
+    def roots_of(term: dict | None) -> list[int]:
+        if not term or term.get("error"):
+            return []
+        if term["kind"] == "predicate":
+            return [term["expr"]]
+        if term["kind"] == "message":
+            return list(term["args"] or [])
+        return []
+
+    for nd in ir["norms"]:
+        for key in ("trigger", "until", "content"):
+            for r in roots_of(nd.get(key)):
+                why = _problem(nodes, r)
+                if why:
+                    reasons.append(f"norm '{nd['id']}', {key}: {why}")
+    for rule in ir["rules"]:
+        for key in ("when", "if"):
+            for r in roots_of(rule.get(key)):
+                why = _problem(nodes, r)
+                if why:
+                    reasons.append(f"counts_as rule creating '{rule['creates']}', {key}: {why}")
+    for key in ("assume", "guarantee"):
+        for pos, it in enumerate(ir["items"][key], start=1):
+            if it["expr"] is None or it.get("unsupported"):
+                continue
+            why = _problem(nodes, it["expr"])
+            if why and key == "assume":
+                reasons.append(f"assume item {pos}: {why}")
+            elif why:
+                it["unsupported"] = why
+    if reasons:
+        raise NormsTargetUnsupported(reasons)
+    return ir
+
+
+def _node_lines(nodes: list[dict], skip: set) -> list[str]:
     out = []
     for k, nd in enumerate(nodes):
         where = f"node {k}"
+        if k in skip:              # a node of an item that is left out
+            out.append('        _node(0, 0, 0, 0, 0, 0, "", "", "", 0, 0, "");')
+            continue
         op = nd["op"]
         bop, a, b, d, ik = 0, 0, 0, 0, 0
         s1 = s2 = s3 = '""'
@@ -135,7 +245,9 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
     """The Solidity text of the monitor of one contract. Raises
     `NormsTargetUnsupported` for a contract that cannot be monitored."""
     check_contract_id(contract.id)
-    ir = build_ir(sos, contract)
+    ir = solidity_ir(sos, contract)
+    skip = {k for it in ir["items"]["guarantee"] if it.get("unsupported") and it["expr"] is not None
+            for k in _subtree(ir["exprs"], it["expr"])}
     body: list[str] = []
     body.append(f"        contractId = {_s(ir['contract'])};")
     for name, (indexed, lo, hi) in ir["actors"].items():
@@ -150,7 +262,7 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
             body.append(f"        lcStates[keccak256(bytes({_s(s)}))] = true;")
         for s in lc["terminal"]:
             body.append(f"        lcTerminal[keccak256(bytes({_s(s)}))] = true;")
-    body += _node_lines(ir["exprs"])
+    body += _node_lines(ir["exprs"], skip)
 
     terms: list[str] = []
     count = [0]
@@ -241,10 +353,17 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
         "",
         "// The model of the contract: the constructor fills it.",
         f"contract {name} is CadlNormsMonitorBase {{",
-        "    constructor() {",
+        "    /// reporter_: the address that records the observations (the deployer when zero)",
+        "    constructor(address reporter_) CadlNormsMonitorBase(reporter_) {",
         *body,
         "    }",
         "}",
         "",
     ]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    size = estimated_initcode(text)
+    if size > INITCODE_LIMIT:
+        raise NormsTargetUnsupported([
+            f"the monitor is too large: its creation code is estimated at {size} bytes, above "
+            f"the limit of {INITCODE_LIMIT} bytes of EIP-3860"])
+    return text

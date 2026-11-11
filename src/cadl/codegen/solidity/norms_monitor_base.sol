@@ -63,6 +63,14 @@ struct Node { uint8 op; uint8 bop; uint256 a; uint256 b; int256 d; uint8 ik; str
 struct Stored { uint256 idx; uint8 k; int256 n; string s; }
 // What the evaluation of predicates reads: the model's nodes and the
 // observations of the contract instance.
+// The scan of a temporal operator (F.4) from one start, advanced by the
+// observations that arrive: its operand has no temporal operator, so its
+// value at an observation is final when the observation is recorded.
+struct Scan {
+    bool started; uint256 next; bool hit; bool unknown;          // within, throughout
+    bool prefixUnknown; bool uncertain; bool broken;              // until
+}
+
 struct EvalData {
     Node[] nodes;
     bool hasLifecycle;
@@ -72,6 +80,9 @@ struct EvalData {
     mapping(bytes32 => Stored) request;
     mapping(bytes32 => bool) known;
     mapping(bytes32 => Stored[]) history;
+    mapping(bytes32 => uint256) head;     // history entries before it are dropped
+    uint256 keepFrom;                     // no lookup reads an observation before it
+    mapping(bytes32 => Scan) scans;       // incremental temporal operators, by (node, start)
     int256[] obsT;
     string[] obsSt;          // lifecycle state before each observation
 }
@@ -232,7 +243,7 @@ library CadlNormsValues {
 // The evaluation of predicates (A.10 with the three-valued reading of F.5 and
 // the temporal operators of F.4), in a library of its own.
 library CadlNormsEval {
-    function evaluate(EvalData storage data, uint256 id, uint256 p, uint256 n) public view returns (Val memory) {
+    function evaluate(EvalData storage data, uint256 id, uint256 p, uint256 n) public returns (Val memory) {
         return ev(data, id, p, n);
     }
 
@@ -266,11 +277,17 @@ library CadlNormsEval {
     }
 
     function lookup(EvalData storage data, string memory key, uint256 p) internal view returns (Val memory v, bool found) {
-        Stored[] storage h = data.history[keccak256(bytes(key))];
-        for (uint256 i = h.length; i > 0; i--) {
-            if (h[i - 1].idx <= p) return (stored(h[i - 1]), true);
+        bytes32 k = keccak256(bytes(key));
+        Stored[] storage h = data.history[k];
+        // the last entry at or before p: binary search over the kept entries
+        uint256 lo = data.head[k];
+        uint256 hi = h.length;
+        if (lo >= hi || h[lo].idx > p) return (mark(K_U), false);
+        while (hi - lo > 1) {
+            uint256 mid = (lo + hi) / 2;
+            if (h[mid].idx <= p) lo = mid; else hi = mid;
         }
-        return (mark(K_U), false);
+        return (stored(h[lo]), true);
     }
 
     function nameVal(EvalData storage data, Node storage nd, uint256 p) internal view returns (Val memory) {
@@ -291,7 +308,7 @@ library CadlNormsEval {
         return x;
     }
 
-    function ev(EvalData storage data, uint256 id, uint256 p, uint256 n) internal view returns (Val memory) {
+    function ev(EvalData storage data, uint256 id, uint256 p, uint256 n) internal returns (Val memory) {
         Node storage nd = data.nodes[id];
         uint8 op = nd.op;
         if (op == OP_LIT) return nd.lit;
@@ -311,8 +328,8 @@ library CadlNormsEval {
         if (op == OP_AND || op == OP_OR) return andOr(op == OP_OR, truth(ev(data, nd.a, p, n)), truth(ev(data, nd.b, p, n)));
         if (op == OP_BIN) return CadlNormsValues.binop(nd.bop, ev(data, nd.a, p, n), ev(data, nd.b, p, n));
         if (op == OP_IN) return inList(data, nd, p, n);
-        if (op == OP_WITHIN || op == OP_THROUGHOUT) return temporal(data, nd, p, n);
-        return untilOp(data, nd, p, n);
+        if (op == OP_WITHIN || op == OP_THROUGHOUT) return temporal(data, id, nd, p, n);
+        return untilOp(data, id, nd, p, n);
     }
 
     function andOr(bool isOr, Val memory l, Val memory r) internal pure returns (Val memory) {
@@ -324,7 +341,7 @@ library CadlNormsEval {
         return boolVal(!isOr);
     }
 
-    function inList(EvalData storage data, Node storage nd, uint256 p, uint256 n) internal view returns (Val memory) {
+    function inList(EvalData storage data, Node storage nd, uint256 p, uint256 n) internal returns (Val memory) {
         Val memory l = ev(data, nd.a, p, n);
         if (l.k == K_U || l.k == K_D) return l;
         if (l.k == K_S) return mark(K_U);
@@ -348,47 +365,49 @@ library CadlNormsEval {
         return acc;
     }
 
-    /// within (decisive true) and throughout (decisive false), F.4
-    function temporal(EvalData storage data, Node storage nd, uint256 p, uint256 n) internal view returns (Val memory) {
+    function scanOf(EvalData storage data, uint256 id, uint256 p) internal returns (Scan storage sc) {
+        sc = data.scans[keccak256(abi.encode(id, p))];
+        if (!sc.started) { sc.started = true; sc.next = p; }
+    }
+
+    /// within (decisive true) and throughout (decisive false), F.4. The
+    /// window is scanned once: each call reads only the new observations.
+    function temporal(EvalData storage data, uint256 id, Node storage nd, uint256 p, uint256 n) internal returns (Val memory) {
         int256 dec = nd.op == OP_WITHIN ? int256(1) : int256(0);
         int256 limit = data.obsT[p] + nd.d;
-        Val memory acc = boolVal(true);
-        bool hit = false;
-        uint256 j = p;
-        while (j <= n && data.obsT[j] <= limit) {
-            Val memory v = truth(ev(data, nd.a, j, n));
-            if (v.k == K_B && v.n == dec) hit = true;
-            else acc = worst(acc, v);
-            j++;
+        Scan storage sc = scanOf(data, id, p);
+        while (!sc.hit && sc.next <= n && data.obsT[sc.next] <= limit) {
+            Val memory v = truth(ev(data, nd.a, sc.next, n));
+            if (v.k == K_B && v.n == dec) sc.hit = true;
+            else if (v.k != K_B) sc.unknown = true;
+            sc.next++;
         }
-        if (hit) return boolVal(dec == 1);
-        if (j > n) return mark(K_D);
-        if (acc.k != K_B) return acc;
+        if (sc.hit) return boolVal(dec == 1);
+        if (data.obsT[n] <= limit) return mark(K_D);
+        if (sc.unknown) return mark(K_U);
         return boolVal(dec == 0);
     }
 
-    function untilOp(EvalData storage data, Node storage nd, uint256 p, uint256 n) internal view returns (Val memory) {
+    function untilOp(EvalData storage data, uint256 id, Node storage nd, uint256 p, uint256 n) internal returns (Val memory) {
         int256 limit = data.obsT[p] + nd.d;
-        Val memory uncertain = boolVal(true);      // true: none yet
-        Val memory prefix = boolVal(true);
-        bool broken = false;
-        uint256 j = p;
-        while (j <= n && data.obsT[j] <= limit) {
-            Val memory qv = truth(ev(data, nd.b, j, n));
+        Scan storage sc = scanOf(data, id, p);
+        while (!sc.hit && !sc.broken && sc.next <= n && data.obsT[sc.next] <= limit) {
+            Val memory qv = truth(ev(data, nd.b, sc.next, n));
             if (qv.k == K_B && qv.n == 1) {
-                if (prefix.k == K_B) return boolVal(true);
-                uncertain = worst(uncertain, prefix);
+                if (!sc.prefixUnknown) { sc.hit = true; break; }
+                sc.uncertain = true;
             } else if (qv.k != K_B) {
-                uncertain = worst(worst(uncertain, qv), prefix);
+                sc.uncertain = true;
             }
-            Val memory pv = truth(ev(data, nd.a, j, n));
-            if (pv.k == K_B && pv.n == 0) { broken = true; break; }
-            if (pv.k != K_B) prefix = worst(prefix, pv);
-            j++;
+            Val memory pv = truth(ev(data, nd.a, sc.next, n));
+            if (pv.k == K_B && pv.n == 0) sc.broken = true;
+            else if (pv.k != K_B) sc.prefixUnknown = true;
+            sc.next++;
         }
-        if (!broken && j > n) return mark(K_D);
-        if (uncertain.k == K_B) return boolVal(false);
-        return uncertain;
+        if (sc.hit) return boolVal(true);
+        if (!sc.broken && data.obsT[n] <= limit) return mark(K_D);
+        if (sc.uncertain) return mark(K_U);
+        return boolVal(false);
     }
 
     /// The text of an actor reference with its index bound; bound is false
@@ -466,6 +485,20 @@ abstract contract CadlNormsMonitorBase {
     mapping(bytes32 => bool) internal lcStates;
     mapping(bytes32 => bool) internal lcTerminal;
 
+    // --- who may record the instance -------------------------------------------------
+    /// Only this address may call begin, observe, addQuantities and finish.
+    address public reporter;
+
+    modifier onlyReporter() {
+        require(msg.sender == reporter, "only the reporter records observations");
+        _;
+    }
+
+    /// The reporter is `reporter_`, or the deployer when it is the zero address.
+    constructor(address reporter_) {
+        reporter = reporter_ == address(0) ? msg.sender : reporter_;
+    }
+
     // --- the state of the contract instance ----------------------------------------
     uint256 public observations;      // observations of the instance so far
     int256 public lastT;
@@ -493,7 +526,7 @@ abstract contract CadlNormsMonitorBase {
 
     /// Bindings, data.request fields (by path, "a.b") and names of quantities,
     /// before the first observation. Optional; may be called once.
-    function begin(ValIn[] calldata bindings_, ValIn[] calldata request_, string[] calldata quantities) external {
+    function begin(ValIn[] calldata bindings_, ValIn[] calldata request_, string[] calldata quantities) external onlyReporter {
         require(observations == 0 && !begun && !ended, "begin() comes before the first observation");
         begun = true;
         CadlNormsValues.checkBegin(bindings_, request_);
@@ -515,7 +548,7 @@ abstract contract CadlNormsMonitorBase {
     }
 
     /// Names of quantities written without an actor that get a value later.
-    function addQuantities(string[] calldata quantities) external {
+    function addQuantities(string[] calldata quantities) external onlyReporter {
         for (uint256 i = 0; i < quantities.length; i++) {
             data.known[keccak256(bytes(CadlNormsValues.canon(quantities[i])))] = true;
         }
@@ -526,7 +559,7 @@ abstract contract CadlNormsMonitorBase {
     /// hasState) and whether the instance ends at it. Reverts, leaving the
     /// monitor as it was, for an observation that is malformed.
     function observe(int256 t, ValIn[] calldata values, Msg[] calldata msgs,
-                     bool hasState, string calldata state, bool end) external {
+                     bool hasState, string calldata state, bool end) external onlyReporter {
         checkInput(t, values, msgs);
         lastT = t;
         hasLastT = true;
@@ -555,6 +588,7 @@ abstract contract CadlNormsMonitorBase {
         for (uint256 i = 0; i < values.length; i++) {
             bytes32 h = keccak256(bytes(CadlNormsValues.canon(values[i].name)));
             data.known[h] = true;
+            prune(h);
             data.history[h].push(Stored(n, values[i].k, values[i].n, values[i].s));
         }
         data.obsT.push(t);
@@ -568,11 +602,46 @@ abstract contract CadlNormsMonitorBase {
         (uint8[] memory ns, uint8[] memory nv, uint8[] memory am, uint8[] memory gm) = marks();
         step(n, t, msgs, endHere);
         emitChanges(ns, nv, am, gm, t);
+        updateKeepFrom(n);
+    }
+
+    /// The first observation that a later step can read (as the buffer of
+    /// the Rego monitor): this one, the candidates of the norms, and the
+    /// first while a temporal item is not decided.
+    function updateKeepFrom(uint256 n) internal {
+        uint256 k = n;
+        for (uint256 i = 0; i < recs.length; i++) {
+            uint256[] storage c = recs[i].cands;
+            for (uint256 j = 0; j < c.length; j++) if (c[j] < k) k = c[j];
+        }
+        if (k > 0 && (pendingTemporal(assumeItems, assumeRecs) || pendingTemporal(guaranteeItems, guaranteeRecs))) k = 0;
+        data.keepFrom = k;
+    }
+
+    function pendingTemporal(Item[] storage items, ItemRec[] storage rs) internal view returns (bool) {
+        for (uint256 i = 0; i < items.length; i++) {
+            if (items[i].temporal && !items[i].broken && !items[i].unsupported && rs[i].value == 0) return true;
+        }
+        return false;
+    }
+
+    /// Drop values of a quantity that no lookup can read any more: at most
+    /// four per new value, so that the cost of an observation stays bounded
+    /// when a long window closes (the rest goes with the next values).
+    function prune(bytes32 h) internal {
+        Stored[] storage hs = data.history[h];
+        uint256 at = data.head[h];
+        uint256 stop = at + 4;
+        while (at < stop && at + 1 < hs.length && hs[at + 1].idx <= data.keepFrom) {
+            delete hs[at];
+            at++;
+        }
+        data.head[h] = at;
     }
 
     /// The end of the contract instance at its last observation (F.5,
     /// item 6), when no observation said so.
-    function finish() external {
+    function finish() external onlyReporter {
         require(observations > 0, "the contract instance has no observation");
         if (ended) {
             return;
@@ -739,7 +808,7 @@ abstract contract CadlNormsMonitorBase {
         return string.concat(m.from, " -> ", m.to, " : ", m.name);
     }
 
-    function occurs(uint256 j, uint256 n, Msg[] calldata msgs, Ev[] memory created) internal view returns (bool) {
+    function occurs(uint256 j, uint256 n, Msg[] calldata msgs, Ev[] memory created) internal returns (bool) {
         Term storage term = terms[j];
         if (term.kind == T_EVENT) {
             bytes32 h = keccak256(bytes(term.text));
@@ -779,7 +848,7 @@ abstract contract CadlNormsMonitorBase {
         return false;
     }
 
-    function collectActs(uint256 n, Msg[] calldata msgs, Ev[] memory created) internal view returns (Act[] memory acts) {
+    function collectActs(uint256 n, Msg[] calldata msgs, Ev[] memory created) internal returns (Act[] memory acts) {
         Act[] memory buf = new Act[](created.length + normDefs.length * msgs.length);
         uint256 c = 0;
         for (uint256 e = 0; e < created.length; e++) {
@@ -902,7 +971,7 @@ abstract contract CadlNormsMonitorBase {
         return false;
     }
 
-    function contentValue(uint256 i, uint256 k, uint256 n, Msg[] calldata msgs, Ev[] memory created) internal view returns (Val memory) {
+    function contentValue(uint256 i, uint256 k, uint256 n, Msg[] calldata msgs, Ev[] memory created) internal returns (Val memory) {
         Term storage term = terms[uint256(normDefs[i].content)];
         if (term.kind == T_PREDICATE) {
             Val memory v = evalTruth(term.root, k, n);
@@ -994,7 +1063,7 @@ abstract contract CadlNormsMonitorBase {
     // Messages and actors
     // =========================================================================
 
-    function msgMatches(Term storage term, Msg calldata m, uint256 n) internal view returns (bool) {
+    function msgMatches(Term storage term, Msg calldata m, uint256 n) internal returns (bool) {
         if (keccak256(bytes(m.name)) != keccak256(bytes(term.msgName))) return false;
         if (!actorMatches(term.sender, m.from) || !actorMatches(term.receiver, m.to)) return false;
         if (!term.hasArgs) return true;
@@ -1071,11 +1140,11 @@ abstract contract CadlNormsMonitorBase {
     // Values (A.10 with the three-valued reading of F.5)
     // =========================================================================
 
-    function evalAt(uint256 root, uint256 p, uint256 n) internal view returns (Val memory) {
+    function evalAt(uint256 root, uint256 p, uint256 n) internal returns (Val memory) {
         return CadlNormsEval.evaluate(data, root, p, n);
     }
 
-    function evalTruth(uint256 root, uint256 p, uint256 n) internal view returns (Val memory) {
+    function evalTruth(uint256 root, uint256 p, uint256 n) internal returns (Val memory) {
         return truth(CadlNormsEval.evaluate(data, root, p, n));
     }
 

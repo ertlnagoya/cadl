@@ -1346,9 +1346,11 @@ errs[14] := "a value of 'values' must be null, a boolean, a number or a string" 
 	not is_array(input.quantities)
 }
 
+# an integer written as one: 1.0 and 1e2 are not (cadl norms-eval would
+# write the member as A[1.0])
 int_number(v) if {
 	is_number(v)
-	v == round(v)
+	regex.match(`^-?(0|[1-9][0-9]*)$`, json.marshal(v))
 }
 
 errs[15] := sprintf("state '%s' at t=%v is not a state of the lifecycle of %s", [lc_after, obs.t, model.contract]) if {

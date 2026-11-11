@@ -27,13 +27,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   counts-as rule or an `assume:` item gets no monitor, with a warning
   that says why; such a `guarantee:` item is left out of the monitor
   with a warning. Amendments are refused at the observation that has
-  one. The Solidity monitor also refuses `*`, `/` and numbers with more
-  than 6 decimals. The tests compare both with the engine of `cadl
+  one. The Solidity monitor also refuses `*`, `/`, numbers with more
+  than 6 decimals, nested temporal operators and a monitor whose
+  creation code would exceed the limit of EIP-3860 (in a `guarantee:`
+  item only the item is left out); only its reporter (an address given
+  to the constructor, by default the deployer) may record observations,
+  and an observation costs gas independent of the length of the trace
+  (windows are scanned once, values found by binary search and pruned).
+  A binding must be an integer written as one or a string. The tests compare both with the engine of `cadl
   norms-eval` after every observation (the example traces, the traces of
   `tests/test_norms_eval.py` and random traces; OPA with `opa eval`,
   Solidity on an EVM from PyPI in a separate Python named by
   `CADL_EVM_PYTHON`) and check that hostile strings stay data. Up to
-  0.3.23 these targets left out the norms and the temporal items with a
+  0.3.24 these targets left out the norms and the temporal items with a
   warning; the files they generated before are unchanged.
 - Wildcard and range references in predicates (Appendix F, F.5,
   "Wildcard and range references"). `A[*]` or `A[lo..hi]` outside the

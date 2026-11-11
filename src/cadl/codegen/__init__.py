@@ -82,12 +82,13 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
     from .norms_ir import NormsTargetUnsupported, build_ir, unsupported_items
     if target not in ("opa", "solidity") or not norms_declared(sos):
         return []
+    ir_of = build_ir
     if target == "opa":
         from .opa.norms_monitor_rego import generate_norms_monitor_rego as gen
         from .opa.norms_monitor_rego import monitor_filename
     else:
         from .solidity.norms_monitor_sol import generate_norms_monitor_sol as gen
-        from .solidity.norms_monitor_sol import monitor_name
+        from .solidity.norms_monitor_sol import monitor_name, solidity_ir as ir_of
 
         def monitor_filename(contract_id: str) -> str:
             return f"{monitor_name(contract_id)}.sol"
@@ -96,7 +97,7 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
         entry = {"contract": contract.id, "file": monitor_filename(contract.id),
                  "text": None, "reasons": [], "left_out": []}
         try:
-            entry["left_out"] = unsupported_items(build_ir(sos, contract))
+            entry["left_out"] = unsupported_items(ir_of(sos, contract))
             entry["text"] = gen(sos, contract)
         except NormsTargetUnsupported as e:
             entry["reasons"] = e.reasons

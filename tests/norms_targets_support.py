@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from decimal import Decimal
@@ -46,18 +47,63 @@ def _item_mark(key: str, item: dict) -> str:
     return "pending" if v in (None, "undefined") else "holds" if v else "failed"
 
 
-def _snapshot(eng, nv: int, ne: int, nu: int, skip: set) -> dict:
+_POWER_RE = re.compile(r"^(.*) exercises the power (\S+) \((.*)\)$")
+
+
+def _next_deadline(eng, t: float):
+    """next_deadline() of the Python monitor, from the engine."""
+    if eng.ended_at is not None:
+        return None
+    due = [t + max(x.deadline - x.elapsed(t), 0.0) for x in eng.norms
+           if x.state == "active" and not x.frozen and x.deadline is not None
+           and x.d.kind in ("obligation", "prohibition") and x.elapsed(t) <= x.deadline + 1e-9]
+    return _round(min(due)) if due else None
+
+
+def _round(x):
+    return None if x is None else round(float(x), 6)
+
+
+def _changes(before: dict, after: dict) -> list:
+    """The changes from one snapshot to the next, as sorted tuples."""
+    out = []
+    for nid, now in after["norms"].items():
+        old = before["norms"].get(nid, ["inactive", "pending"])
+        if old != now:
+            out.append(["norm", nid, old[0], old[1], now[0], now[1]])
+    for key, kind in (("assume", "assumption"), ("guarantee", "guarantee")):
+        for pos, (old, now) in enumerate(zip(before[key], after[key]), start=1):
+            if old != now and now != "-":
+                out.append([kind, pos, old, now])
+    return sorted(out, key=json.dumps)
+
+
+def _marks(eng, skip: set) -> dict:
     return {
         "norms": {x.d.id: [x.state, x.verdict] for x in eng.norms},
         "assume": [_item_mark("assume", i) for i in eng.items["assume"]],
         "guarantee": [_item_mark("guarantee", i) if pos not in skip else "-"
                       for pos, i in enumerate(eng.items["guarantee"])],
-        "violations": [[v["norm"], v["verdict"], v["reparation_activated"], v["transition"]]
-                       for v in eng.violations[nv:]],
+    }
+
+
+def _snapshot(eng, nv: int, ne: int, nu: int, nt: int, skip: set, before: dict, t: float) -> dict:
+    marks = _marks(eng, skip)
+    powers = []
+    for entry in eng.timeline[nt:]:
+        if entry["kind"] == "power":
+            m = _POWER_RE.match(entry["text"])
+            powers.append([m.group(2), m.group(1), m.group(3)])
+    return dict(marks, **{
+        "violations": [[v["norm"], v["verdict"], v["reparation_activated"], v["transition"],
+                        v["severity"], v["sanction"]] for v in eng.violations[nv:]],
         "events": [[e["name"], e["performer"]] for e in eng.inst_events[ne:]],
         "unauthorised": [[u["act"], u["performer"]] for u in eng.unauthorised[nu:]],
+        "powers": powers,
+        "changes": _changes(before, marks),
+        "next_deadline": _next_deadline(eng, t),
         "ended": eng.ended_at is not None,
-    }
+    })
 
 
 def reference(sos, lines: list, contract: str | None = None, skip: set = frozenset()) -> dict:
@@ -81,13 +127,16 @@ def reference(sos, lines: list, contract: str | None = None, skip: set = frozens
     eng = _Engine(c, trace, None, actors)
     eng.ev.known = set(names)
     steps = []
-    nv = ne = nu = 0
+    nv = ne = nu = nt = 0
     last = len(trace.observations) - 1
+    before = _marks(eng, skip)
     for n in range(len(trace.observations)):
         ended = eng._step(n, n == last)
         eng._finish_items()
-        steps.append(_snapshot(eng, nv, ne, nu, skip))
+        steps.append(_snapshot(eng, nv, ne, nu, nt, skip, before, trace.observations[n].t))
+        before = {k: steps[-1][k] for k in ("norms", "assume", "guarantee")}
         nv, ne, nu = len(eng.violations), len(eng.inst_events), len(eng.unauthorised)
+        nt = len(eng.timeline)
         if ended:
             break
     return {"steps": steps, "quantities": sorted(names)}
@@ -112,7 +161,9 @@ def compare(refs: list, got: list, count_steps: list | None = None) -> list:
                     and not have["ended"]):
                 f = dict(g["finish"])
                 f["violations"] = have["violations"] + f["violations"]
-                f["events"], f["unauthorised"] = have["events"], have["unauthorised"]
+                for key in ("events", "unauthorised", "powers"):
+                    f[key] = have[key]
+                f["changes"] = _merge(have["changes"], f["changes"])
                 have = f
             if count_steps is not None:
                 count_steps.append(1)
@@ -120,6 +171,20 @@ def compare(refs: list, got: list, count_steps: list | None = None) -> list:
                 bad.append((i, k, want, have))
                 break
     return bad
+
+
+def _merge(first: list, second: list) -> list:
+    """The changes of two consecutive steps as the changes of one."""
+    def key(c):
+        return (c[0], c[1])
+    state = {}
+    for c in first + second:
+        k = key(c)
+        old = state[k][0] if k in state else (c[2:4] if c[0] == "norm" else [c[2]])
+        new = c[4:6] if c[0] == "norm" else [c[3]]
+        state[k] = (old, new)
+    out = [[k[0], k[1], *old, *new] for k, (old, new) in state.items() if old != new]
+    return sorted(out, key=json.dumps)
 
 
 def records(lines: list) -> list:
@@ -176,11 +241,22 @@ snap(r) := null if {
 	"norms": {id: [x.state, x.verdict] | some id, x in r.verdicts.norms},
 	"assume": [a.status | some a in r.verdicts.assumptions],
 	"guarantee": [g_mark(g) | some g in r.verdicts.guarantees],
-	"violations": [[v.norm, v.verdict, v.reparation_activated, v.transition] | some v in r.violations],
+	"violations": [[v.norm, v.verdict, v.reparation_activated, v.transition, v.severity, v.sanction] |
+		some v in r.violations
+	],
 	"events": [[e.name, e.performer] | some e in r.institutional_events],
 	"unauthorised": [[u.act, u.performer] | some u in r.unauthorised],
+	"powers": [[p.power, p.performer, p.act] | some p in r.powers_exercised],
+	"changes": [change(c) | some c in r.changes],
+	"next_deadline": r.next_deadline,
 	"ended": r.ended,
 }
+
+change(c) := ["norm", c.id, c.previous_state, c.previous_verdict, c.state, c.verdict] if {
+	c.kind == "norm"
+} else := ["assumption", c.index, c.previous, c.status] if {
+	c.kind == "assumption"
+} else := ["guarantee", c.index, c.previous, c.verdict]
 
 g_mark(g) := g.verdict if {
 	g.monitored
@@ -196,33 +272,44 @@ results := [run(tr) | some tr in input.traces]
 """
 
 
-def opa_driver(package: str) -> str:
+def opa_driver(package: str, steps: int | None = None) -> str:
+    steps = steps or MAX_STEPS
     lines, prev = [], "null"
-    for i in range(MAX_STEPS):
+    for i in range(steps):
         lines.append(f"\tr{i} := s(tr, {prev}, {i})")
         lines.append(f"\tp{i} := lastok(r{i}, {prev})")
         prev = f"p{i}"
     return _DRIVER % {"pkg": package, "unrolled": "\n".join(lines),
-                      "names": ", ".join(f"r{i}" for i in range(MAX_STEPS)), "last": prev}
+                      "names": ", ".join(f"r{i}" for i in range(steps)), "last": prev}
 
 
-def run_opa(rego_text: str, package: str, traces: list, refs: list, tmp: Path) -> list:
+def run_opa(rego_text: str, package: str, traces: list, refs: list, tmp: Path,
+            steps: int | None = None) -> list:
     """Replay traces (lists of lines) through the Rego monitor."""
+    steps = steps or MAX_STEPS
     inputs = []
     for lines, ref in zip(traces, refs):
         recs = records(lines)
-        assert len(recs) <= MAX_STEPS
+        assert len(recs) <= steps
         inputs.append({"obs": recs, "q": ref.get("quantities", []), "finish": finishes(lines)})
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / "monitor.rego").write_text(rego_text, encoding="utf-8")
-    (tmp / "driver.rego").write_text(opa_driver(package), encoding="utf-8")
+    (tmp / "driver.rego").write_text(opa_driver(package, steps), encoding="utf-8")
     (tmp / "input.json").write_text(json.dumps({"traces": inputs}), encoding="utf-8")
     proc = subprocess.run(
         [opa_binary(), "eval", "-d", str(tmp / "monitor.rego"), "-d", str(tmp / "driver.rego"),
          "-i", str(tmp / "input.json"), "--format", "json", "data.driver.results"],
         capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
-    return json.loads(proc.stdout)["result"][0]["expressions"][0]["value"]
+    return [_normal(r) for r in json.loads(proc.stdout)["result"][0]["expressions"][0]["value"]]
+
+
+def _normal(run: dict) -> dict:
+    for st in run["steps"] + ([run["finish"]] if run.get("finish") else []):
+        if "changes" in st:
+            st["changes"] = sorted(st["changes"], key=json.dumps)
+            st["next_deadline"] = _round(st["next_deadline"])
+    return run
 
 
 def opa_step(rego_text: str, package: str, input_: dict, tmp: Path) -> dict:
@@ -316,7 +403,10 @@ def sol_run(lines: list, quantities: list) -> dict:
     """A trace as the calls of the Solidity monitor."""
     recs = records(lines)
     first = recs[0]
-    bindings = [sol_value(k, v) for k, v in first.get("bindings", {}).items()]
+    # the host's part: a binding written with a fraction or an exponent (1.0)
+    # is not an integer; it is passed with a kind the contract refuses
+    bindings = [[k, 1, 0, ""] if isinstance(v, float) else sol_value(k, v)
+                for k, v in first.get("bindings", {}).items()]
     request: list = []
     _flat("", first.get("request", {}), request)
     steps = []
@@ -351,15 +441,30 @@ def sol_snapshot(r: dict, ids: list, skip: set) -> dict:
         "norms": {i: [STATES[s], VERDICTS[v]] for i, s, v in zip(ids, states, verdicts)},
         "assume": [STATUS[a] for a in assume],
         "guarantee": [VERDICTS[g] if pos not in skip else "-" for pos, g in enumerate(guarantee)],
-        "violations": [], "events": [], "unauthorised": [], "ended": r["ended"],
+        "violations": [], "events": [], "unauthorised": [], "powers": [], "changes": [],
+        "next_deadline": (r["deadline"][1] / 10 ** 6) if r["deadline"][0] else None,
+        "ended": r["ended"],
     }
+    snap["next_deadline"] = _round(snap["next_deadline"])
     for name, vals in r["logs"]:
         if name == "Violation":
-            snap["violations"].append([vals[0], VERDICTS[vals[2]], vals[5], vals[6] or None])
+            snap["violations"].append([vals[0], VERDICTS[vals[2]], vals[5], vals[6] or None,
+                                       vals[1], vals[3] or None])
+        elif name == "PowerExercised":
+            snap["powers"].append([vals[0], vals[1], vals[2]])
+        elif name == "NormChanged":
+            snap["changes"].append(["norm", vals[1], STATES[vals[4]], VERDICTS[vals[5]],
+                                    STATES[vals[2]], VERDICTS[vals[3]]])
+        elif name == "ItemChanged":
+            names = VERDICTS if vals[0] else STATUS
+            if not (vals[0] and (vals[1] - 1) in skip):
+                snap["changes"].append(["guarantee" if vals[0] else "assumption", vals[1],
+                                        names[vals[3]], names[vals[2]]])
         elif name == "InstitutionalEvent":
             snap["events"].append([vals[0], vals[1] or None])
         elif name == "Unauthorised":
             snap["unauthorised"].append([vals[0], vals[1]])
+    snap["changes"] = sorted(snap["changes"], key=json.dumps)
     return snap
 
 

@@ -11,7 +11,7 @@ JOB.json: {"contracts": {name: {"abi": [...], "bin": "..."}}, "libraries":
 [names in the order of deployment], "monitor": name, "runs": [run, ...]}.
 A run is {"begin": [bindings, request, quantities] or null, "steps":
 [{"observe": [t, values, messages, hasState, state, end]} or {"finish":
-true}, ...]}; values and arguments are [name, kind, n, s].
+true}, with "as": k to send it from account k instead of the reporter, ...]}; values and arguments are [name, kind, n, s].
 OUT.json: per run, per step: {"error": text} for a reverted call, or
 {"verdicts": [states, verdicts, assumptions, guarantees], "logs": [...]}.
 """
@@ -90,6 +90,8 @@ def main() -> int:
     code = contracts[job["monitor"]]["bin"]
     for other, addr in addresses.items():
         code = link(code, other, addr)
+    # the constructor argument: the reporter (zero: the deployer)
+    code += encode(["address"], ["0x" + "00" * 20]).hex()
     # one deployment; each run starts from a snapshot of the chain taken after it
     address = chain.deploy(code)
     t = chain.t
@@ -97,10 +99,10 @@ def main() -> int:
     for run in job["runs"]:
         t.revert_to_snapshot(fresh)
 
-        def call(name: str, args: list, transact: bool):
+        def call(name: str, args: list, transact: bool, sender: int = 0):
             sel, types = selector(name)
             data = "0x" + (sel + encode(types, args)).hex()
-            tx = {"from": chain.acct, "to": address, "data": data, "gas": GAS}
+            tx = {"from": t.get_accounts()[sender], "to": address, "data": data, "gas": GAS}
             if transact:
                 try:
                     h = t.send_transaction(tx)
@@ -132,13 +134,15 @@ def main() -> int:
             if "error" in r:
                 results.append(r)
         for st in run["steps"]:
+            sender = st.get("as", 0)          # another account than the reporter
             if "finish" in st:
-                r = call("finish", [], True)
+                r = call("finish", [], True, sender)
             else:
-                r = call("observe", st["observe"], True)
+                r = call("observe", st["observe"], True, sender)
             if "error" not in r:
                 r["verdicts"] = call("verdicts", [], False)
                 r["ended"] = call("ended", [], False)[0]
+                r["deadline"] = call("nextDeadline", [], False)
             results.append(r)
         out.append(results)
     with open(sys.argv[2], "w", encoding="utf-8") as f:
