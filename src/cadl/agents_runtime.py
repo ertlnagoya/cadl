@@ -240,6 +240,7 @@ class _Instance:
         self.request = request
         self.started = started
         self.ended: float | None = None
+        self.end_line: int | None = None
         self.running = True
         self.state: str | None = None
         self.engine: _BoundaryEngine = None       # type: ignore[assignment]
@@ -281,9 +282,35 @@ class _BoundaryTerm(_Term):
             return self.unknown_as
         return matched
 
+    def unbound_in_predicate(self) -> list[str]:
+        """The index variables of a predicate that neither the contract
+        instance nor a quantifier of the predicate binds."""
+        if self.kind != "predicate" or self.expr is None:
+            return []
+        return sorted(G.predicate_index_vars(self.expr) - set(self.ev.bindings))
+
+    def _unknown_predicate(self) -> bool:
+        names = self.unbound_in_predicate()
+        if names:
+            self.ev.warn(
+                f"the index '{names[0]}' in the predicate '{self.text}' is not bound: "
+                f"whether it holds is unknown and is resolved fail-closed (G.5), here as "
+                f"{'occurring' if self.unknown_as else 'not occurring'}")
+        return bool(names)
+
+    def occurs(self, k: int, created: list[dict]) -> bool:
+        if self._unknown_predicate():
+            return self.unknown_as
+        return super().occurs(k, created)
+
+    def content(self, k: int, n: int, created: list[dict]) -> Any:
+        if self._unknown_predicate():
+            return self.unknown_as
+        return super().content(k, n, created)
+
 
 def _resolve_unknown(term, value: bool) -> None:
-    if term is not None and term.kind == "message":
+    if term is not None and term.kind in ("message", "predicate"):
         term.__class__ = _BoundaryTerm
         term.unknown_as = value
 
@@ -315,8 +342,14 @@ class _BoundaryEngine(_Engine):
         no institutional event is created; a power is not activated, is
         ended, and is not exercised; an obligation is activated, not ended
         and not fulfilled."""
-        for _, when, _ in self.rules:
+        for _, when, cond in self.rules:
             _resolve_unknown(when, False)
+            if cond is not None and not cond.error and cond.kind == "predicate" \
+                    and G.predicate_index_vars(cond.expr) - set(self.ev.bindings):
+                # An `if:` that depends on an unbound index: no event.
+                cond.error = "it depends on an index that the instance does not bind"
+                self.ev.warn(f"the if: '{cond.text}' of a counts_as rule depends on an "
+                             f"index that is not bound: the rule creates no event (G.5)")
         for norm in self.norms:
             kind = norm.d.kind
             if kind in ("permission", "power"):
@@ -481,9 +514,10 @@ class AgentsRuntime:
         self._snapshot: dict[str, Any] = {}
         self._lineno = 0
         self._checked: set[str] = set()
-        self._known: set[str] = set()
-        for line in trace.lines:
-            self._known.update(line.obs.values)
+        # (contract, instance) -> index of the line at which the instance
+        # ended, from a first replay; None while that replay runs.
+        self._ends: dict | None = None
+        self._k = 0
         ids = [c["id"] for c in self.policy["contracts"]]
         named = {}
         for line in trace.lines:
@@ -586,13 +620,32 @@ class AgentsRuntime:
         """A contract instance binds every index variable of its parties."""
         if not self.check:
             return
+        party_vars = set()
         for ref in self._contract(cid)["parties"]:
-            if ref["kind"] == "var" and ref["var"] not in bindings:
+            if ref["kind"] != "var":
+                continue
+            var = ref["var"]
+            party_vars.add(var)
+            if var not in bindings:
                 raise TraceError(
                     f"line {self._lineno}: instance {name} of {cid} has no binding for "
-                    f"the index '{ref['var']}' of its party {ref['text']}; an instance "
+                    f"the index '{var}' of its party {ref['text']}; an instance "
                     f"of an enforced contract binds every index of its parties "
                     f"('bindings')")
+            value = bindings[var]
+            member = {"name": ref["name"], "index": value, "text": f"{ref['name']}[{value}]"}
+            if isinstance(value, bool) or not isinstance(value, int) \
+                    or not G.is_member(self.policy, ref["name"], member):
+                raise TraceError(
+                    f"line {self._lineno}: instance {name} of {cid} binds the index "
+                    f"'{var}' of its party {ref['text']} to {value!r}, which is not a "
+                    f"member of the declared set {ref['name']}")
+        for var in bindings:
+            if var not in party_vars:
+                text = (f"{cid}/{name}: the binding of '{var}' is ignored for the "
+                        f"parties: no party of {cid} is written with [{var}]")
+                if text not in self.warnings:
+                    self.warnings.append(text)
 
     def _create(self, cid: str, name: str, bindings: dict, request: dict, t: float,
                 state: str | None = None) -> _Instance:
@@ -602,7 +655,7 @@ class AgentsRuntime:
         trace = Trace(observations=[], bindings=inst.bindings, request=inst.request,
                       path=self.trace.path)
         inst.engine = _BoundaryEngine(self._ast(cid), trace, self._load, self, inst)
-        inst.engine.ev.known = self._known
+        inst.engine.ev.known = self._known_names(inst)
         inst.engine.ev.actors = declared_actors(self.sos)
         self._build_until(inst)
         self.instances.append(inst)
@@ -612,6 +665,18 @@ class AgentsRuntime:
     @staticmethod
     def _where(inst: _Instance) -> dict:
         return {"contract": inst.contract, "instance": inst.name}
+
+    def _known_names(self, inst: _Instance) -> set[str]:
+        """The quantity names of an instance (F.5): the names that have a
+        value in an observation of the instance. `values` stay until they
+        change, so these are the names of the snapshot at its last line. A
+        line after the end of the instance adds nothing."""
+        lines = self.trace.lines
+        last = len(lines) - 1
+        if self._ends is not None:
+            end = self._ends.get(inst.key)
+            last = last if end is None else end
+        return set(lines[last].obs.values)
 
     def _build_until(self, inst: _Instance) -> None:
         inst.until_terms = {}
@@ -639,6 +704,7 @@ class AgentsRuntime:
         are cancelled; G.7 (c): its derived instances are discharged."""
         inst.running = False
         inst.ended = t
+        inst.end_line = self._k
         terminal = (inst.engine.end_reason or "").startswith("terminal state")
         self._event(t, "instance_end", None, [self._where(inst)],
                     reason="terminal_state" if terminal else "end")
@@ -1148,10 +1214,21 @@ class AgentsRuntime:
         """Replay every line. Messages after an `end` are still decided:
         an ended instance does not come back, so a tool call of its
         contract is denied with `no_instance`."""
+        if self._ends is None:
+            # A first replay finds the line at which each instance ends; it
+            # does not depend on the names (an end comes from the trace).
+            probe = AgentsRuntime(self.sos, self.trace, self.versions, self.check)
+            probe._ends = {}
+            probe._replay()
+            self._ends = {i.key: i.end_line for i in probe.instances}
+        self._replay()
+        return self.result()
+
+    def _replay(self) -> None:
         lines = self.trace.lines
         for k, line in enumerate(lines):
+            self._k = k
             self._line(line, k == 0, k == len(lines) - 1)
-        return self.result()
 
     # --- result ---------------------------------------------------------------------------------------
 
@@ -1166,6 +1243,11 @@ class AgentsRuntime:
                 n["in_force"] = (eng.in_force(n["id"]) if inst.running else False) \
                     if n["id"] in taking_part else None
             for w in r["warnings"]:
+                # The norms engine says "it matches any X" (F.3); in an
+                # enforced contract that is not what happens.
+                w = w.replace("; it matches any " + w.rsplit(" ", 1)[-1],
+                              "; in an enforced contract what depends on it is "
+                              "unknown (G.5)") if "('bindings'); it matches any " in w else w
                 text = f"{inst.contract}/{inst.name}: {w}"
                 if text not in self.warnings:
                     self.warnings.append(text)

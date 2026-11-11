@@ -2469,3 +2469,154 @@ class TestLowerBoundsUnderOpa:
             capture_output=True, text=True, timeout=300)
         assert proc.returncode == 0, proc.stderr
         assert json.loads(proc.stdout)["result"][0]["expressions"][0]["value"] == expected
+
+
+# === Findings of the fourth review ===============================================================
+
+class TestIndexVariablesInPredicates:
+    """Q1: G-18 also for predicates, and their fail-closed resolution."""
+
+    def test_q_pred2_is_rejected(self):
+        errors = rule_errors(unchecked("q_pred2.cadl"), "G-18")
+        assert len(errors) == 2
+        assert any("until: of norm 'may_read'" in e and "'j'" in e for e in errors)
+        assert any("trigger: of norm 'stop_act'" in e for e in errors)
+
+    @pytest.mark.parametrize("blocks, count", [
+        (('counts_as:\n  - { when: "R[j].load > 5", creates: hot }\n',), 1),
+        (('counts_as:\n  - { when: "OP -> AG : go", creates: hot, if: "R[j].load > 5" }\n',), 1),
+        (('assume:\n  - "R[j].load < 9"\n',), 1),
+        (('guarantee:\n  - "R[j].load < 9 AND R[q].load > 0"\n',), 2),
+        (('guarantee:\n  - "for all j in R: R[j].load < 9"\n',), 0),
+        (('guarantee:\n  - "R[2].load < 9"\n',), 0),
+    ])
+    def test_predicates_of_the_contract(self, blocks, count):
+        from .test_agents_extension import check, with_rule
+        assert len(with_rule(check(*blocks).errors, "G-18")) == count
+        bound = '[OP, SUP, AG, SUB, T, "R[j]"]'
+        expected = 1 if "R[q]" in blocks[0] else 0
+        assert len(with_rule(check(*blocks, parties=bound).errors, "G-18")) == expected
+
+    def test_predicates_of_norms_and_delegations(self):
+        from .test_agents_extension import check, with_rule
+        entry = ('- id: n\n  kind: obligation\n  bearer: AG\n  trigger: "R[j].load > 5"\n'
+                 '  until: "R[j].load < 1"\n  content: "R[j].done == true"\n')
+        assert len(with_rule(check(norms(entry)).errors, "G-18")) == 3
+        res = check(norms(perm("p", "OP", "OP -> T : read")),
+                    'delegations:\n  - { norm: p, to: [AG], grant: g, until: "R[j].load > 5" }\n')
+        assert len(with_rule(res.errors, "G-18")) == 1
+
+    def test_runtime_resolves_an_unknown_predicate_fail_closed(self):
+        # qp.jsonl: the prohibition is triggered and the permission ended,
+        # although no `W[j].alarm` becomes true for a bound j.
+        sos = unchecked("q_pred2.cadl")
+        lines = (REVIEW / "qp.jsonl").read_text().splitlines()
+        r = run_unchecked(sos, parse_run_trace(lines))
+        assert [x[1:5] for x in decisions(r)] == [
+            ("AG>TOOL:act", "deny", "prohibition", ["stop_act"]),
+            ("AG>TOOL:read", "deny", "default", [])]
+        assert r["warnings"] and all("matches any" not in w for w in r["warnings"])
+        assert any("unknown and is resolved fail-closed" in w for w in r["warnings"])
+        with pytest.raises(NormsEvalError, match=r"\(G-18\)"):
+            run(sos, parse_run_trace(lines))
+
+    def test_unknown_predicate_creates_no_event_and_fulfils_nothing(self):
+        src = source(
+            """
+            counts_as:
+              - { when: "R[j].load > 5", creates: hot }
+              - { when: "OP -> AG : go", creates: gone, if: "R[j].load > 5" }
+            """,
+            norms(perm("p_hot", "AG", "AG -> T : read", "trigger: hot"),
+                  perm("p_gone", "AG", "AG -> T : write", "trigger: gone"),
+                  """
+                  - id: must
+                    kind: obligation
+                    bearer: AG
+                    deadline: 5s
+                    content: "R[j].done == true"
+                  """))
+        r = run_unchecked(parse(src), parse_run_trace(trace(
+            (0, None, {"values": {"R[j].load": 1, "R[j].done": False}}),
+            (1, m("OP", "AG", "go"), {"values": {"R[j].load": 9, "R[j].done": True,
+                                                 "R[1].load": 9, "R[1].done": True}}),
+            (2, [m("AG", "T", "read"), m("AG", "T", "write")]),
+            (9, None, {"end": False}))))
+        assert [x[2:4] for x in decisions(r)] == [
+            ("allow", "default"), ("deny", "default"), ("deny", "default")]
+        assert r["instances"][0]["institutional_events"] == []
+        assert norm_states(r)["must"][0] == "violated"
+
+
+class TestNamesOfAnInstance:
+    """R1: the quantity names of an instance come from its own observations
+    (F.5); a line after its end has no effect on it."""
+
+    Q = REVIEW / "q_names.cadl"
+    BASE = ['{"t":0,"values":{"A.mode":"fast"}}', '{"t":2,"end":true}']
+
+    def state(self, lines) -> tuple:
+        r = replay(parse_file(self.Q), lines)
+        return norm_states(r)["n"]
+
+    def test_a_line_after_the_end_does_not_change_the_verdict(self):
+        after = self.BASE + ['{"t":3,"values":{"target":"fast"}}']
+        assert self.state(self.BASE) == ("violated", "violated")
+        assert self.state(after) == ("violated", "violated")
+
+    def test_a_name_with_a_value_during_the_instance_counts(self):
+        # Also when the value comes late, as in `cadl norms-eval`.
+        during = [self.BASE[0], '{"t":1,"values":{"target":"fast"}}', self.BASE[1]]
+        assert self.state(during)[0] == "fulfilled"
+        before = ['{"t":0,"values":{"A.mode":"fast","target":"fast"}}', self.BASE[1]]
+        assert self.state(before)[0] == "fulfilled"
+
+    def test_host_created_instances_have_their_own_names(self):
+        sos = parse_file(self.Q)
+        entry = dict(contract="C")
+        r = replay(sos, trace(
+            (0, None, {"values": {"A.mode": "fast"},
+                       "instances": [dict(entry, instance="a")]}),
+            (1, None, {"instances": [dict(entry, instance="a", end=True)]}),
+            (2, None, {"values": {"target": "fast"},
+                       "instances": [dict(entry, instance="b")]}),
+            (3, None, {"end": True})))
+        assert [norm_states(r, k)["n"][0] for k in (0, 1)] == ["violated", "fulfilled"]
+
+
+class TestBindingsAreMembers:
+    """R2: the bindings of an instance against the declared sets."""
+
+    ACT = m("AG", "TOOL", "act")
+
+    @pytest.mark.parametrize("value", [9, 0, -1])
+    def test_value_outside_the_declared_set(self, value):
+        with pytest.raises(TraceError) as err:
+            replay(review("x1.cadl"), trace(
+                (0, None, {"instances": [c1("a", bindings={"i": value})]}), (1, self.ACT)))
+        text = str(err.value)
+        assert "line 1: instance a of C1 binds the index 'i'" in text
+        assert f"to {value}, which is not a member of the declared set OP" in text
+
+    def test_default_instance_and_symbolic_upper_bound(self):
+        with pytest.raises(TraceError, match="binds the index 'k'.* to 4"):
+            replay(review("w1.cadl"), trace((0, None), (1, self.ACT), bindings={"k": 4}))
+        lb = review("lb.cadl")          # party R[i], declared as R[2..N]
+        d = dict(contract="D", instance="d")
+        for value, ok in ((1, False), (2, True), (500, True)):
+            lines = trace((0, None, {"instances": [
+                dict(contract="C", instance="c", bindings={"i": value}), d]}),
+                (1, None, {"end": False}))
+            if ok:
+                assert replay(lb, lines)["instances"][0]["bindings"] == {"i": value}
+            else:
+                with pytest.raises(TraceError, match="not a member of the declared set R"):
+                    replay(lb, lines)
+
+    def test_binding_of_a_variable_that_no_party_has(self):
+        r = replay(review("w1.cadl"), trace((0, None), (1, self.ACT), E_,
+                                            bindings={"k": 1, "z": 7}))
+        assert r["warnings"] == [
+            "C/default: the binding of 'z' is ignored for the parties: no party of C is "
+            "written with [z]"]
+        assert decisions(r)[0][2] == "escalate"

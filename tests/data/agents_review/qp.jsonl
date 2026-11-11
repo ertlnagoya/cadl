@@ -1,0 +1,4 @@
+{"t":0}
+{"t":1,"values":{"W[3].alarm":true,"W[j].alarm":false}}
+{"t":2,"messages":[{"from":"AG","to":"TOOL","name":"act"},{"from":"AG","to":"TOOL","name":"read"}]}
+{"t":3,"end":false}
