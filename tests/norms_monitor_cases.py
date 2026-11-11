@@ -11,9 +11,11 @@ tests of the generated monitor replay the same traces and compare.
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import os
+import pickle
 
 _cases: list = []
 _skipped: list = []
@@ -38,6 +40,10 @@ def _patch(module) -> None:
             try:
                 case = {
                     "source": generate_norms_monitor_module(sos),
+                    # the parsed file, for the monitors of the OPA target
+                    # (tests/test_norms_monitor_targets.py)
+                    "sos": base64.b64encode(pickle.dumps(sos)).decode("ascii")
+                    if os.environ.get("CADL_NORMS_CASES_SOS") else None,
                     "versions": {k: build_model(v) for k, v in (versions or {}).items()},
                     "lines": lines, "contract": contract_id,
                 }

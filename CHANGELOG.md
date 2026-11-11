@@ -8,6 +8,43 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Norms monitors in the generated Rego and Solidity (Appendix F, F.5;
+  Appendix D). For a file that declares `norms: 0.1`, `cadl codegen -t
+  opa` writes `norms_monitor_<contract>.rego` per contract: a step
+  function that takes the previous state of the monitor (plain JSON,
+  whose keys Appendix D lists) and one observation, and returns the next
+  state, the changes of the norm states and verdicts, the violations,
+  institutional events and unauthorised acts, and the verdicts.
+  `cadl codegen -t solidity` writes `<Contract>NormsMonitor.sol`: a
+  contract that keeps that state, with `begin`, `observe` (the time is an
+  argument, fixed-point with 6 decimals) and `finish`, `verdicts()` and
+  events, and two libraries it links to stay under the size limit of
+  EIP-170. Both follow the order of F.5 of `cadl norms-eval`, with
+  message and institutional events, three-valued predicates, triggers,
+  `until:`, deadlines, reparations, powers, counts-as rules and the
+  temporal operators. A contract with a quantifier, an aggregate, a
+  wildcard or range reference or an index expression in a norm, a
+  counts-as rule or an `assume:` item gets no monitor, with a warning
+  that says why; such a `guarantee:` item is left out of the monitor
+  with a warning. Amendments are refused at the observation that has
+  one. The Solidity monitor also refuses `*`, `/`, numbers with more
+  than 6 decimals, nested temporal operators and a monitor whose
+  creation code would exceed the limit of EIP-3860 (in a `guarantee:`
+  item only the item is left out); only its reporter (an address given
+  to the constructor, by default the deployer) may record observations,
+  and an observation costs gas independent of the length of the trace
+  (windows are scanned once, values found by binary search and pruned),
+  except about 4 x 10^4 gas per observation inside an open window of a
+  temporal content, which `cadl codegen` names in a warning; a bare name
+  read inside a temporal operator that becomes a quantity after the
+  first observation is refused (give it in `begin`).
+  A binding must be an integer written as one or a string. The tests compare both with the engine of `cadl
+  norms-eval` after every observation (the example traces, the traces of
+  `tests/test_norms_eval.py` and random traces; OPA with `opa eval`,
+  Solidity on an EVM from PyPI in a separate Python named by
+  `CADL_EVM_PYTHON`) and check that hostile strings stay data. Up to
+  0.3.24 these targets left out the norms and the temporal items with a
+  warning; the files they generated before are unchanged.
 - `cadl norms-check FILE [--contract ID] [--bindings i=n] [--members SET=n]
   [--step DURATION] [--horizon N] [--export DIR] [--format text|json]`:
   design-time checking of the norms of one contract instance by a model

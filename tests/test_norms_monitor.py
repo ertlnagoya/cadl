@@ -177,7 +177,10 @@ class TestGeneratedModule:
         assert (tmp_path / "norms" / "norms_monitor.py").exists()
         for target in ("solidity", "opa", "unity-csharp"):
             generate(parse_file(EXAMPLE), tmp_path / target, target=target)
-            assert not list((tmp_path / target).rglob("norms_monitor*"))
+            assert not list((tmp_path / target).rglob("norms_monitor.py"))
+        # the OPA and Solidity targets have monitors of their own
+        assert (tmp_path / "opa" / "norms_monitor_delivery_sla.rego").exists()
+        assert (tmp_path / "solidity" / "DeliverySlaNormsMonitor.sol").exists()
 
     def test_imports_only_the_standard_library(self):
         tree = ast.parse(generate_norms_monitor_module(parse_file(EXAMPLE)))
@@ -285,15 +288,27 @@ print("ok")
         assert text.count("# (norms_monitor.py monitors it)") == 2
 
     @pytest.mark.parametrize("target", ["solidity", "opa"])
-    def test_cli_warning_of_other_targets_names_the_python_target(self, target, tmp_path):
+    def test_cli_warning_of_other_targets_names_their_monitor(self, target, tmp_path):
+        """The OPA and Solidity targets have norms monitors of their own
+        (tests/test_norms_monitor_targets.py); where one cannot be
+        generated, the warning names the python target."""
         proc = subprocess.run(
             [sys.executable, "-m", "cadl.cli", "codegen", str(EXAMPLE), "-t", target,
              "-o", str(tmp_path / "out")], capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr
         warnings = [l for l in proc.stderr.splitlines() if "temporal operator" in l]
         assert len(warnings) == 2
-        assert all("is not generated (only the python target generates a monitor for it)" in w
-                   for w in warnings)
+        assert all("NormsMonitor.sol monitors it" in w or "norms_monitor_delivery_sla.rego "
+                   "monitors it" in w for w in warnings)
+        proc = subprocess.run(
+            [sys.executable, "-m", "cadl.cli", "codegen",
+             str(EXAMPLES / "norms_no_double_assignment.cadl"), "-t", target,
+             "-o", str(tmp_path / "out2")], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        warnings = [l for l in proc.stderr.splitlines() if "temporal operator" in l]
+        assert len(warnings) == 2
+        assert all("is not generated (no norms monitor of the" in w and "the python target does"
+                   in w for w in warnings)
 
     def test_cli_python_target_reports_the_monitor(self, tmp_path):
         proc = subprocess.run(
@@ -417,18 +432,11 @@ for c in MODEL["contracts"]:
 
 # === The cases of tests/test_norms_eval.py ======================================
 
-def test_cases_of_test_norms_eval(tmp_path):
+def test_cases_of_test_norms_eval(tmp_path, norms_eval_cases):
     """Every `evaluate` call of tests/test_norms_eval.py, replayed through
     the monitor generated from the same file (and the models of the same
     new versions): the same result, or the same error."""
-    recorded = tmp_path / "recorded.json"
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/test_norms_eval.py", "-q", "-x",
-         "-p", "tests.norms_monitor_cases", "-p", "no:cacheprovider"],
-        cwd=ROOT, capture_output=True, text=True,
-        env=dict(os.environ, CADL_NORMS_CASES=str(recorded)))
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    data = json.loads(recorded.read_text(encoding="utf-8"))
+    data = norms_eval_cases
     cases = data["cases"]
     assert len(cases) >= 120
     assert sum(1 for c in cases if c["versions"]) >= 15

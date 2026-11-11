@@ -270,6 +270,7 @@ Generates Ethereum smart contracts (`.sol`):
 - `RegimeController.sol` with enum-based state machine for transitions
 - Main orchestrator contract importing all sub-contracts
 - Institutional parameters (alpha, beta, lambda) as scaled `uint256` constants
+- For a file that declares `norms: 0.1`: `<Contract>NormsMonitor.sol` per contract, a monitor of its norms ([below](#norms-monitors-in-generated-rego-and-solidity))
 
 **OPA/Rego** (`--target opa`):
 
@@ -277,6 +278,7 @@ Generates Open Policy Agent policies (`.rego`):
 - One package per CADL `ContractDef` with `assumptions_hold`, `guarantees_hold`, `allow`, and `violation` rules
 - Main policy package aggregating all contracts
 - Information sharing and authority policy rules
+- For a file that declares `norms: 0.1`: `norms_monitor_<contract>.rego` per contract, the step function of a monitor of its norms ([below](#norms-monitors-in-generated-rego-and-solidity))
 
 **Unity C#** (`--target unity-csharp`):
 
@@ -695,7 +697,26 @@ A refused observation leaves the monitor exactly as it was, and the monitor stay
 
 **Strings and numbers of the file.** Everything the monitor takes from the `.cadl` file is in `MODEL`: one JSON text (ASCII, no NaN or Infinity) in one Python string literal, read with `json.loads`; none of it is formatted into code. A model with a number that is not finite is not generated (`cadl codegen` reports where it is and writes nothing); a predicate with a number that overflows, such as `1e999`, is not a predicate for `cadl` at all and is kept as text. The input check of `cadl codegen` still applies to the whole file, so a string with a quote, a backslash or a control character is refused before anything is generated.
 
-The Solidity and OPA targets do not monitor norms; they leave the temporal items out and say so in a warning.
+### Norms Monitors in Generated Rego and Solidity
+
+For a file that declares `norms: 0.1`, `cadl codegen -t opa` writes `norms_monitor_<contract>.rego` and `cadl codegen -t solidity` writes `<Contract>NormsMonitor.sol` for each contract (Appendix D and F.5 of the specification). They monitor the norms, the counts-as rules and the `assume:` / `guarantee:` items, also those with `within`, `throughout` and `until`, which the contract policy (`<contract>.rego`, `<Contract>.sol`) leaves out. Each step follows the order of F.5 as `cadl norms-eval` implements it, and the tests compare both with the engine of `cadl norms-eval` after every observation.
+
+**What they support.** Message events (actor patterns with `[*]`, ranges and bound indices, arguments), institutional events, predicates with the three-valued reading of F.5 (bare names, `A[i].x`, `request.x`, `now`, `state`, comparisons, `+ - * /`, `IN`, `AND`, `OR`, `NOT`), triggers, `until:`, deadlines, reparations, powers (`activate`, `suspend`, `resume`, `discharge`), counts-as rules with `if:`, and the temporal operators, nested too. Not supported: quantifiers, aggregates and wildcard or range references in predicates, an index that is an expression (`A[i+1]`), and amendments (F.6; an observation with `amend` is refused). A contract that uses one of them in a norm, a counts-as rule or an `assume:` item gets no monitor, and `cadl codegen` says so in a warning with the reason (the other files are still generated; the python target monitors such a contract); a `guarantee:` item that uses one is left out of the monitor, with a warning, since nothing else depends on it. The Solidity monitor also refuses `*` and `/`, numbers with more than 6 decimals, a temporal operator inside another one (it scans each window once, as the observations arrive), and a monitor whose creation code would exceed the 49152 bytes of EIP-3860 (estimated from the generated constructor); in a `guarantee:` item these leave out only the item.
+
+**Rego: a step function.** OPA keeps no state, so the policy computes the next state of the monitor from the previous one and one observation:
+
+```bash
+echo '{"state": null, "observation": {"t": 0, "bindings": {"i": 2}}}' > input.json
+opa eval -d norms_monitor_delivery_sla.rego -i input.json 'data.cadl.norms_monitor.delivery_sla.result'
+```
+
+The input is `{"state": S, "observation": O}` (`S` null or absent for the first observation; `O` one trace line of `cadl norms-eval`) or `{"state": S, "finish": true}` (the end of the instance at its last observation, `end()` of the Python monitor); `bindings`, `request` and `quantities` may be given next to the first observation. `result` has `state` (the host stores it and passes it with the next observation), `changes` (as `observe()` of the Python monitor, without `reason`), `violations`, `institutional_events`, `powers_exercised`, `unauthorised`, `verdicts`, `ended` and `next_deadline`; for a refused observation it has `error` and the unchanged `state`. The state is plain JSON (Appendix D lists its keys): the bindings, the request, the known names, the current values, the lifecycle state, the norm instances with their activation, active time and pending candidates, the items, and a buffer of the observations that a temporal operator or a pending candidate still reads (older ones are dropped). The contract is in the policy as one JSON text (`model`, read with `json.unmarshal`); the predicates are Rego functions whose literals are JSON strings, so no text of the `.cadl` file is Rego code.
+
+**Solidity: a contract with the state.** The constructor takes the address of the reporter (`address(0)`: the deployer); only the reporter may call `begin(bindings, request, quantities)` (optional, before the first observation), `observe(t, values, messages, hasState, state, end)`, `addQuantities(names)` and `finish()`, which record the instance. `verdicts()` (in the order of `normIds()`), `ok()`, `nextDeadline()`, `contractId()`, `observations()`, `lastT()`, `ended()`, `ignored()` and the events `NormChanged`, `ItemChanged`, `Violation`, `InstitutionalEvent`, `PowerExercised` and `Unauthorised` report it. A malformed observation reverts, which leaves the contract as it was. Numbers, including the time `t`, are fixed-point with 6 decimals (`int256` times 10**6); `t` is an argument, so a recorded trace can be replayed, and a deployment may pass `block.timestamp * 10**6`. A value is `(name, kind, n, s)` with kind 0 (null), 2 (boolean), 3 (number) or 4 (string). The file has the base contract, an interpreter of the contract that its constructor stores as data (texts as hex literals), and two libraries, `CadlNormsValues` and `CadlNormsEval`, that are deployed separately and linked, so that the runtime code of each stays below the 24 KB limit of EIP-170. The cost of an observation does not grow with the number of earlier observations: each window of a temporal operator is scanned once, values are found by binary search, and values no later step reads are deleted (a few per new value). In the tests an observation of the example costs about 6.4 × 10^5 gas over 320 observations at one per second, while the 300 s window of its assumption is open and after it; observations of the richest test contract cost from 3 × 10^4 to 3.3 × 10^6 gas (median 1.3 × 10^6). A norm whose content has a temporal operator costs about 4 × 10^4 gas more on every observation for each observation inside an open window of its content (a `throughout(1000s, …)` content at one observation per second: 1.3 × 10^7 gas per observation after 320 observations); `cadl codegen` names such norms in a warning. Keep those observations well below the block gas limit: a monitor whose observations reach it cannot record any further observation and does not recover, and neither can one whose reporter key is lost. A bare name read inside a temporal operator that is a quantity (`flag` in `throughout(10s, A.s == flag)`) must be given in `begin` or observed at the first observation; an `observe` or `addQuantities` that makes it known later reverts, since the scans keep the values they have read. Compile with solc 0.8.24 or later and `--optimize --optimize-runs 1` (the header of the file says so; without the optimizer the runtime code exceeds EIP-170).
+
+**What differs from `cadl norms-eval`.** As for the Python monitor, a deadline is detected at the first observation after it, the instance ends with `finish` or an observation that ends it, and the names of quantities written without an actor come from `quantities` and the observations so far. Arithmetic is decimal (OPA) or fixed-point (Solidity), where `cadl norms-eval` uses binary floating point, so `0.1 + 0.2 == 0.3` holds in the monitors and not in `cadl norms-eval`; with integers they agree. Times are computed exactly (Rego: decimals with the tolerance of 1e-9 s; Solidity: microseconds), while `cadl norms-eval` compares floats, whose spacing at epoch seconds with fractions is larger than its tolerance; a deadline that ends within that spacing of an observation can be judged differently. A binding must be an integer written as one (`1.0` is refused) or a string, and a value of `values` null, a boolean, a number or a string (a list is refused, in `request` too, and so are two keys of `values` that differ only in whitespace); the Solidity monitor wants the request as leaves (`"a.b"`) and ASCII names of values. The Rego monitor trusts the state it is given (it checks its format and contract only): the host keeps the stored states intact. Reasons, warnings and the timeline of `cadl norms-eval` are not reported.
+
+The tests (`tests/test_norms_monitor_targets.py`) run the Rego with `opa eval` and the Solidity on an EVM (eth-tester with py-evm, in a separate Python named by `CADL_EVM_PYTHON`; solc from `CADL_SOLC`, the PATH or `~/.solcx`) and skip what is not installed. They compare the state and verdict of every norm, the items, the violations, the institutional events and the unauthorised acts after every observation of the example traces, of the traces of `tests/test_norms_eval.py` (OPA) and of random traces; `CADL_NORMS_TARGET_TRACES` sets the number of random traces. They also check that strings of the file that would end a string literal or a comment stay data.
 
 ### Grounding of the Institutional Parameters (grounding 0.1)
 
@@ -961,12 +982,17 @@ src/cadl/
     runtime_gen.py     Orchestrator generation
     norms_monitor_gen.py       Norms monitor generation (norms_monitor.py of the Python target)
     norms_monitor_template.py  Text copied into the generated norms monitor (not imported)
+    norms_ir.py        The norms of a contract as data, for the OPA and Solidity monitors
     solidity/
       solidity_expr.py Expression AST -> Solidity source
       solidity_gen.py  Solidity smart contract generation
+      norms_monitor_sol.py    Norms monitor of the Solidity target
+      norms_monitor_base.sol  Its base contract and libraries (copied verbatim)
     opa/
       rego_expr.py     Expression AST -> Rego source
       rego_gen.py      OPA/Rego policy generation
+      norms_monitor_rego.py   Norms monitor of the OPA target
+      norms_monitor_lib.rego  Its step function (copied verbatim)
     agent_policy/
       rego_gen.py      Boundary policy as Rego (agents 0.1)
       cedar_gen.py     Boundary policy as Cedar, with the side table (agents 0.1)
@@ -1015,6 +1041,10 @@ tests/
   test_norms_wildcards.py Wildcard and range references in predicates (F.5): rewriting, equivalence with the quantified forms, N-15
   test_norms_monitor.py  Generated norms monitor against `cadl norms-eval` (examples, recorded and random traces)
   norms_monitor_cases.py pytest plugin that records the cases of test_norms_eval.py for it
+  test_norms_monitor_targets.py  Norms monitors of the OPA and Solidity targets against `cadl norms-eval`
+  norms_targets_support.py       Its reference, OPA driver and EVM conversion
+  norms_evm_driver.py            Runs the Solidity monitor on an EVM (separate Python, no cadl)
+  conftest.py                    The cases of test_norms_eval.py, recorded once per session
   test_name_resolution.py Actor vs state-variable resolution in generated code
   test_method_dispatch.py Verification method dispatch tests
   test_codegen_safety.py Code generation input-safety tests
@@ -1066,7 +1096,8 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | Simulator IR and config generation (Python, Unity, Go) | Available |
 | SoS-DSL extension (`lifecycle:` / `monitors:`) and Unity C# generation | Available |
 | Norms extension: static checks, and verdicts and amendments on a recorded trace (`cadl norms-eval`, `cadl norms-diff`) | Available |
-| Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available (Solidity, OPA and Unity C# do not monitor norms) |
+| Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available |
+| Norms extension: monitors in generated Rego (step function) and Solidity | Available without quantifiers, aggregates, wildcard references and amendments (refused at generation, with a warning); Unity C# does not monitor norms |
 | Norms extension: design-time checking of one contract instance with PRISM (`cadl norms-check`) | Available (quantified predicates, several instances and amendments are not translated) |
 | Grounding extension (grounding 0.1), norms side: derived indices and incentive coverage (`cadl norms-indices`), rules J-1 to J-9, IR, comparison of two versions (J-13 in `cadl norms-diff`) | Available |
 | Strategic model extension (games 0.1): equilibrium checks and certified equilibrium maps (`cadl game-check`), with the link to norms of Appendix J (`sanction_of:` / `reward_of:`, J-10 to J-12, J-14) | Available (the export for PRISM-games has not been run through PRISM-games) |

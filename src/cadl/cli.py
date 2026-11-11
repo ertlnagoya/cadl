@@ -672,15 +672,42 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
     # Generate
     target = args.target
     output_dir = args.output
+    from .codegen import norms_monitors
+    try:
+        monitors = {m["contract"]: m for m in norms_monitors(sos, target)}
+    except Exception as e:
+        print(f"Code generation error: {e}", file=sys.stderr)
+        return 1
     for contract_id, key, text in omitted_temporal_items(sos):
         if target == "python":
             print(f"  [WARNING]: {key} item of contract '{contract_id}' has a temporal "
                   f"operator (norms 0.1) and is left out of contracts.py; "
                   f"norms_monitor.py monitors it: {text}", file=sys.stderr)
+        elif contract_id in monitors and monitors[contract_id]["text"] is not None \
+                and not any(k == key and t == text for k, _, t, _ in monitors[contract_id]["left_out"]):
+            print(f"  [WARNING]: {key} item of contract '{contract_id}' has a temporal "
+                  f"operator (norms 0.1) and is left out of the contract policy; "
+                  f"{monitors[contract_id]['file']} monitors it: {text}", file=sys.stderr)
         else:
             print(f"  [WARNING]: {key} item of contract '{contract_id}' has a temporal "
-                  f"operator (norms 0.1) and is not generated (only the python target "
-                  f"generates a monitor for it): {text}", file=sys.stderr)
+                  f"operator (norms 0.1) and is not generated (no norms monitor of the "
+                  f"{target} target monitors it; the python target does): {text}",
+                  file=sys.stderr)
+    for m in monitors.values():
+        if m["text"] is None:
+            print(f"  [WARNING]: contract '{m['contract']}': no norms monitor is generated "
+                  f"for the {target} target, so its norms, counts-as rules and items are "
+                  f"not monitored ({'; '.join(m['reasons'])}); the python target "
+                  f"monitors them (norms_monitor.py)", file=sys.stderr)
+        for norm in m.get("gas", []) if m["text"] is not None else []:
+            print(f"  [WARNING]: contract '{m['contract']}', norm '{norm}': its content has a "
+                  f"temporal operator; in {m['file']} each observation inside an open window "
+                  f"of it costs about 4 x 10^4 gas on every later observation until the window "
+                  f"closes; keep such observations well below the block gas limit (a monitor "
+                  f"that reaches it cannot record any further observation)", file=sys.stderr)
+        for key, pos, text, reason in m["left_out"]:
+            print(f"  [WARNING]: {key} item {pos} of contract '{m['contract']}' is not "
+                  f"monitored by {m['file']} ({reason}): {text}", file=sys.stderr)
     try:
         generate(sos, output_dir, target=target)
     except Exception as e:
@@ -699,6 +726,11 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
             print(f"  Norms monitor: norms_monitor.py "
                   f"({sum(len(c.norms) for c in sos.contracts)} norm(s), "
                   f"{sum(len(c.counts_as) for c in sos.contracts)} counts-as rule(s))")
+    for m in monitors.values():
+        if m["text"] is not None:
+            c = next(c for c in sos.contracts if c.id == m["contract"])
+            print(f"  Norms monitor: {m['file']} ({len(c.norms)} norm(s), "
+                  f"{len(c.counts_as)} counts-as rule(s))")
     return 0
 
 
