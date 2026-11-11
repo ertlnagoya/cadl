@@ -12,6 +12,7 @@
 #   cadl model-export examples/stochastic_robot_delivery.cadl -o out/
 #   cadl model-check  examples/stochastic_robot_delivery.cadl
 #   cadl model-check  examples/stochastic_robot_delivery.cadl --regime-map best_for_delivery --grid 5
+#   cadl model-check  examples/stochastic_robot_delivery.cadl --regime-map best_for_delivery --certify
 
 sos:
   name: "RobotDeliveryStochastic"

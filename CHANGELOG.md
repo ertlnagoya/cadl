@@ -104,6 +104,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   (`_Engine._step`), and a norm can be exempted from the content of one
   observation; `cadl agents-run` uses both. `cadl norms-eval` and its
   output are unchanged.
+- `cadl model-check FILE --regime-map ID --certify`: the **certified
+  regime map** of a regime map query (Appendix H, H.9). The result is a
+  set of cells that cover the region, each `decided` with the regimes
+  that are optimal at every valuation of the cell, `infeasible`, or
+  `undecided`, with the undecided fraction and whether `resolution:` is
+  reached. The method is parameter lifting with exact rational arithmetic
+  (new module `cadl.stochastic_regions`, no new dependency): on a cell a
+  design is relaxed to a Markov decision process over the corners of the
+  cell, whose minimal and maximal values bound the design's value on the
+  whole cell; undecided cells are bisected, the largest first.
+  `--max-depth N` (default 24) and `--max-cells N` (default 20000) bound
+  the refinement; a map that stops at a budget is printed and says that
+  the resolution is not reached. Exit status 0 when the resolution is
+  reached, 1 when it is not, 2 on an error. `--format json` gives the
+  cells, counts, fractions, method and budget under `regime_map`.
+  Probabilities that are not multi-affine in the open parameters are
+  enclosed by interval arithmetic; cells that are not graph-preserving
+  are analysed soundly. `--grid N` still prints estimates at sample
+  points, separately; `--grid` and `--certify` cannot be combined.
+  A probability that is not multi-affine and leaves [0, 1] inside the
+  region, where the corner check of S-14 in `cadl check` cannot see it,
+  is reported as an error (exit status 2) when the centre or a corner of
+  a cell shows it.
+- Tests: every `decided` and `infeasible` cell of eight maps is checked
+  at sample points with the exact point evaluator, and, when `stormpy`
+  is installed, the bounds are compared with Storm's parameter lifting
+  on the exported files. New test model
+  `tests/data/stochastic_regions.cadl`.
+
+### Fixed
+- `cadl model-export`: a transition reward whose action label no command
+  of the design has (a command with `when:` in another regime) is no
+  longer written. PRISM 4.11 and Storm reject a reward item that names an
+  action the model does not have, so such a file did not load. A reward
+  structure left without items gets the item `true : (0);`, because Storm
+  rejects an empty structure.
 
 ## [0.3.21] — 2026-11-11
 

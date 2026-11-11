@@ -158,7 +158,8 @@ def main(argv: list[str] | None = None) -> int:
     # model-check command (stochastic extension, Appendix H)
     mchk_cmd = subparsers.add_parser("model-check",
         help="Evaluate the properties of the model: block (stochastic 0.1) with the "
-             "internal reference evaluator (exact arithmetic; not a model checker)")
+             "internal reference evaluator (exact arithmetic; not a model checker), "
+             "or compute a certified regime map (--regime-map ID --certify)")
     mchk_cmd.add_argument("file", type=Path, help="CADL file to evaluate")
     mchk_cmd.add_argument("--regime", default=None,
                           help="Evaluate only the design of this regime")
@@ -166,11 +167,20 @@ def main(argv: list[str] | None = None) -> int:
                           metavar="p=v", help="Give parameter p the value v (a decimal "
                           "or n/d) instead of its fixed value; may be repeated")
     mchk_cmd.add_argument("--regime-map", dest="regime_map", default=None, metavar="ID",
-                          help="Evaluate this regime map query at sample points "
-                               "(estimates; not a certified regime map)")
-    mchk_cmd.add_argument("--grid", type=int, default=4, metavar="N",
+                          help="Evaluate this regime map query: at sample points "
+                               "(estimates; the default) or, with --certify, as a "
+                               "certified regime map")
+    mchk_cmd.add_argument("--grid", type=int, default=None, metavar="N",
                           help="With --regime-map: intervals per open parameter of the "
                                "uniform grid whose corner points are evaluated (default: 4)")
+    mchk_cmd.add_argument("--certify", action="store_true",
+                          help="With --regime-map: compute the certified regime map "
+                               "(cells decided by parameter lifting with exact arithmetic)")
+    mchk_cmd.add_argument("--max-depth", dest="max_depth", type=int, default=None, metavar="N",
+                          help="With --certify: bisect a cell at most N times (default: 24)")
+    mchk_cmd.add_argument("--max-cells", dest="max_cells", type=int, default=None, metavar="N",
+                          help="With --certify: refine the partition to at most N cells "
+                               "(default: 20000)")
     mchk_cmd.add_argument("--format", choices=["text", "json"], default="text",
                           help="Output format (default: text)")
 
@@ -919,6 +929,108 @@ def _cmd_model_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_certified_map(args: argparse.Namespace, model, result: dict) -> int:
+    """Print a certified regime map (H.9). Exit status 0 when the
+    resolution is reached, 1 when it is not."""
+    from .stochastic import decimal_text
+    from .stochastic_eval import value_text
+
+    status = 0 if result["resolution_reached"] else 1
+    stopped = {
+        "resolution": "the resolution is reached",
+        "max_depth": f"no undecided cell may be bisected again (--max-depth {result['max_depth']})",
+        "max_cells": f"the partition has {result['cells_before_merging']} cells "
+                     f"(--max-cells {result['max_cells']})",
+    }[result["stopped"]]
+    if args.format == "json":
+        import json
+        output = {
+            "file": str(args.file),
+            "sos": model.sos_name,
+            "regime_map": {
+                "id": result["id"],
+                "certified": True,
+                "note": result["note"],
+                "method": result["method"],
+                "direction": result["direction"],
+                "objective": result["objective"],
+                "constraint": result["constraint"],
+                "open": result["open"],
+                "regimes": result["regimes"],
+                "region": {n: [decimal_text(lo), decimal_text(hi)]
+                           for n, (lo, hi) in result["region"].items()},
+                "resolution": decimal_text(result["resolution"]),
+                "undecided_fraction": str(result["undecided_fraction"]),
+                "undecided_fraction_decimal": value_text(result["undecided_fraction"]),
+                "resolution_reached": result["resolution_reached"],
+                "stopped": result["stopped"],
+                "budget": {"max_depth": result["max_depth"], "max_cells": result["max_cells"]},
+                "counts": {
+                    **result["counts"],
+                    "cells": len(result["cells"]),
+                    "cells_before_merging": result["cells_before_merging"],
+                    "cells_analysed": result["cells_analysed"],
+                    "deepest_bisection": result["deepest"],
+                },
+                "volume_fractions": {k: str(v) for k, v in result["fractions"].items()},
+                "volume_fraction_by_best": {k: str(v)
+                                            for k, v in result["fraction_by_best"].items()},
+                "cells": [
+                    {
+                        "box": {n: [decimal_text(lo), decimal_text(hi)]
+                                for n, (lo, hi) in c.box.items()},
+                        "status": c.status,
+                        "best": list(c.best),
+                        **({"reason": c.reason} if c.reason else {}),
+                    }
+                    for c in result["cells"]
+                ],
+            },
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        return status
+
+    counts = result["counts"]
+    print(f"Model check: {args.file}")
+    print(f"  SoS: {model.sos_name}")
+    print()
+    print(f"--- Regime map '{result['id']}': {result['note']} ---")
+    print(f"  method: {result['method']}")
+    print(f"  objective: {result['direction']} {result['objective']}")
+    if result["constraint"]:
+        print(f"  constraint: {result['constraint']}")
+    print(f"  regimes: {', '.join(result['regimes'])}")
+    region = ", ".join(f"{n} in [{decimal_text(lo)}, {decimal_text(hi)}]"
+                       for n, (lo, hi) in result["region"].items())
+    print(f"  region: {region}")
+    print(f"  cells: {len(result['cells'])} ({counts['decided']} decided, "
+          f"{counts['infeasible']} infeasible, {counts['undecided']} undecided); "
+          f"{result['cells_analysed']} cell(s) analysed, deepest bisection {result['deepest']}")
+    for best, share in result["fraction_by_best"].items():
+        print(f"  decided, best = {best}: {value_text(share)} of the region")
+    if counts["infeasible"]:
+        print(f"  infeasible: {value_text(result['fractions']['infeasible'])} of the region")
+    print(f"  undecided fraction: {value_text(result['undecided_fraction'])} "
+          f"(exact: {result['undecided_fraction']}); resolution: "
+          f"{decimal_text(result['resolution'])}")
+    if result["resolution_reached"]:
+        print("  The resolution is reached.")
+    else:
+        print(f"  The resolution is NOT reached: {stopped}.")
+    print()
+    for c in result["cells"]:
+        box = ", ".join(f"{n} in [{decimal_text(lo)}, {decimal_text(hi)}]"
+                        for n, (lo, hi) in c.box.items())
+        if c.status == "decided":
+            what = f"decided, best = {', '.join(c.best)}"
+        elif c.reason:
+            what = f"{c.status} ({c.reason})"
+        else:
+            what = c.status
+        print(f"  {box}: {what}")
+    return status
+
+
 def _cmd_model_check(args: argparse.Namespace) -> int:
     from .stochastic import decimal_text
     from .stochastic_eval import (
@@ -929,18 +1041,43 @@ def _cmd_model_check(args: argparse.Namespace) -> int:
     # Exit status: 0 when every threshold property evaluated is satisfied
     # (queries do not count), 1 when at least one is violated, 2 when
     # nothing could be evaluated (usage error, or no interpreted model).
+    # With --certify: 0 when the certified map reaches its resolution, 1
+    # when it does not.
     model = _load_stochastic_model(args.file)
     if model is None:
         return 2
+    certified = None
     try:
+        if args.certify and args.regime_map is None:
+            raise EvaluationError("--certify needs --regime-map ID")
+        if args.certify and args.grid is not None:
+            raise EvaluationError(
+                "--grid asks for estimates at sample points and --certify for a "
+                "certified regime map; give one of them")
+        if not args.certify and (args.max_depth is not None or args.max_cells is not None):
+            raise EvaluationError("--max-depth and --max-cells need --certify")
+        if args.certify and args.regime is not None:
+            raise EvaluationError("--regime cannot be combined with --certify: the "
+                                  "query lists the regimes it compares")
         overrides = {}
         for item in args.assignments:
             name, sep, value = item.partition("=")
             if not sep:
                 raise EvaluationError(f"--set expects p=v, not '{item}'")
             overrides[name.strip()] = parse_number(value)
-        if args.regime_map is not None:
-            estimate = regime_map_estimate(model, args.regime_map, args.grid, overrides)
+        if args.certify:
+            from .stochastic_regions import (
+                DEFAULT_MAX_CELLS, DEFAULT_MAX_DEPTH, certified_regime_map,
+            )
+            certified = certified_regime_map(
+                model, args.regime_map, overrides,
+                DEFAULT_MAX_DEPTH if args.max_depth is None else args.max_depth,
+                DEFAULT_MAX_CELLS if args.max_cells is None else args.max_cells)
+            estimate = None
+            designs = []
+        elif args.regime_map is not None:
+            estimate = regime_map_estimate(
+                model, args.regime_map, 4 if args.grid is None else args.grid, overrides)
             designs = []
         else:
             estimate = None
@@ -950,6 +1087,8 @@ def _cmd_model_check(args: argparse.Namespace) -> int:
         return 2
     status = 1 if any(p["result"] == "violated"
                       for d in designs for p in d["properties"]) else 0
+    if certified is not None:
+        return _print_certified_map(args, model, certified)
 
     if args.format == "json":
         import json
