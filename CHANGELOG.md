@@ -6,6 +6,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.23] — 2026-11-11
+
+Two new extensions and an extension of the norms engine. The strategic
+model extension (`games` 0.1, Appendix I) reads the model of Appendix H
+as a turn-based stochastic game and decides whether a named profile,
+such as compliance, is an equilibrium, also as a certified map over
+parameters (`cadl game-check`). The grounding extension (`grounding`
+0.1, Appendix J) derives indices of information sharing, concentration
+of powers and incentive coverage from the norms of a contract, compares
+them with the declared α and β (`cadl norms-indices`), and links the
+sanction of a norm to a payoff term weighted by λ. Quantified predicates
+and aggregates are now evaluated by the norms engine, the generated
+monitor and the agent runtime. Each part was reviewed independently
+before the release; see the review histories in Appendices I, J and F.5.
+
+Known limits: the strategic export targets PRISM-games and was not run
+through it here; the assumption that a reward structure counts the
+violations of a norm cannot be checked and is reported with every
+result that relies on it; J-14 is available only in files that declare
+`grounding`; `[*]` inside a predicate is not evaluated.
+
 ### Added
 - Quantified predicates and aggregates in the dynamic semantics of the
   norms extension (Appendix F, F.5, "Quantifiers and aggregates"):
