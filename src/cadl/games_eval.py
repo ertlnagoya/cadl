@@ -104,9 +104,9 @@ class Game:
     # Commands of the design with a probability that is not multi-affine
     # in the open parameters: (command index, polynomials).
     non_affine: list = field(default_factory=list)
-    # The end-point certification of J-14, when its conditions hold for the
-    # map being computed (`j14_setup`).
-    j14: Any = None
+    # The end-point certification of I.9, when its condition A holds for
+    # the map being computed (`endpoint_setup`).
+    endpoints: Any = None
     _selection: dict = field(default_factory=dict)
     _target: dict = field(default_factory=dict)
     _rho: dict = field(default_factory=dict)
@@ -518,6 +518,17 @@ class PlayerAtPoint:
     # The canonical best response where it differs from the profile, on the
     # states reachable under it: state index of the game -> command position.
     deviation: dict = field(default_factory=dict)
+    # Per state of Reach_p (state index of the game): V*_p(s) − V_p(s), 0
+    # where the target holds (I.7).
+    state_gains: dict = field(default_factory=dict)
+    # The largest of them, the first state of S (in the order of S) that
+    # attains it when it is positive, and the canonical best response on the
+    # states reachable from that state under it.
+    state_gain: Fraction = ZERO
+    state: Any = None
+    state_deviation: dict = field(default_factory=dict)
+    # The canonical best response on all of Reach_p, where it differs.
+    best_response: dict = field(default_factory=dict)
 
 
 def canonical_best_response(proc: Process, v_star: list, reward: Callable) -> dict:
@@ -538,12 +549,13 @@ def canonical_best_response(proc: Process, v_star: list, reward: Callable) -> di
     return tau
 
 
-def reachable_deviation(proc: Process, tau: dict) -> dict:
-    """τ restricted to the states that are reachable when the player
-    follows τ and the others the profile."""
+def reachable_deviation(proc: Process, tau: dict, start: int = 0) -> dict:
+    """τ restricted to the states that are reachable from the local state
+    `start` when the player follows τ and the others the profile (on a
+    cell: through every distribution a command may have)."""
     choose = _strategy(proc, tau)
-    seen = {0}
-    todo = [0]
+    seen = {start}
+    todo = [start]
     while todo:
         i = todo.pop()
         if proc.target[i]:
@@ -570,6 +582,7 @@ def player_at_point(game: Game, profile: str, player: str, point: tuple) -> Play
     reward = point_reward(game, proc, point)
     v = optimal_values(proc, _profile(proc), reward)
     out.payoff = v[0]
+    out.state_gains = {g: ZERO for g in proc.states}
     if not any(proc.mine[i] and not proc.target[i] and len(proc.options[i]) > 1
                for i in range(len(proc.states))):
         out.best_response_value = v[0]
@@ -586,9 +599,17 @@ def player_at_point(game: Game, profile: str, player: str, point: tuple) -> Play
             q = reward(i, k) + sum((p * v[j] for j, p in ds[0].items()), ZERO)
             if q > v[i]:
                 out.one_step = False
-    if out.gain > 0:
+    out.state_gains = {g: v_star[i] - v[i] for i, g in enumerate(proc.states)}
+    out.state_gain = max(out.state_gains.values())
+    if out.state_gain > 0:
         tau = canonical_best_response(proc, v_star, reward)
-        out.deviation = reachable_deviation(proc, tau)
+        out.best_response = tau
+        if out.gain > 0:
+            out.deviation = reachable_deviation(proc, tau)
+        model = game.model
+        out.state = min((g for g, x in out.state_gains.items() if x == out.state_gain),
+                        key=lambda g: _state_key(model, game.states[g]))
+        out.state_deviation = reachable_deviation(proc, tau, proc.states.index(out.state))
     return out
 
 
@@ -667,10 +688,11 @@ def _expected_in(game: Game, profile: str, player: str, reward_id: str,
 
 
 # ---------------------------------------------------------------------------
-# J-14: certification of a cell [a, b] from its end points
+# End points: certification of a cell [a, b] from its end points (I.9)
 # ---------------------------------------------------------------------------
 
-J14_METHOD = "endpoints (J-14)"
+ENDPOINT_METHOD = "end points (I.9)"
+J14_METHOD = ENDPOINT_METHOD           # J-14 refers to the method of I.9
 
 
 def syntactic_degree(tree: tuple, name: str) -> int:
@@ -688,10 +710,10 @@ def syntactic_degree(tree: tuple, name: str) -> int:
     return 0
 
 
-def j14_parameter_free_model(model: Model, design: Design, name: str) -> str | None:
-    """Condition 2 of J-14, first part: ℓ occurs in no `prob:` (of a
-    command of the design) and in no reward `value:`. None when it holds,
-    otherwise why not."""
+def endpoint_parameter_free_model(model: Model, design: Design, name: str) -> str | None:
+    """Condition A of the end-point certification (I.9), first part: ℓ
+    occurs in no `prob:` (of a command of the design) and in no reward
+    `value:`. None when it holds, otherwise why not."""
     for c in model.commands:
         if not c.exists_in(design.name):
             continue
@@ -705,10 +727,10 @@ def j14_parameter_free_model(model: Model, design: Design, name: str) -> str | N
     return None
 
 
-def j14_affine_weights(model: Model, name: str) -> str | None:
-    """Condition 2 of J-14, second part: in every weight of every player,
-    the written ones and those defined by J.7, ℓ occurs with a power of
-    at most one, read on the text."""
+def endpoint_affine_weights(model: Model, name: str) -> str | None:
+    """Condition A, second part: in every weight of every player, the
+    written ones and those defined by J.7, ℓ occurs with a power of at
+    most one, read on the text."""
     for payoff in model.payoffs:
         for term in payoff.terms:
             weight = term_weight(model, payoff, term)
@@ -719,53 +741,74 @@ def j14_affine_weights(model: Model, name: str) -> str | None:
     return None
 
 
-def j14_condition_ii(game: Game, profile: str, player: str, name: str) -> bool:
-    """Condition 5 of J-14 (condition (ii) of J.7 for p): every term of p
-    in whose weight ℓ occurs has, at the values used for the other
-    parameters, the weight −m·ℓ with m ≥ 0, and its reward structure has
-    the expected value 0 under the profile, computed exactly."""
+def endpoint_monotone_states(game: Game, profile: str, player: str, name: str) -> dict:
+    """Condition B of the end-point certification (I.9) for p: the states
+    s of Reach_p from which the gain of p is non-increasing in ℓ
+    (`"decreasing"`) or non-decreasing (`"increasing"`). Under condition
+    A the weight of a term is a + c·ℓ at the fixed values of the other
+    parameters. B− holds from s when c ≤ 0 for every term and the reward
+    structure of every term with c ≠ 0 has the expected accumulated value
+    0 from s under the profile; B+ is the same with c ≥ 0. Reach_p and the
+    expected values do not depend on ℓ (condition A)."""
     model = game.model
     payoff = payoff_of(model, player)
-    point = (game.j14["region"][0],)
+    point = (game.endpoints["region"][0],)
+    signs = set()
+    moving = []
     for term in payoff.terms:
         weight = term_weight(model, payoff, term)
         if name not in param_names(weight):
             continue
         poly = polynomial(weight, game.theta, [name])
-        if any(e != (1,) for e in poly) or poly.get((1,), ZERO) > 0:
-            return False
-        if _expected_in(game, profile, player, term.reward, point) != 0:
-            return False
-    return True
+        coefficient = poly.get((1,), ZERO)
+        if any(e not in ((0,), (1,)) for e in poly):
+            return {"decreasing": set(), "increasing": set()}     # cannot happen under A
+        if coefficient != 0:
+            signs.add(coefficient > 0)
+            moving.append(term.reward)
+    proc = build_process(game, player, profile, point_distributions(game, point))
+    zero = set(proc.states)
+    for reward_id in moving:
+        values = optimal_values(proc, _profile(proc), structure_reward(game, proc, reward_id))
+        zero &= {g for g, x in zip(proc.states, values) if x == 0}
+    return {"decreasing": zero if True not in signs else set(),
+            "increasing": zero if False not in signs else set()}
 
 
-def j14_setup(game: Game, query: EquilibriumQuery, design: Design) -> dict:
-    """Whether J-14 may be used for the map in this design, and the
-    players for whom condition 5 holds. ℓ is the open parameter of the
-    query, whether or not it is bound to `C.lambda`."""
-    out: dict = {"applicable": False, "reason": None, "condition_ii": []}
+def endpoint_setup(game: Game, query: EquilibriumQuery, design: Design) -> dict:
+    """Whether the end-point certification of I.9 may be used for the map
+    in this design (condition A), and, per player, the states from which
+    condition B holds. ℓ is the open parameter of the query."""
+    out: dict = {"applicable": False, "reason": None, "decreasing": [], "increasing": []}
     if len(query.over) != 1:
-        out["reason"] = "the query has more than one open parameter"
+        out["reason"] = "the map has more than one open parameter"
         return out
     name = next(iter(query.over))
-    why = j14_parameter_free_model(game.model, design, name) \
-        or j14_affine_weights(game.model, name)
+    why = endpoint_parameter_free_model(game.model, design, name) \
+        or endpoint_affine_weights(game.model, name)
     if why:
         out["reason"] = why
         return out
     out.update(applicable=True, parameter=name, region=query.over[name])
-    game.j14 = out
-    out["condition_ii"] = [p.id for p in game.model.players
-                           if j14_condition_ii(game, query.profile, p.id, name)]
+    game.endpoints = out
+    out["states"] = {p.id: endpoint_monotone_states(game, query.profile, p.id, name)
+                     for p in game.model.players}
+    # The players whose gain (from the initial state) is monotone.
+    for key in ("decreasing", "increasing"):
+        out[key] = [p.id for p in game.model.players if 0 in out["states"][p.id][key]]
     return out
 
 
 def endpoint_verdict(game: Game, query: EquilibriumQuery, cell: "EqCell") -> bool:
-    """Decide a cell [a, b] by J-14 when the end points allow a claim;
-    True when the cell got a claim. The cell is `equilibrium` when the
-    profile is an ε-equilibrium at a and at b; a player for whom
-    condition 5 holds is a deviator when its gain at b exceeds ε."""
+    """Decide a cell [a, b] from its end points (I.9) when they allow a
+    claim; True when the cell got a claim. The cell is `equilibrium` when
+    the profile is an ε-equilibrium (in the sense of the query's concept)
+    at a and at b; p is a deviator when condition B− holds for p from a
+    state s and the gain from s at b exceeds ε, or B+ holds and the gain
+    from s at a exceeds ε (s is the initial state for the concept
+    `nash`, any state of Reach_p for `every_reachable_state`)."""
     (a, b), = [cell.box[n] for n in game.names]
+    every = query.concept == "every_reachable_state"
     at_a, at_b = {}, {}
     for p in game.model.players:
         at_a[p.id] = player_at_point(game, query.profile, p.id, (a,))
@@ -773,19 +816,50 @@ def endpoint_verdict(game: Game, query: EquilibriumQuery, cell: "EqCell") -> boo
         if not (at_a[p.id].admissible and at_b[p.id].admissible):
             return False
     eps = query.epsilon
-    if all(at_a[p].gain <= eps and at_b[p].gain <= eps for p in at_a):
-        cell.status, cell.method = "equilibrium", J14_METHOD
-        # gain_p is convex in ℓ (J.7, proposition, part 1).
+
+    def worst(at: PlayerAtPoint) -> Fraction:
+        return at.state_gain if every else at.gain
+
+    if all(worst(at_a[p]) <= eps and worst(at_b[p]) <= eps for p in at_a):
+        cell.status, cell.method = "equilibrium", ENDPOINT_METHOD
+        # Every gain is convex in ℓ (I.9).
         cell.gain_bounds = {p: (ZERO, max(at_a[p].gain, at_b[p].gain)) for p in at_a}
+        if every and eps == 0:
+            cell.from_every_state = True
         return True
-    deviators = [p for p in at_a
-                 if p in game.j14["condition_ii"] and at_b[p].gain > eps]
-    if not deviators:
+    model = game.model
+    states = game.endpoints["states"]
+    found = {}
+    for p in at_a:
+        for key, at, other in (("decreasing", at_b[p], at_a[p]),
+                               ("increasing", at_a[p], at_b[p])):
+            if every:
+                candidates = sorted((g for g in states[p][key] if at.state_gains.get(g, ZERO) > eps),
+                                    key=lambda g: _state_key(model, game.states[g]))
+            else:
+                candidates = [0] if 0 in states[p][key] and at.gain > eps else []
+            if candidates and p not in found:
+                g = candidates[0]
+                found[p] = (g, at, other)
+    if not found:
         return False
-    cell.status, cell.deviators, cell.method = "not_equilibrium", deviators, J14_METHOD
-    # gain_p is non-increasing in ℓ under (ii) (part 2): [gain(b), gain(a)].
-    cell.gain_bounds = {p: (at_b[p].gain, at_a[p].gain) for p in deviators}
-    cell.deviations = {p: _deviation_list(game, at_b[p].deviation) for p in deviators}
+    deviators = [p for p in at_a if p in found]
+    cell.status, cell.deviators, cell.method = "not_equilibrium", deviators, ENDPOINT_METHOD
+    cell.gain_bounds, cell.deviations = {}, {}
+    for p in deviators:
+        g, at, other = found[p]
+        if g == 0:
+            # The gain is monotone in ℓ (I.9): between its values at the ends.
+            cell.gain_bounds[p] = (at.gain, other.gain)
+            deviation = at.deviation
+        else:
+            cell.gain_bounds[p] = (ZERO, max(at.gain, other.gain))
+            proc = build_process(game, p, query.profile, point_distributions(game, (a,)))
+            deviation = reachable_deviation(proc, at.best_response, proc.states.index(g))
+        cell.deviations[p] = _deviation_list(game, deviation)
+        if every:
+            # The gain from g is monotone in ℓ: at least its value at the end.
+            cell.deviation_states[p] = (state_dict(model, game.states[g]), at.state_gains[g])
     return True
 
 
@@ -819,27 +893,39 @@ def equilibrium_check(model: Model, query_id: str, regime: str | None = None,
                     f"state {show_state(model, at.witness)} the player can avoid the "
                     f"target of its payoff for ever")
             players.append(at)
-        deviators = [at.player for at in players if at.gain > query.epsilon]
+        every = query.concept == "every_reachable_state"
+        deviators = [at.player for at in players
+                     if (at.state_gain if every else at.gain) > query.epsilon]
         status = "not_equilibrium" if deviators else "equilibrium"
         from_every_state = None
         if status == "equilibrium" and query.epsilon == 0:
             from_every_state = all(at.one_step for at in players)
+        entries = []
+        for at in players:
+            entry = {"player": at.player, "payoff": at.payoff,
+                     "best_response_value": at.best_response_value, "gain": at.gain}
+            if every:
+                deviates = at.state_gain > query.epsilon
+                entry.update(
+                    state_gain=at.state_gain,
+                    state=state_dict(model, game.states[at.state]) if deviates else None,
+                    best_response=(_deviation_list(game, at.state_deviation)
+                                   if deviates else []))
+            else:
+                entry["best_response"] = (_deviation_list(game, at.deviation)
+                                          if at.gain > query.epsilon else [])
+            entries.append(entry)
         designs.append({
             "design": design.name,
             "parameters": theta,
             "status": status,
             "deviators": deviators,
             "from_every_state": from_every_state,
-            "players": [
-                {"player": at.player, "payoff": at.payoff,
-                 "best_response_value": at.best_response_value, "gain": at.gain,
-                 "best_response": (_deviation_list(game, at.deviation)
-                                   if at.gain > query.epsilon else [])}
-                for at in players
-            ],
+            "players": entries,
         })
     return {"id": query.id, "profile": query.profile, "epsilon": query.epsilon,
-            "assumptions": link_assumptions(model), "designs": designs}
+            "concept": query.concept, "assumptions": link_assumptions(model),
+            "designs": designs}
 
 
 # ---------------------------------------------------------------------------
@@ -950,6 +1036,49 @@ def deviation_lower(proc: Process, tau: dict, lo: Callable) -> Fraction:
     return optimal_values(proc, _strategy(proc, tau), lo, maximize=False)[0]
 
 
+def positive_on_cell(poly: tuple, cell: tuple) -> bool:
+    """Whether a probability is positive at every valuation of the cell:
+    at every corner of the cell when it is multi-affine (its value at any
+    valuation of the box is a convex combination of the values at the
+    corners), and by an exact interval enclosure otherwise."""
+    if not poly:
+        return False
+    if _multi_affine(poly):
+        occurring = [d for d in range(len(cell)) if any(e[d] for e, _ in poly)]
+        for corner in itertools.product((0, 1), repeat=len(occurring)):
+            point = [b[0] for b in cell]
+            for d, side in zip(occurring, corner):
+                point[d] = cell[d][side]
+            if _p_eval(poly, point) <= 0:
+                return False
+        return True
+    return _p_interval(poly, cell)[0] > 0
+
+
+def certified_reach(game: Game, profile: str, player: str, cell: tuple) -> set:
+    """States (indices of the game) that belong to Reach_p at every
+    valuation of the cell: reachable from the initial state, before the
+    target of p's payoff, through commands allowed for p (I.6) and
+    transitions whose probability is positive on the whole cell."""
+    sel = game.selection(profile)
+    target = game.target(player)
+    seen = {0}
+    todo = [0]
+    while todo:
+        g = todo.pop()
+        if target[g] or not game.commands[g]:
+            continue
+        cmds = game.commands[g]
+        ks = range(len(cmds)) if game.owner[g] == player else [sel[g]]
+        for k in ks:
+            c = cmds[k]
+            for j, poly in zip(c.targets, c.row.polys):
+                if j not in seen and positive_on_cell(poly, cell):
+                    seen.add(j)
+                    todo.append(j)
+    return seen
+
+
 @dataclass
 class PlayerOnCell:
     player: str
@@ -959,13 +1088,20 @@ class PlayerOnCell:
     deviation: dict = field(default_factory=dict)    # the τ of N
     gain_lower: Fraction = ZERO
     gain_upper: Fraction | None = None
+    # For the concept every_reachable_state: the state s of condition N_s
+    # (index of the game) and the lower bound of the gain from s.
+    state: Any = None
+    state_gain_lower: Fraction = ZERO
 
 
 def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Callable,
-                   epsilon: Fraction) -> PlayerOnCell | None:
+                   epsilon: Fraction, every_state: bool = False) -> PlayerOnCell | None:
     """The conditions of I.9 for one player on a cell, or None when the
     relaxed process of the player has a policy that misses the target
-    (then nothing is established for the cell)."""
+    (then nothing is established for the cell). With `every_state`, the
+    conditions for the concept every_reachable_state: E2, E1 at every
+    state of R_C(p), and N at the initial state or N_s at a state that is
+    in Reach_p at every valuation of the cell."""
     proc = build_process(game, player, profile, dists)
     if improper_states(proc):
         return None
@@ -988,9 +1124,14 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
     if out.e2:
         out.gain_upper = ZERO
         return out
-    b = optimal_values(proc, _all(proc), hi, maximize=True)[0]    # b_p
+    best = optimal_values(proc, _all(proc), hi, maximize=True)    # b_p(s)
+    b = best[0]
     out.gain_upper = b - lower[0]
-    out.e1 = condition_e1(b, lower[0], epsilon)
+    if every_state:
+        out.e1 = all(condition_e1(best[i], lower[i], epsilon)
+                     for i in range(len(proc.states)) if not proc.target[i])
+    else:
+        out.e1 = condition_e1(b, lower[0], epsilon)
     if out.e1:
         return out
     # N, with the canonical best response at the centre of the cell as τ.
@@ -1002,7 +1143,37 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
         if condition_n(d_tau, upper[0], epsilon):
             out.n = True
             out.deviation = at.deviation
+            if every_state:
+                out.state, out.state_gain_lower = 0, d_tau - upper[0]
+            return out
+    if every_state and at.admissible and at.state_gain > epsilon:
+        state_deviation(game, profile, proc, out, at, lo, upper, cell, epsilon)
     return out
+
+
+def state_deviation(game: Game, profile: str, proc: Process, out: PlayerOnCell,
+                    at: PlayerAtPoint, lo: Callable, upper: list, cell: tuple,
+                    epsilon: Fraction) -> None:
+    """Condition N_s of I.9 (concept every_reachable_state): a state s
+    that is in Reach_p at every valuation of the cell (`certified_reach`)
+    and a strategy τ of p with d_p(τ, s) − u_p(s) > ε, where d_p(τ, s) is
+    a lower bound of the payoff of p from s when p plays τ and u_p(s) an
+    upper bound of V_p(s). τ is the canonical best response at the centre
+    of the cell, restricted to the states that the relaxed process reaches
+    from s under it; s is the first such state in the order of S."""
+    d = optimal_values(proc, _strategy(proc, at.best_response), lo, maximize=False)
+    reach = certified_reach(game, profile, out.player, cell)
+    model = game.model
+    candidates = sorted((i for i, g in enumerate(proc.states)
+                         if g in reach and not proc.target[i]
+                         and condition_n(d[i], upper[i], epsilon)),
+                        key=lambda i: _state_key(model, game.states[proc.states[i]]))
+    if not candidates:
+        return
+    i = candidates[0]
+    out.n = True
+    out.state, out.state_gain_lower = proc.states[i], d[i] - upper[i]
+    out.deviation = reachable_deviation(proc, at.best_response, i)
 
 
 @dataclass
@@ -1015,19 +1186,24 @@ class EqCell:
     reason: str | None = None          # of an undecided cell
     deviations: dict = field(default_factory=dict)   # deviator -> strategy (list, I.13)
     gain_bounds: dict = field(default_factory=dict)  # player -> (lower, upper)
-    method: str | None = None          # J14_METHOD for a cell certified by J-14
+    method: str | None = None          # ENDPOINT_METHOD for a cell certified from end points
+    # Concept every_reachable_state: deviator -> (the state s of N_s as a
+    # dict (I.13), a lower bound of the gain from s on the cell).
+    deviation_states: dict = field(default_factory=dict)
 
     def claim(self) -> tuple:
         return (self.status, tuple(self.deviators), self.from_every_state, self.reason,
-                repr(self.deviations), self.method)
+                repr(self.deviations), self.method,
+                repr({p: g for p, (g, _) in self.deviation_states.items()}))
 
 
 def cell_verdict(game: Game, query: EquilibriumQuery, cell: EqCell) -> None:
-    """Decide one cell by the conditions of I.9; when the conditions of
-    J-14 hold for the map, a cell that they leave undecided, and deviators
-    they do not establish, are decided from the end points (J-14)."""
+    """Decide one cell by the conditions of I.9; when condition A of the
+    end-point certification holds for the map, a cell that they leave
+    undecided, and deviators they do not establish, are decided from the
+    end points (I.9)."""
     bound_verdict(game, query, cell)
-    if game.j14 is None or cell.status == "equilibrium":
+    if game.endpoints is None or cell.status == "equilibrium":
         return
     trial = EqCell(box=cell.box, depth=cell.depth)
     if not endpoint_verdict(game, query, trial):
@@ -1043,7 +1219,9 @@ def cell_verdict(game: Game, query: EquilibriumQuery, cell: EqCell) -> None:
             cell.deviators.append(p)
             cell.deviations[p] = trial.deviations[p]
             cell.gain_bounds[p] = trial.gain_bounds[p]
-            cell.method = f"{METHOD_SHORT} and {J14_METHOD}"
+            if p in trial.deviation_states:
+                cell.deviation_states[p] = trial.deviation_states[p]
+            cell.method = f"{METHOD_SHORT} and {ENDPOINT_METHOD}"
     order = [p.id for p in game.model.players]
     cell.deviators.sort(key=order.index)
 
@@ -1055,16 +1233,18 @@ def _copy_claim(src: EqCell, dst: EqCell) -> None:
     dst.status, dst.deviators, dst.method = src.status, list(src.deviators), src.method
     dst.from_every_state, dst.reason = src.from_every_state, src.reason
     dst.deviations, dst.gain_bounds = dict(src.deviations), dict(src.gain_bounds)
+    dst.deviation_states = dict(src.deviation_states)
 
 
 def bound_verdict(game: Game, query: EquilibriumQuery, cell: EqCell) -> None:
     """Decide one cell by the conditions of I.9, or leave it `undecided`."""
     box = tuple(cell.box[n] for n in game.names)
+    every = query.concept == "every_reachable_state"
     try:
         dists = cell_distributions(game, box)
         players = []
         for p in game.model.players:
-            on = player_on_cell(game, query.profile, p.id, box, dists, query.epsilon)
+            on = player_on_cell(game, query.profile, p.id, box, dists, query.epsilon, every)
             if on is None:
                 # The face-centre check of I-9 settles admissibility on the
                 # region for a design with multi-affine probabilities; the
@@ -1083,9 +1263,14 @@ def bound_verdict(game: Game, query: EquilibriumQuery, cell: EqCell) -> None:
         cell.status, cell.deviators = "not_equilibrium", deviators
         cell.deviations = {on.player: _deviation_list(game, on.deviation)
                            for on in players if on.n}
+        if every:
+            cell.deviation_states = {
+                on.player: (state_dict(game.model, game.states[on.state]), on.state_gain_lower)
+                for on in players if on.n and on.state is not None}
     elif all(on.e1 or on.e2 for on in players):
         cell.status, cell.gain_bounds = "equilibrium", bounds
-        cell.from_every_state = True if all(on.e2 for on in players) else None
+        cell.from_every_state = True if all(on.e2 for on in players) or \
+            (every and query.epsilon == 0) else None
     else:
         cell.status, cell.reason = "undecided", "bounds"
 
@@ -1130,12 +1315,15 @@ def merge_cells(cells: list, names: list) -> list:
                         for p, (lo, hi) in current.gain_bounds.items():
                             lo2, hi2 = nxt.gain_bounds.get(p, (lo, hi))
                             bounds[p] = (min(lo, lo2), max(hi, hi2))
+                        states = {p: (g, min(x, nxt.deviation_states[p][1]))
+                                  for p, (g, x) in current.deviation_states.items()}
                         current = EqCell(
                             box=box, depth=min(current.depth, nxt.depth),
                             status=current.status, deviators=current.deviators,
                             from_every_state=current.from_every_state,
                             reason=current.reason, deviations=current.deviations,
-                            gain_bounds=bounds, method=current.method)
+                            gain_bounds=bounds, method=current.method,
+                            deviation_states=states)
                         changed = True
                     else:
                         merged.append(current)
@@ -1190,24 +1378,19 @@ def prepare_map(model: Model, query: EquilibriumQuery, design: Design,
 
 def design_map(game: Game, query: EquilibriumQuery, max_depth: int = DEFAULT_MAX_DEPTH,
                max_cells: int = DEFAULT_MAX_CELLS, partition: int | None = None,
-               merge: bool = True, use_j14: bool | None = None) -> dict:
+               merge: bool = True, use_endpoints: bool = True) -> dict:
     """The equilibrium map of one design (I.9): the largest undecided
     cell is bisected until the undecided fraction is at most the
     resolution or the budget is exhausted. With `partition`, the map
     starts from the uniform partition of the region into that many
-    intervals per open parameter."""
+    intervals per open parameter. With `use_endpoints`, cells that the
+    bounds leave undecided are certified from their end points where
+    condition A of I.9 holds."""
     names = game.names
     region = {n: tuple(query.over[n]) for n in names}
-    j14 = None
-    if use_j14 is None:
-        # J-14 is a rule of the grounding extension (J.8).
-        use_j14 = game.model.grounding
-        if not use_j14:
-            j14 = {"applicable": False, "condition_ii": [],
-                   "reason": "J-14 is a rule of the grounding extension and is used only in "
-                             "a file that declares 'grounding: 0.1'"}
-    if use_j14:
-        j14 = j14_setup(game, query, game.model.design(game.design))
+    endpoints = None
+    if use_endpoints:
+        endpoints = endpoint_setup(game, query, game.model.design(game.design))
     total = _volume(region)
     if partition is None or partition == 1:
         roots = [EqCell(box=dict(region))]
@@ -1264,10 +1447,10 @@ def design_map(game: Game, query: EquilibriumQuery, max_depth: int = DEFAULT_MAX
     return {
         "design": game.design,
         "parameters": {k: v for k, v in game.theta.items() if k not in names},
-        "method": METHOD + (f"; where the conditions of J-14 hold, cells are certified from "
-                            f"exact evaluations at their end points ({J14_METHOD})"
-                            if game.j14 is not None else ""),
-        "j14": j14,
+        "method": METHOD + (f"; cells that these conditions leave undecided are certified "
+                            f"from exact evaluations at their end points (I.9)"
+                            if game.endpoints is not None else ""),
+        "endpoints": endpoints,
         "cells": leaves,
         "undecided_fraction": undecided / total,
         "resolution_reached": undecided <= query.resolution * total,
@@ -1283,7 +1466,7 @@ def design_map(game: Game, query: EquilibriumQuery, max_depth: int = DEFAULT_MAX
 def equilibrium_map(model: Model, query_id: str, regime: str | None = None,
                     overrides: dict | None = None, max_depth: int = DEFAULT_MAX_DEPTH,
                     max_cells: int = DEFAULT_MAX_CELLS, partition: int | None = None,
-                    merge: bool = True, use_j14: bool | None = None) -> dict:
+                    merge: bool = True, use_endpoints: bool = True) -> dict:
     """The result of an equilibrium map query (I.9): one certified map
     per listed design. Raises `EvaluationError` when the conditions of
     I-9 fail at the values used, and `NotEvaluated` when a payoff cannot
@@ -1306,9 +1489,9 @@ def equilibrium_map(model: Model, query_id: str, regime: str | None = None,
     for design in _designs(model, query, regime):
         game = prepare_map(model, query, design, overrides)
         designs.append(design_map(game, query, max_depth, max_cells, partition, merge,
-                                  use_j14))
+                                  use_endpoints))
     return {"id": query.id, "profile": query.profile, "epsilon": query.epsilon,
-            "assumptions": link_assumptions(model),
+            "concept": query.concept, "assumptions": link_assumptions(model),
             "over": dict(query.over), "resolution": query.resolution,
             "max_depth": max_depth, "max_cells": max_cells, "designs": designs}
 
@@ -1322,9 +1505,28 @@ def exact(value: Fraction) -> str:
     return str(Fraction(value))
 
 
+def _concept_json(result: dict) -> dict:
+    """`concept` is written for a query that names a concept other than
+    the default `nash` (I.13)."""
+    concept = result.get("concept", "nash")
+    return {} if concept == "nash" else {"concept": concept}
+
+
+def _player_json(p: dict) -> dict:
+    out = {"player": p["player"], "payoff": exact(p["payoff"]),
+           "best_response_value": exact(p["best_response_value"]),
+           "gain": exact(p["gain"])}
+    if "state_gain" in p:
+        out["state_gain"] = exact(p["state_gain"])
+        out["state"] = p["state"]
+    out["best_response"] = p["best_response"]
+    return out
+
+
 def check_json(result: dict) -> dict:
     return {
         "id": result["id"], "profile": result["profile"], "epsilon": exact(result["epsilon"]),
+        **_concept_json(result),
         **({"assumptions": result["assumptions"]} if result.get("assumptions") else {}),
         "designs": [
             {
@@ -1333,12 +1535,7 @@ def check_json(result: dict) -> dict:
                 "status": d["status"],
                 "deviators": list(d["deviators"]),
                 "from_every_state": d["from_every_state"],
-                "players": [
-                    {"player": p["player"], "payoff": exact(p["payoff"]),
-                     "best_response_value": exact(p["best_response_value"]),
-                     "gain": exact(p["gain"]), "best_response": p["best_response"]}
-                    for p in d["players"]
-                ],
+                "players": [_player_json(p) for p in d["players"]],
             }
             for d in result["designs"]
         ],
@@ -1353,6 +1550,10 @@ def _cell_json(cell: EqCell) -> dict:
     if cell.status == "not_equilibrium":
         out["deviators"] = list(cell.deviators)
         out["deviations"] = cell.deviations
+        if cell.deviation_states:
+            out["deviation_states"] = {
+                p: {"state": state, "gain_lower": exact(x)}
+                for p, (state, x) in cell.deviation_states.items()}
     elif cell.status == "equilibrium":
         out["from_every_state"] = cell.from_every_state
     else:
@@ -1363,19 +1564,21 @@ def _cell_json(cell: EqCell) -> dict:
     return out
 
 
-def _j14_json(j14: dict) -> dict:
-    out = {"applicable": j14["applicable"]}
-    if j14["applicable"]:
-        out["parameter"] = j14["parameter"]
-        out["condition_ii"] = list(j14["condition_ii"])
+def _endpoints_json(endpoints: dict) -> dict:
+    out = {"applicable": endpoints["applicable"]}
+    if endpoints["applicable"]:
+        out["parameter"] = endpoints["parameter"]
+        out["non_increasing"] = list(endpoints["decreasing"])
+        out["non_decreasing"] = list(endpoints["increasing"])
     else:
-        out["reason"] = j14["reason"]
+        out["reason"] = endpoints["reason"]
     return out
 
 
 def map_json(result: dict) -> dict:
     return {
         "id": result["id"], "profile": result["profile"], "epsilon": exact(result["epsilon"]),
+        **_concept_json(result),
         **({"assumptions": result["assumptions"]} if result.get("assumptions") else {}),
         "over": {n: [exact(lo), exact(hi)] for n, (lo, hi) in result["over"].items()},
         "resolution": exact(result["resolution"]),
@@ -1384,7 +1587,7 @@ def map_json(result: dict) -> dict:
                 "design": d["design"],
                 "parameters": {k: exact(v) for k, v in d["parameters"].items()},
                 "method": d["method"],
-                **({"j14": _j14_json(d["j14"])} if d.get("j14") else {}),
+                **({"endpoints": _endpoints_json(d["endpoints"])} if d.get("endpoints") else {}),
                 "cells": [_cell_json(c) for c in d["cells"]],
                 "undecided_fraction": exact(d["undecided_fraction"]),
                 "resolution_reached": d["resolution_reached"],
@@ -1417,7 +1620,7 @@ def _strategy_text(strategy: list) -> str:
 
 def check_text(result: dict) -> list:
     out = [f"--- Equilibrium check '{result['id']}': profile '{result['profile']}', "
-           f"epsilon = {decimal_text(result['epsilon'])} ---"]
+           f"epsilon = {decimal_text(result['epsilon'])}{_concept_text(result)} ---"]
     out += [f"  assumption (J.7): {a}" for a in result.get("assumptions", [])]
     for d in result["designs"]:
         params = ", ".join(f"{k}={decimal_text(v)}" for k, v in d["parameters"].items())
@@ -1428,8 +1631,15 @@ def check_text(result: dict) -> list:
             out.append(f"      best-response value = {value_text(p['best_response_value'])}"
                        f"  (exact: {exact(p['best_response_value'])})")
             out.append(f"      gain = {value_text(p['gain'])}  (exact: {exact(p['gain'])})")
+            if "state_gain" in p:
+                line = (f"      largest gain from a state of Reach_p = "
+                        f"{value_text(p['state_gain'])}  (exact: {exact(p['state_gain'])})")
+                if p["state"] is not None:
+                    line += f", from {_state_text(p['state'])}"
+                out.append(line)
             if p["best_response"]:
-                out.append(f"      canonical best response: "
+                out.append(f"      canonical best response"
+                           f"{' from that state' if 'state_gain' in p else ''}: "
                            f"{_strategy_text(p['best_response'])}")
         line = f"    status: {d['status']}"
         if d["deviators"]:
@@ -1442,6 +1652,11 @@ def check_text(result: dict) -> list:
     return out
 
 
+def _concept_text(result: dict) -> str:
+    concept = result.get("concept", "nash")
+    return "" if concept == "nash" else f", concept {concept}"
+
+
 def _box_text(box: dict) -> str:
     return ", ".join(f"{n} in [{decimal_text(lo)}, {decimal_text(hi)}]"
                      for n, (lo, hi) in box.items())
@@ -1449,7 +1664,8 @@ def _box_text(box: dict) -> str:
 
 def map_text(result: dict) -> list:
     out = [f"--- Equilibrium map '{result['id']}': profile '{result['profile']}', "
-           f"epsilon = {decimal_text(result['epsilon'])}; {MAP_NOTE} ---",
+           f"epsilon = {decimal_text(result['epsilon'])}{_concept_text(result)}; "
+           f"{MAP_NOTE} ---",
            f"  region: {_box_text(result['over'])}; resolution: "
            f"{decimal_text(result['resolution'])}"]
     out += [f"  assumption (J.7): {a}" for a in result.get("assumptions", [])]
@@ -1460,12 +1676,13 @@ def map_text(result: dict) -> list:
         params = ", ".join(f"{k}={decimal_text(v)}" for k, v in d["parameters"].items())
         out.append(f"  Design {d['design']} ({params})")
         out.append(f"    method: {d['method']}")
-        j14 = d.get("j14")
-        if j14 and j14["applicable"]:
-            out.append(f"    J-14 applies (open parameter '{j14['parameter']}'; condition (ii) "
-                       f"holds for: {', '.join(j14['condition_ii']) or 'no player'})")
-        elif j14:
-            out.append(f"    J-14 does not apply: {j14['reason']}")
+        ends = d.get("endpoints")
+        if ends and ends["applicable"]:
+            out.append(f"    end points (I.9): condition A holds for '{ends['parameter']}'; the "
+                       f"gain is non-increasing for: {', '.join(ends['decreasing']) or 'no player'}"
+                       f"; non-decreasing for: {', '.join(ends['increasing']) or 'no player'}")
+        elif ends:
+            out.append(f"    end points (I.9) not used: {ends['reason']}")
         out.append(f"    cells: {len(cells)} ({counts['equilibrium']} equilibrium, "
                    f"{counts['not_equilibrium']} not_equilibrium, {counts['undecided']} "
                    f"undecided); {d['cells_analysed']} cell(s) analysed, deepest bisection "
@@ -1484,7 +1701,9 @@ def map_text(result: dict) -> list:
             out.append(f"    The resolution is NOT reached: {why}.")
         for c in cells:
             if c.status == "not_equilibrium":
-                what = f"not_equilibrium, deviators: {', '.join(c.deviators)}"
+                what = f"not_equilibrium, deviators: " + ", ".join(
+                    p + (f" (from {_state_text(c.deviation_states[p][0])})"
+                         if p in c.deviation_states else "") for p in c.deviators)
             elif c.status == "equilibrium":
                 what = "equilibrium" + (", from_every_state: true"
                                         if c.from_every_state else "")

@@ -2,9 +2,11 @@
 extension (Appendix I, I.9).
 
 `generate` writes a small random parametric turn-based game as a CADL
-file: 2 or 3 players, cycles, signed payoff weights with parameters,
+file: 2 or 3 players (3 or 4 with `mode="scale"`, with three open
+parameters in most maps), cycles, signed payoff weights with parameters,
 parameters in probabilities (also with a power above one), and regions
-that touch probability 0 or 1. `Oracle` evaluates the same game
+that touch probability 0 or 1. With `concept="every"` (or `"both"`) the
+queries ask for an equilibrium from every reachable state. `Oracle` evaluates the same game
 directly from the generated data, sharing no code with `cadl`: it
 enumerates every memoryless deterministic strategy of a player and
 solves each Markov chain by Gaussian elimination over fractions.
@@ -14,14 +16,18 @@ decided cell at exact rational points (corners, face centres, the
 centre, random points):
 
 - the design is well-defined and the profile admissible at the point;
-- `equilibrium`: no player gains more than ε by any deviation;
+- `equilibrium`: no player gains more than ε by any deviation (for the
+  concept every_reachable_state: from any state of Reach_p);
 - `from_every_state: true`: no player gains from any state of Reach_p;
 - `not_equilibrium`: every listed deviator gains more than ε, and so
-  does the reported deviation.
+  does the reported deviation (for every_reachable_state: from the
+  reported state, which must be in Reach_p at the point), within the
+  reported bounds.
 
 Run as a script for a long run::
 
-    python tests/games_fuzz.py --seed 0 --count 400 [--mutation NAME]
+    python tests/games_fuzz.py --seed 0 --count 400 [--mode scale] [--concept every]
+                                [--mutation NAME]
 
 `MUTATIONS` are deliberate soundness bugs; the fuzzer must detect each.
 """
@@ -98,11 +104,17 @@ REGIONS = {
 RANGES = {"p": (0, 1), "q": (0, 1), "lam": (0, 2)}
 
 
-def generate(rng: random.Random, j14: bool = False) -> dict:
-    """A random game, as plain data. With `j14`, a game for J-14: λ is the
-    only open parameter, the weights are mostly affine in λ, and some
-    games break a condition of J-14 (λ in a probability, a weight that is
-    not affine in λ)."""
+def generate(rng: random.Random, j14: bool = False, mode: str | None = None,
+             concept: str = "nash") -> dict:
+    """A random game, as plain data. With `j14` (or `mode="endpoints"`), a
+    game for the end-point certification of I.9: λ is the only open
+    parameter, the weights are mostly affine in λ, and some games break
+    condition A (λ in a probability, a weight that is not affine in λ);
+    `j14` writes a file that declares grounding 0.1, `mode="endpoints"`
+    one that does not. `mode="scale"`: 3 or 4 players and, in most games,
+    three open parameters."""
+    if mode == "endpoints":
+        j14 = True
     lam_in_prob = j14 and rng.random() < 0.3
     not_affine = j14 and rng.random() < 0.3
     probs = PROBS_LAM + PROBS_LAM + PROBS[:4] if lam_in_prob else PROBS
@@ -110,6 +122,9 @@ def generate(rng: random.Random, j14: bool = False) -> dict:
         WEIGHTS_J14 if j14 else WEIGHTS
     n = rng.choice([3, 4, 4, 5])                 # states 0..n-1; n is the goal
     players = ["A", "B"] if rng.random() < 0.6 else ["A", "B", "C"]
+    if mode == "scale":
+        n = rng.choice([4, 5, 5, 6])
+        players = ["A", "B", "C"] if rng.random() < 0.5 else ["A", "B", "C", "D"]
     states = []
     for i in range(n):
         owner = rng.choice(players + players + [None])
@@ -169,6 +184,8 @@ def generate(rng: random.Random, j14: bool = False) -> dict:
         open_ = ["p"]
     elif kind < 0.5:
         open_ = ["p", "q", "lam"]
+    if mode == "scale" and rng.random() < 0.7:
+        open_ = ["p", "q", "lam"]
     if not j14:
         region = {name: rng.choice(REGIONS[name]) for name in open_}
     fixed = {"p": rng.choice([F(1, 2), F(3, 10), F(1)]), "q": rng.choice([F(1, 2), F(4, 5)]),
@@ -176,9 +193,13 @@ def generate(rng: random.Random, j14: bool = False) -> dict:
     for name, (lo, hi) in region.items():
         if not lo <= fixed[name] <= hi:
             fixed[name] = (lo + hi) / 2
-    return {"j14": j14, "n": n, "players": players, "states": states, "rewards": rewards,
-            "payoffs": payoffs, "sigma": sigma, "region": region, "fixed": fixed,
-            "epsilon": rng.choice([F(0), F(0), F(0), F(1, 4), F(1)])}
+    epsilon = rng.choice([F(0), F(0), F(0), F(1, 4), F(1)])
+    if concept == "both":
+        concept = "every" if rng.random() < 0.5 else "nash"
+    return {"j14": j14, "grounding": j14 and mode != "endpoints", "n": n, "players": players,
+            "states": states, "rewards": rewards, "payoffs": payoffs, "sigma": sigma,
+            "region": region, "fixed": fixed, "epsilon": epsilon,
+            "concept": concept}
 
 
 def _num(x: Fraction):
@@ -240,10 +261,13 @@ def to_cadl(g: dict) -> str:
              "resolution": 0.05},
         ],
     }
+    if g.get("concept") == "every":
+        for entry in model["equilibria"]:
+            entry["concept"] = "every_reachable_state"
     sos = {"sos": {
         "name": "FuzzGame", "type": "Acknowledged",
         "extensions": [{"stochastic": 0.1}, {"games": 0.1}]
-        + ([{"norms": 0.1}, {"grounding": 0.1}] if g.get("j14") else []),
+        + ([{"norms": 0.1}, {"grounding": 0.1}] if g.get("grounding", g.get("j14")) else []),
         "actors": [{"id": f"ACT_{pl}", "role": "x"} for pl in g["players"]],
         "model": model,
     }}
@@ -383,6 +407,10 @@ class Oracle:
             "best": max(values[0]),
             "gain": max(values[0]) - values[0][index],
             "gain_somewhere": any(max(values[s]) > values[s][index] for s in states),
+            # The largest gain from a state of Reach_p (every_reachable_state).
+            "state_gain": max(max(values[s]) - values[s][index] for s in states),
+            "reach": set(states),
+            "profile_values": {s: values[s][index] for s in states},
         }
 
 
@@ -415,6 +443,7 @@ def _tau_choice(g: dict, deviation: list) -> list:
 
 def check_cell(g: dict, cell, epsilon: Fraction, rng: random.Random, extra: int) -> int:
     """Check one decided cell at sample points; returns the number of points."""
+    every = g.get("concept") == "every"
     points = sample_points(cell.box, rng, extra)
     for point in points:
         v = dict(g["fixed"])
@@ -430,20 +459,37 @@ def check_cell(g: dict, cell, epsilon: Fraction, rng: random.Random, extra: int)
             if cell.status == "equilibrium":
                 if a["gain"] > epsilon:
                     raise Unsound(f"{pl} gains {a['gain']} > {epsilon} in {where}")
+                if every and a["state_gain"] > epsilon:
+                    raise Unsound(f"{pl} gains {a['state_gain']} > {epsilon} from a state of "
+                                  f"Reach_p in {where}")
                 if cell.from_every_state and a["gain_somewhere"]:
                     raise Unsound(f"{pl} gains from some state of Reach_p in {where}, "
                                   f"but from_every_state is true")
+                hi = cell.gain_bounds.get(pl, (0, None))[1]
+                if hi is not None and a["gain"] > hi:
+                    raise Unsound(f"gain bound {hi} of {pl} misses {a['gain']} in {where}")
             elif pl in cell.deviators:
+                tau = _tau_choice(g, cell.deviations[pl])
+                lo, hi = cell.gain_bounds[pl]
+                if not lo <= a["gain"] <= hi:
+                    raise Unsound(f"gain bounds [{lo}, {hi}] of {pl} miss {a['gain']} in {where}")
+                if every and pl in cell.deviation_states:
+                    state, lower = cell.deviation_states[pl]
+                    s = state["loc"]
+                    if s not in a["reach"]:
+                        raise Unsound(f"the state {s} of {pl} is not in Reach_p in {where}")
+                    got = oracle.value(pl, tau, s)
+                    if got is None or not got - a["profile_values"][s] > epsilon \
+                            or got - a["profile_values"][s] < lower:
+                        raise Unsound(f"the reported deviation of {pl} from {s} does not gain "
+                                      f"more than {epsilon} (at least {lower}) in {where}")
+                    continue
                 if not a["gain"] > epsilon:
                     raise Unsound(f"the deviator {pl} gains only {a['gain']} in {where}")
-                tau = _tau_choice(g, cell.deviations[pl])
                 got = oracle.value(pl, tau)
                 if got is None or not got - a["payoff"] > epsilon:
                     raise Unsound(f"the reported deviation of {pl} does not gain more "
                                   f"than {epsilon} in {where}")
-                lo, hi = cell.gain_bounds[pl]
-                if not lo <= a["gain"] <= hi:
-                    raise Unsound(f"gain bounds [{lo}, {hi}] of {pl} miss {a['gain']} in {where}")
         if cell.status == "not_equilibrium" and not cell.deviators:
             raise Unsound(f"no deviator in {where}")
     return len(points)
@@ -451,18 +497,19 @@ def check_cell(g: dict, cell, epsilon: Fraction, rng: random.Random, extra: int)
 
 def check_endpoint_cells(g: dict, model, rng: random.Random, extra: int,
                          stats: dict) -> int:
-    """J-14 directly: the end-point verdict on the whole region, its halves
-    and quarters, and random sub-intervals, each claim checked at sample
-    points (the map itself uses J-14 only where the bounds leave a cell
-    open)."""
-    from cadl.games_eval import EqCell, endpoint_verdict, j14_setup, prepare_map
+    """The end-point certification of I.9 directly: the end-point verdict
+    on the whole region, its halves and quarters, and random
+    sub-intervals, each claim checked at sample points (the map itself
+    uses the end points only where the bounds leave a cell open)."""
+    from cadl.games_eval import EqCell, endpoint_setup, endpoint_verdict, prepare_map
     query = next(q for q in model.equilibria if q.id == "on_region")
     design = model.designs[0]
     game = prepare_map(model, query, design, None)
-    j14_setup(game, query, design)
-    if game.j14 is None:
+    endpoint_setup(game, query, design)
+    if game.endpoints is None:
         return 0
-    lo, hi = g["region"]["lam"]
+    name, = g["region"]
+    lo, hi = g["region"][name]
     cuts = [lo + (hi - lo) * F(k, 4) for k in range(5)]
     boxes = [(lo, hi), (cuts[0], cuts[2]), (cuts[2], cuts[4])]
     boxes += [(cuts[k], cuts[k + 1]) for k in range(4)]
@@ -472,9 +519,10 @@ def check_endpoint_cells(g: dict, model, rng: random.Random, extra: int,
             boxes.append((a, b))
     points = 0
     for a, b in boxes:
-        cell = EqCell(box={"lam": (a, b)})
+        cell = EqCell(box={name: (a, b)})
         if endpoint_verdict(game, query, cell):
-            stats[f"direct_j14_{cell.status}"] = stats.get(f"direct_j14_{cell.status}", 0) + 1
+            key = f"direct_endpoints_{cell.status}"
+            stats[key] = stats.get(key, 0) + 1
             points += check_cell(g, cell, g["epsilon"], rng, extra)
     return points
 
@@ -501,6 +549,8 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
         return False
     model = analysis.model
     count("models")
+    count(f"players_{len(g['players'])}")
+    count(f"open_{len(g['region'])}")
     # The check at the fixed values against the oracle.
     oracle = Oracle(g, dict(g["fixed"]))
     result = equilibrium_check(model, "at_fixed")["designs"][0]
@@ -510,13 +560,28 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
         if (entry["payoff"], entry["best_response_value"], entry["gain"]) != \
                 (a["payoff"], a["best"], a["gain"]):
             raise Unsound(f"check at the fixed values: {entry} against {a}")
-        if entry["best_response"]:
+        if entry["best_response"] and g.get("concept") != "every":
             got = oracle.value(entry["player"], _tau_choice(g, entry["best_response"]))
             if got != a["best"]:
                 raise Unsound(f"the reported best response of {entry['player']} has the "
                               f"payoff {got}, not {a['best']}")
+    every = g.get("concept") == "every"
+    if every:
+        for entry in result["players"]:
+            a = oracle.analyse(entry["player"])
+            if entry["state_gain"] != a["state_gain"]:
+                raise Unsound(f"check at the fixed values: largest gain from a state "
+                              f"{entry['state_gain']}, expected {a['state_gain']}")
+            if entry["state"] is not None:
+                s = entry["state"]["loc"]
+                got = oracle.value(entry["player"], _tau_choice(g, entry["best_response"]), s)
+                if s not in a["reach"] or got is None or \
+                        got - a["profile_values"][s] != a["state_gain"]:
+                    raise Unsound(f"check at the fixed values: the best response of "
+                                  f"{entry['player']} from {s} is wrong")
     gains = [oracle.analyse(pl) for pl in g["players"]]
-    expected = "equilibrium" if all(a["gain"] <= g["epsilon"] for a in gains) \
+    key = "state_gain" if every else "gain"
+    expected = "equilibrium" if all(a[key] <= g["epsilon"] for a in gains) \
         else "not_equilibrium"
     if result["status"] != expected:
         raise Unsound(f"check at the fixed values: {result['status']}, expected {expected}")
@@ -530,12 +595,15 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
     except EvaluationError as e:
         raise Unsound(f"the map raised: {e}") from e
     total = F(0)
-    j14 = design.get("j14")
-    if j14 is not None:
-        count("j14_applicable" if j14["applicable"] else "j14_not_applicable")
+    ends = design.get("endpoints")
+    if ends is not None:
+        count("endpoints_applicable" if ends["applicable"] else "endpoints_not_applicable")
     for cell in design["cells"]:
-        if cell.method and "J-14" in cell.method:
-            count(f"cells_j14_{cell.status}")
+        if cell.method and "end points" in cell.method:
+            count(f"cells_endpoints_{cell.status}")
+        if cell.deviation_states and any(st["loc"] != 0 for st, _ in
+                                         cell.deviation_states.values()):
+            count("cells_deviation_from_a_later_state")
         volume = F(1)
         for lo, hi in cell.box.values():
             volume *= hi - lo
@@ -547,7 +615,7 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
         if cell.status == "equilibrium" and cell.from_every_state:
             count("cells_from_every_state")
         count("points", check_cell(g, cell, g["epsilon"], rng, extra))
-    if j14 is not None and j14["applicable"]:
+    if ends is not None and ends["applicable"]:
         count("points", check_endpoint_cells(g, model, rng, extra, stats))
     region = F(1)
     for lo, hi in g["region"].values():
@@ -569,8 +637,8 @@ def mutation(name: str | None):
     import cadl.games_eval as ge
     saved = {k: getattr(ge, k) for k in
              ("deviation_lower", "improper_states", "one_step_upper", "cell_distributions",
-              "reward_bounds", "j14_parameter_free_model", "j14_affine_weights",
-              "j14_condition_ii")}
+              "reward_bounds", "endpoint_parameter_free_model", "endpoint_affine_weights",
+              "endpoint_monotone_states", "certified_reach", "player_on_cell")}
     if name == "swap_bound_direction":
         # d(τ): the best case over the cell instead of the worst case.
         ge.deviation_lower = lambda proc, tau, lo: ge.optimal_values(
@@ -595,15 +663,27 @@ def mutation(name: str | None):
             lo, hi = original_rb(game, proc, cell)
             return hi, lo
         ge.reward_bounds = swapped
-    elif name == "j14_drop_probability":
-        # Condition 2 without "ℓ occurs in no prob:".
-        ge.j14_parameter_free_model = lambda model, design, name: None
-    elif name == "j14_drop_affine":
-        # Condition 2 without "ℓ occurs with a power of at most one".
-        ge.j14_affine_weights = lambda model, name: None
-    elif name == "j14_drop_condition_ii":
-        # Condition 5 assumed for every player.
-        ge.j14_condition_ii = lambda game, profile, player, name: True
+    elif name == "endpoints_drop_probability":
+        # Condition A without "ℓ occurs in no prob:".
+        ge.endpoint_parameter_free_model = lambda model, design, name: None
+    elif name == "endpoints_drop_affine":
+        # Condition A without "ℓ occurs with a power of at most one".
+        ge.endpoint_affine_weights = lambda model, name: None
+    elif name == "endpoints_drop_condition_b":
+        # Condition B assumed for every player from every state.
+        def everywhere(game, profile, player, name):
+            states = set(range(len(game.states)))
+            return {"decreasing": states, "increasing": set(states)}
+        ge.endpoint_monotone_states = everywhere
+    elif name == "drop_reach_certificate":
+        # N_s: every state of R_C(p) taken to be in Reach_p on the whole cell.
+        ge.certified_reach = lambda game, profile, player, cell: set(range(len(game.states)))
+    elif name == "every_state_as_nash":
+        # The conditions of I.9 for the concept nash also for
+        # every_reachable_state (E1 at the initial state only, no N_s).
+        original_on = saved["player_on_cell"]
+        ge.player_on_cell = lambda game, profile, player, cell, dists, epsilon, every=False: \
+            original_on(game, profile, player, cell, dists, epsilon)
     elif name is not None:
         raise ValueError(name)
     try:
@@ -615,11 +695,14 @@ def mutation(name: str | None):
 
 MUTATIONS = ("swap_bound_direction", "drop_admissibility", "profile_command_for_deviator",
              "lower_corner_only", "swap_reward_bounds")
-J14_MUTATIONS = ("j14_drop_probability", "j14_drop_affine", "j14_drop_condition_ii")
+ENDPOINT_MUTATIONS = ("endpoints_drop_probability", "endpoints_drop_affine",
+                      "endpoints_drop_condition_b")
+EVERY_STATE_MUTATIONS = ("drop_reach_certificate", "every_state_as_nash")
 
 
 def run(seed: int, count: int, mutant: str | None = None, max_cells: int = 24,
-        extra: int = 4, j14: bool = False) -> dict:
+        extra: int = 4, j14: bool = False, mode: str | None = None,
+        concept: str = "nash") -> dict:
     """Generate and check `count` accepted models. Returns statistics;
     `stats["failure"]` describes the first violation, if any (also an
     exception raised by a mutant)."""
@@ -630,7 +713,7 @@ def run(seed: int, count: int, mutant: str | None = None, max_cells: int = 24,
         tries = 0
         while done < count and tries < 50 * count:
             tries += 1
-            g = generate(rng, j14)
+            g = generate(rng, j14, mode, concept)
             try:
                 if check_model(g, rng, max_cells, extra, stats):
                     done += 1
@@ -652,13 +735,19 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--count", type=int, default=300)
     parser.add_argument("--max-cells", type=int, default=24)
     parser.add_argument("--extra", type=int, default=4)
-    parser.add_argument("--mutation", choices=MUTATIONS + J14_MUTATIONS, default=None)
+    parser.add_argument("--mutation", default=None,
+                        choices=MUTATIONS + ENDPOINT_MUTATIONS + EVERY_STATE_MUTATIONS)
     parser.add_argument("--j14", action="store_true",
                         help="one-parameter maps over lam in files that declare grounding "
-                             "0.1, so that the end-point certification of J-14 is used")
+                             "0.1 (the end-point certification of I.9, through J-14)")
+    parser.add_argument("--mode", choices=("endpoints", "scale"), default=None,
+                        help="endpoints: one-parameter maps over lam in files without "
+                             "grounding; scale: 3 or 4 players, mostly 3 open parameters")
+    parser.add_argument("--concept", choices=("nash", "every", "both"), default="nash")
     args = parser.parse_args(argv)
     start = time.time()
-    stats = run(args.seed, args.count, args.mutation, args.max_cells, args.extra, args.j14)
+    stats = run(args.seed, args.count, args.mutation, args.max_cells, args.extra, args.j14,
+                args.mode, args.concept)
     model = stats.pop("failing_model", None)
     print({k: stats[k] for k in sorted(stats)}, f"{time.time() - start:.1f}s")
     if model and args.mutation is None:

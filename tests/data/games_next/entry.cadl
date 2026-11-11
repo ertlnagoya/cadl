@@ -1,0 +1,51 @@
+# Entry deterrence: a threat that is not credible. B threatens to fight
+# when A enters; fighting costs B as well. A stays out, so the state in
+# which B fights is reached only when A deviates: it is in Reach_A, where B
+# does not choose, and not in Reach_B. The profile (out; fight) is an
+# equilibrium from every reachable state, but not subgame perfect: in the
+# state loc = 1, B gains by sharing.
+sos:
+  name: "EntryDeterrence"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+    - games: 0.1
+  actors:
+    - { id: ENTRANT, role: "x" }
+    - { id: INCUMBENT, role: "y" }
+  model:
+    kind: smg
+    variables:
+      - { id: loc, type: "[0..2]", init: 0 }
+    players:
+      - { id: A, actors: [ENTRANT] }
+      - { id: B, actors: [INCUMBENT] }
+    commands:
+      - { action: out,   owner: A, guard: "loc == 0", updates: [ { set: { loc: 2 } } ] }
+      - { action: enter, owner: A, guard: "loc == 0", updates: [ { set: { loc: 1 } } ] }
+      - { action: fight, owner: B, guard: "loc == 1", updates: [ { set: { loc: 2 } } ] }
+      - { action: share, owner: B, guard: "loc == 1", updates: [ { set: { loc: 2 } } ] }
+    rewards:
+      - { id: r_out,   items: [ { action: out, value: 1 } ] }
+      - { id: r_fight, items: [ { action: fight, value: 1 } ] }
+      - { id: r_share, items: [ { action: share, value: 1 } ] }
+    profiles:
+      deter: [ { choose: out }, { choose: fight } ]
+      accommodate: [ { choose: enter }, { choose: share } ]
+    compliance: deter
+    payoffs:
+      - player: A
+        until: "loc == 2"
+        terms:
+          - { reward: r_out, weight: 1 }
+          - { reward: r_fight, weight: -1 }
+          - { reward: r_share, weight: 2 }
+      - player: B
+        until: "loc == 2"
+        terms:
+          - { reward: r_out, weight: 3 }
+          - { reward: r_fight, weight: -1 }
+          - { reward: r_share, weight: 2 }
+    equilibria:
+      - { id: deter_every, concept: every_reachable_state }
+      - { id: accommodate_every, profile: accommodate, concept: every_reachable_state }
