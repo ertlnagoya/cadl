@@ -260,6 +260,48 @@ norms:
 """
 
 
+# arithmetic and sum (with --domain), orders and equalities between
+# quantities, an order against a text literal
+ARITH = """\
+norms:
+  - id: sum_ok
+    kind: obligation
+    bearer: D
+    trigger: "D -> R[1] : go"
+    content: "R[1].x + R[1].y > 3"
+    deadline: 1s
+  - id: order
+    kind: prohibition
+    bearer: D
+    content: "R[1].a < R[1].b AND R[1].b != R[2].b"
+  - id: load
+    kind: prohibition
+    bearer: D
+    content: "sum(R[*].load) > 2"
+  - id: names
+    kind: prohibition
+    bearer: D
+    content: "R[1].s < \\"m\\" OR R[1].s >= R[2].s"
+  - id: names2
+    kind: prohibition
+    bearer: D
+    content: "R[1].s < R[2].s"
+  - id: names3
+    kind: prohibition
+    bearer: D
+    content: "R[1].s == R[2].s"
+  - id: objects
+    kind: prohibition
+    bearer: D
+    content: "R[1].o < R[2].o"
+  - id: objects2
+    kind: prohibition
+    bearer: D
+    content: "R[1].o == R[2].o"
+"""
+ARITH_DOMAINS = ["R[1].x=0..3", "R[1].y=0..3", "R[*].load=0..1"]
+
+
 def make_sos(body: str):
     sos = parse(HEAD + textwrap.indent(body, "      "))
     result = type_check(sos)
@@ -276,7 +318,8 @@ def model_of(name: str, **kw):
     key = (name, json.dumps(kw, sort_keys=True))
     if key not in _MODELS:
         texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS,
-                 "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES, "QUANT": QUANT}
+                 "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES, "QUANT": QUANT,
+                 "ARITH": ARITH}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
         _MODELS[key] = (sos, m, PrismModel(m.prism_text(), {"early_end": True}))
@@ -294,6 +337,9 @@ CASES = [
     ("TYPES", {"bindings": ["i=1"]}),
     (str(EXAMPLES / "norms_check_value_types.cadl"), {"bindings": ["i=1"]}),
     ("QUANT", {"members": ["R=2"]}),
+    ("ARITH", {"domains": ARITH_DOMAINS}),
+    (str(EXAMPLES / "norms_check_arithmetic.cadl"),
+     {"members": ["ROBOT=2"], "domains": ["ROBOT[*].load=0..3", "DEPOT.capacity=2..4"]}),
     (str(EXAMPLES / "norms_check_quantifiers.cadl"), {"members": ["ROBOT=2"]}),
 ]
 
@@ -348,7 +394,7 @@ norms:
   - id: a
     kind: obligation
     bearer: "R[i]"
-    content: "R[i].x == R[i].y"
+    content: "R[i].x + 1 == R[i].y"
     on_violation: {reparation: b}
   - id: b
     kind: obligation
@@ -357,7 +403,7 @@ norms:
 """)
         tr = build_model(sos, bindings={"i": 1}).tr
         assert tr.by_id["a"].status == "untranslated"
-        assert "two quantities" in tr.by_id["a"].reason
+        assert "--domain" in tr.by_id["a"].reason
         assert tr.by_id["b"].status == "untranslated"
         assert "reparation of a" in tr.by_id["b"].reason
 
@@ -541,6 +587,25 @@ def test_conflict_through_quantifiers():
             r = evaluate(sos, parse_trace(w["trace"]))
             states = {n["id"]: n["state"] for n in r["norms"]}
             assert states[w["keeps"]] != "violated"
+
+
+def test_arithmetic_needs_a_domain():
+    """Arithmetic, sum and avg need --domain; orders and equalities between
+    quantities and orders against texts do not. The report says for which
+    traces the answers hold."""
+    tr = build_model(make_sos(ARITH), bindings={"i": 1}).tr
+    assert tr.by_id["sum_ok"].status == "untranslated"
+    assert "--domain R[1].x=0..10" in tr.by_id["sum_ok"].reason
+    assert tr.by_id["load"].status == "untranslated"
+    assert tr.by_id["order"].status == "model" and tr.by_id["names"].status == "model"
+    tr = model_of("ARITH", domains=ARITH_DOMAINS)[1].tr
+    assert all(n.status == "model" for n in tr.norms)
+    assert tr.quantities["R[1].x"].reps[1:5] == [0, 1, 2, 3]
+    assert any("R[1].x takes the integers 0..3" in n for n in tr.notes)
+    # three quantities ordered against each other: three values in every gap
+    assert tr.quantities["R[1].a"].order == 3
+    with pytest.raises(NormsCheckError, match="--domain takes"):
+        build_model(make_sos(ARITH), domains=["R[1].x=3..1"])
 
 
 def test_paths_cover_the_semantics():
@@ -911,9 +976,13 @@ def test_cli_require_checker_and_timeout(tmp_path):
         assert "Traceback" not in p.stderr
 
 
-def _random_json(rng, consts):
-    pool = [None, True, False, [], {}, [1], {"a": 1}, "", "x", "OTHER",
+def _random_json(rng, consts, domain=None):
+    pool = [None, True, False, [], {}, [1], [0, 2], {"a": 1}, {"b": 2}, "", "x", "OTHER",
+            rng.choice(["a", "b", "zz", "m", "ma", "l\uffff"]),
             rng.randint(-30, 30), rng.uniform(-30, 30), rng.choice([0, 0.0, 1, 1.0, -0.0])]
+    if domain is not None:
+        pool = [v for v in pool if type(v) not in (int, float)]
+        return rng.choice(pool + [rng.randint(*domain)] * len(pool))
     for c in consts:
         pool.append(c)
         if isinstance(c, (int, float)) and not isinstance(c, bool):
@@ -938,7 +1007,8 @@ def test_value_classes_cover_every_json_value(case):
         exprs = [tr.preds[i].expr for i in ids]
         known = {v for v, _vals in vecs}
         for _ in range(150):
-            vals = {k: _random_json(rng, tr.quantities[k].consts) for k in keys}
+            vals = {k: _random_json(rng, tr.quantities[k].consts, tr.quantities[k].domain)
+                    for k in keys}
             assert tuple(tr._oracle(exprs, vals)) in known, vals
 
 

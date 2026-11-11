@@ -30,6 +30,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   members of a set with integer bounds that are outside the instance.
   `examples/norms_check_quantifiers.cadl` shows a conflict between a
   quantified obligation and a prohibition with `count`.
+- `cadl norms-check` translates comparisons of two quantities: the
+  quantities compared with each other form groups, and for a group of k
+  quantities the classes hold k numbers, texts, lists and objects below,
+  between and above the literals, enough for every order and pattern of
+  equalities (exact). Arithmetic, `sum` and `avg` are translated for
+  quantities with a domain given by the new option `--domain
+  Q=lo..hi` (`Q` a quantity or a pattern such as `ROBOT[*].load`); such a
+  quantity takes the integers of its domain and the values that are not
+  numbers, and the report states that the answers hold for traces whose
+  numbers for it are such integers. Without a domain such a norm is not
+  translated, and the reason names the option.
+  `examples/norms_check_arithmetic.cadl` sums loads against a capacity.
 
 ### Fixed
 

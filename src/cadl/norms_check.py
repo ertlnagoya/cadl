@@ -526,6 +526,8 @@ class Quantity:
     reps: list = field(default_factory=list)    # one value per class
     atoms: set = field(default_factory=set)     # (op, literal), ("in", literals), ("truth",)
     raw: bool = False      # its value is used otherwise than in an atom
+    domain: tuple | None = None     # (lo, hi) of --domain, for arithmetic
+    order: int = 1         # quantities compared with each other in its group
 
 
 class _Name(str):
@@ -595,9 +597,12 @@ class Translator:
     """The translation of one contract instance (F.12)."""
 
     def __init__(self, sos: SoSDefinition, contract: ContractDef, bindings: dict,
-                 members: dict, step_ms: int | None, horizon: int | None) -> None:
+                 members: dict, step_ms: int | None, horizon: int | None,
+                 domains: dict | None = None) -> None:
         self.sos = sos
         self.contract = contract
+        self.domain_patterns = dict(domains or {})     # pattern -> (lo, hi)
+        self.links: list = []                           # keys compared with each other
         self.notes: list[str] = []
         self.actors = declared_actors(sos)
         self.bindings = dict(bindings)
@@ -1032,7 +1037,13 @@ class Translator:
                         if x[0] == "qty" and o is not None:
                             info["atoms"].setdefault(k, set()).update(
                                 (o, v) for v in range(y[1] + 1))
-                elif y[0] in ("qty", "minmax", "num"):
+                elif y[0] in ("qty", "minmax"):
+                    # an order or equality between quantities: exact with
+                    # enough values between the literals (F.12)
+                    info["links"].append(frozenset(x[1]) | frozenset(y[1]))
+                    info["raw"].update(x[1])
+                    info["raw"].update(y[1])
+                elif y[0] == "num":
                     info["domain"].update(x[1])
                     info["domain"].update(y[1])
             elif x[0] == "num":
@@ -1044,10 +1055,12 @@ class Translator:
         key = repr(expr)
         if key in self._pred_index:
             return self._pred_index[key]
-        info: dict = {"consts": {}, "domain": set(), "keys": set(), "atoms": {}, "raw": set()}
+        info: dict = {"consts": {}, "domain": set(), "keys": set(), "atoms": {}, "raw": set(),
+                      "links": []}
         self._cond(expr, {}, info)
         if info["domain"]:
             self._needs_domain(info["domain"])
+        self.links += info["links"]
         for k, cs in info["consts"].items():
             self._quantity(k).consts.update(c for c in cs if c is not None)
         for k, atoms in info["atoms"].items():
@@ -1058,8 +1071,24 @@ class Translator:
         self.preds.append(Pred(expr=expr, text=_expr_text(expr), keys=frozenset(info["keys"])))
         return self._pred_index[key]
 
+    def domain_of(self, key: str) -> tuple | None:
+        """The --domain of a quantity: given for the key or for a pattern
+        with [*] in place of the index of a member."""
+        for pat, dom in self.domain_patterns.items():
+            rx = re.escape(pat).replace(r"\[\*\]", r"\[\d+\]")
+            if re.fullmatch(rx, key):
+                return dom
+        return None
+
     def _needs_domain(self, keys: set) -> None:
-        raise _Refuse("arithmetic, sum, avg, or a comparison of two quantities is not translated")
+        missing = sorted(k for k in keys if self.domain_of(k) is None)
+        if missing:
+            raise _Refuse(
+                f"arithmetic, sum or avg uses {', '.join(missing)} without a finite domain: "
+                f"give one with --domain (such as --domain {missing[0]}=0..10); the answers "
+                f"then hold for traces whose numbers for it are integers in that range")
+        for k in keys:
+            self._quantity(k).domain = self.domain_of(k)
 
     def _parse_pred(self, text: str) -> Any:
         from .parser import parse_rule
@@ -1340,24 +1369,47 @@ class Translator:
         if any(isinstance(c, bool) for c in q.consts):
             nums.update((0, 1))
         cs = sorted(nums)
-        numbers = [cs[0] - 1]
-        for i, c in enumerate(cs):
-            numbers.append(c)
-            if i + 1 < len(cs):
-                nxt = cs[i + 1]
-                if isinstance(c, int) and isinstance(nxt, int) and nxt - c >= 2:
-                    numbers.append(c + 1)
-                else:
-                    mid = (c + nxt) / 2
-                    numbers.append(int(mid) if float(mid).is_integer() and mid not in cs else mid)
-        numbers.append(cs[-1] + 1)
-        texts = sorted({str(c) for c in q.consts if isinstance(c, str)})
-        other = "OTHER"
-        while other in texts:
-            other += "_"
+        k = q.order
+        if q.domain is not None:
+            numbers = list(range(q.domain[0], q.domain[1] + 1))
+        else:
+            # k values below, between and above the literals, so that k
+            # quantities compared with each other can take every order
+            numbers = [cs[0] - j for j in range(k, 0, -1)]
+            for i, c in enumerate(cs):
+                numbers.append(c)
+                if i + 1 < len(cs):
+                    nxt = cs[i + 1]
+                    for j in range(1, k + 1):
+                        if k == 1 and isinstance(c, int) and isinstance(nxt, int) \
+                                and nxt - c >= 2:
+                            v = c + 1
+                        else:
+                            v = c + (nxt - c) * Fraction(j, k + 1)
+                            v = int(v) if v.denominator == 1 else float(v)
+                        if v not in numbers:
+                            numbers.append(v)
+            numbers += [cs[-1] + j for j in range(1, k + 1)]
+        lits = sorted({str(c) for c in q.consts if isinstance(c, str)})
+        ordered = k > 1 or any(a[0] in ("<", "<=", ">", ">=") and isinstance(a[1], str)
+                               for a in q.atoms)
+        if ordered:
+            # texts are ordered too: k texts below, between and above the
+            # text literals
+            texts, others = self._text_grid(q.key, lits, k), []
+        else:
+            texts, others = lits, []
+            while len(others) < k:
+                other = "OTHER" + ("_" * len(others))
+                while other in texts:
+                    other += "_"
+                others.append(other)
+        # lists are ordered among themselves, objects only equal or not
+        objects = ([[]] if k == 1 else [[j] for j in range(k)]
+                   + [{}] + [{"k": j} for j in range(1, k)])
         # plain values first, so that a witness shows them when they will do
-        reps = ([None] + sorted(numbers, key=lambda x: (abs(x), x)) + texts + [other]
-                + [True, False, []])
+        reps = ([None] + sorted(numbers, key=lambda x: (abs(x), x)) + texts + others
+                + [True, False] + objects)
         if q.raw:
             return reps
         # the quantity occurs only in comparisons with literals and as a
@@ -1372,6 +1424,30 @@ class Translator:
                 seen.add(sig)
                 out.append(v)
         return out
+
+    @staticmethod
+    def _text_grid(key: str, lits: list, k: int) -> list:
+        """k texts below, at, between and above the text literals, in the
+        order of norms-eval (Python's order of strings)."""
+        if any("\x00" in t for t in lits):
+            raise _Refuse(f"{key} is ordered against a text with the character U+0000, "
+                          f"which is not translated")
+        out = []
+        lo = lits[0] if lits else None
+        below = ["\x00" * j for j in range(0, 2 * k + 1)]
+        out += [t for t in below if lo is None or t < lo][:k]
+        for i, t in enumerate(lits):
+            out.append(t)
+            nxt = lits[i + 1] if i + 1 < len(lits) else None
+            between = [t + "\x00" * j for j in range(1, k + 1)]
+            out += [b for b in between if nxt is None or b < nxt]
+        top = lits[-1] if lits else ""
+        out += [top + "\uffff" * j for j in range(1, k + 1)]
+        res = []
+        for t in out:
+            if t not in res:
+                res.append(t)
+        return res
 
     @staticmethod
     def _lit_node(v: Any) -> Any:
@@ -1413,8 +1489,38 @@ class Translator:
         return out
 
     def _choices(self) -> None:
+        # quantities compared with each other: groups, their sizes, and the
+        # values of --domain quantities as literals of the others
+        parent: dict = {}
+
+        def root(k: str) -> str:
+            while parent.setdefault(k, k) != k:
+                k = parent[k]
+            return k
+
+        for link in self.links:
+            link = sorted(link)
+            for k in link[1:]:
+                parent[root(k)] = root(link[0])
+        groups: dict = {}
+        for k in parent:
+            groups.setdefault(root(k), []).append(k)
+        for keys in groups.values():
+            for k in keys:
+                q = self.quantities[k]
+                q.order = len(keys)
+                q.consts.update((0, 1))         # an ordering compares true as 1
+                for other in keys:
+                    dom = self.quantities[other].domain
+                    if dom is not None and other != k:
+                        q.consts.update(range(dom[0], dom[1] + 1))
         for q in self.quantities.values():
             q.reps = self._reps(q)
+        for q in self.quantities.values():
+            if q.domain is not None:
+                self._note(f"{q.key} takes the integers {q.domain[0]}..{q.domain[1]} of --domain "
+                           f"and the values that are not numbers: the answers hold for traces in "
+                           f"which its numbers are such integers")
         # components of predicates that share quantities
         parent = list(range(len(self.preds)))
 
@@ -2305,9 +2411,24 @@ def all_paths(tr: Translator, length: int) -> list[list]:
 
 # === Building ==============================================================
 
+def _parse_domains(items) -> dict:
+    out: dict = {}
+    for item in items or []:
+        for part in str(item).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            m = re.fullmatch(r"([A-Za-z_][\w\[\]*.]*)\s*=\s*(-?\d+)\s*\.\.\s*(-?\d+)", part)
+            if not m or int(m.group(2)) > int(m.group(3)):
+                raise NormsCheckError(f"--domain takes QUANTITY=lo..hi with integers lo <= hi, "
+                                      f"such as ROBOT[*].load=0..5, got {part!r}")
+            out[m.group(1)] = (int(m.group(2)), int(m.group(3)))
+    return out
+
+
 def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=None,
                 members=None, step: str | int | None = None,
-                horizon: int | None = None) -> NormsModel:
+                horizon: int | None = None, domains=None) -> NormsModel:
     """Translate one contract instance (F.12). `bindings` and `members`
     map names to integers (or are lists of "name=n" texts), `step` is a
     duration text or milliseconds."""
@@ -2319,7 +2440,9 @@ def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=Non
     if not isinstance(members, dict):
         members = _parse_assignments(members, "--members")
     step_ms = _parse_duration_ms(step) if isinstance(step, str) else step
-    tr = Translator(sos, contract, bindings, members, step_ms, horizon)
+    if not isinstance(domains, dict):
+        domains = _parse_domains(domains)
+    tr = Translator(sos, contract, bindings, members, step_ms, horizon, domains)
     return NormsModel(tr)
 
 
@@ -2752,6 +2875,8 @@ def _report_head(model: NormsModel) -> dict:
             "messages": [a.text() for a in tr.atoms],
             "quantities": {q.key: q.reps for q in tr.quantities.values()},
             "choices": len(tr.choices),
+            "domains": {q.key: list(q.domain) for q in tr.quantities.values()
+                        if q.domain is not None},
         },
         "model": {"variables": len(model.vars), "commands": len(model.commands), "states": None},
         "norms": norms,
@@ -2971,11 +3096,12 @@ def format_text(report: dict) -> str:
 
 
 def check_file(path, contract_id=None, bindings=None, members=None, step=None,
-               horizon=None, export_dir=None, prism=None, timeout: float = 600) -> dict:
+               horizon=None, export_dir=None, prism=None, timeout: float = 600,
+               domains=None) -> dict:
     """`cadl norms-check`: build the model of a file, check it, export."""
     from .norms_eval import load_version
     sos = load_version(path)
-    model = build_model(sos, contract_id, bindings, members, step, horizon)
+    model = build_model(sos, contract_id, bindings, members, step, horizon, domains)
     if export_dir is not None:
         export(model, None, export_dir)       # the model, also when the check fails
     report = check(model, prism, timeout)

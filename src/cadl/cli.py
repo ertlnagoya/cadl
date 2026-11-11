@@ -372,6 +372,10 @@ def main(argv: list[str] | None = None) -> int:
     nchk_cmd.add_argument("--export", type=Path, default=None, metavar="DIR",
                           help="Write the PRISM model, the properties and the witness traces "
                                "to DIR")
+    nchk_cmd.add_argument("--domain", action="append", default=[], metavar="Q=lo..hi",
+                          help="Integer domain of a quantity used in arithmetic, sum or avg "
+                               "(ROBOT[*].load=0..5); the answers then hold for traces whose "
+                               "numbers for it are such integers; may be repeated")
     nchk_cmd.add_argument("--timeout", type=float, default=600, metavar="SECONDS",
                           help="Time for all runs of the model checker together; exit status 2 "
                                "when it is exceeded (default: 600)")
@@ -1197,7 +1201,8 @@ def _cmd_norms_check(args: argparse.Namespace) -> int:
         return 2
     try:
         report = check_file(args.file, args.contract, args.bindings, args.members,
-                            args.step, args.horizon, args.export, timeout=args.timeout)
+                            args.step, args.horizon, args.export, timeout=args.timeout,
+                            domains=args.domain)
     except NormsEvalError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
