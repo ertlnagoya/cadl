@@ -753,4 +753,8 @@ class SoSDefinition:
     # Stochastic model extension (Appendix H); read whether or not
     # `stochastic: 0.1` is declared, interpreted only when it is.
     model: ModelBlock | None = None
+    # Grounding extension (Appendix J): the keys grounding:, shares:,
+    # on_fulfilment: and on_violation.magnitude as written
+    # (`cadl.grounding.GroundingRaw`), or None when the file uses none.
+    grounding: Any = None
     loc: SourceLocation | None = None

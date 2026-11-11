@@ -180,6 +180,11 @@ cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
 
 # What an amendment from one version to the next does to the norms
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
+
+# Grounding extension: the derived indices of information sharing and of the
+# concentration of powers, and the incentive coverage, of each contract
+cadl norms-indices examples/grounding_robot_delivery.cadl
+cadl norms-indices examples/grounding_robot_delivery.cadl --format json
 # Stochastic model extension: export the model: block to PRISM, one model
 # file and one properties file per design
 cadl model-export examples/stochastic_robot_delivery.cadl -o prism_out/
@@ -608,6 +613,70 @@ A refused observation leaves the monitor exactly as it was, and the monitor stay
 
 The Solidity and OPA targets do not monitor norms; they leave the temporal items out and say so in a warning.
 
+### Grounding of the Institutional Parameters (grounding 0.1)
+
+The grounding extension (Appendix J of the specification) relates the declared `alpha`, `beta` and `lambda` of a contract to its norms. A file declares `grounding: 0.1` together with `norms: 0.1`, which it requires, and may then use four keys:
+
+```yaml
+contracts:
+  - id: DELIVERY_SLA
+    parties: [DISPATCHER, "ROBOT[*]", "CUSTOMER[*]"]
+    authority:   { decision_holder: DISPATCHER, beta: 0.9 }
+    information:
+      alpha: 0.6
+      sharing: ["DISPATCHER -> ROBOT[*] : route"]
+    incentives:  { lambda: 0.5 }
+    grounding:
+      items: { route: DISPATCHER, battery: "ROBOT[*]" }   # information item: its origin
+      tolerance: 0.25                                      # default 0.25
+    norms:
+      - id: may_return_to_charge
+        kind: permission
+        bearer: "ROBOT[i]"
+        content: "ROBOT[i] -> DISPATCHER : charging_request"
+        shares: [battery]                                  # the message conveys these items
+      - id: no_low_battery_driving
+        kind: prohibition
+        bearer: "ROBOT[i]"
+        content: "ROBOT[i].battery < 10 AND ROBOT[i].status == InTransit"
+        on_violation: { sanction: "removed from the pool", magnitude: 4 }
+        on_fulfilment: { reward: "bonus", magnitude: 1 }
+```
+
+`cadl norms-indices FILE [--contract ID] [--format text|json]` computes three quantities for every contract, each an exact ratio of two counts, or undefined when its denominator is zero (J.4):
+
+| Quantity | Ratio | Reported with it |
+|---|---|---|
+| **alpha^**, information sharing | pairs (item, party other than its origin) that a sharing entry, an obligation or a permission gives to the whole party / all such pairs | the pairs given in each of the three ways, the pairs not given, and the entries and norms whose target is member-specific (`ROBOT[3]`), which give no pair |
+| **beta^**, concentration of powers | largest number of powers borne by one single actor / powers | the powers per bearer, the number of norms each power names in `effects:`, and the share of the `decision_holder` |
+| **chi**, incentive coverage | obligations and prohibitions with a sanction text, a reward text or a magnitude greater than zero / obligations and prohibitions | the norms with a reparation only, and the norms with a `transition:` |
+
+```console
+$ cadl norms-indices examples/grounding_robot_delivery.cadl
+Contract DELIVERY_SLA (tolerance 0.25)
+  alpha^ (information sharing) = 5/8 = 0.625  given pairs / pairs
+    declared alpha: 0.6, declared - index = -0.025
+    pairs given by a sharing entry: 3, by an obligation: 1, by a permission: 1
+    ...
+  beta^ (concentration of powers) = 1/2 = 0.5  largest number of powers of one single actor / powers
+    declared beta: 0.9, declared - index = 0.4
+    ...
+  chi (incentive coverage) = 1/3 = 0.333333  norms that carry an incentive / obligations and prohibitions
+    declared lambda: 0.5 (a scale; not compared with chi)
+    ...
+  warning  contract 'DELIVERY_SLA' declares beta: 0.9, but the index of concentration of powers is 1/2 = 0.5 ...; they differ by 0.4, more than the tolerance 0.25 (J-7)
+```
+
+JSON has `file`, `grounding`, `contracts[]` (`id`, `items`, `tolerance`, and `alpha`, `beta`, `coverage`, each with `defined`, `numerator`, `denominator`, `exact`, `value` or `undefined` with the reason, and the counts above; `diagnostics[]`) and `designs[]` (the diagnostics of J-9). The exit status is 0 when the indices were reported, whatever the warnings, and 2 on a usage error (no file, a type-check error, or a file that does not declare `grounding: 0.1` with `norms: 0.1`).
+
+The indices are evidence about the norms, not the meaning of the parameters: `cadl check` compares the declared `alpha` and `beta` with them and only warns (item 14 under Type Checks). `lambda` is a scale and is not compared with a number. Declaring `grounding: 0.1` never makes a file invalid that declares `norms: 0.1` and uses none of the new keys.
+
+**Annotations only.** `shares:`, `on_fulfilment:` and the magnitudes change no verdict: `cadl norms-eval`, `cadl agents-run` and the generated `norms_monitor.py` give the same results with and without them, and the generated monitor does not carry them. The code generators do not write them either, so a reward text may contain a quote. The IR (`cadl sim-ir`) carries them for a file that declares the extension: each contract gains `grounding` (`items`, `tolerance`, and `indices` with the counts of `alpha`, `beta` and `coverage`, `null` for an undefined quantity) and each norm `shares`, `on_violation_magnitude`, `on_fulfilment_reward` and `on_fulfilment_magnitude` (J.10). The IR of a file that does not declare the extension is unchanged.
+
+**Two versions.** `cadl norms-diff OLD NEW` also reports a changed `on_violation.magnitude`, `on_fulfilment:`, `shares:`, `grounding.items` and `grounding.tolerance` and each changed index, and warns when a declared `alpha` or `beta` and its index move in opposite directions between the versions (J-13), for example when `beta` is raised while the amendment gives a power to the robots.
+
+**For strategic models.** The payoff terms `sanction_of:` / `reward_of:` of Appendix I are not implemented here. `cadl.grounding.norm_payoff_link(sos, "C.n", "sanction_of" | "reward_of")` gives what such a term needs from the norm it names: the magnitude (exact), the bearer, the source name `C.lambda`, or a description of why the reference cannot be used.
+
 ### Stochastic Model (PRISM Export)
 
 A file that declares `stochastic: 0.1` under `extensions:` may carry a `model:` block (Appendix H of the specification): a parametric discrete-time Markov chain written as guarded probabilistic commands over finite state variables, in which parameters can be bound to `alpha`, `beta`, or `lambda` of a contract. Each regime of `transitions:` is a *design* with its own parameter values and commands. See `examples/stochastic_robot_delivery.cadl`.
@@ -669,6 +738,8 @@ The type checker (`cadl check`) validates:
 
 13. **Agent governance static semantics** (Appendix G, G.9; only when the file declares `agents: 0.1`) — the file also declares `norms: 0.1` (G-1); `agent:` has a `kind:` of `llm_agent`, `tool_server`, `human`, or `service` and a `protocol:` that is a name (G-2); `tools:` belongs to a tool server, which lists at least one, and tool names are unique identifiers (G-3); a message event whose receiver is a tool server names one of its tools (G-4; a warning for a protocol step); `enforcement.default` is `deny` or `allow` and `enforcement.point` is `caller`, `receiver`, or `gateway` (G-5); in an enforced contract the sender of the message content of a permission or prohibition is its bearer (G-6); `on_denied:` belongs to a prohibition with a message content in an enforced contract, has at least one key, and its `timeout:` is a duration greater than zero that requires `escalate_to:` (G-7); `escalate_to:` and `notify:` name single declared actors, and `escalate_to:` names a party other than the bearer (G-8); a contract with `escalate_to: A` has a `counts_as:` rule that creates `approval` from a message of `A`, and `approval` and `rejection` are reserved in an enforced contract (G-9); a `fallback:` is a message event of the bearer to a declared actor that differs from the prohibited message (G-10); `delegations:` belongs to an enforced contract, and each entry names one permission with a message content whose bearer has no bound index (G-11), lists declared actors other than tool servers under `to:`, and has a `max_depth:` of at least 1 (G-12); `grant:` and `revoke:` are identifiers that differ from each other, from `approval` and `rejection`, and from the tools of the parties (G-13); in an enforced contract the sender and the receiver of every message event (`trigger:`, `until:` and `content:` of a norm, `when:` of a `counts_as:` rule, `until:` of a delegation) are covered by one reference in the parties, because the contract observes only the messages it governs, and name only declared members (G-17), and every index variable of the contract (in bearers, counterparties, `escalate_to:`, `notify:`, `fallback:`, the senders, receivers and arguments of its message events, and its predicates, also inside an index expression such as `ROBOT[j+1]`) is bound: by a party (`i` for a party `ROBOT[i]`), by a quantifier, or by a comprehension (G-18). Warnings: an institutional event created under an `if:` that is the trigger of a prohibition or the `until:` of a permission (G-19), `escalate_to:` without `timeout:` (G-7), an approver that is not `human` (G-8), no rule for `rejection` (G-9), the bearer listed under `to:` (G-12), a permission or prohibition whose content is not a message event or has arguments (G-14), tools left open by `default: allow` and a tool server that is a party of no enforced contract (G-15), and a message the contract needs but would itself deny (G-16). Without the declaration, `agent:`, `enforcement:`, `delegations:`, and `on_denied:` get one warning as undeclared extension keys and are neither checked nor lowered to the IR
 
+14. **Grounding static semantics** (Appendix J, J.8; only when the file declares `grounding: 0.1`) — the file also declares `norms: 0.1` (J-1); the keys of `grounding.items` are identifiers, not reserved words, and their values actor references to a party of the contract, and `tolerance:` is a number in `[0, 1]` (J-2); `shares:` belongs to an obligation or a permission whose content is a message event and lists at least one declared item, each once (J-3); a magnitude is a finite number that is not negative, and `on_fulfilment:` belongs to an obligation or a prohibition and has a `reward:` or a `magnitude:` (J-4). Warnings, never errors: a sharing norm that gives an item to its origin, a target that is not a party or is the bare name of an actor set, a sharing entry with an undeclared item (J-3); a magnitude of zero next to a sanction or reward text (J-4); `alpha: 0` with a given pair or, when the index is undefined, with a sharing entry, `alpha: 1` with a pair that is not given, `beta: 1` with a power that the single actor with the most powers does not bear, `beta: 0` with a single actor that bears more than an even share (J-6); a declared `alpha` or `beta` farther from its index than the tolerance, and a decision holder with fewer powers than another actor (J-7); for a contract with norms, `lambda` greater than zero while no obligation or prohibition carries a sanction or a reward, and `lambda: 0` while one does (J-8). Informational, in a file that also declares `stochastic: 0.1`: a design in which a parameter bound to `C.alpha` or `C.beta` is farther from the index than the tolerance (J-9). The comparisons are exact (decimals as written, ratios as fractions). Without the declaration, `grounding:`, `shares:`, `on_fulfilment:` and `on_violation.magnitude` get one warning as undeclared extension keys, are not interpreted, and no index is computed (J.12). The rules J-10 to J-12 and J-14 belong to the strategic models of Appendix I and are not implemented
+
 It also reports, without failing the check, a `codegen:` target that `cadl codegen` cannot emit (warning), an extension name it does not know, and a `motivation:` block, which it keeps and passes on in `cadl sim-ir` but does not interpret (informational).
 
 ## Hands-on
@@ -715,6 +786,7 @@ This generates the IR JSON, the Unity C# tree, and drops the latter into the Uni
 | `raspimouse_mcp_sos.cadl` | Raspimouse swarm (MCP-SoS) | Acknowledged | LLM-controlled via MCP tools, Static/Dynamic path modes, 3 regimes |
 | `sos_dsl_robot_delivery.cadl` | Robot delivery with the SoS-DSL extension | Acknowledged | Contract lifecycle (7 states), 3 monitors; the example used by the hands-on course |
 | `agents_tool_governance.cadl` | LLM planner, sub-agent and two tool servers (agents 0.1) | — | Enforced contract, escalation to a human, delegation with provenance; sample inputs in `agents_inputs/`, traces for `cadl agents-run` in `traces/` |
+| `grounding_robot_delivery.cadl` | Robot delivery with norms and the grounding extension (grounding 0.1) | Acknowledged | The example of Appendix J, J.9: information items, `shares:`, a sanction magnitude; indices 5/8, 1/2 and coverage 1/3 with `cadl norms-indices` |
 | `agents_change_control.cadl` | Owner, lead agent, two workers and a repository (agents 0.1) | — | A prohibition in force between a trigger and an `until:`, delegation with `max_depth: 1` and `until:`; traces for `cadl agents-run` in `traces/` |
 
 ### Demo Scripts
@@ -752,6 +824,7 @@ src/cadl/
   norms_eval.py        Verdicts of the norms extension on a recorded trace
   agents_runtime.py    Runtime of the agent governance extension: decisions, holds, delegations and audit records on a trace
   norms_diff.py        Effect of an amendment on the norms (two versions compared)
+  grounding.py         Grounding extension: derived indices, rules J-1 to J-9 and J-13
   cli.py               Command-line interface
   codegen/
     __init__.py        Public generate() API (multi-target dispatch)
@@ -814,6 +887,7 @@ tests/
   test_expr_parser.py    Expression grammar tests
   test_unparse.py        Expression round-trip tests
   test_norms_eval.py     Norm verdicts on a trace (`cadl norms-eval`)
+  test_grounding_extension.py  Grounding extension: indices, rules, IR, `cadl norms-indices`
   test_norms_monitor.py  Generated norms monitor against `cadl norms-eval` (examples, recorded and random traces)
   norms_monitor_cases.py pytest plugin that records the cases of test_norms_eval.py for it
   test_name_resolution.py Actor vs state-variable resolution in generated code
@@ -865,6 +939,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | SoS-DSL extension (`lifecycle:` / `monitors:`) and Unity C# generation | Available |
 | Norms extension: static checks, and verdicts and amendments on a recorded trace (`cadl norms-eval`, `cadl norms-diff`) | Available |
 | Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available (Solidity, OPA and Unity C# do not monitor norms; no translation to a model checker) |
+| Grounding extension (grounding 0.1), norms side: derived indices and incentive coverage (`cadl norms-indices`), rules J-1 to J-9, IR, comparison of two versions (J-13 in `cadl norms-diff`) | Available (the payoff terms `sanction_of:` / `reward_of:` and the rules J-10 to J-12 and J-14 belong to the strategic models of Appendix I and are not implemented) |
 | Agent governance extension (agents 0.1): checks, decision function, runtime on a recorded trace (holds, delegations, audit records; `cadl agents-run`), Rego / Cedar boundary policies | Available (the runtime is an offline reference: it replays a trace and is not connected to a protocol) |
 | `model_check` / `simulation` / `proof` verification methods | Not supported yet (reported explicitly) |
 

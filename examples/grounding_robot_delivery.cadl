@@ -1,0 +1,141 @@
+# Grounding extension (Appendix J, grounding 0.1): the example of J.9.
+#
+# The delivery contract of the norms demo (norms_robot_delivery.cadl, the
+# example of Appendix F, F.8) with the three institutional parameters, a
+# grounding: block that declares four information items, two shares:
+# annotations, a magnitude for the sanction, and one more power, decline,
+# by which a robot refuses an assignment. From them cadl computes the
+# derived indices of J.4: information sharing 5/8, concentration of powers
+# 1/2, and the incentive coverage 1/3. The declared beta: 0.9 is farther
+# from 1/2 than the tolerance, so `cadl check` warns (J-7).
+#
+#   cadl check         examples/grounding_robot_delivery.cadl
+#   cadl norms-indices examples/grounding_robot_delivery.cadl
+#   cadl norms-indices examples/grounding_robot_delivery.cadl --format json
+#   cadl sim-ir        examples/grounding_robot_delivery.cadl --format json
+
+sos:
+  name: "RobotDeliveryNorms"
+  type: Acknowledged
+  version: "0.1.0"
+  description: "Robot-delivery SoS used to demonstrate the grounding extension."
+  extensions:
+    - sos-dsl: 0.1
+    - norms: 0.1
+    - grounding: 0.1
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities:
+        - assign_tasks
+        - reassign_tasks
+        - monitor_fleet
+      interface:
+        input:  [delivery_request, ack, failure_report, charging_request, decline]
+        output: [route_assignment, replan_command, delivery_notification]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities:
+        - follow_path
+        - pick_up
+        - deliver
+      interface:
+        input:  [route_assignment, replan_command]
+        output: [ack, failure_report, charging_request, decline]
+
+    - id: "CUSTOMER[1..M]"
+      role: "service_requester"
+      autonomy: medium
+      capabilities:
+        - submit_order
+        - confirm_receipt
+      interface:
+        input:  [delivery_notification]
+        output: [delivery_request]
+
+  contracts:
+    - id: DELIVERY_SLA
+      parties: [DISPATCHER, "ROBOT[*]", "CUSTOMER[*]"]
+      authority:   { decision_holder: DISPATCHER, beta: 0.9 }
+      information:
+        alpha: 0.6
+        sharing:
+          - "DISPATCHER -> ROBOT[*] : route"
+          - "ROBOT[*] -> DISPATCHER : status"
+          - "DISPATCHER -> CUSTOMER[*] : status"
+      incentives:  { lambda: 0.5 }
+      grounding:
+        items:
+          route:   DISPATCHER
+          status:  "ROBOT[*]"
+          battery: "ROBOT[*]"
+          failure: "ROBOT[*]"
+      assume:
+        - "throughout(300s, DISPATCHER.is_operational == true)"
+      guarantee:
+        - "within(300s, ROBOT[i].status == Delivered)"
+
+      lifecycle:
+        states:   [Proposed, Assigned, Delivering, Completed, Violated]
+        initial:  Proposed
+        terminal: [Completed, Violated]
+        transitions:
+          - { id: assign,   from: Proposed,   to: Assigned,   on: "DISPATCHER -> ROBOT[i] : route_assignment" }
+          - { id: start,    from: Assigned,   to: Delivering, on: "ROBOT[i].status == InTransit" }
+          - { id: complete, from: Delivering, to: Completed,  on: "ROBOT[i].status == Delivered" }
+
+      counts_as:
+        - when: "DISPATCHER -> ROBOT[i] : replan_command"
+          creates: reassignment
+
+      norms:
+        - id: acknowledge
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: DISPATCHER
+          trigger: "DISPATCHER -> ROBOT[i] : route_assignment"
+          content: "ROBOT[i] -> DISPATCHER : ack(accepted)"
+          deadline: 5s
+          on_violation:
+            severity: Major
+            reparation: report_failure
+        - id: report_failure
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: DISPATCHER
+          content: "ROBOT[i] -> DISPATCHER : failure_report"
+          shares: [failure]
+          deadline: 2s
+          on_violation:
+            severity: Critical
+            transition: Violated
+        - id: no_low_battery_driving
+          kind: prohibition
+          bearer: "ROBOT[i]"
+          content: "ROBOT[i].battery < 10 AND ROBOT[i].status == InTransit"
+          on_violation:
+            severity: Critical
+            sanction: "removed from the dispatch pool for one period"
+            magnitude: 4
+        - id: may_return_to_charge
+          kind: permission
+          bearer: "ROBOT[i]"
+          content: "ROBOT[i] -> DISPATCHER : charging_request"
+          shares: [battery]
+        - id: reassign
+          kind: power
+          bearer: DISPATCHER
+          content: reassignment
+          effects:
+            discharge: [acknowledge, report_failure]
+          on_amendment: discharge
+        - id: decline
+          kind: power
+          bearer: "ROBOT[i]"
+          content: "ROBOT[i] -> DISPATCHER : decline"
+          effects:
+            discharge: [acknowledge]
