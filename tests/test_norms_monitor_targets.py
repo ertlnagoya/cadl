@@ -215,6 +215,26 @@ class TestGeneration:
         [m] = norms_monitors(sos, "solidity")
         assert m["text"] is None and "too large" in m["reasons"][0]
 
+    def test_solidity_names_the_bare_names_of_temporal_operators(self):
+        from cadl.codegen.solidity.norms_monitor_sol import solidity_ir, temporal_names
+        sos = _small("      guarantee:\n        - \"throughout(10s, A.s == flag OR now > 3)\"\n"
+                     "        - \"other == 1\"\n")
+        assert temporal_names(solidity_ir(sos, sos.contracts[0])) == ["flag"]
+        assert "temporalName[keccak256" in generate_norms_monitor_sol(sos, sos.contracts[0])
+
+    def test_cli_warns_about_the_gas_of_temporal_contents(self, tmp_path):
+        proc = subprocess.run(
+            [sys.executable, "-m", "cadl.cli", "codegen", str(RICH), "-t", "solidity",
+             "-o", str(tmp_path / "out")], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        gas = [l for l in proc.stderr.splitlines() if "4 x 10^4 gas" in l]
+        assert {l.split("norm '")[1].split("'")[0] for l in gas} == {"stay_ok", "steady"}
+        assert all("cannot record any further observation" in l for l in gas)
+        proc = subprocess.run(
+            [sys.executable, "-m", "cadl.cli", "codegen", str(RICH), "-t", "opa",
+             "-o", str(tmp_path / "out2")], capture_output=True, text=True)
+        assert "4 x 10^4 gas" not in proc.stderr
+
     def test_rego_carries_the_contract_as_one_json_text(self):
         """No text of the .cadl file is Rego code: the model is one JSON
         string, and the other literals are JSON strings too."""
@@ -523,6 +543,10 @@ def test_every_solidity_monitor_compiles_within_the_size_limit(tmp_path):
                     assert len(c["bin"]) // 2 <= 49152, (path, name)
             init = len(compiled[f"Monitor.sol:{m['file'][:-4]}"]["bin"]) // 2
             assert init <= estimated_initcode(m["text"]), (path, init)
+            if path == RICH:            # the default of solc, 200 runs: larger code
+                big = S.compile_solidity(m["text"], m["file"], tmp_path / "runs200", runs=200)
+                init = len(big[f"Monitor.sol:{m['file'][:-4]}"]["bin"]) // 2
+                assert init <= estimated_initcode(m["text"]), (path, init)
             seen += 1
     assert seen >= 6
 
@@ -681,3 +705,27 @@ def test_evm_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
         got = S.sol_results(raw, runs, [n.id for n in contract.norms], skip)
         assert S.compare(refs, got, steps) == [], cases[0]["lines"]
     assert len(steps) >= 300
+
+
+@needs_evm
+def test_evm_refuses_a_temporal_name_that_becomes_known_late(tmp_path):
+    """A bare name read inside a temporal operator must be given in
+    begin(): the scans keep the values they have read, so a name that
+    becomes a quantity later would leave them stale. The observation that
+    would make it known is refused; with the name given in begin() the
+    monitor agrees with norms-eval."""
+    sos = _small("      assume:\n        - \"throughout(10s, A.s == flag)\"\n"
+                 "      guarantee:\n        - \"throughout(10s, A.s == flag)\"\n")
+    lines = _lines({"t": 0, "values": {"A.s": "flag"}}, {"t": 1, "values": {"flag": "flag"}},
+                   {"t": 20, "end": True})
+    refs = [S.reference(sos, lines)]
+    contract = sos.contracts[0]
+    compiled = S.compile_solidity(generate_norms_monitor_sol(sos, contract),
+                                  monitor_name(contract.id), tmp_path)
+    late = S.sol_run(lines, [])                        # flag not given in begin()
+    given = S.sol_run(lines, refs[0]["quantities"])
+    raw = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", [late, given],
+                    tmp_path)
+    assert "error" not in raw[0][0] and "error" in raw[0][1]
+    got = S.sol_results(raw[1:], [given], [n.id for n in contract.norms])
+    assert S.compare(refs, got) == []

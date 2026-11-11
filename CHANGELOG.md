@@ -33,7 +33,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   item only the item is left out); only its reporter (an address given
   to the constructor, by default the deployer) may record observations,
   and an observation costs gas independent of the length of the trace
-  (windows are scanned once, values found by binary search and pruned).
+  (windows are scanned once, values found by binary search and pruned),
+  except about 4 x 10^4 gas per observation inside an open window of a
+  temporal content, which `cadl codegen` names in a warning; a bare name
+  read inside a temporal operator that becomes a quantity after the
+  first observation is refused (give it in `begin`).
   A binding must be an integer written as one or a string. The tests compare both with the engine of `cadl
   norms-eval` after every observation (the example traces, the traces of
   `tests/test_norms_eval.py` and random traces; OPA with `opa eval`,

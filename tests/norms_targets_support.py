@@ -355,13 +355,13 @@ def evm_python() -> str | None:
     return None
 
 
-def compile_solidity(source: str, name: str, tmp: Path) -> dict:
+def compile_solidity(source: str, name: str, tmp: Path, runs: int = 1) -> dict:
     """solc --combined-json abi,bin of the generated file."""
     tmp.mkdir(parents=True, exist_ok=True)
     path = tmp / "Monitor.sol"
     path.write_text(source, encoding="utf-8")
     proc = subprocess.run(
-        [solc_binary(), "--optimize", "--optimize-runs", "1", "--combined-json",
+        [solc_binary(), "--optimize", "--optimize-runs", str(runs), "--combined-json",
          "abi,bin,bin-runtime", "Monitor.sol"], cwd=tmp, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr[-3000:]
     data = json.loads(proc.stdout)["contracts"]

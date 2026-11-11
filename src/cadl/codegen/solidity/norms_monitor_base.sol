@@ -484,6 +484,8 @@ abstract contract CadlNormsMonitorBase {
     string internal lcInitial;
     mapping(bytes32 => bool) internal lcStates;
     mapping(bytes32 => bool) internal lcTerminal;
+    // the bare names read inside a temporal operator (see makeKnown)
+    mapping(bytes32 => bool) internal temporalName;
 
     // --- who may record the instance -------------------------------------------------
     /// Only this address may call begin, observe, addQuantities and finish.
@@ -550,8 +552,21 @@ abstract contract CadlNormsMonitorBase {
     /// Names of quantities written without an actor that get a value later.
     function addQuantities(string[] calldata quantities) external onlyReporter {
         for (uint256 i = 0; i < quantities.length; i++) {
-            data.known[keccak256(bytes(CadlNormsValues.canon(quantities[i])))] = true;
+            makeKnown(keccak256(bytes(CadlNormsValues.canon(quantities[i]))));
         }
+    }
+
+    /// A name becomes a known quantity (F.5). The scans of the temporal
+    /// operators keep the values they have read; a bare name read inside a
+    /// temporal operator as a symbol would be read as a quantity from now
+    /// on, which would change values already read. Such a name must be
+    /// given in begin() (or be observed at the first observation): later
+    /// the call is refused.
+    function makeKnown(bytes32 h) internal {
+        if (data.known[h]) return;
+        require(observations == 0 || !temporalName[h] || data.hasBinding[h],
+                "a name used inside a temporal operator becomes a quantity after the first observation; give it in begin()");
+        data.known[h] = true;
     }
 
     /// One observation (F.5): its time (seconds * SCALE), the values that
@@ -587,7 +602,7 @@ abstract contract CadlNormsMonitorBase {
         }
         for (uint256 i = 0; i < values.length; i++) {
             bytes32 h = keccak256(bytes(CadlNormsValues.canon(values[i].name)));
-            data.known[h] = true;
+            makeKnown(h);
             prune(h);
             data.history[h].push(Stored(n, values[i].k, values[i].n, values[i].s));
         }
@@ -630,13 +645,13 @@ abstract contract CadlNormsMonitorBase {
     /// when a long window closes (the rest goes with the next values).
     function prune(bytes32 h) internal {
         Stored[] storage hs = data.history[h];
-        uint256 at = data.head[h];
-        uint256 stop = at + 4;
-        while (at < stop && at + 1 < hs.length && hs[at + 1].idx <= data.keepFrom) {
-            delete hs[at];
-            at++;
+        uint256 first = data.head[h];
+        uint256 stop = first + 4;
+        while (first < stop && first + 1 < hs.length && hs[first + 1].idx <= data.keepFrom) {
+            delete hs[first];
+            first++;
         }
-        data.head[h] = at;
+        data.head[h] = first;
     }
 
     /// The end of the contract instance at its last observation (F.5,
