@@ -6,6 +6,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- CI runs the EVM tests of the Solidity norms monitor
+  (`tests/test_norms_monitor_targets.py`) in the Python 3.12 job: it
+  builds a venv with eth-tester and py-evm, gets solc 0.8.24 with
+  py-solc-x, and sets `CADL_EVM_PYTHON`, `CADL_SOLC` and
+  `CADL_NORMS_EVM_CASES=40` (the number of traces of
+  `tests/test_norms_eval.py` the EVM runs; all by default). The
+  dependencies of cadl are unchanged.
+
 ### Fixed
 
 - `cadl game-check` and `cadl model-check` no longer stop with

@@ -690,6 +690,15 @@ def test_evm_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
             continue
         groups.setdefault(text, (sos, contract, []))[2].append(case)
     assert sum(len(g[2]) for g in groups.values()) >= 100
+    # CADL_NORMS_EVM_CASES: only the first so many traces (CI)
+    limit = int(os.environ.get("CADL_NORMS_EVM_CASES", "0")) or None
+    if limit:
+        kept: dict = {}
+        for text, (sos, contract, cases) in groups.items():
+            room = limit - sum(len(g[2]) for g in kept.values())
+            if room > 0:
+                kept[text] = (sos, contract, cases[:room])
+        groups = kept
     steps: list = []
     from cadl.codegen.norms_ir import unsupported_items
     from cadl.codegen.solidity.norms_monitor_sol import solidity_ir
@@ -704,7 +713,7 @@ def test_evm_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
                         tmp_path / f"m{k}")
         got = S.sol_results(raw, runs, [n.id for n in contract.norms], skip)
         assert S.compare(refs, got, steps) == [], cases[0]["lines"]
-    assert len(steps) >= 300
+    assert len(steps) >= (300 if not limit else limit)
 
 
 @needs_evm
