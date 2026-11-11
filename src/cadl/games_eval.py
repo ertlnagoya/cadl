@@ -33,6 +33,7 @@ from typing import Any, Callable
 from .games import (
     EquilibriumQuery,
     NotEvaluated,
+    link_assumptions,
     payoff_of,
     profile_of,
     term_weight,
@@ -46,6 +47,7 @@ from .stochastic import (
     decimal_text,
     eval_param_expr,
     ill_defined,
+    param_names,
 )
 from .stochastic_eval import EvaluationError, _design, _solve, valuation, value_text
 from .stochastic_regions import (
@@ -102,6 +104,9 @@ class Game:
     # Commands of the design with a probability that is not multi-affine
     # in the open parameters: (command index, polynomials).
     non_affine: list = field(default_factory=list)
+    # The end-point certification of J-14, when its conditions hold for the
+    # map being computed (`j14_setup`).
+    j14: Any = None
     _selection: dict = field(default_factory=dict)
     _target: dict = field(default_factory=dict)
     _rho: dict = field(default_factory=dict)
@@ -622,6 +627,166 @@ def _require_payoffs(model: Model) -> None:
         raise NotEvaluated("; ".join(missing))
 
 
+def structure_reward(game: Game, proc: Process, reward_id: str) -> Callable:
+    """`(i, k) -> number`: the reward of the structure for taking command
+    k in the local state i of a process (H.8), at the fixed values."""
+    structure = next(r for r in game.model.rewards if r.id == reward_id)
+    items = [(item.action, compile_state_expr(item.guard, game.index, game.labels),
+              eval_param_expr(item.value, game.theta)) for item in structure.items]
+
+    def reward(i: int, k: Any) -> Fraction:
+        if k is None:
+            return ZERO
+        g = proc.states[i]
+        action = game.commands[g][k].command.action
+        total = ZERO
+        for act, guard, value in items:
+            if (act is None or act == action) and guard(game.states[g]):
+                total += value
+        return total
+    return reward
+
+
+def expected_reward_under(model: Model, design: Design, profile: str, player: str,
+                          reward_id: str, overrides: dict | None = None) -> Fraction:
+    """The expected accumulated value of a reward structure until the
+    target of the player's payoff, under a profile at the fixed values
+    (J-12, condition (ii) of J.7)."""
+    theta = valuation(model, design, overrides)
+    game = build_game(model, design, [], theta)
+    return _expected_in(game, profile, player, reward_id, ())
+
+
+def _expected_in(game: Game, profile: str, player: str, reward_id: str,
+                 point: tuple) -> Fraction:
+    proc = build_process(game, player, profile, point_distributions(game, point))
+    if improper_states(proc, _profile(proc)):
+        raise EvaluationError(f"the profile '{profile}' does not reach the target of the "
+                              f"payoff of '{player}'")
+    return optimal_values(proc, _profile(proc), structure_reward(game, proc, reward_id))[0]
+
+
+# ---------------------------------------------------------------------------
+# J-14: certification of a cell [a, b] from its end points
+# ---------------------------------------------------------------------------
+
+J14_METHOD = "endpoints (J-14)"
+
+
+def syntactic_degree(tree: tuple, name: str) -> int:
+    """The power with which a parameter occurs in a `param_expr`, read on
+    the text: the sum over a product, the maximum over a sum, without
+    cancellation."""
+    kind = tree[0]
+    if kind == "id":
+        return 1 if tree[1] == name else 0
+    if kind in ("par", "neg"):
+        return syntactic_degree(tree[1], name)
+    if kind == "bin":
+        left, right = syntactic_degree(tree[2], name), syntactic_degree(tree[3], name)
+        return left + right if tree[1] == "*" else max(left, right)
+    return 0
+
+
+def j14_parameter_free_model(model: Model, design: Design, name: str) -> str | None:
+    """Condition 2 of J-14, first part: ℓ occurs in no `prob:` (of a
+    command of the design) and in no reward `value:`. None when it holds,
+    otherwise why not."""
+    for c in model.commands:
+        if not c.exists_in(design.name):
+            continue
+        for u in c.updates:
+            if u.prob is not None and name in param_names(u.prob):
+                return f"'{name}' occurs in the probability '{u.prob_text}' of command {c.index}"
+    for r in model.rewards:
+        for item in r.items:
+            if name in param_names(item.value):
+                return f"'{name}' occurs in a value of the reward structure '{r.id}'"
+    return None
+
+
+def j14_affine_weights(model: Model, name: str) -> str | None:
+    """Condition 2 of J-14, second part: in every weight of every player,
+    the written ones and those defined by J.7, ℓ occurs with a power of
+    at most one, read on the text."""
+    for payoff in model.payoffs:
+        for term in payoff.terms:
+            weight = term_weight(model, payoff, term)
+            if syntactic_degree(weight, name) > 1:
+                return (f"'{name}' occurs with a power above one in the weight of the term "
+                        f"'{term.reward}' of the payoff of '{payoff.player}'")
+    return None
+
+
+def j14_condition_ii(game: Game, profile: str, player: str, name: str) -> bool:
+    """Condition 5 of J-14 (condition (ii) of J.7 for p): every term of p
+    in whose weight ℓ occurs has a weight −m·ℓ with m ≥ 0, and its reward
+    structure has the expected value 0 under the profile, computed
+    exactly."""
+    model = game.model
+    payoff = payoff_of(model, player)
+    point = (game.j14["region"][0],)
+    for term in payoff.terms:
+        weight = term_weight(model, payoff, term)
+        if name not in param_names(weight):
+            continue
+        poly = polynomial(weight, game.theta, [name])
+        if any(e != (1,) for e in poly) or poly.get((1,), ZERO) > 0:
+            return False
+        if _expected_in(game, profile, player, term.reward, point) != 0:
+            return False
+    return True
+
+
+def j14_setup(game: Game, query: EquilibriumQuery, design: Design) -> dict:
+    """Whether J-14 may be used for the map in this design, and the
+    players for whom condition 5 holds."""
+    out: dict = {"applicable": False, "reason": None, "condition_ii": []}
+    if len(query.over) != 1:
+        out["reason"] = "the query has more than one open parameter"
+        return out
+    name = next(iter(query.over))
+    why = j14_parameter_free_model(game.model, design, name) \
+        or j14_affine_weights(game.model, name)
+    if why:
+        out["reason"] = why
+        return out
+    out.update(applicable=True, parameter=name, region=query.over[name])
+    game.j14 = out
+    out["condition_ii"] = [p.id for p in game.model.players
+                           if j14_condition_ii(game, query.profile, p.id, name)]
+    return out
+
+
+def endpoint_verdict(game: Game, query: EquilibriumQuery, cell: "EqCell") -> bool:
+    """Decide a cell [a, b] by J-14 when the end points allow a claim;
+    True when the cell got a claim. The cell is `equilibrium` when the
+    profile is an ε-equilibrium at a and at b; a player for whom
+    condition 5 holds is a deviator when its gain at b exceeds ε."""
+    (a, b), = [cell.box[n] for n in game.names]
+    at_a, at_b = {}, {}
+    for p in game.model.players:
+        at_a[p.id] = player_at_point(game, query.profile, p.id, (a,))
+        at_b[p.id] = player_at_point(game, query.profile, p.id, (b,))
+        if not (at_a[p.id].admissible and at_b[p.id].admissible):
+            return False
+    eps = query.epsilon
+    if all(at_a[p].gain <= eps and at_b[p].gain <= eps for p in at_a):
+        cell.status, cell.method = "equilibrium", J14_METHOD
+        # gain_p is convex in ℓ (J.7, proposition, part 1).
+        cell.gain_bounds = {p: (ZERO, max(at_a[p].gain, at_b[p].gain)) for p in at_a}
+        return True
+    deviators = [p for p in at_a
+                 if p in game.j14["condition_ii"] and at_b[p].gain > eps]
+    if not deviators:
+        return False
+    cell.status, cell.deviators, cell.method = "not_equilibrium", deviators, J14_METHOD
+    # gain_p is non-increasing in ℓ under (ii) (part 2): [gain(b), gain(a)].
+    cell.gain_bounds = {p: (at_b[p].gain, at_a[p].gain) for p in deviators}
+    cell.deviations = {p: _deviation_list(game, at_b[p].deviation) for p in deviators}
+    return True
+
+
 def equilibrium_check(model: Model, query_id: str, regime: str | None = None,
                       overrides: dict | None = None) -> dict:
     """The result of an equilibrium check (I.8), per design: the payoff,
@@ -672,7 +837,7 @@ def equilibrium_check(model: Model, query_id: str, regime: str | None = None,
             ],
         })
     return {"id": query.id, "profile": query.profile, "epsilon": query.epsilon,
-            "designs": designs}
+            "assumptions": link_assumptions(model), "designs": designs}
 
 
 # ---------------------------------------------------------------------------
@@ -848,13 +1013,49 @@ class EqCell:
     reason: str | None = None          # of an undecided cell
     deviations: dict = field(default_factory=dict)   # deviator -> strategy (list, I.13)
     gain_bounds: dict = field(default_factory=dict)  # player -> (lower, upper)
+    method: str | None = None          # J14_METHOD for a cell certified by J-14
 
     def claim(self) -> tuple:
         return (self.status, tuple(self.deviators), self.from_every_state, self.reason,
-                repr(self.deviations))
+                repr(self.deviations), self.method)
 
 
 def cell_verdict(game: Game, query: EquilibriumQuery, cell: EqCell) -> None:
+    """Decide one cell by the conditions of I.9; when the conditions of
+    J-14 hold for the map, a cell that they leave undecided, and deviators
+    they do not establish, are decided from the end points (J-14)."""
+    bound_verdict(game, query, cell)
+    if game.j14 is None or cell.status == "equilibrium":
+        return
+    trial = EqCell(box=cell.box, depth=cell.depth)
+    if not endpoint_verdict(game, query, trial):
+        return
+    if cell.status != "not_equilibrium":
+        _copy_claim(trial, cell)
+        return
+    if trial.status != "not_equilibrium":
+        return                         # cannot happen: both methods are sound
+    # Deviators from both methods; each with its own deviation and bounds.
+    for p in trial.deviators:
+        if p not in cell.deviators:
+            cell.deviators.append(p)
+            cell.deviations[p] = trial.deviations[p]
+            cell.gain_bounds[p] = trial.gain_bounds[p]
+            cell.method = f"{METHOD_SHORT} and {J14_METHOD}"
+    order = [p.id for p in game.model.players]
+    cell.deviators.sort(key=order.index)
+
+
+METHOD_SHORT = "parameter lifting (I.9)"
+
+
+def _copy_claim(src: EqCell, dst: EqCell) -> None:
+    dst.status, dst.deviators, dst.method = src.status, list(src.deviators), src.method
+    dst.from_every_state, dst.reason = src.from_every_state, src.reason
+    dst.deviations, dst.gain_bounds = dict(src.deviations), dict(src.gain_bounds)
+
+
+def bound_verdict(game: Game, query: EquilibriumQuery, cell: EqCell) -> None:
     """Decide one cell by the conditions of I.9, or leave it `undecided`."""
     box = tuple(cell.box[n] for n in game.names)
     try:
@@ -932,7 +1133,7 @@ def merge_cells(cells: list, names: list) -> list:
                             status=current.status, deviators=current.deviators,
                             from_every_state=current.from_every_state,
                             reason=current.reason, deviations=current.deviations,
-                            gain_bounds=bounds)
+                            gain_bounds=bounds, method=current.method)
                         changed = True
                     else:
                         merged.append(current)
@@ -987,7 +1188,7 @@ def prepare_map(model: Model, query: EquilibriumQuery, design: Design,
 
 def design_map(game: Game, query: EquilibriumQuery, max_depth: int = DEFAULT_MAX_DEPTH,
                max_cells: int = DEFAULT_MAX_CELLS, partition: int | None = None,
-               merge: bool = True) -> dict:
+               merge: bool = True, use_j14: bool | None = None) -> dict:
     """The equilibrium map of one design (I.9): the largest undecided
     cell is bisected until the undecided fraction is at most the
     resolution or the budget is exhausted. With `partition`, the map
@@ -995,6 +1196,12 @@ def design_map(game: Game, query: EquilibriumQuery, max_depth: int = DEFAULT_MAX
     intervals per open parameter."""
     names = game.names
     region = {n: tuple(query.over[n]) for n in names}
+    j14 = None
+    if use_j14 is None:
+        # J-14 is a rule of the grounding extension (J.8).
+        use_j14 = game.model.grounding
+    if use_j14:
+        j14 = j14_setup(game, query, game.model.design(game.design))
     total = _volume(region)
     if partition is None or partition == 1:
         roots = [EqCell(box=dict(region))]
@@ -1051,7 +1258,10 @@ def design_map(game: Game, query: EquilibriumQuery, max_depth: int = DEFAULT_MAX
     return {
         "design": game.design,
         "parameters": {k: v for k, v in game.theta.items() if k not in names},
-        "method": METHOD,
+        "method": METHOD + (f"; where the conditions of J-14 hold, cells are certified from "
+                            f"exact evaluations at their end points ({J14_METHOD})"
+                            if game.j14 is not None else ""),
+        "j14": j14,
         "cells": leaves,
         "undecided_fraction": undecided / total,
         "resolution_reached": undecided <= query.resolution * total,
@@ -1067,7 +1277,7 @@ def design_map(game: Game, query: EquilibriumQuery, max_depth: int = DEFAULT_MAX
 def equilibrium_map(model: Model, query_id: str, regime: str | None = None,
                     overrides: dict | None = None, max_depth: int = DEFAULT_MAX_DEPTH,
                     max_cells: int = DEFAULT_MAX_CELLS, partition: int | None = None,
-                    merge: bool = True) -> dict:
+                    merge: bool = True, use_j14: bool | None = None) -> dict:
     """The result of an equilibrium map query (I.9): one certified map
     per listed design. Raises `EvaluationError` when the conditions of
     I-9 fail at the values used, and `NotEvaluated` when a payoff cannot
@@ -1089,8 +1299,10 @@ def equilibrium_map(model: Model, query_id: str, regime: str | None = None,
     designs = []
     for design in _designs(model, query, regime):
         game = prepare_map(model, query, design, overrides)
-        designs.append(design_map(game, query, max_depth, max_cells, partition, merge))
+        designs.append(design_map(game, query, max_depth, max_cells, partition, merge,
+                                  use_j14))
     return {"id": query.id, "profile": query.profile, "epsilon": query.epsilon,
+            "assumptions": link_assumptions(model),
             "over": dict(query.over), "resolution": query.resolution,
             "max_depth": max_depth, "max_cells": max_cells, "designs": designs}
 
@@ -1107,6 +1319,7 @@ def exact(value: Fraction) -> str:
 def check_json(result: dict) -> dict:
     return {
         "id": result["id"], "profile": result["profile"], "epsilon": exact(result["epsilon"]),
+        **({"assumptions": result["assumptions"]} if result.get("assumptions") else {}),
         "designs": [
             {
                 "design": d["design"],
@@ -1129,6 +1342,8 @@ def check_json(result: dict) -> dict:
 def _cell_json(cell: EqCell) -> dict:
     out: dict = {"box": {n: [exact(lo), exact(hi)] for n, (lo, hi) in cell.box.items()},
                  "status": cell.status}
+    if cell.method:
+        out["method"] = cell.method
     if cell.status == "not_equilibrium":
         out["deviators"] = list(cell.deviators)
         out["deviations"] = cell.deviations
@@ -1142,9 +1357,20 @@ def _cell_json(cell: EqCell) -> dict:
     return out
 
 
+def _j14_json(j14: dict) -> dict:
+    out = {"applicable": j14["applicable"]}
+    if j14["applicable"]:
+        out["parameter"] = j14["parameter"]
+        out["condition_ii"] = list(j14["condition_ii"])
+    else:
+        out["reason"] = j14["reason"]
+    return out
+
+
 def map_json(result: dict) -> dict:
     return {
         "id": result["id"], "profile": result["profile"], "epsilon": exact(result["epsilon"]),
+        **({"assumptions": result["assumptions"]} if result.get("assumptions") else {}),
         "over": {n: [exact(lo), exact(hi)] for n, (lo, hi) in result["over"].items()},
         "resolution": exact(result["resolution"]),
         "designs": [
@@ -1152,6 +1378,7 @@ def map_json(result: dict) -> dict:
                 "design": d["design"],
                 "parameters": {k: exact(v) for k, v in d["parameters"].items()},
                 "method": d["method"],
+                **({"j14": _j14_json(d["j14"])} if d.get("j14") else {}),
                 "cells": [_cell_json(c) for c in d["cells"]],
                 "undecided_fraction": exact(d["undecided_fraction"]),
                 "resolution_reached": d["resolution_reached"],
@@ -1185,6 +1412,7 @@ def _strategy_text(strategy: list) -> str:
 def check_text(result: dict) -> list:
     out = [f"--- Equilibrium check '{result['id']}': profile '{result['profile']}', "
            f"epsilon = {decimal_text(result['epsilon'])} ---"]
+    out += [f"  assumption (J.7): {a}" for a in result.get("assumptions", [])]
     for d in result["designs"]:
         params = ", ".join(f"{k}={decimal_text(v)}" for k, v in d["parameters"].items())
         out.append(f"  Design {d['design']} ({params})")
@@ -1218,6 +1446,7 @@ def map_text(result: dict) -> list:
            f"epsilon = {decimal_text(result['epsilon'])}; {MAP_NOTE} ---",
            f"  region: {_box_text(result['over'])}; resolution: "
            f"{decimal_text(result['resolution'])}"]
+    out += [f"  assumption (J.7): {a}" for a in result.get("assumptions", [])]
     for d in result["designs"]:
         cells = d["cells"]
         counts = {s: sum(1 for c in cells if c.status == s)
@@ -1225,6 +1454,12 @@ def map_text(result: dict) -> list:
         params = ", ".join(f"{k}={decimal_text(v)}" for k, v in d["parameters"].items())
         out.append(f"  Design {d['design']} ({params})")
         out.append(f"    method: {d['method']}")
+        j14 = d.get("j14")
+        if j14 and j14["applicable"]:
+            out.append(f"    J-14 applies (open parameter '{j14['parameter']}'; condition (ii) "
+                       f"holds for: {', '.join(j14['condition_ii']) or 'no player'})")
+        elif j14:
+            out.append(f"    J-14 does not apply: {j14['reason']}")
         out.append(f"    cells: {len(cells)} ({counts['equilibrium']} equilibrium, "
                    f"{counts['not_equilibrium']} not_equilibrium, {counts['undecided']} "
                    f"undecided); {d['cells_analysed']} cell(s) analysed, deepest bisection "
@@ -1249,6 +1484,8 @@ def map_text(result: dict) -> list:
                                         if c.from_every_state else "")
             else:
                 what = f"undecided ({c.reason})"
+            if c.method:
+                what += f" [{c.method}]"
             out.append(f"    {_box_text(c.box)}: {what}")
     if not result["designs"]:
         out.append("  (the query does not concern this design)")

@@ -97,12 +97,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   unchanged.
 - `cadl.grounding.norm_payoff_link`, `covers` and `lambda_parameters`:
   what a payoff term `sanction_of:` / `reward_of:` of a strategic model
-  (Appendix I; J.7, J-10) needs from the norm it names. The terms
-  themselves and the rules J-10 to J-12 and J-14 are not implemented.
+  (Appendix I; J.7, J-10) needs from the norm it names.
+- **The link between the strategic model and the norms (J.7).** In a
+  file that declares `stochastic`, `games`, `norms` and `grounding`, a
+  payoff term `sanction_of: "C.n"` has the weight −m · ℓ and a term
+  `reward_of: "C.n"` the weight m′ · ℓ (m, m′ the magnitudes of the
+  norm, ℓ the parameter bound to `C.lambda`). `cadl check` applies J-10
+  (errors), J-11 (warnings) and J-12 (the expected count of each
+  sanction under the compliance profile, per design). Every result of
+  `cadl game-check` computed with such a term carries the assumption of
+  J.7 (`assumptions` in JSON). The IR writes the defined weight and the
+  fields `sanction_of` / `reward_of`.
+- **J-14** in `cadl game-check --certify`: in a file that declares
+  `grounding: 0.1`, a one-parameter equilibrium map whose parameter
+  occurs only in weights, with a power of at most one, decides a cell
+  that the bounds of I.9 leave undecided from exact evaluations at its
+  end points (`method: "endpoints (J-14)"`; deviators only under
+  condition (ii) of J.7). The fuzzer (`tests/games_fuzz.py --j14`) checks
+  these cells and detects three deliberate violations of the conditions.
+- `examples/games_grounding_robot_delivery.cadl`: the example of J.7.
 - `examples/grounding_robot_delivery.cadl`: the example of J.9
   (alpha^ = 5/8, beta^ = 1/2, chi = 1/3).
 
 ### Changed
+- `cadl model-export` of a strategic model renames also the keywords that
+  PRISM-games adds (`player`, `endplayer`, `smg`, `csg`, `tptg`) by the
+  rule of H.11, and reports two players that are written the same (I.11).
+- `cadl game-check` reports a query that is not evaluated in the shape of
+  I.13: per design `{design, status: "not_evaluated", reason}`.
 - In a file that declares `stochastic: 0.1` and not `games: 0.1`, a
   `model:` block that uses `kind: smg` or keys of the strategic model
   extension gets one more informational diagnostic (the keys belong to an

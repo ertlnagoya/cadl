@@ -1351,9 +1351,13 @@ def _cmd_game_check(args: argparse.Namespace) -> int:
                     result = equilibrium_check(model, query.id, args.regime, overrides)
                     checks.append(check_json(result) if args.format == "json" else result)
             except NotEvaluated as e:
+                # I.13: per design {design, status: not_evaluated, reason}.
                 status = 1
+                regimes = query.regimes if args.regime is None else \
+                    [r for r in query.regimes if r == args.regime]
                 entry = {"id": query.id, "profile": query.profile,
-                         "status": "not_evaluated", "diagnostic": str(e)}
+                         "designs": [{"design": r, "status": "not_evaluated",
+                                      "reason": str(e)} for r in regimes]}
                 (maps if query.is_map else checks).append(entry)
     except EvaluationError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -1370,9 +1374,10 @@ def _cmd_game_check(args: argparse.Namespace) -> int:
     print(f"  Evaluator: {NOTE}")
     for result in checks + maps:
         print()
-        if result.get("status") == "not_evaluated":
+        if any(d.get("status") == "not_evaluated" for d in result["designs"]):
             print(f"--- Equilibrium query '{result['id']}': not_evaluated ---")
-            print(f"  {result['diagnostic']}")
+            for d in result["designs"]:
+                print(f"  Design {d['design']}: not_evaluated: {d['reason']}")
             continue
         for line in (map_text(result) if "over" in result else check_text(result)):
             print(line)

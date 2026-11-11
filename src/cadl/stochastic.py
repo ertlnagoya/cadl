@@ -59,6 +59,12 @@ PRISM_KEYWORDS = frozenset({
 # (`min`, `max` and `func` are keywords already).
 PRISM_FUNCTIONS = frozenset({"floor", "ceil", "round", "pow", "mod", "log"})
 
+# I.11: the keywords that the PRISM-games manual adds to the PRISM
+# language; names of a strategic model are renamed by them as well.
+PRISM_GAMES_KEYWORDS = frozenset({"player", "endplayer", "smg", "csg", "tptg"})
+# The keywords added to those of PRISM while a strategic model is exported.
+_extra_keywords: frozenset = frozenset()
+
 # Labels that PRISM defines in every model; they cannot be defined again (S-2).
 PRISM_BUILTIN_LABELS = frozenset({"init", "deadlock"})
 
@@ -562,6 +568,7 @@ class Model:
     # Weights of payoff terms that are defined outside Appendix I (a term
     # with sanction_of: or reward_of:, Appendix J): (player, reward) -> param_expr tree.
     term_weights: dict = field(default_factory=dict)
+    grounding: bool = False            # the file declares grounding 0.1 (J.10)
 
     def design(self, name: str) -> Design | None:
         return next((d for d in self.designs if d.name == name), None)
@@ -1880,7 +1887,9 @@ _TR_OPS = {"AND": "&", "OR": "|", "==": "="}
 def _prism_name(name: str) -> str:
     """H.11: a name equal to a PRISM keyword or built-in function name gets
     one trailing underscore."""
-    return name + "_" if name in PRISM_KEYWORDS or name in PRISM_FUNCTIONS else name
+    if name in PRISM_KEYWORDS or name in PRISM_FUNCTIONS or name in _extra_keywords:
+        return name + "_"
+    return name
 
 
 def tr(tree: tuple) -> str:
@@ -1992,7 +2001,19 @@ def property_text(prop: PropertyExpr) -> str:
 
 
 def prism_model_text(model: Model, design: Design) -> str:
-    """The model file of a design (H.11)."""
+    """The model file of a design (H.11; I.11 for a strategic model)."""
+    global _extra_keywords
+    if model.kind != "smg":
+        return _prism_model_text(model, design)
+    saved = _extra_keywords
+    _extra_keywords = PRISM_GAMES_KEYWORDS
+    try:
+        return _prism_model_text(model, design)
+    finally:
+        _extra_keywords = saved
+
+
+def _prism_model_text(model: Model, design: Design) -> str:
     _check_export_names(model)
     fixed = model.fixed_values(design)
     out = ["dtmc", ""]

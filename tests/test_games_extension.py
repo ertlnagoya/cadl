@@ -432,48 +432,81 @@ class TestPayoffs:
             model["payoffs"][0]["terms"][1] = {"reward": "cost", "sanction_of": "C.n"}
         assert any("sanction_of" in e and "grounding" in e for e in errors(mutate, "I-7"))
 
-    def grounded(self, key="sanction_of"):
+    def grounded(self, key="sanction_of", norms=True):
+        """The second term of A names a norm of a contract C instead of
+        giving a weight; `lc` is bound to C.lambda (1, as `lam`)."""
         def mutate(model, sos):
-            # grounding 0.1 requires norms 0.1 (J-1).
-            sos["extensions"] += [{"norms": 0.1}, {"grounding": 0.1}]
+            sos["extensions"].append({"grounding": 0.1})
+            if norms:
+                sos["extensions"].append({"norms": 0.1})
+            sos["contracts"] = [{
+                "id": "C", "parties": ["ALICE", "BOB[*]"], "incentives": {"lambda": 1},
+                "norms": [{"id": "n", "kind": "prohibition", "bearer": "ALICE",
+                           "counterparty": "BOB[i]", "content": "ALICE.waiting == true",
+                           "on_violation": {"severity": "Minor", "sanction": "fine",
+                                            "magnitude": 1},
+                           "on_fulfilment": {"reward": "bonus", "magnitude": 1}}]}]
+            model["parameters"].append({"id": "lc", "from": "C.lambda"})
             model["payoffs"][0]["terms"][1] = {"reward": "cost", key: "C.n"}
         return mutate
 
     @pytest.mark.parametrize("key", ["sanction_of", "reward_of"])
-    def test_i7_grounded_term_is_not_evaluated(self, key, tmp_path, capsys):
+    def test_linked_term_gets_its_weight(self, key):
         result = check(self.grounded(key))
-        assert result.ok
-        assert any(key in i and "not evaluated" in i for i in with_rule(result.infos, "I-7"))
+        assert result.ok, [str(e) for e in result.errors]
         model = checked_model(parse(build(self.grounded(key))))
-        term = model.payoffs[0].terms[1]
+        payoff = model.payoffs[0]
+        term = payoff.terms[1]
         assert term.grounded and term.weight is None
-        with pytest.raises(NotEvaluated, match=key):
-            term_weight(model, model.payoffs[0], term)
+        assert term_weight(model, payoff, term) == parse_param_expr(
+            "-1 * lc" if key == "sanction_of" else "1 * lc")
+        assert term.weight_text == ("-1 * lc" if key == "sanction_of" else "1 * lc")
+
+    def test_without_norms_the_term_is_not_evaluated(self):
+        result = check(self.grounded(norms=False))
+        assert any("J-1" in str(e) or "norms: 0.1" in str(e) for e in result.errors)
+        assert any("not evaluated" in i for i in with_rule(result.infos, "I-7"))
+
+    def test_a_term_without_its_weight_is_not_evaluated(self, tmp_path, capsys, monkeypatch):
+        """I-7, I.13: a payoff whose term has no weight from Appendix J is
+        not evaluated; the queries report `not_evaluated` per design."""
+        model = checked_model(parse(build(self.grounded())))
+        model.term_weights.clear()
+        with pytest.raises(NotEvaluated, match="sanction_of"):
+            term_weight(model, model.payoffs[0], model.payoffs[0].terms[1])
         with pytest.raises(NotEvaluated):
             equilibrium_check(model, "eq")
+        import cadl.games_eval as ge
+        monkeypatch.setattr(ge, "unevaluated_terms", lambda m: ["the term 'cost' ... (I-7)"])
         path = tmp_path / "g.cadl"
-        path.write_text(build(self.grounded(key)), encoding="utf-8")
+        path.write_text(build(self.grounded()), encoding="utf-8")
         status, out, _ = cli(capsys, "game-check", path, "--certify", "--format", "json")
         data = json.loads(out)
         assert status == 1
-        assert [c["status"] for c in data["checks"]] == ["not_evaluated"]
-        assert [m["status"] for m in data["maps"]] == ["not_evaluated"]
-        assert key in data["checks"][0]["diagnostic"]
+        assert data["checks"][0]["designs"] == [
+            {"design": "base", "status": "not_evaluated", "reason": "the term 'cost' ... (I-7)"}]
+        assert data["maps"][0]["designs"][0]["status"] == "not_evaluated"
+        status, out, _ = cli(capsys, "game-check", path)
+        assert status == 1 and "Design base: not_evaluated" in out
         # A property does not need the payoff.
         status, out, _ = cli(capsys, "model-check", path)
         assert status == 0 and "REACH" in out
 
-    def test_a_supplied_weight_is_used(self):
-        model = checked_model(parse(build(self.grounded())))
-        model.term_weights[("A", "cost")] = parse_param_expr("-1 * lam")
-        with_link = equilibrium_check(model, "eq")["designs"][0]["players"]
-        plain = equilibrium_check(model_of(), "eq")["designs"][0]["players"]
-        assert with_link == plain
+    def test_a_linked_weight_is_used(self):
+        linked = equilibrium_check(checked_model(parse(build(self.grounded()))), "eq")
+        plain = equilibrium_check(model_of(), "eq")
+        assert linked["designs"][0]["players"] == plain["designs"][0]["players"]
+        assert linked["assumptions"] == [
+            "the reward structure cost is taken to count the violations of C.n"]
+        assert plain["assumptions"] == []
 
-    def test_ir_of_a_grounded_term(self):
+    def test_ir_of_a_linked_term(self):
         ir = game_to_ir(checked_model(parse(build(self.grounded()))))
-        assert ir["payoffs"][0]["terms"][1] == {
-            "reward": "cost", "weight": None, "sanction_of": "C.n", "reward_of": None}
+        assert ir["payoffs"][0]["terms"] == [
+            {"reward": "win", "weight": "2", "sanction_of": None, "reward_of": None},
+            {"reward": "cost", "weight": "-1 * lc", "sanction_of": "C.n", "reward_of": None}]
+        # Without the extension the two fields are not written.
+        assert "sanction_of" not in game_to_ir(model_of())["payoffs"][0]["terms"][0]
 
 
 # ---------------------------------------------------------------------------

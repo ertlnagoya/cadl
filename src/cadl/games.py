@@ -41,6 +41,7 @@ from .stochastic import (
     ill_defined,
     model_to_ir,
     param_names,
+    parse_param_expr,
     yaml_number,
 )
 
@@ -117,10 +118,26 @@ class PayoffTerm:
     weight_text: str = "1"
     sanction_of: Any = None
     reward_of: Any = None
+    link: Any = None                   # grounding.NormLink, when the link is usable
 
     @property
     def grounded(self) -> bool:
         return self.weight is None
+
+    @property
+    def link_key(self) -> str | None:
+        if self.sanction_of is not None:
+            return "sanction_of"
+        if self.reward_of is not None:
+            return "reward_of"
+        return None
+
+    def assumption(self) -> str:
+        """The assumption of J.7 that every result computed with the term
+        carries (J-12)."""
+        what = "violations" if self.link_key == "sanction_of" else "fulfilments"
+        ref = self.sanction_of if self.link_key == "sanction_of" else self.reward_of
+        return f"the reward structure {self.reward} is taken to count the {what} of {ref}"
 
 
 @dataclass
@@ -173,14 +190,22 @@ def term_weight(model: Model, payoff: Payoff, term: PayoffTerm) -> tuple:
         return term.weight
     supplied = model.term_weights.get((payoff.player, term.reward))
     if supplied is None:
-        key = "sanction_of" if term.sanction_of is not None else "reward_of"
-        ref = term.sanction_of if term.sanction_of is not None else term.reward_of
+        key = term.link_key
+        ref = term.sanction_of if key == "sanction_of" else term.reward_of
         raise NotEvaluated(
             f"the term '{term.reward}' of the payoff of player '{payoff.player}' has "
-            f"'{key}: {_as_text(ref)}', whose weight is defined by Appendix J (grounding "
-            f"0.1), which this processor does not implement; the payoff is not evaluated "
-            f"(I-7)")
+            f"'{key}: {_as_text(ref)}', whose weight Appendix J defines, and the link to "
+            f"the norm cannot be used here (the file does not declare 'norms: 0.1' with "
+            f"'grounding: 0.1', or the reference is not valid); the payoff is not "
+            f"evaluated (I-7)")
     return supplied
+
+
+def link_assumptions(model: Model) -> list:
+    """The assumptions of J.7 for the terms whose weight Appendix J
+    defines, in the order of the payoffs (J-12)."""
+    return [t.assumption() for p in model.payoffs for t in p.terms
+            if t.grounded and (p.player, t.reward) in model.term_weights]
 
 
 def unevaluated_terms(model: Model) -> list:
@@ -214,6 +239,7 @@ class _GameAnalyser(_Analyser):
         self.reported5: set = set()
         self.reported6: set = set()
         self._rule_fns: dict | None = None
+        self.pending_links: list = []
 
     def run(self) -> Analysis:
         for rule, message in self.block.malformed:
@@ -232,6 +258,7 @@ class _GameAnalyser(_Analyser):
         if self.strategic:
             self.check_profiles()
             self.check_payoffs()
+            self.check_links()
         self.check_properties()
         self.check_regime_maps()
         if self.strategic:
@@ -246,6 +273,8 @@ class _GameAnalyser(_Analyser):
             self.model.kind = "smg"
             if self.out.ok:
                 self.check_admissible()
+            if self.out.ok:
+                self.report_compliance_sanctions()
         if self.out.ok:
             self.out.model = self.model
         return self.out
@@ -457,6 +486,7 @@ class _GameAnalyser(_Analyser):
             self.error("model.payoffs must be a sequence of mappings", "I-7")
             return
         grounding = GROUNDING_EXTENSION in self.sos.extensions
+        self.model.grounding = grounding
         seen: dict = {}
         for i, d in enumerate(raw, start=1):
             if not isinstance(d, dict):
@@ -509,20 +539,24 @@ class _GameAnalyser(_Analyser):
                         continue
                     term.weight, term.weight_text = res
                 if grounded:
-                    term.sanction_of = t.get("sanction_of")
-                    term.reward_of = t.get("reward_of")
                     if not grounding:
                         self.error(f"The {twhere} has '{grounded[0]}', which Appendix J "
                                    f"defines, but the file does not declare 'grounding: "
                                    f"0.1'", "I-7")
                         continue
+                    written = [k for k in ("weight",) + GROUNDED_TERM_KEYS if k in t]
+                    if len(written) > 1:
+                        self.error(f"The {twhere} has {', '.join(repr(k) for k in written)}; "
+                                   f"a term has at most one of 'weight', 'sanction_of' and "
+                                   f"'reward_of'", "J-10")
+                        continue
+                    if grounded[0] == "sanction_of":
+                        term.sanction_of = t.get("sanction_of")
+                    else:
+                        term.reward_of = t.get("reward_of")
                     # Appendix J defines the weight; it is never the default.
                     term.weight, term.weight_text = None, ""
-                    self.info(f"The {twhere} has '{grounded[0]}: "
-                              f"{_as_text(t.get(grounded[0]))}'; this processor does not "
-                              f"implement Appendix J (grounding 0.1), so the payoff and "
-                              f"the equilibrium queries of the model are not evaluated",
-                              "I-7")
+                    self.pending_links.append((payoff, term, twhere))
                 payoff.terms.append(term)
             if player:
                 self.model.payoffs.append(payoff)
@@ -530,6 +564,123 @@ class _GameAnalyser(_Analyser):
             if seen.get(name, 0) != 1:
                 self.error(f"model.payoffs has {seen.get(name, 0)} entries for the player "
                            f"'{name}'; every player has exactly one payoff", "I-7")
+
+    # -- J-10, J-11: the link between a payoff term and a norm (J.7) --
+    def check_links(self) -> None:
+        """Resolve the terms `sanction_of:` / `reward_of:` and supply their
+        weights (−m · ℓ or m · ℓ) through `model.term_weights`."""
+        from .grounding import (
+            annotations, covers, grounding_active, lambda_parameters, norm_payoff_link,
+        )
+        if not self.pending_links:
+            return
+        if not grounding_active(self.sos):
+            # J-1 reports the missing 'norms: 0.1'; the terms are not evaluated.
+            for payoff, term, twhere in self.pending_links:
+                self.info(f"The {twhere} has '{term.link_key}', but the file does not "
+                          f"declare 'norms: 0.1' with 'grounding: 0.1' (J-1), so its weight "
+                          f"is not defined; the payoff and the equilibrium queries of the "
+                          f"model are not evaluated", "I-7")
+            return
+        named: dict = {}
+        reported_lambda: set = set()
+        linked_contracts: list = []
+        for payoff, term, twhere in self.pending_links:
+            key = term.link_key
+            ref = term.sanction_of if key == "sanction_of" else term.reward_of
+            link = norm_payoff_link(self.sos, ref, key)
+            if link.error:
+                self.error(f"The {twhere}: {link.error}", "J-10")
+                continue
+            ok = True
+            lams = lambda_parameters(self.model.params, link.contract)
+            if len(lams) != 1:
+                if link.contract not in reported_lambda:
+                    reported_lambda.add(link.contract)
+                    shown = ", ".join(f"'{x}'" for x in lams) or "none"
+                    self.error(f"The model has a term that names a norm of contract "
+                               f"'{link.contract}' ({twhere}), so it must have exactly one "
+                               f"parameter bound by from: \"{link.contract}.lambda\"; it has "
+                               f"{len(lams)} ({shown})", "J-10")
+                ok = False
+            player = self.players.get(payoff.player)
+            if player is not None and not any(covers(a, link.bearer) for a in player.actors):
+                self.error(f"The {twhere} names '{link.contract}.{link.norm}', whose bearer "
+                           f"is '{link.bearer}', but the player '{payoff.player}' lists no "
+                           f"actor reference that covers it (actors: "
+                           f"{', '.join(player.actors)})", "J-10")
+                ok = False
+            ident = (key, link.contract, link.norm)
+            named[ident] = named.get(ident, 0) + 1
+            if named[ident] == 2:
+                self.error(f"The norm '{link.contract}.{link.norm}' is named by more than one "
+                           f"'{key}' term of the model; a norm is named at most once by each "
+                           f"key", "J-10")
+                ok = False
+            if link.contract not in linked_contracts:
+                linked_contracts.append(link.contract)
+            if not ok:
+                continue
+            term.link = link
+            text = link.weight_text(lams[0])
+            term.weight_text = text
+            self.model.term_weights[(payoff.player, term.reward)] = parse_param_expr(text)
+        # J-11: the coverage of the representation.
+        actors = [a for p in self.model.players for a in p.actors]
+        for cid in linked_contracts:
+            contract = next(c for c in self.sos.contracts if c.id == cid)
+            ann = annotations(self.sos, contract)
+            for norm, a in zip(contract.norms, ann.norms):
+                if norm.kind not in ("obligation", "prohibition"):
+                    continue
+                if not any(covers(x, norm.bearer) for x in actors):
+                    continue
+                for key, magnitude in (("sanction_of", a.sanction_magnitude),
+                                       ("reward_of", a.reward_magnitude)):
+                    if magnitude is not None and magnitude > 0 \
+                            and (key, cid, norm.id) not in named:
+                        what = "on_violation" if key == "sanction_of" else "on_fulfilment"
+                        self.warn(f"The {norm.kind} '{cid}.{norm.id}' has an {what}.magnitude "
+                                  f"greater than zero and a bearer that a player stands for, "
+                                  f"but no payoff term names it with '{key}'", "J-11")
+            bound = set(lambda_parameters(self.model.params, cid))
+            for payoff in self.model.payoffs:
+                for term in payoff.terms:
+                    if term.grounded or term.weight is None:
+                        continue
+                    used = sorted(param_names(term.weight) & bound)
+                    if used:
+                        self.warn(f"The term '{term.reward}' of the payoff of player "
+                                  f"'{payoff.player}' has the weight '{term.weight_text}', in "
+                                  f"which '{used[0]}', bound to {cid}.lambda, occurs; the size "
+                                  f"of such a term is not checked against a norm", "J-11")
+
+    # -- J-12: the expected sanctions of the compliance profile --
+    def report_compliance_sanctions(self) -> None:
+        from .games_eval import EvaluationError, expected_reward_under
+        from .stochastic_eval import value_text
+        model = self.model
+        terms = [(p, t) for p in model.payoffs for t in p.terms
+                 if t.link is not None and t.link_key == "sanction_of"]
+        for payoff, term in terms:
+            for design in model.designs:
+                try:
+                    value = expected_reward_under(model, design, model.compliance,
+                                                  payoff.player, term.reward)
+                except EvaluationError:
+                    continue
+                if value == 0:
+                    what = ("0: compliance incurs no sanction of this term, so condition "
+                            "(ii) of J.7 holds for it")
+                else:
+                    what = (f"{value_text(value)} (exact: {value}): compliance incurs this sanction with a "
+                            f"positive expected count, so condition (ii) of J.7 does not "
+                            f"hold for it")
+                self.info(f"Design {design.name}: under the compliance profile "
+                          f"'{model.compliance}' at the fixed values, the expected value of "
+                          f"'{term.reward}' (the term '{term.sanction_of}' of the payoff of "
+                          f"player '{payoff.player}') until '{payoff.until_text}' is {what}",
+                          "J-12")
 
     def warn_initial_target(self, payoff: Payoff, where: str) -> None:
         if not self.vars_ok or not self.model.variables:
@@ -929,8 +1080,8 @@ def game_to_ir(model: Model) -> dict:
     for p in model.payoffs:
         terms = []
         for t in p.terms:
-            term = {"reward": t.reward, "weight": None if t.grounded else t.weight_text}
-            if t.grounded:                    # J.10: written only for such a term
+            term = {"reward": t.reward, "weight": t.weight_text or None}
+            if model.grounding:               # J.10: written when the extension is declared
                 term["sanction_of"] = t.sanction_of
                 term["reward_of"] = t.reward_of
             terms.append(term)
@@ -959,6 +1110,14 @@ def prism_games_header(model: Model, design: Design) -> list:
     """The first lines of the model file of a design of a strategic model:
     `smg` and one `player ... endplayer` construct per player that owns a
     command of the design."""
+    from .stochastic import ExportError
+    written: dict = {}
+    for player in model.players:
+        name = _prism_name(player.id)
+        if written.setdefault(name, player.id) != player.id:
+            raise ExportError(
+                f"cannot export: the players '{written[name]}' and '{player.id}' are both "
+                f"written '{name}' in the PRISM-games model (I.11)")
     out = ["smg", ""]
     for player in model.players:
         labels = []
@@ -974,9 +1133,20 @@ def prism_games_header(model: Model, design: Design) -> list:
 
 
 def export_warnings(model: Model) -> list:
-    """I.11: a player whose name equals another identifier of the model."""
+    """I.11: a player whose name equals another identifier of the model,
+    after the renaming of H.11 with the keywords of PRISM-games."""
     if model.kind != "smg":
         return []
+    from . import stochastic
+    saved = stochastic._extra_keywords
+    stochastic._extra_keywords = stochastic.PRISM_GAMES_KEYWORDS
+    try:
+        return _export_warnings(model)
+    finally:
+        stochastic._extra_keywords = saved
+
+
+def _export_warnings(model: Model) -> list:
     names: dict = {}
     for p in model.params:
         names[_prism_name(p.id)] = f"the parameter '{p.id}'"

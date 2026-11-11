@@ -65,6 +65,31 @@ WEIGHTS = [
     ("p - lam", lambda v: v["p"] - v["lam"]),
     ("-p", lambda v: -v["p"]),
 ]
+# J-14 mode: λ (`lam`, in [0, 2]) in a probability (violates condition 2)
+PROBS_LAM = [
+    ("0.5 * lam", lambda v: v["lam"] / 2),
+    ("0.25 + 0.25 * lam", lambda v: F(1, 4) + v["lam"] / 4),
+    ("0.25 * lam * lam", lambda v: v["lam"] ** 2 / 4),
+    ("0.5 * lam * (2 - lam)", lambda v: v["lam"] * (2 - v["lam"]) / 2),
+    ("lam * (2 - lam)", lambda v: v["lam"] * (2 - v["lam"])),
+]
+# J-14 mode: weights affine in λ, sanction-like weights, and some that are
+# not affine (violate condition 2).
+WEIGHTS_J14 = [
+    ("1", lambda v: F(1)),
+    ("-1", lambda v: F(-1)),
+    ("3", lambda v: F(3)),
+    ("-2 * lam", lambda v: -2 * v["lam"]),
+    ("-0.5 * lam", lambda v: -v["lam"] / 2),
+    ("lam", lambda v: v["lam"]),                            # a reward: (ii) fails
+    ("1 - lam", lambda v: 1 - v["lam"]),
+    ("2 * p - lam", lambda v: 2 * v["p"] - v["lam"]),
+]
+WEIGHTS_NOT_AFFINE = [
+    ("-1 * lam * lam", lambda v: -v["lam"] ** 2),
+    ("lam * (2 - lam)", lambda v: v["lam"] * (2 - v["lam"])),
+    ("lam * lam - lam", lambda v: v["lam"] ** 2 - v["lam"]),
+]
 REGIONS = {
     "p": [(F(0), F(1)), (F(0), F(1, 2)), (F(1, 4), F(3, 4)), (F(1, 2), F(1)), (F(1, 10), F(9, 10))],
     "q": [(F(0), F(1)), (F(1, 4), F(1))],
@@ -73,8 +98,16 @@ REGIONS = {
 RANGES = {"p": (0, 1), "q": (0, 1), "lam": (0, 2)}
 
 
-def generate(rng: random.Random) -> dict:
-    """A random game, as plain data."""
+def generate(rng: random.Random, j14: bool = False) -> dict:
+    """A random game, as plain data. With `j14`, a game for J-14: λ is the
+    only open parameter, the weights are mostly affine in λ, and some
+    games break a condition of J-14 (λ in a probability, a weight that is
+    not affine in λ)."""
+    lam_in_prob = j14 and rng.random() < 0.3
+    not_affine = j14 and rng.random() < 0.3
+    probs = PROBS_LAM + PROBS_LAM + PROBS[:4] if lam_in_prob else PROBS
+    weights = WEIGHTS_NOT_AFFINE + WEIGHTS_NOT_AFFINE + WEIGHTS_J14 if not_affine else \
+        WEIGHTS_J14 if j14 else WEIGHTS
     n = rng.choice([3, 4, 4, 5])                 # states 0..n-1; n is the goal
     players = ["A", "B"] if rng.random() < 0.6 else ["A", "B", "C"]
     states = []
@@ -89,7 +122,7 @@ def generate(rng: random.Random) -> dict:
             if shape < 0.15:
                 updates = [(None, forward if rng.random() < 0.7 else any_)]
             elif shape < 0.7:
-                prob = rng.choice(PROBS)
+                prob = rng.choice(probs)
                 targets = [forward, any_]
                 rng.shuffle(targets)
                 updates = [(prob, targets[0]), (None, targets[1])]
@@ -122,23 +155,28 @@ def generate(rng: random.Random) -> dict:
             target.add(rng.randrange(1, n))
         ids = rng.sample([r["id"] for r in rewards], rng.choice([1, 2, min(3, len(rewards))]))
         payoffs[pl] = {"target": target,
-                       "terms": [(rid, rng.choice(WEIGHTS)) for rid in ids]}
+                       "terms": [(rid, rng.choice(weights)) for rid in ids]}
     sigma = [rng.randrange(len(s["cmds"])) for s in states]
     open_ = ["p", "lam"]
     kind = rng.random()
-    if kind < 0.2:
+    if j14:
+        open_ = ["lam"]
+        region = {"lam": rng.choice([(F(0), F(2)), (F(0), F(2)), (F(0), F(1)),
+                                     (F(1, 2), F(3, 2))])}
+    elif kind < 0.2:
         open_ = ["lam"]
     elif kind < 0.35:
         open_ = ["p"]
     elif kind < 0.5:
         open_ = ["p", "q", "lam"]
-    region = {name: rng.choice(REGIONS[name]) for name in open_}
+    if not j14:
+        region = {name: rng.choice(REGIONS[name]) for name in open_}
     fixed = {"p": rng.choice([F(1, 2), F(3, 10), F(1)]), "q": rng.choice([F(1, 2), F(4, 5)]),
              "lam": rng.choice([F(1, 2), F(1), F(0)])}
     for name, (lo, hi) in region.items():
         if not lo <= fixed[name] <= hi:
             fixed[name] = (lo + hi) / 2
-    return {"n": n, "players": players, "states": states, "rewards": rewards,
+    return {"j14": j14, "n": n, "players": players, "states": states, "rewards": rewards,
             "payoffs": payoffs, "sigma": sigma, "region": region, "fixed": fixed,
             "epsilon": rng.choice([F(0), F(0), F(0), F(1, 4), F(1)])}
 
@@ -204,7 +242,8 @@ def to_cadl(g: dict) -> str:
     }
     sos = {"sos": {
         "name": "FuzzGame", "type": "Acknowledged",
-        "extensions": [{"stochastic": 0.1}, {"games": 0.1}],
+        "extensions": [{"stochastic": 0.1}, {"games": 0.1}]
+        + ([{"norms": 0.1}, {"grounding": 0.1}] if g.get("j14") else []),
         "actors": [{"id": f"ACT_{pl}", "role": "x"} for pl in g["players"]],
         "model": model,
     }}
@@ -410,6 +449,36 @@ def check_cell(g: dict, cell, epsilon: Fraction, rng: random.Random, extra: int)
     return len(points)
 
 
+def check_endpoint_cells(g: dict, model, rng: random.Random, extra: int,
+                         stats: dict) -> int:
+    """J-14 directly: the end-point verdict on the whole region, its halves
+    and quarters, and random sub-intervals, each claim checked at sample
+    points (the map itself uses J-14 only where the bounds leave a cell
+    open)."""
+    from cadl.games_eval import EqCell, endpoint_verdict, j14_setup, prepare_map
+    query = next(q for q in model.equilibria if q.id == "on_region")
+    design = model.designs[0]
+    game = prepare_map(model, query, design, None)
+    j14_setup(game, query, design)
+    if game.j14 is None:
+        return 0
+    lo, hi = g["region"]["lam"]
+    cuts = [lo + (hi - lo) * F(k, 4) for k in range(5)]
+    boxes = [(lo, hi), (cuts[0], cuts[2]), (cuts[2], cuts[4])]
+    boxes += [(cuts[k], cuts[k + 1]) for k in range(4)]
+    for _ in range(3):
+        a, b = sorted(lo + (hi - lo) * F(rng.randint(0, 64), 64) for _ in range(2))
+        if a < b:
+            boxes.append((a, b))
+    points = 0
+    for a, b in boxes:
+        cell = EqCell(box={"lam": (a, b)})
+        if endpoint_verdict(game, query, cell):
+            stats[f"direct_j14_{cell.status}"] = stats.get(f"direct_j14_{cell.status}", 0) + 1
+            points += check_cell(g, cell, g["epsilon"], rng, extra)
+    return points
+
+
 def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4,
                 stats: dict | None = None) -> bool:
     """Run cadl on the game and check its results against the oracle.
@@ -461,7 +530,12 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
     except EvaluationError as e:
         raise Unsound(f"the map raised: {e}") from e
     total = F(0)
+    j14 = design.get("j14")
+    if j14 is not None:
+        count("j14_applicable" if j14["applicable"] else "j14_not_applicable")
     for cell in design["cells"]:
+        if cell.method and "J-14" in cell.method:
+            count(f"cells_j14_{cell.status}")
         volume = F(1)
         for lo, hi in cell.box.values():
             volume *= hi - lo
@@ -473,6 +547,8 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
         if cell.status == "equilibrium" and cell.from_every_state:
             count("cells_from_every_state")
         count("points", check_cell(g, cell, g["epsilon"], rng, extra))
+    if j14 is not None and j14["applicable"]:
+        count("points", check_endpoint_cells(g, model, rng, extra, stats))
     region = F(1)
     for lo, hi in g["region"].values():
         region *= hi - lo
@@ -493,7 +569,8 @@ def mutation(name: str | None):
     import cadl.games_eval as ge
     saved = {k: getattr(ge, k) for k in
              ("deviation_lower", "improper_states", "one_step_upper", "cell_distributions",
-              "reward_bounds")}
+              "reward_bounds", "j14_parameter_free_model", "j14_affine_weights",
+              "j14_condition_ii")}
     if name == "swap_bound_direction":
         # d(τ): the best case over the cell instead of the worst case.
         ge.deviation_lower = lambda proc, tau, lo: ge.optimal_values(
@@ -518,6 +595,15 @@ def mutation(name: str | None):
             lo, hi = original_rb(game, proc, cell)
             return hi, lo
         ge.reward_bounds = swapped
+    elif name == "j14_drop_probability":
+        # Condition 2 without "ℓ occurs in no prob:".
+        ge.j14_parameter_free_model = lambda model, design, name: None
+    elif name == "j14_drop_affine":
+        # Condition 2 without "ℓ occurs with a power of at most one".
+        ge.j14_affine_weights = lambda model, name: None
+    elif name == "j14_drop_condition_ii":
+        # Condition 5 assumed for every player.
+        ge.j14_condition_ii = lambda game, profile, player, name: True
     elif name is not None:
         raise ValueError(name)
     try:
@@ -529,10 +615,11 @@ def mutation(name: str | None):
 
 MUTATIONS = ("swap_bound_direction", "drop_admissibility", "profile_command_for_deviator",
              "lower_corner_only", "swap_reward_bounds")
+J14_MUTATIONS = ("j14_drop_probability", "j14_drop_affine", "j14_drop_condition_ii")
 
 
 def run(seed: int, count: int, mutant: str | None = None, max_cells: int = 24,
-        extra: int = 4) -> dict:
+        extra: int = 4, j14: bool = False) -> dict:
     """Generate and check `count` accepted models. Returns statistics;
     `stats["failure"]` describes the first violation, if any (also an
     exception raised by a mutant)."""
@@ -543,7 +630,7 @@ def run(seed: int, count: int, mutant: str | None = None, max_cells: int = 24,
         tries = 0
         while done < count and tries < 50 * count:
             tries += 1
-            g = generate(rng)
+            g = generate(rng, j14)
             try:
                 if check_model(g, rng, max_cells, extra, stats):
                     done += 1
@@ -565,10 +652,13 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--count", type=int, default=300)
     parser.add_argument("--max-cells", type=int, default=24)
     parser.add_argument("--extra", type=int, default=4)
-    parser.add_argument("--mutation", choices=MUTATIONS, default=None)
+    parser.add_argument("--mutation", choices=MUTATIONS + J14_MUTATIONS, default=None)
+    parser.add_argument("--j14", action="store_true",
+                        help="one-parameter maps over lam in files that declare grounding "
+                             "0.1, so that the end-point certification of J-14 is used")
     args = parser.parse_args(argv)
     start = time.time()
-    stats = run(args.seed, args.count, args.mutation, args.max_cells, args.extra)
+    stats = run(args.seed, args.count, args.mutation, args.max_cells, args.extra, args.j14)
     model = stats.pop("failing_model", None)
     print({k: stats[k] for k in sorted(stats)}, f"{time.time() - start:.1f}s")
     if model and args.mutation is None:
