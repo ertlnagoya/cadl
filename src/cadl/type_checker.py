@@ -195,12 +195,49 @@ def _message_args(text: str):
     return re.sub(r"\s+", "", raw)
 
 
+def _contract_predicates(contract: ContractDef) -> list:
+    """(where, position, parsed predicate) of the predicates of a contract that the
+    norms engine evaluates: the trigger:, until: and content: of the norms
+    that are not message events, the when: and if: of the counts-as rules,
+    and the assume: and guarantee: items (`where` "assume: item" with the
+    position from 1; None for the others). Texts that are not predicates
+    are left out."""
+    from .ast_nodes import StringLiteral
+    from .parser import parse_rule
+    exprs = []
+    for d in contract.norms:
+        for key in ("trigger", "until", "content"):
+            text = getattr(d, key)
+            if text and "->" not in text:
+                exprs.append((f"{key}: of norm '{d.id}'", None, text))
+    for r in contract.counts_as:
+        for key, text in (("when", r.when), ("if", r.if_)):
+            if text and "->" not in text:
+                exprs.append((f"{key}: of the counts_as rule creating '{r.creates}'",
+                              None, text))
+    for key in ("assume", "guarantee"):
+        for pos, e in enumerate(getattr(contract, key), start=1):
+            exprs.append((f"{key}: item", pos, e))
+    out = []
+    for where, pos, e in exprs:
+        if isinstance(e, str):
+            try:
+                e = parse_rule(e)
+            except Exception:
+                continue
+        elif isinstance(e, StringLiteral):
+            try:
+                e = parse_rule(e.value)
+            except Exception:
+                continue
+        out.append((where, pos, e))
+    return out
+
+
 def _symbolic_bound_shadows(sos: SoSDefinition, contract: ContractDef) -> list:
     """(variable, where) of the quantifiers and comprehensions of a
     contract whose variable has the name of a symbolic bound of a
     declared set (N-14)."""
-    from .ast_nodes import StringLiteral
-    from .parser import parse_rule
     names = set()
     for a in sos.actors:
         if isinstance(a.id.index, RangeExpr):
@@ -209,19 +246,6 @@ def _symbolic_bound_shadows(sos: SoSDefinition, contract: ContractDef) -> list:
                     names.add(b)
     if not names:
         return []
-    exprs = []
-    for d in contract.norms:
-        for key in ("trigger", "until", "content"):
-            text = getattr(d, key)
-            if text and "->" not in text:
-                exprs.append((f"{key}: of norm '{d.id}'", text))
-    for r in contract.counts_as:
-        for key, text in (("when", r.when), ("if", r.if_)):
-            if text and "->" not in text:
-                exprs.append((f"{key}: of the counts_as rule creating '{r.creates}'", text))
-    for key in ("assume", "guarantee"):
-        for e in getattr(contract, key):
-            exprs.append((f"{key}: item", e))
     out = []
 
     def walk(node, where):
@@ -235,18 +259,21 @@ def _symbolic_bound_shadows(sos: SoSDefinition, contract: ContractDef) -> list:
                 if f != "loc":
                     walk(getattr(node, f), where)
 
-    for where, e in exprs:
-        if isinstance(e, str):
-            try:
-                e = parse_rule(e)
-            except Exception:
-                continue
-        elif isinstance(e, StringLiteral):
-            try:
-                e = parse_rule(e.value)
-            except Exception:
-                continue
+    for where, _, e in _contract_predicates(contract):
         walk(e, where)
+    return out
+
+
+def _wildcard_notes(contract: ContractDef) -> list:
+    """(where, note) of the wildcard and range references of the
+    predicates of a contract whose reading may surprise (N-15)."""
+    from .norms_eval import desugar_wildcards
+    out = []
+    for where, pos, e in _contract_predicates(contract):
+        notes: list = []
+        desugar_wildcards(e, notes)
+        place = where if pos is None else f"{where} {pos}"
+        out += [(place, text) for _, text in notes]
     return out
 
 
@@ -1158,6 +1185,12 @@ class TypeChecker:
                     f"bound keeps its own value inside the quantifier (N-14)",
                     contract.loc,
                 )
+
+        # N-15: wildcard and range references whose reading may surprise.
+        for where, note in _wildcard_notes(contract):
+            self.result.add_warning(
+                f"The {where} of {ctx} has {note} (N-15)", contract.loc,
+            )
 
     # --- Agent governance extension (Appendix G, G.9) ---
 

@@ -183,6 +183,10 @@ class InstitutionLayer:
     """Layer 1: institutional structure and governance."""
     actors: list[ActorSpec] = field(default_factory=list)
     contracts: list[ContractSpec] = field(default_factory=list)
+    # Grounding extension (Appendix J, J.10): the quantities of the SoS
+    # over all contracts; serialized only when it is not None (a file that
+    # declares the extension and has two or more contracts).
+    grounding: Any = None
 
 
 # ---------------------------------------------------------------------------

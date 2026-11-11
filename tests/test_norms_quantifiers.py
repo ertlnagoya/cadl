@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from cadl.norms_eval import (
-    UNKNOWN, _Evaluator, declared_actors, evaluate, parse_trace,
+    UNKNOWN, _Evaluator, declared_actors, desugar_wildcards, evaluate, parse_trace,
 )
 from cadl.parser import parse, parse_rule
 from cadl.type_checker import type_check
@@ -331,25 +331,39 @@ class TestAggregates:
 
 class TestNotEvaluable:
     @pytest.mark.parametrize("text, reason", [
-        ("R[*].x > 1", "a wildcard or range actor reference is not evaluable"),
-        ("count(R[*].x == 1) >= 2", "the function call count() is not evaluable"),
+        ("sum(R[*].x * S[*].x) > 1", "the argument of sum() refers to R[*] and S[*]"),
         ("exists j in 3: R[j].x == 1", "the domain of a quantifier"),
         ("sum(i.x for i in 1..3) > 1", "ranges over integers"),
         ("exists j in R: within(5s, R[j].x == 1)", "the temporal operator within()"),
-        ("sum(R[j].x for j in R[*]) > 1 AND R[1..2].x == 1",
-         "a wildcard or range actor reference"),
+        ("foo(R[*].x) > 1", "the function call foo() is not evaluable"),
         ("foo(R[j].x for j in R) > 1", "the function call foo() is not evaluable"),
     ])
     def test_reasons(self, text, reason):
         ev = evaluator([{"t": 0}])
-        assert reason in ev.unsupported(parse_rule(text), False)
+        assert reason in ev.unsupported(desugar_wildcards(parse_rule(text)), False)
+
+    @pytest.mark.parametrize("text", [
+        "R[*].x > 1", "count(R[*].x == 1) >= 2",
+        "sum(R[j].x for j in R[*]) > 1 AND R[1..2].x == 1",
+    ])
+    def test_wildcards_are_evaluable(self, text):
+        # up to cadl 0.3.23 these were not evaluable (F.5, wildcards)
+        ev = evaluator([{"t": 0}])
+        assert ev.unsupported(desugar_wildcards(parse_rule(text)), False) is None
 
     def test_norm_is_reported_not_evaluable(self):
-        sos = make_sos('norms:\n  - {id: p, kind: prohibition, bearer: D, content: "R[*].x > 1"}\n')
+        # an aggregate shorthand over two sets is what stays of the
+        # wildcards (F.5): `R[*].x > 1` alone is evaluated, see
+        # test_norms_wildcards.py
+        content = "sum(R[*].x * S[*].x) > 1"
+        sos = make_sos('norms:\n  - {id: p, kind: prohibition, bearer: D, content: "%s"}\n'
+                       % content)
         r = evaluate(sos, parse_trace([json.dumps({"t": 0}), json.dumps({"t": 1})]))
         n = r["norms"][0]
         assert n["verdict"] == "pending"
-        assert n["reason"].startswith("not evaluable: content 'R[*].x > 1': a wildcard")
+        assert n["reason"] == (f"not evaluable: content '{content}': the argument of sum() "
+                               f"refers to R[*] and S[*]; an aggregate ranges over one set "
+                               f"or range")
 
 
 # === Soundness of the open domain ==============================================
@@ -365,6 +379,22 @@ FORMULAS = [
     "for all j in S: exists k in S: S[k].y == S[j].x",
     "count(S[j].x == 1 for j in S) >= 1",
     "sum(S[j].x for j in S) < 3",
+    # monotone aggregates compared with an operand without a binder (F.5)
+    "count(S[j].x == 1 for j in S) >= 2",
+    "count(S[j].x == 1 for j in S) > 1",
+    "count(S[j].x == 1 for j in S) <= 1",
+    "count(S[j].x == 1 for j in S) < 2",
+    "count(S[j].x == 1 for j in S) == 1",
+    "count(S[j].x == 1 for j in S) != 1",
+    "2 <= count(S[j].y == 1 for j in S)",
+    "max(S[j].x for j in S) >= 1",
+    "max(S[j].x for j in S) < 1",
+    "max(S[j].x for j in S) == 0",
+    "min(S[j].y for j in S) <= 0",
+    "min(S[j].y for j in S) > 0",
+    "1 > min(S[j].x for j in S)",
+    "count(S[j].x == 1 for j in S[2..N]) >= 1",
+    "max(S[j].x for j in S) > S[1].y",
 ]
 
 
@@ -376,7 +406,7 @@ def test_open_domain_is_sound():
     arbitrary value of x and y (0, 1 or none)."""
     rng = random.Random(20261111)
     checks = decided = 0
-    for _ in range(260):
+    for _ in range(520):
         known = sorted(rng.sample(range(1, 5), rng.randint(0, 3)))
         values = {}
         for i in known:
@@ -407,7 +437,7 @@ def test_open_domain_is_sound():
                 got = value(text, [{"t": 0, "values": ext}])
                 assert got is base, (text, values, ext, base, got)
                 checks += 1
-    assert decided >= 40 and checks >= 10000, (decided, checks)
+    assert decided >= 120 and checks >= 20000, (decided, checks)
 
 
 # === The bundled example and the traces of the exercise ===========================
