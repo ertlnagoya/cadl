@@ -292,7 +292,8 @@ def value_text(value: Any, digits: int = 6) -> str:
 def exact_text(value: Any) -> str:
     if value == INFINITY:
         return "+inf"
-    return str(value)
+    from .stochastic import fraction_text
+    return fraction_text(value) if isinstance(value, (int, Fraction)) else str(value)
 
 
 def parse_number(text: str) -> Fraction:

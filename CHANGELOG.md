@@ -45,6 +45,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   deadlines of all connections in one thread.
 
 ### Fixed
+
+- `cadl game-check` and `cadl model-check` no longer stop with
+  `ValueError: Exceeds the limit (4300 digits) for integer string
+  conversion` when an exact result (I.13, H.8) has a numerator or
+  denominator of more than 4300 digits, as a model with a few hundred
+  steps can have. Exact numbers are now written by
+  `cadl.stochastic.int_text` and `fraction_text`, which split such an
+  integer by powers of ten and leave the limit of the process unchanged;
+  the output is the same as with the limit lifted.
 - A relayed stream kept its place among the requests handled at the same
   time after its client had gone, while the agent sent nothing or only
   comments; the gateway now watches the client while the agent is silent
