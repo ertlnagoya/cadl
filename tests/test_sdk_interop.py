@@ -325,3 +325,75 @@ def test_a2a_sdk_allow_deny_hold(tmp_path, a2a_sdk):
         ("publish", "allow", "approved"), ("publish", "escalate", "prohibition"),
         ("reject", "allow", "permission"), ("publish", "deny", "rejected"),
         ("publish", "escalate", "prohibition"), ("publish", "deny", "withdrawn")]
+
+
+def test_a2a_sdk_streaming(tmp_path, a2a_sdk):
+    """SendStreamingMessage and SubscribeToTask with the streaming client of
+    a2a-sdk: an allowed stream passes the agent's events, a denied one is a
+    single rejected task, a held one waits and then passes the events of the
+    released request, and a subscription follows a task of the client."""
+    import asyncio
+
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.types import SendMessageConfiguration, SendMessageRequest, SubscribeToTaskRequest
+    gw = A2AGateway(tmp_path)
+    out: dict = {}
+
+    async def stream(client, msg, **conf):
+        req = SendMessageRequest(message=msg)
+        if conf:
+            req.configuration.CopyFrom(SendMessageConfiguration(**conf))
+        return [_dict(ev) async for ev in client.send_message(req)]
+
+    async def run():
+        async with gw.httpx_client() as hc:
+            client = await ClientFactory(ClientConfig(httpx_client=hc, streaming=True)) \
+                .create_from_url(gw.url)
+            out["allow"] = await stream(client, gw.message("summarize", "one"))
+            out["deny"] = await stream(client, gw.message("translate"))
+            held = asyncio.create_task(stream(client, gw.message("publish", "two")))
+            await asyncio.to_thread(approve_when_published, gw.inbox, "h-1", "approve",
+                                    tmp_path / "approver.key")
+            out["approved"] = await held
+            held = asyncio.create_task(stream(client, gw.message("publish", "three")))
+            await asyncio.to_thread(approve_when_published, gw.inbox, "h-2", "reject",
+                                    tmp_path / "approver.key")
+            out["rejected"] = await held
+            sub = await stream(client, gw.message("publish", "wait"), return_immediately=True)
+            out["submitted"] = sub
+            gw_id = sub[0]["task"]["id"]
+
+            async def follow():
+                events = []
+                async for ev in client.subscribe(SubscribeToTaskRequest(id=gw_id)):
+                    events.append(_dict(ev))
+                    gw.agent.executor.release.set()         # then the task completes
+                return events
+            following = asyncio.create_task(follow())      # waits while the task is held
+            await asyncio.to_thread(approve_when_published, gw.inbox, "h-3", "approve",
+                                    tmp_path / "approver.key")
+            out["subscribed"] = await following
+
+    asyncio.run(run())
+    err = gw.stop()
+    kinds = [next(iter(ev)) for ev in out["allow"]]
+    assert kinds[0] == "task" and kinds[-1] == "statusUpdate", (kinds, err)
+    assert "artifactUpdate" in kinds
+    assert out["allow"][-1]["statusUpdate"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert [next(iter(ev)) for ev in out["deny"]] == ["task"]
+    assert out["deny"][0]["task"]["status"]["state"] == "TASK_STATE_REJECTED"
+    assert out["approved"][-1]["statusUpdate"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert [ev["task"]["status"]["state"] for ev in out["rejected"]] == ["TASK_STATE_REJECTED"]
+    assert out["submitted"][0]["task"]["status"]["state"] == "TASK_STATE_SUBMITTED"
+    sub_ids = {ev.get("task", {}).get("id") or ev.get("statusUpdate", ev.get("artifactUpdate",
+                                                                               {})).get("taskId")
+               for ev in out["subscribed"]}
+    assert sub_ids == {out["submitted"][0]["task"]["id"]}        # the gateway's task id
+    assert gw.agent.executor.seen == ["one", "two", "wait"]
+    assert replay_equal(A2A_FILE, gw.trace, gw.audit) == [
+        ("summarize", "allow", "permission"), ("translate", "deny", "default"),
+        ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
+        ("publish", "allow", "approved"), ("publish", "escalate", "prohibition"),
+        ("reject", "allow", "permission"), ("publish", "deny", "rejected"),
+        ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
+        ("publish", "allow", "approved")]

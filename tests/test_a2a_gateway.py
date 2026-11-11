@@ -660,8 +660,7 @@ class TestMalformed:
         assert loc.post(rpc("SendMessage", p), version="0.3").body["error"]["code"] == -32009
         assert loc.post(rpc("SendMessage", p), ctype="text/plain").status == 415
         assert loc.post(rpc("SendMessage", p), ctype=None).status == 415
-        for method, code in (("SendStreamingMessage", -32004), ("SubscribeToTask", -32004),
-                             ("ListTasks", -32004), ("GetExtendedAgentCard", -32004),
+        for method, code in (("ListTasks", -32004), ("GetExtendedAgentCard", -32004),
                              ("CreateTaskPushNotificationConfig", -32003),
                              ("message/send", -32601), ("tasks/get", -32601)):
             assert loc.post(rpc(method, p)).body["error"]["code"] == code
@@ -670,7 +669,7 @@ class TestMalformed:
         assert loc.sent == []
         assert [r["reason"] for r in read_records(loc.audit)
                 if r.get("event") == "method_refused"] == [
-            "SendStreamingMessage", "SubscribeToTask", "ListTasks", "GetExtendedAgentCard",
+            "ListTasks", "GetExtendedAgentCard",
             "CreateTaskPushNotificationConfig", "message/send", "tasks/get"]
         loc.stop_and_replay()
 
@@ -1326,3 +1325,139 @@ def test_peer_key_groups_ipv6_by_prefix():
     assert k(("::ffff:192.0.2.7", 1, 0, 0)) == k(("192.0.2.7", 5)) == "192.0.2.7"
     assert k(("192.0.2.7", 1)) != k(("192.0.2.8", 1))
     assert k(("fe80::1%lo0", 1, 0, 0)) == "fe80::/64"
+
+
+def read_sse(r: "Run", actor: str, method: str, p, id_=1, timeout=30.0):
+    """A streamed request: the status, the content type, the comments and
+    the events (event name, JSON) of the answer."""
+    body = json.dumps(rpc(method, p, id_)).encode()
+    conn = http.client.HTTPConnection("127.0.0.1", r.client.port, timeout=timeout)
+    try:
+        conn.request("POST", "/", body=body, headers={
+            "Content-Type": "application/json", "A2A-Version": "1.0",
+            "Authorization": authorization(CLIENT_KEYS[actor], actor, r.run_id, body)})
+        resp = conn.getresponse()
+        ctype = resp.getheader("Content-Type")
+        data = resp.read().decode()
+    finally:
+        conn.close()
+    if not ctype.startswith("text/event-stream"):
+        return resp.status, ctype, [], [("json", json.loads(data))]
+    comments, events, name, lines = [], [], "message", []
+    for line in data.split("\n"):
+        if not line:
+            if lines:
+                events.append((name, json.loads("\n".join(lines))))
+            name, lines = "message", []
+        elif line.startswith(":"):
+            comments.append(line)
+        elif line.startswith("event: "):
+            name = line[7:]
+        elif line.startswith("data: "):
+            lines.append(line[6:])
+    return resp.status, ctype, comments, events
+
+
+class TestStreaming:
+    """SendStreamingMessage and SubscribeToTask (SSE, JSON-RPC binding)."""
+
+    def test_allow_deny_and_events(self, tmp_path, capsys):
+        r = Run(tmp_path)
+        status, ctype, comments, events = read_sse(r, "PLANNER", "SendStreamingMessage",
+                                                   params("summarize"), id_="s1")
+        assert status == 200 and ctype.startswith("text/event-stream")
+        assert comments == []                   # the agent's comment is not passed on
+        assert [next(iter(e["result"])) for _, e in events] == [
+            "task", "statusUpdate", "artifactUpdate", "statusUpdate"]
+        assert {e["id"] for _, e in events} == {"s1"}
+        _, _, _, events = read_sse(r, "PLANNER", "SendStreamingMessage", params("translate"))
+        assert len(events) == 1
+        assert events[0][1]["result"]["task"]["status"]["state"] == "TASK_STATE_REJECTED"
+        # Own tasks only, for subscriptions too.
+        _, _, _, events = read_sse(r, "OPERATOR", "SubscribeToTask", {"id": "up-task-1"})
+        assert events[0][1]["error"]["code"] == -32001
+        _, _, _, events = read_sse(r, "PLANNER", "SubscribeToTask", {"id": "up-task-1"}, 7)
+        assert [e["result"]["task"]["id"] for _, e in events[:1]] == ["up-task-1"]
+        r.stop()
+        assert r.agent.sent("SendStreamingMessage") == ["summarize"]
+        assert r.agent.sent("SubscribeToTask") == ["up-task-1"]
+        result = r.replay_check()
+        assert decisions(result) == [("PLANNER", "summarize", "allow", "permission"),
+                                     ("PLANNER", "translate", "deny", "default")]
+        capsys.readouterr()
+
+    def test_held_stream_approved_and_rejected(self, tmp_path, capsys):
+        r = Run(tmp_path)
+        fut = r.pool.submit(read_sse, r, "PLANNER", "SendStreamingMessage",
+                            params("publish", "x"))
+        r.wait_hold("h-1")
+        time.sleep(1.3)                        # at least one comment while held
+        assert r.agent.sent("SendStreamingMessage") == []
+        r.approve("h-1")
+        status, _, comments, events = fut.result(timeout=30)
+        assert comments and comments[0].startswith(": held as h-1")
+        assert events[-1][1]["result"]["statusUpdate"]["status"]["state"] == \
+            "TASK_STATE_COMPLETED"
+        fut = r.pool.submit(read_sse, r, "PLANNER", "SendStreamingMessage", params("publish"))
+        r.approve("h-2", "reject")
+        _, _, _, events = fut.result(timeout=30)
+        assert [e["result"]["task"]["status"]["state"] for _, e in events] == [
+            "TASK_STATE_REJECTED"]
+        r.stop()
+        assert r.agent.sent("SendStreamingMessage") == ["publish"]
+        assert [h["state"] for h in r.replay_check()["holds"]] == ["approved", "rejected"]
+        capsys.readouterr()
+
+    def test_held_stream_withdrawn_on_disconnect(self, tmp_path, capsys):
+        r = Run(tmp_path)
+        body = json.dumps(rpc("SendStreamingMessage", params("publish"))).encode()
+        sock = socket.create_connection(("127.0.0.1", r.client.port))
+        auth = authorization(CLIENT_KEYS["PLANNER"], "PLANNER", r.run_id, body)
+        sock.sendall((f"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                      f"A2A-Version: 1.0\r\nContent-Length: {len(body)}\r\n"
+                      f"Authorization: {auth}\r\n\r\n").encode() + body)
+        hold = r.wait_hold("h-1")
+        late = approval_file(r.inbox, "h-1", "approve", "OPERATOR", APPROVER_KEYS["OPERATOR"])
+        sock.close()
+        wait_for(lambda: not hold.exists(), "the withdrawal")
+        (r.inbox / "late.json").write_text(json.dumps(late))
+        r.wait_inbox_done()
+        r.stop()
+        assert r.agent.sent("SendStreamingMessage") == []
+        assert [h["state"] for h in r.replay_check()["holds"]] == ["withdrawn"]
+        capsys.readouterr()
+
+    def test_returns_immediately_and_subscription(self, tmp_path, capsys):
+        r = Run(tmp_path)
+        _, _, _, events = read_sse(r, "PLANNER", "SendStreamingMessage",
+                                   params("publish", returnImmediately=True))
+        task = events[0][1]["result"]["task"]
+        assert len(events) == 1 and task["status"]["state"] == "TASK_STATE_SUBMITTED"
+        fut = r.pool.submit(read_sse, r, "PLANNER", "SubscribeToTask", {"id": task["id"]}, 2)
+        time.sleep(0.3)
+        r.approve("h-1")
+        _, _, _, events = fut.result(timeout=30)
+        ids = {(e["result"].get("task") or {}).get("id") for _, e in events if "task" in
+               e["result"]} | {e["result"][k]["taskId"] for _, e in events
+                               for k in ("statusUpdate", "artifactUpdate") if k in e["result"]}
+        assert ids == {task["id"]}               # the gateway's id, not the agent's
+        r.stop()
+        assert r.agent.sent() == ["publish"] and r.agent.sent("SubscribeToTask") == ["up-task-1"]
+        r.replay_check()
+        capsys.readouterr()
+
+    @pytest.mark.parametrize("text,why,good", [("stream-foreign", "not of a task", 1),
+                                               ("stream-cr", "carriage return", 2)])
+    def test_bad_events_end_the_stream(self, tmp_path, capsys, text, why, good):
+        r = Run(tmp_path)
+        _, _, _, events = read_sse(r, "PLANNER", "SendStreamingMessage",
+                                   params("summarize", text))
+        name, last = events[-1]
+        assert name == "error" and last["error"]["code"] == -32006
+        assert all("result" in e for _, e in events[:-1])
+        assert len(events) == good + 1         # nothing after the bad event
+        r.stop()
+        assert any(why in (x["reason"] or "") for x in read_records(r.audit)
+                   if x.get("event") == "invalid_response")
+        r.replay_check()
+        capsys.readouterr()
