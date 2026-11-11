@@ -406,14 +406,36 @@ def _substitute(node: Any, names: dict, nested_aggregates: bool) -> Any:
     return node
 
 
+def _compared_with_itself(node: Any, key: tuple) -> bool:
+    """Whether a comparison in `node` (outside nested aggregate calls) has
+    a reference of the group `key` on both sides."""
+    if isinstance(node, BinaryOp):
+        if node.op in _COMPARISON_OPS:
+            left: list = []
+            right: list = []
+            _wildcards(node.left, left, False)
+            _wildcards(node.right, right, False)
+            if key in left and key in right:
+                return True
+        return _compared_with_itself(node.left, key) or _compared_with_itself(node.right, key)
+    if isinstance(node, UnaryOp):
+        return _compared_with_itself(node.operand, key)
+    if isinstance(node, QuantifiedExpr):
+        return _compared_with_itself(node.predicate, key)
+    if isinstance(node, FunctionCall) and node.name not in AGGREGATES:
+        return any(_compared_with_itself(a, key) for a in node.args)
+    return False
+
+
 class _Desugar:
     """The rewriting of `desugar_wildcards`; `notes` collects the readings
-    that may surprise, as (kind, text) with kind `not`, `pairs`, `or` or
-    `aggregate`."""
+    that may surprise, as (kind, text) with kind `not`, `pairs`, `or`,
+    `same`, `temporal` or `aggregate`."""
 
     def __init__(self, notes: list | None) -> None:
         self.count = 0
         self.notes = notes
+        self.temporal: str | None = None      # the temporal operator being walked
 
     def note(self, kind: str, text: str) -> None:
         if self.notes is not None and (kind, text) not in self.notes:
@@ -455,6 +477,13 @@ class _Desugar:
                           f"{' and '.join(wildcard_text(k) for k in keys)}, so it is not "
                           f"evaluated; write a comprehension")
             return node
+        if _compared_with_itself(node.args[0], keys[0]):
+            t = wildcard_text(keys[0])
+            self.note("same", f"{t} on both sides of a comparison in the argument of "
+                      f"{node.name}(): each member is compared with itself; to compare two "
+                      f"members, write a comprehension with a quantifier over a second "
+                      f"member, as in {node.name}((exists k in {t}: k != j AND ...) "
+                      f"for j in {t})")
         var = self.fresh()
         element = _substitute(node.args[0], {keys[0]: var}, False)
         return replace(node, args=[Comprehension(element=element, variable=var,
@@ -480,6 +509,23 @@ class _Desugar:
         if len(keys) > 1:
             self.note("pairs", f"{texts} in one comparison: it must hold for every "
                       f"combination of their members")
+        if isinstance(node, BinaryOp) and node.op in _COMPARISON_OPS:
+            left: list = []
+            right: list = []
+            _wildcards(node.left, left, True)
+            _wildcards(node.right, right, True)
+            for k in [k for k in keys if k in left and k in right]:
+                t = wildcard_text(k)
+                self.note("same", f"{t} on both sides of a comparison: each member is "
+                          f"compared with itself; to compare two members, write "
+                          f"for all j in {t}: for all k in {t}: j == k OR ... "
+                          f"with {k[0]}[j] and {k[0]}[k]")
+        if self.temporal is not None:
+            first = wildcard_text(keys[0])
+            self.note("temporal", f"{texts} inside {self.temporal}(): the comparison must "
+                      f"hold for all members at the same observation; for each member on "
+                      f"its own, write the quantifier outside, as in for all j in {first}: "
+                      f"{self.temporal}(...) with {keys[0][0]}[j]")
         return body, set(keys)
 
     def walk(self, node: Any, pred: bool, negated: bool) -> tuple:
@@ -501,13 +547,17 @@ class _Desugar:
             return replace(node, predicate=body), keys
         if isinstance(node, FunctionCall) and node.name in TEMPORAL_OPERATORS:
             args, keys = [], set()
-            for a in node.args:
-                if isinstance(a, DurationLiteral):
-                    args.append(a)
-                else:
-                    a, k = self.walk(a, True, negated)
-                    args.append(a)
-                    keys |= k
+            outer, self.temporal = self.temporal, node.name
+            try:
+                for a in node.args:
+                    if isinstance(a, DurationLiteral):
+                        args.append(a)
+                    else:
+                        a, k = self.walk(a, True, negated)
+                        args.append(a)
+                        keys |= k
+            finally:
+                self.temporal = outer
             return replace(node, args=args), keys
         keys: set = set()
         if isinstance(node, ActorRef):
@@ -1230,27 +1280,33 @@ class _Evaluator:
     def _elements(self, name: str, comp: Comprehension, group: Any, members: list,
                   k: int, n: int) -> tuple:
         """The values of the element of an aggregate for the members of its
-        domain: (values, markers). For `count` a value is a truth value;
-        for the others a number. An element without such a value is
-        UNKNOWN (with a warning)."""
-        vals, markers = [], []
+        domain: (values, markers, invalid). For `count` a value is a truth
+        value; for the others a number. An undefined element is a marker.
+        `invalid` is True when an element has a value of the wrong kind (a
+        text or symbolic value; for min, max, sum and avg also a boolean),
+        which makes the aggregate undefined (F.5), with a warning."""
+        vals, markers, invalid = [], [], False
         for index in members:
             v = self._with(comp.variable, (group, index),
                            lambda: self.value(comp.element, k, n))
             if name == "count":
+                if not isinstance(v, (_Marker, bool, int, float)) or isinstance(v, _Sym):
+                    invalid = True
                 v = self.truth(v, comp.element)
             elif isinstance(v, _Sym):
+                invalid = True
                 v = self._no_value(v)
             elif not isinstance(v, _Marker) and (isinstance(v, bool)
                                                   or not isinstance(v, (int, float))):
                 self.warn(f"{name}() of the value {v!r}, which is not a number; "
                           f"the predicate does not hold")
+                invalid = True
                 v = UNKNOWN
             if isinstance(v, _Marker):
                 markers.append(v)
             else:
                 vals.append(v)
-        return vals, markers
+        return vals, markers, invalid
 
     def _aggregate(self, name: str, comp: Comprehension, k: int, n: int) -> Any:
         """sum, count, min, max or avg of a comprehension at observation k;
@@ -1267,7 +1323,7 @@ class _Evaluator:
                 self.warn(f"the range of '{comp.variable}' in {name}() has a bound without "
                           f"a value; the aggregate is undefined")
             return UNKNOWN
-        vals, markers = self._elements(name, comp, group, members, k, n)
+        vals, markers, _ = self._elements(name, comp, group, members, k, n)
         worst = self._worst(*markers)
         if worst is not None:
             return worst
@@ -1308,9 +1364,9 @@ class _Evaluator:
         b = self.value(other, k, n)
         if isinstance(b, bool) or not isinstance(b, (int, float)):
             return None
-        vals, markers = self._elements(call.name, comp, group, members, k, n)
-        if any(m is UNDECIDED for m in markers) or (closed and not markers):
-            return None
+        vals, markers, invalid = self._elements(call.name, comp, group, members, k, n)
+        if invalid or any(m is UNDECIDED for m in markers) or (closed and not markers):
+            return None         # a value of the wrong kind: undefined, as F.5 says
         inf = float("inf")
         if call.name == "count":
             lo = sum(1 for v in vals if v is True)

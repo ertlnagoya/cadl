@@ -96,7 +96,15 @@ class TestRewriting:
 
     @pytest.mark.parametrize("text, kinds", [
         ("R[*].x > 1", []),
-        ("R[*].x > R[*].y", []),
+        ("R[*].x > R[*].y", ["same"]),
+        ("R[*].pos != R[*].pos", ["same"]),
+        ("R[*].x > R[1..2].x", ["pairs"]),          # two groups, not the same one
+        ("count(R[*].delivery == R[*].delivery) < 2", ["same"]),
+        ("count(R[*].ok AND R[*].x > 1) < 2", []),
+        ("within(5s, R[*].status == Delivered)", ["temporal"]),
+        ("until(R[*].ok, D.done, 5s)", ["temporal"]),
+        ("throughout(5s, D.up) AND R[*].ok", []),
+        ("for all j in R[*]: within(5s, R[j].ok)", []),
         ("NOT R[*].x > 1", ["not"]),
         ("NOT (D.up AND R[*].ok)", ["not"]),
         ("NOT NOT R[*].ok", []),
@@ -272,8 +280,12 @@ def _warnings(path_or_text) -> list:
 
 def test_n15_on_the_example_file():
     found = _warnings(WILD)
-    assert len(found) == 3, found
+    assert len(found) == 7, found
     joined = "\n".join(found)
+    assert "R[*] on both sides of a comparison: each member is compared with itself" in joined
+    assert "S[*] inside within(): the comparison must hold for all members at the same " \
+           "observation" in joined
+    assert "R[*] inside throughout()" in joined and "S[*] inside throughout()" in joined
     assert "content: of norm 'same_job'" in joined and "R[*] and S[1..2]" in joined
     assert "until: of norm 'may_assign'" not in joined        # two sets under OR: no note
     assert "content: of norm 'light'" in joined and "under NOT" in joined
@@ -429,6 +441,21 @@ class TestMonotoneAggregates:
     ])
     def test_open_domain(self, text, expected):
         assert value(text, self.OPEN) is expected
+
+    @pytest.mark.parametrize("text", [
+        "max(R[j].x for j in R) >= 3", "max(R[j].x for j in R) < 3",
+        "min(R[j].x for j in R) <= 1", "count(R[j].x for j in R) >= 1",
+        "max(S[j].x for j in S) >= 3",
+    ])
+    def test_a_value_of_the_wrong_kind_makes_it_undefined(self, text):
+        """F.5: an element that has a value that is not a number (for count,
+        not a truth value) makes the aggregate undefined; only undefined
+        elements and members not yet named take any value."""
+        obs = [{"t": 0, "values": {"R[1].x": 5, "R[2].x": "a", "R[3].x": 1,
+                                   "S[1].x": 5, "S[2].x": "a"}}]
+        assert value(text, obs) is None
+        defined = [{"t": 0, "values": {"R[1].x": 5, "R[3].x": 1, "S[1].x": 5}}]
+        assert value(text, defined) is not None
 
     def test_closed_domain_with_undefined_elements(self):
         obs = [{"t": 0, "values": {"R[1].x": 1, "R[2].x": 1}}]          # R[3].x: none

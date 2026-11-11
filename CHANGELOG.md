@@ -33,10 +33,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   above when open; max from the largest defined value up; min from the
   smallest down). `count(ROBOT[*].delivery == request.id) >= 2` now
   detects a double assignment while `N` has no value. `sum` and `avg`
-  are not refined. Up to 0.3.23 such comparisons were undefined.
+  are not refined; an element with a value of the wrong kind still
+  makes the aggregate undefined. Up to 0.3.23 such comparisons were
+  undefined.
 - N-15 (`cadl check`, warning): a wildcard or range reference bound
   under `NOT`, two sets in one comparison, the same set in both operands
-  of `OR`, and an aggregate argument over two sets.
+  of `OR`, the same set on both sides of one comparison (also inside an
+  aggregate), a set inside `within`/`throughout`/`until`, and an
+  aggregate argument over two sets; each warning names the quantified
+  form that was probably meant.
 - The quantities of the SoS (Appendix J, J.4, "The quantities of the
   SoS"): alpha^_SoS, beta^_SoS and chi_SoS over all contracts of a file,
   with an item qualified by its contract and the powers of one single
@@ -44,7 +49,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   in a last section and under the JSON key `sos` for a file with two or
   more contracts (without `--contract`); `cadl sim-ir` writes them as
   `institution.grounding`. They are not weighted and not compared with
-  any declared value. The output for each contract is unchanged.
+  any declared value; tied single actors are all named, sorted, so the
+  report does not depend on the order of the contracts. The output for each contract is unchanged.
 
 ### Changed
 

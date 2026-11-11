@@ -702,7 +702,9 @@ class SoSIndices:
 
     @property
     def ids(self) -> list:
-        return [ci.id for ci in self.contracts]
+        """The ids of the contracts, sorted: the report does not depend on
+        the order of the contracts in the file."""
+        return sorted(ci.id for ci in self.contracts)
 
     # α̂
     @property
@@ -731,32 +733,34 @@ class SoSIndices:
 
     @property
     def bearers(self) -> dict:
-        """Bearer reference, as written -> number of powers in all contracts."""
+        """Bearer reference, as written -> number of powers in all
+        contracts, sorted by the reference."""
         out: dict = {}
         for ci in self.contracts:
             for b, n in ci.beta.bearers.items():
                 out[b] = out.get(b, 0) + n
-        return out
+        return dict(sorted(out.items()))
 
     @property
     def singles(self) -> dict:
-        """Single actor -> K(a), the number of its powers in all contracts."""
+        """Single actor -> K(a), the number of its powers in all contracts,
+        sorted by the actor."""
         out: dict = {}
         for ci in self.contracts:
             for a, n in ci.beta.singles.items():
                 out[a] = out.get(a, 0) + n
-        return out
+        return dict(sorted(out.items()))
 
     @property
     def largest(self) -> int:
         return max(self.singles.values(), default=0)
 
     @property
-    def top(self) -> Optional[str]:
-        """The single actor with the largest K(a), the first in file order
-        when several have it; None when no single actor bears a power."""
+    def top(self) -> list:
+        """The single actors with the largest K(a), sorted (several when
+        they tie); empty when no single actor bears a power."""
         k = self.largest
-        return next((a for a, n in self.singles.items() if n == k), None)
+        return [a for a, n in self.singles.items() if n == k] if self.singles else []
 
     @property
     def beta(self) -> Optional[Fraction]:
@@ -1318,7 +1322,7 @@ def sos_report(si: SoSIndices) -> dict:
     alpha.update(by_sharing=si.by("sharing"), by_obligation=si.by("obligation"),
                  by_permission=si.by("permission"), member_specific=si.member_specific)
     beta = _ratio(si.beta, si.largest, si.powers, si.undefined_reason("beta"))
-    beta.update(largest_bearer=si.top, bearers=si.bearers, single_actors=si.singles)
+    beta.update(largest_bearers=si.top, bearers=si.bearers, single_actors=si.singles)
     chi = _ratio(si.coverage, si.incentive, si.norms, si.undefined_reason("coverage"))
     chi.update(reparation_only=si.reparation_only, transition=si.transition)
     return {"contracts": si.ids, "alpha": alpha, "beta": beta, "coverage": chi}
@@ -1414,8 +1418,9 @@ def format_report_text(result: dict) -> str:
         if b["bearers"]:
             lines.append("    powers per bearer: " + ", ".join(
                 f"{k}: {v}" for k, v in b["bearers"].items()))
-        if b["largest_bearer"] is not None:
-            lines.append(f"    single actor with the most powers: {b['largest_bearer']}")
+        if b["largest_bearers"]:
+            lines.append(f"    single actor(s) with the most powers: "
+                         f"{', '.join(b['largest_bearers'])}")
         lines.append(head("chi_SoS (incentive coverage)", x)
                      + ("" if not x["defined"] else
                         "  norms that carry an incentive / obligations and prohibitions "

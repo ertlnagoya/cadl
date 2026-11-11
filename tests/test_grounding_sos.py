@@ -90,7 +90,7 @@ class TestHandComputed:
         # C1: (route, R) given by the entry, (status, D) not; C2: (route@C2, D) not.
         assert (si.given, si.pairs, si.by("sharing")) == (1, 3, 1)
         # D bears p1 and p2, X bears p3
-        assert (si.largest, si.powers, si.top) == (2, 3, "D")
+        assert (si.largest, si.powers, si.top) == (2, 3, ["D"])
         # o1 (sanction), q1 (none, reparation only), o2 (magnitude 2)
         assert (si.incentive, si.norms, si.reparation_only) == (2, 3, 1)
         assert values(si) == (F(1, 3), F(2, 3), F(2, 3))
@@ -99,9 +99,9 @@ class TestHandComputed:
         si = G.sos_indices(sos_of(C1, C2, C3))
         # C3: (route@C3, X) given by the entry "Y -> X : route"
         assert (si.given, si.pairs) == (2, 4)
-        # X bears p3 in C2 and p4 in C3: K(X) = 2 = K(D); D comes first
+        # X bears p3 in C2 and p4 in C3: K(X) = 2 = K(D); both are named
         assert si.singles == {"D": 2, "X": 2, "Y": 1}
-        assert (si.largest, si.powers, si.top) == (2, 5, "D")
+        assert (si.largest, si.powers, si.top) == (2, 5, ["D", "X"])
         assert values(si) == (F(1, 2), F(2, 5), F(2, 4))
         # the per-contract β̂ are 1, 1 and 1/2: β̂_SoS lies below all of them
         betas = [ci.beta.value for ci in si.contracts]
@@ -164,7 +164,7 @@ class TestOutputs:
         assert "SoS: all 2 contracts (C1, C2)" in out
         assert "alpha^_SoS (information sharing) = 1/3" in out
         assert "beta^_SoS (concentration of powers) = 2/3" in out
-        assert "single actor with the most powers: D" in out
+        assert "single actor(s) with the most powers: D" in out
         assert "chi_SoS (incentive coverage) = 2/3" in out
         assert main(["norms-indices", str(path), "--contract", "C2"]) == 0
         assert "SoS" not in capsys.readouterr().out
@@ -271,11 +271,12 @@ class TestLemmas:
             before = _si(cs)
             if before.beta is None:
                 continue
-            if before.top is not None:
+            if before.top:
+                top = rng.choice(before.top)
                 ds = copy.deepcopy(cs)
                 c = rng.choice(ds)
-                c["norms"].append({"id": "added", "kind": "power", "bearer": before.top,
-                                   "content": f"{before.top} -> A : madd"})
+                c["norms"].append({"id": "added", "kind": "power", "bearer": top,
+                                   "content": f"{top} -> A : madd"})
                 after = _si(ds)
                 assert after.beta >= before.beta and after.largest == before.largest + 1
                 seen[0] += 1
@@ -387,19 +388,22 @@ class TestLemmas:
         assert (same.beta, other.beta) == (1, F(1, 2))
 
     def test_invariant_under_reordering_contracts(self):
+        """The whole report of the SoS, and its text, are the same for every
+        order of the contracts; tied actors are all named, sorted."""
         rng = random.Random(25)
-        for _ in range(60):
+        ties = 0
+        for _ in range(80):
             cs = _random_file(rng)
             a = G.sos_report(_si(cs))
             shuffled = cs[:]
             rng.shuffle(shuffled)
-            b = G.sos_report(_si(shuffled))
-            for rep in (a, b):
-                rep["contracts"] = sorted(rep["contracts"])
-                rep["beta"]["bearers"] = sorted(rep["beta"]["bearers"].items())
-                rep["beta"]["single_actors"] = sorted(rep["beta"]["single_actors"].items())
-                top = rep["beta"].pop("largest_bearer")
-                # the named actor is one with the largest K (the first in file order)
-                assert top is None or dict(rep["beta"]["single_actors"])[top] == \
-                    rep["beta"].get("numerator")
-            assert a == b
+            assert G.sos_report(_si(shuffled)) == a
+            ties += len(a["beta"]["largest_bearers"]) > 1
+            assert a["beta"]["largest_bearers"] == sorted(a["beta"]["largest_bearers"])
+            ra, rb = G.report(_sos(cs)), G.report(_sos(shuffled))
+            for r in (ra, rb):
+                r["file"] = "f"
+                r["contracts"] = []          # per contract: in file order, as before
+                r["designs"] = []
+            assert G.format_report_text(ra) == G.format_report_text(rb)
+        assert ties > 5, ties
