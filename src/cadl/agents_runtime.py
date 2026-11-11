@@ -28,6 +28,10 @@ Trace format: the JSON Lines of `cadl norms-eval` (keys ``t``,
 ``epoch``      first line only: the time of ``t = 0`` as an ISO 8601 time
                stamp. With it the times of the audit records and ``now``
                are time stamps; without it they are the numbers of ``t``.
+``quantities`` first line only: the names that are quantities, as a list.
+               With it exactly these names are quantities from the start;
+               without it a name is a quantity from the first line on that
+               gives it a value, and a symbolic value before (F.5).
 ``instances``  host-created contract instances. Each entry has
                ``contract`` and ``instance`` and may have ``bindings``,
                ``request``, ``state`` and ``"end": true``. An entry that
@@ -97,6 +101,8 @@ class RunTrace:
     request: dict[str, Any] = field(default_factory=dict)
     epoch: datetime | None = None
     path: str | None = None
+    # The quantity names of the run when the trace gives them, else None.
+    quantities: list[str] | None = None
 
 
 def _parse_epoch(text: Any, where: str) -> datetime:
@@ -149,6 +155,7 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
     plain: list[str] = []
     extras: list[tuple[str | None, list[dict]]] = []
     epoch = None
+    quantities = None
     for lineno, line in enumerate(lines, start=1):
         if not line.strip():
             plain.append("")
@@ -165,6 +172,14 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
             if extras:
                 raise TraceError(f"{where}: 'epoch' is allowed only on the first line")
             epoch = _parse_epoch(rec.pop("epoch"), where)
+        if "quantities" in rec:
+            if extras:
+                raise TraceError(f"{where}: 'quantities' is allowed only on the first line")
+            quantities = rec.pop("quantities")
+            if not isinstance(quantities, list) or any(
+                    not isinstance(q, str) or not q.strip() for q in quantities):
+                raise TraceError(f"{where}: 'quantities' must be a list of names")
+            quantities = [q.strip() for q in quantities]
         entries = _check_instances(rec.pop("instances", []), where)
         if "bindings" in rec and isinstance(rec["bindings"], dict):
             _check_bindings(rec["bindings"], where)
@@ -185,7 +200,8 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
     return RunTrace(
         lines=[Line(obs=o, state=s, instances=e, lineno=n)
                for o, (s, e, n) in zip(base.observations, extras)],
-        bindings=base.bindings, request=base.request, epoch=epoch, path=path)
+        bindings=base.bindings, request=base.request, epoch=epoch, path=path,
+        quantities=quantities)
 
 
 def load_run_trace(path) -> RunTrace:
@@ -240,7 +256,6 @@ class _Instance:
         self.request = request
         self.started = started
         self.ended: float | None = None
-        self.end_line: int | None = None
         self.running = True
         self.state: str | None = None
         self.engine: _BoundaryEngine = None       # type: ignore[assignment]
@@ -288,6 +303,32 @@ class _BoundaryTerm(_Term):
         if self.kind != "predicate" or self.expr is None:
             return []
         return sorted(G.predicate_index_vars(self.expr) - set(self.ev.bindings))
+
+    def unbound_in_arguments(self) -> list[str]:
+        """The free index variables in the arguments of a message event
+        that the contract instance does not bind."""
+        if self.kind != "message" or not self.msg_args:
+            return []
+        names = {v for a in self.msg_args for v in G.predicate_index_vars(a)}
+        return sorted(names - set(self.ev.bindings))
+
+    def matching_messages(self, k: int) -> list[dict]:
+        names = self.unbound_in_arguments()
+        if not names:
+            return super().matching_messages(k)
+        # Whether the arguments are those of the event is unknown: the
+        # messages that match in sender, receiver and name occur, or none.
+        args, self.msg_args = self.msg_args, None
+        try:
+            candidates = super().matching_messages(k)
+        finally:
+            self.msg_args = args
+        if candidates:
+            self.ev.warn(
+                f"the index '{names[0]}' in the arguments of '{self.text}' is not bound: "
+                f"its occurrence is unknown and is resolved fail-closed (G.5), here as "
+                f"{'occurring' if self.unknown_as else 'not occurring'}")
+        return candidates if self.unknown_as else []
 
     def _unknown_predicate(self) -> bool:
         names = self.unbound_in_predicate()
@@ -514,10 +555,16 @@ class AgentsRuntime:
         self._snapshot: dict[str, Any] = {}
         self._lineno = 0
         self._checked: set[str] = set()
-        # (contract, instance) -> index of the line at which the instance
-        # ended, from a first replay; None while that replay runs.
-        self._ends: dict | None = None
-        self._k = 0
+        # Names that predicates of the enforced contracts use as values,
+        # and the names that have had a value so far: for the warning about
+        # a name whose first value comes after a decision.
+        self._bare: set[str] = set()
+        for c in sos.contracts:
+            if c.enforcement is not None:
+                for _, expr, _ in G.contract_expressions(c):
+                    self._bare |= G.bare_names(expr)
+        self._bare -= set(self.policy["actors"]) | {"now", "state", "request"}
+        self._valued: set[str] = set()
         ids = [c["id"] for c in self.policy["contracts"]]
         named = {}
         for line in trace.lines:
@@ -633,13 +680,18 @@ class AgentsRuntime:
                     f"of an enforced contract binds every index of its parties "
                     f"('bindings')")
             value = bindings[var]
-            member = {"name": ref["name"], "index": value, "text": f"{ref['name']}[{value}]"}
-            if isinstance(value, bool) or not isinstance(value, int) \
-                    or not G.is_member(self.policy, ref["name"], member):
-                raise TraceError(
-                    f"line {self._lineno}: instance {name} of {cid} binds the index "
-                    f"'{var}' of its party {ref['text']} to {value!r}, which is not a "
-                    f"member of the declared set {ref['name']}")
+            # Every declared set that the variable indexes in the contract:
+            # the party's own, and any other (`SUP[i]` beside a party `W[i]`).
+            sets = [ref["name"]] + sorted(
+                G.contract_index_sets(self._ast(cid)).get(var, set()) - {ref["name"]})
+            for set_name in sets:
+                member = {"name": set_name, "index": value, "text": f"{set_name}[{value}]"}
+                if isinstance(value, bool) or not isinstance(value, int) \
+                        or not G.is_member(self.policy, set_name, member):
+                    raise TraceError(
+                        f"line {self._lineno}: instance {name} of {cid} binds the index "
+                        f"'{var}' of its party {ref['text']} to {value!r}, which is not "
+                        f"a member of the declared set {set_name}")
         for var in bindings:
             if var not in party_vars:
                 text = (f"{cid}/{name}: the binding of '{var}' is ignored for the "
@@ -667,16 +719,14 @@ class AgentsRuntime:
         return {"contract": inst.contract, "instance": inst.name}
 
     def _known_names(self, inst: _Instance) -> set[str]:
-        """The quantity names of an instance (F.5): the names that have a
-        value in an observation of the instance. `values` stay until they
-        change, so these are the names of the snapshot at its last line. A
-        line after the end of the instance adds nothing."""
-        lines = self.trace.lines
-        last = len(lines) - 1
-        if self._ends is not None:
-            end = self._ends.get(inst.key)
-            last = last if end is None else end
-        return set(lines[last].obs.values)
+        """The quantity names of a new instance (F.5). The runtime decides
+        every message on what was observed up to it, so without the names
+        from the trace (`quantities`) a name is a quantity from the first
+        observation on that gives it a value: this set grows with every
+        observation of the instance (`_push`) and never looks ahead."""
+        if self.trace.quantities is not None:
+            return set(self.trace.quantities)
+        return set(self._snapshot)
 
     def _build_until(self, inst: _Instance) -> None:
         inst.until_terms = {}
@@ -704,7 +754,6 @@ class AgentsRuntime:
         are cancelled; G.7 (c): its derived instances are discharged."""
         inst.running = False
         inst.ended = t
-        inst.end_line = self._k
         terminal = (inst.engine.end_reason or "").startswith("terminal state")
         self._event(t, "instance_end", None, [self._where(inst)],
                     reason="terminal_state" if terminal else "end")
@@ -722,6 +771,8 @@ class AgentsRuntime:
         if exempt:
             eng._exempt[n] = set(exempt)
         before = len(eng.unauthorised)
+        if self.trace.quantities is None:
+            eng.ev.known.update(o.values)       # names valued up to now
         ended = eng.push(o)
         inst.state = eng.obs[n].state_after
         for u in eng.unauthorised[before:]:          # F.5, item 7
@@ -1214,21 +1265,26 @@ class AgentsRuntime:
         """Replay every line. Messages after an `end` are still decided:
         an ended instance does not come back, so a tool call of its
         contract is denied with `no_instance`."""
-        if self._ends is None:
-            # A first replay finds the line at which each instance ends; it
-            # does not depend on the names (an end comes from the trace).
-            probe = AgentsRuntime(self.sos, self.trace, self.versions, self.check)
-            probe._ends = {}
-            probe._replay()
-            self._ends = {i.key: i.end_line for i in probe.instances}
-        self._replay()
-        return self.result()
-
-    def _replay(self) -> None:
         lines = self.trace.lines
         for k, line in enumerate(lines):
-            self._k = k
+            self._late_names(line)
             self._line(line, k == 0, k == len(lines) - 1)
+        return self.result()
+
+    def _late_names(self, line: Line) -> None:
+        """Warn when a name that a predicate uses as a value gets its first
+        value after a decision: until then it was read as a symbolic value."""
+        new = set(line.obs.values) - self._valued
+        self._valued |= new
+        if self.trace.quantities is not None or not self.steps:
+            return
+        late = sorted(new & self._bare)
+        if late:
+            self.warnings.append(
+                f"line {line.lineno}: {', '.join(late)} get(s) a first value after "
+                f"earlier messages were decided; until then a predicate read the name as "
+                f"a symbolic value (F.5). Give the quantity names of the run with "
+                f"'quantities' on the first line to make them quantities from the start")
 
     # --- result ---------------------------------------------------------------------------------------
 

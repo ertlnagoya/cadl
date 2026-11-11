@@ -1501,31 +1501,20 @@ class TypeChecker:
         for d in contract.delegations:
             if d.until and d.until.strip() not in events:
                 items.append((f"until: of the delegation of '{d.norm}'", d.until, d.loc))
-        # G-18 for predicates: an index variable that neither a party nor a
-        # quantifier of the predicate binds.
-        from .agents import predicate_index_vars
-        from .ast_nodes import StringLiteral
-        from .parser import parse_rule
-        predicates = [(w, t, loc) for w, t, loc in items
-                      if "->" not in t and t.strip() not in events]
-        predicates += [(f"if: of the counts_as rule that creates '{r.creates}'", r.if_, r.loc)
-                       for r in contract.counts_as if r.if_]
-        for key, exprs in (("assume", contract.assume), ("guarantee", contract.guarantee)):
-            for pos, expr in enumerate(exprs, start=1):
-                predicates.append((f"{key}: item {pos}", expr, contract.loc))
-        for where, text, loc in predicates:
-            expr = text.value if isinstance(text, StringLiteral) else text
-            if isinstance(expr, str):
-                try:
-                    expr = parse_rule(expr)
-                except Exception:
-                    continue
+        # G-18 for every expression of the contract: a free variable that is
+        # used as or inside an index, in a predicate or in the arguments of
+        # a message event, and that no party binds. A quantifier or a
+        # comprehension of the expression binds its own variable.
+        from .agents import contract_expressions, predicate_index_vars
+        for where, expr, is_predicate in contract_expressions(contract):
+            what = "predicate" if is_predicate else "arguments"
             for var in sorted(predicate_index_vars(expr) - bound):
                 self.result.add_error(
-                    f"The index '{var}' in the predicate of the {where} in {ctx} is "
-                    f"not bound by a party of the contract (no party is written with "
-                    f"[{var}]) and by no quantifier of the predicate; a contract "
-                    f"instance binds only the indices of its parties (G-18)", loc,
+                    f"The index variable '{var}' in the {what} of the {where} in {ctx} "
+                    f"is not bound by a party of the contract (no party is written "
+                    f"with [{var}]), by a quantifier or by a comprehension; a contract "
+                    f"instance binds only the indices of its parties (G-18)",
+                    contract.loc,
                 )
 
         for where, text, loc in items:

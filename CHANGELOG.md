@@ -63,9 +63,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   variables of the parties of its contract (`bindings`); an instance
   without such a binding, or with a value that is not the index of a
   member of the set the party names, is a trace error; a binding of a
-  variable that no party has is ignored with a warning. The quantity
-  names of an instance are those of its own observations: a `values` line
-  after its end does not change its verdicts. `cadl.agents_runtime.run`
+  variable that no party has is ignored with a warning; a value must be
+  a member of every declared set that the variable indexes in the
+  contract. Every decision depends only on the lines up to it: a bare
+  name of a predicate is a quantity from the first line on that gives it
+  a value (a symbolic value before), or from the start when the first
+  line names it under `quantities`; nothing after the end of an instance
+  changes its verdicts. `cadl.agents_runtime.run`
   refuses a file with errors of `cadl check`; `check=False` is an unsafe
   switch for tests. As defence in depth, an occurrence that depends on an
   unbound index is unknown and never has an effect that lets a message
@@ -106,10 +110,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   parties, by one reference of `parties:`, and must name only declared
   members (`SUP[7]` for a set `SUP[1..3]` is an error); G-18, every index
   variable of the contract (in bearers, counterparties, `escalate_to:`,
-  `notify:`, `fallback:`, the senders and receivers of its message
-  events, and its predicates, unless a quantifier of the predicate binds
-  the variable) must be one that a party binds (`i` with a party
-  `ROBOT[i]`).
+  `notify:`, `fallback:`, the senders, receivers and arguments of its
+  message events, and its predicates, also inside an index expression
+  such as `ROBOT[j+1]`) must be bound: by a party (`i` with a party
+  `ROBOT[i]`), by a quantifier, or by a comprehension.
   Both are errors. A contract with parties `ROBOT[*]` and norms of
   `ROBOT[i]` has to write the party as `ROBOT[i]`. A file that 0.3.21
   accepted with such an event has to name the actor as a party. For
