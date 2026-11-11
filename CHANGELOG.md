@@ -93,8 +93,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   Two files of the independent review (`bstate.cadl`: condition B must
   be checked per state; `ns_affine_zero.cadl`: the cell at p = 0 stays
   undecided) are tests too, with the mutant `endpoints_b_from_initial`.
-
-### Changed
 - The end-point certification of a cell (formerly J-14 of Appendix J)
   is a method of I.9 and is used by `cadl game-check --certify` for any
   strategic model, also without `grounding: 0.1`, on the cells that the
