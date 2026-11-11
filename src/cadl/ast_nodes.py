@@ -672,6 +672,7 @@ class ModelCommandDef:
     guard: Any = None
     updates: Any = None                # list[ModelUpdateDef], or the value as written
     keys: tuple = ()
+    owner: Any = None                  # games 0.1 (Appendix I), as written
 
 
 @dataclass
@@ -697,6 +698,7 @@ class ModelPropertyDef:
     regimes: Any = None
     expr: Any = None
     keys: tuple = ()
+    profile: Any = None                # games 0.1 (Appendix I), as written
 
 
 @dataclass
@@ -709,6 +711,7 @@ class ModelRegimeMapDef:
     constraint: Any = None
     resolution: Any = None
     keys: tuple = ()
+    profile: Any = None                # games 0.1 (Appendix I), as written
 
 
 @dataclass
@@ -724,6 +727,9 @@ class ModelBlock:
     properties: list[ModelPropertyDef] = field(default_factory=list)
     regime_maps: list[ModelRegimeMapDef] = field(default_factory=list)
     keys: tuple = ()
+    # games 0.1 (Appendix I): the values of players:, profiles:, compliance:,
+    # payoffs: and equilibria:, as written; `cadl.games` reads them.
+    games: dict = field(default_factory=dict)
     # Structural problems found while reading the block (an entry that is
     # not a mapping, ...), as (rule, message) pairs for the type checker.
     malformed: list[tuple[str, str]] = field(default_factory=list)

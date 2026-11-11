@@ -6,6 +6,62 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Strategic model extension (`games` 0.1, Appendix I).** A file that
+  declares `stochastic: 0.1` and `games: 0.1` may give its `model:` block
+  `kind: smg`: a turn-based stochastic game on the model of Appendix H,
+  with `players:`, `owner:` on a command, named profiles of memoryless
+  deterministic strategies (`profiles:`, `compliance:`), payoffs as signed
+  weighted sums of expected rewards accumulated until a target
+  (`payoffs:`), and equilibrium queries (`equilibria:`).
+  - `cadl check` applies the rules I-1 to I-11 of I.10, among them I-5
+    (at most one player chooses in a state; it replaces S-9), I-6 (every
+    profile selects a command wherever there is a choice), I-8 (every
+    profile is admissible at the fixed values: no single player can keep
+    the game away from the target of its payoff) and I-9 (for a map: the
+    design is well-defined at the corners of the region and the profile
+    admissible at the centre of each of its 3ⁿ faces).
+  - `cadl game-check FILE [--equilibrium ID] [--regime R] [--set p=v]`:
+    the **equilibrium checks** of I.8 at the fixed values, with exact
+    rational arithmetic: per player the payoff, the best-response value
+    (policy iteration with exact linear solves), the deviation gain and
+    the canonical best response; `status`, `deviators`, and
+    `from_every_state`.
+  - `cadl game-check FILE --certify [--max-depth N] [--max-cells N]
+    [--partition N] [--no-merge]`: the **equilibrium maps** of I.9. A cell
+    is `equilibrium` or `not_equilibrium` (with `deviators`, a deviation
+    for each, and bounds of the gains) only when that holds at every
+    valuation of the cell, established by parameter lifting of the game
+    of each player against the profile and the conditions N, E1 and E2;
+    otherwise `undecided`, with a `reason`. Text and JSON output in the
+    shape of I.13; exit status 0 (computed), 1 (a map did not reach its
+    resolution, or a query was not evaluated), 2 (nothing can be claimed).
+  - `cadl model-check` evaluates the properties and regime maps of a
+    strategic model in the Markov chain of their `profile:` (default: the
+    compliance profile). `cadl model-export` writes the game in the model
+    language of PRISM-games (`smg`, `player … endplayer`; no properties
+    file; not run through PRISM-games). `cadl sim-ir` carries the game in
+    `stochastic_model` (`kind: "smg"`, `owner`, `profile`,
+    `open_in_equilibria`, `players`, `profiles`, `compliance`, `payoffs`,
+    `equilibria`).
+  - A payoff term with `sanction_of:` or `reward_of:` (Appendix J) is
+    parsed and never read with a default weight: the equilibrium queries
+    of such a model report `not_evaluated`.
+  - Examples `examples/games_robot_delivery.cadl` and
+    `examples/games_two_players.cadl` (the two examples of I.12).
+  - Tests: every number of I.12; a soundness fuzzer of the maps
+    (`tests/games_fuzz.py`: random parametric games against a brute-force
+    oracle that shares no code with `cadl`), with five deliberate
+    soundness bugs that it must detect; best-response values compared with
+    Storm (exact) when `stormpy` is installed.
+
+### Changed
+- In a file that declares `stochastic: 0.1` and not `games: 0.1`, a
+  `model:` block that uses `kind: smg` or keys of the strategic model
+  extension gets one more informational diagnostic (the keys belong to an
+  undeclared extension, I.15). It is read by Appendix H as before. Models
+  of Appendix H are evaluated, exported and lowered exactly as in 0.3.22.
+
 ## [0.3.22] — 2026-11-11
 
 Three parts of the extension appendices that were specified but not

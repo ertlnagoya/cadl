@@ -450,6 +450,7 @@ class Param:
     hi: Fraction | None = None
     value: Fraction | None = None      # the declared value of H.3
     open: bool = False                 # listed in the over: of a regime map
+    open_in_equilibria: bool = False   # listed in the over: of an equilibrium map (I.13)
 
 
 @dataclass
@@ -489,6 +490,7 @@ class Command:
     guard: tuple = ("bool", True)
     guard_text: str = "true"
     updates: list = field(default_factory=list)
+    owner: str | None = None           # the player who chooses it (Appendix I, I.3)
 
     def exists_in(self, design: str) -> bool:
         return not self.when or design in self.when
@@ -515,6 +517,7 @@ class Prop:
     regimes: list = field(default_factory=list)     # the designs it concerns
     text: str = ""
     expr: PropertyExpr | None = None
+    profile: str | None = None         # strategic model: evaluated under this profile (I.5)
 
 
 @dataclass
@@ -528,6 +531,7 @@ class RegimeMapQuery:
     constraint_text: str | None = None
     constraint: PropertyExpr | None = None
     resolution: Fraction = Fraction(1, 20)
+    profile: str | None = None         # strategic model: evaluated under this profile (I.5)
 
 
 @dataclass
@@ -549,6 +553,15 @@ class Model:
     properties: list = field(default_factory=list)
     regime_maps: list = field(default_factory=list)
     designs: list = field(default_factory=list)
+    # Strategic model (Appendix I, kind "smg"); empty for a model of Appendix H.
+    players: list = field(default_factory=list)
+    profiles: list = field(default_factory=list)
+    compliance: str | None = None
+    payoffs: list = field(default_factory=list)
+    equilibria: list = field(default_factory=list)
+    # Weights of payoff terms that are defined outside Appendix I (a term
+    # with sanction_of: or reward_of:, Appendix J): (player, reward) -> param_expr tree.
+    term_weights: dict = field(default_factory=dict)
 
     def design(self, name: str) -> Design | None:
         return next((d for d in self.designs if d.name == name), None)
@@ -1661,19 +1674,24 @@ class _Analyser:
                             f"'{var.id}' the value {_as_text(value)}, outside its domain, "
                             f"in the state {self.show_state(state)}, where its guard is "
                             f"true", "S-7")
-            if len(enabled) > 1:
-                for a, b in itertools.combinations(enabled, 2):
-                    if (a, b) in reported9:
-                        continue
-                    both = [d for d in self.design_names
-                            if cmds[a].exists_in(d) and cmds[b].exists_in(d)]
-                    if both:
-                        reported9.add((a, b))
-                        self.error(
-                            f"Commands {cmds[a].index} and {cmds[b].index} of the model "
-                            f"are both enabled in the state {self.show_state(state)} under "
-                            f"the design {both[0]}; at most one command may be enabled in "
-                            f"a state", "S-9")
+            self.check_enabled(state, enabled, cmds, reported9)
+
+    def check_enabled(self, state: tuple, enabled: list, cmds: list, reported9: set) -> None:
+        """S-9 in one state: `enabled` are the positions in `cmds` of the
+        commands whose guard is true."""
+        if len(enabled) > 1:
+            for a, b in itertools.combinations(enabled, 2):
+                if (a, b) in reported9:
+                    continue
+                both = [d for d in self.design_names
+                        if cmds[a].exists_in(d) and cmds[b].exists_in(d)]
+                if both:
+                    reported9.add((a, b))
+                    self.error(
+                        f"Commands {cmds[a].index} and {cmds[b].index} of the model "
+                        f"are both enabled in the state {self.show_state(state)} under "
+                        f"the design {both[0]}; at most one command may be enabled in "
+                        f"a state", "S-9")
 
     def show_state(self, state: tuple) -> str:
         return "(" + ", ".join(f"{v.id}={_as_text(x)}"
@@ -1752,7 +1770,20 @@ def analyse(sos: SoSDefinition) -> Analysis:
     """
     if sos.model is None:
         return Analysis()
-    return _Analyser(sos).run()
+    from .games import games_declared, analyse_game_file
+    if games_declared(sos):
+        return analyse_game_file(sos)         # Appendix I, I.10
+    out = _Analyser(sos).run()
+    from .games import undeclared_use
+    used = undeclared_use(sos.model)
+    if used:
+        # Informational: S-1, S-9 and S-15 already report what Appendix H
+        # makes of these keys.
+        out.infos.append(
+            f"The model uses {', '.join(used)}, which belong to the strategic model "
+            f"extension, but the file does not declare 'games: 0.1' under extensions:; "
+            f"the block is read by Appendix H (Appendix I, I.15)")
+    return out
 
 
 def checked_model(sos: SoSDefinition) -> Model | None:
@@ -1770,6 +1801,9 @@ def checked_model(sos: SoSDefinition) -> Model | None:
 def model_to_ir(model: Model) -> dict:
     """The `stochastic_model` field of the IR (H.13)."""
     designs = [d.name for d in model.designs]
+    if model.kind == "smg":
+        from .games import game_to_ir
+        return game_to_ir(model)              # Appendix I, I.13
     return {
         "kind": model.kind,
         "parameters": [
@@ -1962,6 +1996,9 @@ def prism_model_text(model: Model, design: Design) -> str:
     _check_export_names(model)
     fixed = model.fixed_values(design)
     out = ["dtmc", ""]
+    if model.kind == "smg":
+        from .games import prism_games_header
+        out = prism_games_header(model, design)   # Appendix I, I.11
     for p in model.params:
         if p.open:
             out.append(f"const double {_prism_name(p.id)};")
@@ -2067,7 +2104,8 @@ def export_prism(model: Model, regime: str | None = None) -> dict[str, str]:
     for d in designs:
         stem = f"{_file_part(model.sos_name)}_{_file_part(d.name)}"
         files[f"{stem}.prism"] = prism_model_text(model, d)
-        files[f"{stem}.props"] = prism_properties_text(model, d)
+        if model.kind != "smg":               # I.11 defines no properties file
+            files[f"{stem}.props"] = prism_properties_text(model, d)
     return files
 
 

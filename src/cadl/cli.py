@@ -184,6 +184,36 @@ def main(argv: list[str] | None = None) -> int:
     mchk_cmd.add_argument("--format", choices=["text", "json"], default="text",
                           help="Output format (default: text)")
 
+    # game-check command (strategic model extension, Appendix I)
+    gchk_cmd = subparsers.add_parser("game-check",
+        help="Evaluate the equilibrium checks of a strategic model (games 0.1) with "
+             "exact arithmetic and, with --certify, compute its equilibrium maps")
+    gchk_cmd.add_argument("file", type=Path, help="CADL file to evaluate")
+    gchk_cmd.add_argument("--equilibrium", dest="equilibria", action="append", default=[],
+                          metavar="ID", help="Evaluate only this entry of "
+                          "model.equilibria; may be repeated (default: all)")
+    gchk_cmd.add_argument("--regime", default=None,
+                          help="Evaluate only the design of this regime")
+    gchk_cmd.add_argument("--set", dest="assignments", action="append", default=[],
+                          metavar="p=v", help="Give parameter p the value v (a decimal "
+                          "or n/d) instead of its fixed value; may be repeated")
+    gchk_cmd.add_argument("--certify", action="store_true",
+                          help="Also compute the equilibrium maps (entries with over:), "
+                               "with certified cells")
+    gchk_cmd.add_argument("--max-depth", dest="max_depth", type=int, default=None, metavar="N",
+                          help="With --certify: bisect a cell at most N times (default: 24)")
+    gchk_cmd.add_argument("--max-cells", dest="max_cells", type=int, default=None, metavar="N",
+                          help="With --certify: refine the partition to at most N cells "
+                               "(default: 20000)")
+    gchk_cmd.add_argument("--partition", type=int, default=None, metavar="N",
+                          help="With --certify: start from the uniform partition of the "
+                               "region into N intervals per open parameter")
+    gchk_cmd.add_argument("--no-merge", dest="no_merge", action="store_true",
+                          help="With --certify: report the cells as analysed, without "
+                               "joining cells that carry the same claim")
+    gchk_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                          help="Output format (default: text)")
+
     # ai command
     ai_cmd = subparsers.add_parser("ai", help="Generate CADL from natural language description")
     ai_cmd.add_argument("description", nargs="?", default=None,
@@ -233,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_model_export(args)
     elif args.command == "model-check":
         return _cmd_model_check(args)
+    elif args.command == "game-check":
+        return _cmd_game_check(args)
     elif args.command == "ai":
         return _cmd_ai(args)
 
@@ -933,6 +965,10 @@ def _cmd_model_export(args: argparse.Namespace) -> int:
     except ExportError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+    if model.kind == "smg":
+        from .games import export_warnings
+        for message in export_warnings(model):
+            print(f"Warning: {message}", file=sys.stderr)
     args.output.mkdir(parents=True, exist_ok=True)
     for name, text in files.items():
         (args.output / name).write_text(text, encoding="utf-8")
@@ -1057,6 +1093,14 @@ def _cmd_model_check(args: argparse.Namespace) -> int:
     model = _load_stochastic_model(args.file)
     if model is None:
         return 2
+    strategic = model.kind == "smg"
+    if strategic:
+        # A property or regime map of a strategic model is evaluated in the
+        # Markov chain of its profile (Appendix I, I.5).
+        from .games import check_properties_game as check_properties  # noqa: F811
+        from .games import model_of_regime_map
+        if args.regime_map is not None:
+            model = model_of_regime_map(model, args.regime_map)
     certified = None
     try:
         if args.certify and args.regime_map is None:
@@ -1112,7 +1156,8 @@ def _cmd_model_check(args: argparse.Namespace) -> int:
                     "reachable_states": d["states"],
                     "properties": [
                         {"id": p["id"], "expr": p["expr"], "value": exact_text(p["value"]),
-                         "decimal": value_text(p["value"]), "result": p["result"]}
+                         "decimal": value_text(p["value"]), "result": p["result"],
+                         **({"profile": p["profile"]} if strategic else {})}
                         for p in d["properties"]
                     ],
                 }
@@ -1150,7 +1195,8 @@ def _cmd_model_check(args: argparse.Namespace) -> int:
                   f"{d['states']} reachable state(s)) ---")
             for p in d["properties"]:
                 result = f"  {p['result']}" if p["result"] else "  (query)"
-                print(f"  {p['id']}: {p['expr']}")
+                under = f"  (profile {p['profile']})" if strategic else ""
+                print(f"  {p['id']}: {p['expr']}{under}")
                 print(f"    value = {value_text(p['value'])}  (exact: "
                       f"{exact_text(p['value'])}){result}")
             if not d["properties"]:
@@ -1174,6 +1220,110 @@ def _cmd_model_check(args: argparse.Namespace) -> int:
         best = ", ".join(pt["best"]) if pt["best"] else "none (no regime satisfies the constraint)"
         print(f"  {at}: {values}; best at this point: {best}")
     return 0
+
+
+def _cmd_game_check(args: argparse.Namespace) -> int:
+    """Equilibrium checks and maps of a strategic model (Appendix I, I.13).
+
+    Exit status: 0 when every requested result was computed, whatever the
+    answers; 1 when a map did not reach its resolution or a query was not
+    evaluated; 2 when nothing can be claimed (a static error, a usage
+    error, a design that is not well-defined or a profile that is not
+    admissible at the values used)."""
+    from .games import NotEvaluated
+    from .games_eval import (
+        NOTE, EvaluationError, check_json, check_text, equilibrium_check,
+        equilibrium_map, map_json, map_text,
+    )
+    from .stochastic_eval import parse_number
+    from .stochastic_regions import DEFAULT_MAX_CELLS, DEFAULT_MAX_DEPTH
+
+    model = _load_stochastic_model(args.file)
+    if model is None:
+        return 2
+    checks, maps, skipped = [], [], []
+    status = 0
+    try:
+        if model.kind != "smg":
+            raise EvaluationError(
+                f"the model of {args.file} is not a strategic model (kind: smg, "
+                f"Appendix I); it has no equilibrium queries")
+        map_options = (args.max_depth is not None or args.max_cells is not None
+                       or args.partition is not None or args.no_merge)
+        if map_options and not args.certify:
+            raise EvaluationError(
+                "--max-depth, --max-cells, --partition and --no-merge need --certify")
+        if args.regime is not None and model.design(args.regime) is None:
+            raise EvaluationError(
+                f"'{args.regime}' is not a design of the file "
+                f"(designs: {', '.join(d.name for d in model.designs)})")
+        overrides = {}
+        for item in args.assignments:
+            name, sep, value = item.partition("=")
+            if not sep:
+                raise EvaluationError(f"--set expects p=v, not '{item}'")
+            overrides[name.strip()] = parse_number(value)
+        known = {q.id: q for q in model.equilibria}
+        for name in args.equilibria:
+            if name not in known:
+                raise EvaluationError(
+                    f"'{name}' is not an entry of model.equilibria "
+                    f"(entries: {', '.join(known) or 'none'})")
+            if known[name].is_map and not args.certify:
+                raise EvaluationError(
+                    f"'{name}' is an equilibrium map; computing it needs --certify")
+        for query in model.equilibria:
+            if args.equilibria and query.id not in args.equilibria:
+                continue
+            if query.is_map and not args.certify:
+                skipped.append(query.id)
+                continue
+            try:
+                if query.is_map:
+                    result = equilibrium_map(
+                        model, query.id, args.regime, overrides,
+                        DEFAULT_MAX_DEPTH if args.max_depth is None else args.max_depth,
+                        DEFAULT_MAX_CELLS if args.max_cells is None else args.max_cells,
+                        args.partition, not args.no_merge)
+                    if not all(d["resolution_reached"] for d in result["designs"]):
+                        status = 1
+                    maps.append(map_json(result) if args.format == "json" else result)
+                else:
+                    result = equilibrium_check(model, query.id, args.regime, overrides)
+                    checks.append(check_json(result) if args.format == "json" else result)
+            except NotEvaluated as e:
+                status = 1
+                entry = {"id": query.id, "profile": query.profile,
+                         "status": "not_evaluated", "diagnostic": str(e)}
+                (maps if query.is_map else checks).append(entry)
+    except EvaluationError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+    if args.format == "json":
+        import json
+        output = {"file": str(args.file), "sos": model.sos_name, "evaluator": NOTE,
+                  "checks": checks, "maps": maps, "maps_not_computed": skipped}
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        return status
+    print(f"Game check: {args.file}")
+    print(f"  SoS: {model.sos_name}")
+    print(f"  Evaluator: {NOTE}")
+    for result in checks + maps:
+        print()
+        if result.get("status") == "not_evaluated":
+            print(f"--- Equilibrium query '{result['id']}': not_evaluated ---")
+            print(f"  {result['diagnostic']}")
+            continue
+        for line in (map_text(result) if "over" in result else check_text(result)):
+            print(line)
+    if skipped:
+        print()
+        print(f"Equilibrium maps not computed (give --certify): {', '.join(skipped)}")
+    if not checks and not maps and not skipped:
+        print()
+        print("  (model.equilibria has no entry)")
+    return status
 
 
 def _cmd_ai(args: argparse.Namespace) -> int:

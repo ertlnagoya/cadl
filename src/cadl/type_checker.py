@@ -64,7 +64,7 @@ CODEGEN_TARGETS = ("python", "solidity", "opa", "unity-csharp",
 SIM_TARGETS = ("unity", "go")
 # Extensions this processor implements, with the versions it knows
 KNOWN_EXTENSIONS = {"sos-dsl": ("0.1",), "norms": ("0.1",), "agents": ("0.1",),
-                    "stochastic": ("0.1",)}
+                    "stochastic": ("0.1",), "games": ("0.1",)}
 
 
 @dataclass
@@ -149,6 +149,14 @@ class TypeChecker:
         """Rules S-1 to S-15 for `model:`, when the file declares
         `stochastic: 0.1`; otherwise one warning (H.15)."""
         from .stochastic import analyse, stochastic_declared
+        from .games import games_declared
+        if games_declared(sos) and not stochastic_declared(sos):
+            self.result.add_error(
+                "The file declares 'games: 0.1' without 'stochastic: 0.1'; the strategic "
+                "model extension requires the stochastic model extension, and its keys "
+                "are not interpreted (Appendix I, I-1)",
+                sos.loc,
+            )
         if sos.model is None:
             return
         if not stochastic_declared(sos):
