@@ -137,7 +137,9 @@ MAX_BODY = 1 << 20
 MAX_RESPONSE = 16 << 20
 MAX_ARGS = 16
 MAX_ARG_LEN = 256
-UNAUTH_PER_SECOND = 20
+UNAUTH_PER_SECOND = 20         # records of refused requests a second, per event
+MAX_NONCES = 1_000_000         # authenticated requests in one run
+MAX_HANDLERS = 64              # requests handled at the same time
 
 _AUTH_RE = re.compile(r'CADL-HMAC actor="([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]{1,9}\])?)", '
                       r'nonce="([0-9a-f]{32})", mac="([0-9a-f]{64})"')
@@ -258,7 +260,8 @@ class A2AGateway(EnforcementPoint):
                  upstream_token: str | None = None,
                  upstream_timeout: float = 300.0,
                  agent_card: dict | None = None,
-                 post_upstream: Callable[[str], bytes] | None = None) -> None:
+                 post_upstream: Callable[[str], bytes] | None = None,
+                 max_nonces: int = MAX_NONCES) -> None:
         self._load(file)
         self.receiver = self._actor(agent_actor, "--agent-actor")
         decl = next((a for a in self.sos.actors if a.id.name == self.receiver["name"]), None)
@@ -268,6 +271,8 @@ class A2AGateway(EnforcementPoint):
                                f"(agent: {{ kind: llm_agent, protocol: a2a }})")
         if decl.agent.protocol != "a2a":
             raise GatewayError(f"{agent_actor} does not declare protocol: a2a")
+        self.approval_rules = self._approval_rules(self.receiver)
+        self._check_approvable(self.receiver)
         if not client_keys:
             raise GatewayError("--client-keys names no actor")
         for actor in client_keys:
@@ -295,12 +300,24 @@ class A2AGateway(EnforcementPoint):
         if upstream_token is not None and not _TOKEN_RE.fullmatch(upstream_token):
             raise GatewayError("the upstream token has a character that is not printable "
                                "ASCII")
+        if upstream_token is not None and parts.scheme == "http" \
+                and not _is_loopback(parts.hostname):
+            raise GatewayError("--upstream-token needs an https upstream or a loopback "
+                               "address (the token would cross the network in the clear)")
+        if agent_card is not None:
+            caps = agent_card.get("capabilities")
+            exts = caps.get("extensions") if isinstance(caps, dict) else None
+            if not isinstance(exts, list) or not any(
+                    isinstance(e, dict) and e.get("uri") == EXTENSION_URI for e in exts):
+                raise GatewayError(f"--agent-card does not declare the extension "
+                                   f"{EXTENSION_URI} under capabilities.extensions")
         self.upstream_token = upstream_token
         self.upstream_timeout = upstream_timeout
         self.agent_card = agent_card
         self.post_upstream = post_upstream or self._post
         self.client_nonces: set = set()
-        self.unauth_second, self.unauth_count, self.unauth_suppressed = -1, 0, 0
+        self.max_nonces = max_nonces
+        self.refusals: dict[str, list] = {}     # event -> [second, count, not recorded]
         self.tasks: dict[str, _Task] = {}          # the tasks of the gateway
         self.task_owner: dict[str, str] = {}       # tasks of the agent -> actor
         self.context_owner: dict[str, str] = {}    # contexts -> actor
@@ -441,21 +458,33 @@ class A2AGateway(EnforcementPoint):
                                f"gateway")
 
     def _unauthenticated(self, why: str) -> None:
-        """Record a request without identity: at most `UNAUTH_PER_SECOND`
-        records in a second of the gateway's clock; the next record
-        counts the requests that were not recorded."""
+        self._refusal("unauthenticated_request", why)
+
+    def _refusal(self, event: str, why: str) -> None:
+        """Record a request that is refused before it has an identity: at
+        most `UNAUTH_PER_SECOND` records of `event` in a second of the
+        gateway's clock; the next record counts the requests that were not
+        recorded."""
         second = int(self.now())
-        if second != self.unauth_second:
-            self.unauth_second, self.unauth_count = second, 0
-        if self.unauth_count >= UNAUTH_PER_SECOND:
-            self.unauth_suppressed += 1
+        entry = self.refusals.setdefault(event, [-1, 0, 0])
+        if second != entry[0]:
+            entry[0], entry[1] = second, 0
+        if entry[1] >= UNAUTH_PER_SECOND:
+            entry[2] += 1
             return
-        self.unauth_count += 1
+        entry[1] += 1
         reason = why
-        if self.unauth_suppressed:
-            reason += f";not_recorded_before={self.unauth_suppressed}"
-            self.unauth_suppressed = 0
-        self._host_event("unauthenticated_request", reason=reason)
+        if entry[2]:
+            reason += f";not_recorded_before={entry[2]}"
+            entry[2] = 0
+        self._host_event(event, reason=reason)
+
+    def overloaded(self) -> Reply:
+        """A request beyond `MAX_HANDLERS` at the same time: 503."""
+        with self.lock:
+            self._refusal("overloaded", "handlers")
+        return Reply(503, _error(None, INTERNAL_ERROR, "the gateway is busy"),
+                     self._headers({"Retry-After": "1"}))
 
     def _authenticate(self, values: list, path: str, body: bytes) -> tuple[str | None, str]:
         if not values:
@@ -476,6 +505,8 @@ class A2AGateway(EnforcementPoint):
         with self.lock:
             if nonce in self.client_nonces:
                 return None, "replayed"
+            if len(self.client_nonces) >= self.max_nonces:
+                return None, "nonce_limit"
             self.client_nonces.add(nonce)
         return who["text"], ""
 
@@ -690,12 +721,16 @@ class A2AGateway(EnforcementPoint):
         return self._rejected(h.actor, h.id, h.request["params"]["message"].get("contextId"),
                               h.message, rec)
 
-    def _withdraw(self, hold_id: str) -> None:
-        """Withdraw a held request (G.6); with the lock held."""
-        self.held.pop(hold_id, None)
-        self._unpublish_hold(hold_id)
+    def _withdraw(self, hold_id: str, events: list | None = None) -> None:
+        """Withdraw a held request (G.6); with the lock held. The hold
+        stays in `held` until the step closes it, so that the answer comes
+        from its closing record: `withdrawn`, or `expired` when its deadline
+        passed before the ticker observed it."""
+        line: dict[str, Any] = {"t": self.now(), "withdraw": [hold_id]}
+        if events:
+            line["host_events"] = events
         try:
-            self._settle(self._step({"t": self.now(), "withdraw": [hold_id]}))
+            self._settle(self._step(line))
         except Exception:       # noqa: BLE001
             self._fail_held()
 
@@ -712,8 +747,13 @@ class A2AGateway(EnforcementPoint):
 
     def _closed_denied(self, hold_id: str, h: _A2AHeld, rec: dict) -> None:
         h.outcome = ("deny", rec)
-        self._settle_task(h, "TASK_STATE_REJECTED", denial_text(h.message, rec, "message"),
-                          _result_meta(rec))
+        if rec.get("outcome") == "withdrawn":
+            self._settle_task(h, "TASK_STATE_CANCELED",
+                              f"Withdrawn by the client while held ({hold_id}).",
+                              _result_meta(rec))
+        else:
+            self._settle_task(h, "TASK_STATE_REJECTED",
+                              denial_text(h.message, rec, "message"), _result_meta(rec))
         h.done.set()
 
     def _failed_answer(self, hold_id: str, h: _A2AHeld) -> None:
@@ -732,7 +772,18 @@ class A2AGateway(EnforcementPoint):
     def _forward_released(self, h: _A2AHeld) -> None:
         """Pass on a released request whose client has the task of the
         gateway (returnImmediately), and keep what the agent answered."""
-        reply = self._forward(h.actor, h.id, h.wire, h.upstream_id, h.message)
+        try:
+            reply = self._forward(h.actor, h.id, h.wire, h.upstream_id, h.message)
+        except Exception as e:      # noqa: BLE001 - the task never stays submitted
+            _log(f"the released request {h.id!r} failed: {type(e).__name__}: {e}")
+            with self.lock:
+                self._host_event("forward_failed", reason=f"{type(e).__name__}: {e}"[:200],
+                                 message=h.message)
+                t = self.tasks.get(h.task_id)
+                if t is not None:
+                    t.state, t.timestamp = "TASK_STATE_FAILED", self._stamp()
+                    t.text = "The request was released and could not be passed on."
+            return
         with self.lock:
             t = self.tasks.get(h.task_id)
             if t is None:
@@ -949,11 +1000,11 @@ class A2AGateway(EnforcementPoint):
             if t is not None and t.owner == actor:
                 h = self.held.get(t.hold_id) if t.hold_id else None
                 if h is not None:
-                    self._withdraw(t.hold_id)
-                    _log(f"the client cancelled the held request {h.id!r} ({t.hold_id}); "
-                         f"it is withdrawn")
-                    t.state, t.timestamp = "TASK_STATE_CANCELED", self._stamp()
-                    t.text = f"Withdrawn by the client while held ({t.hold_id})."
+                    self._withdraw(t.hold_id, [{
+                        "event": "task_cancel", "reason": f"gateway task {tid}",
+                        "hold_id": t.hold_id,
+                        "message": {k: h.message[k] for k in ("from", "to", "name")}}])
+                    _log(f"the client cancelled the held request {h.id!r} ({t.hold_id})")
                     return self._rpc({"jsonrpc": "2.0", "id": id_,
                                       "result": self._task_json(t)})
                 if t.upstream_id is None:
@@ -965,6 +1016,8 @@ class A2AGateway(EnforcementPoint):
                 upstream = tid
             else:
                 return self._task_refused("CancelTask", id_, "not a task of the client")
+            # Recorded before it is passed on: it changes the state of the agent.
+            self._host_event("task_cancel", reason=f"agent task {upstream} ({actor})")
         return self._task_call(actor, id_, "CancelTask", params, upstream, tid)
 
     # --- end ----------------------------------------------------------------------------
@@ -1017,8 +1070,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _closed(self) -> bool:
         """Whether the client has closed the connection. The gateway reads
         one request per connection, so whatever the client sends while its
-        request is held is read here and dropped. Plain TCP: a readable
-        socket with nothing to read. TLS: a read that ends the connection
+        request is held is read here and dropped. Plain TCP: a read that
+        ends the connection; a half-close (SHUT_WR) counts as closed. TLS: a read that ends the connection
         (close_notify, or the end of the stream); TLS 1.3 encrypts the
         alert, so the raw bytes do not tell."""
         conn = self.connection
@@ -1042,7 +1095,10 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         try:
             s.setblocking(False)
-            return s.recv(1, socket.MSG_PEEK) == b""
+            for _ in range(256):            # at most 1 MiB in one look
+                if s.recv(4096) == b"":
+                    return True             # closed, or half-closed (SHUT_WR)
+            return False
         except BlockingIOError:
             return False
         except OSError:
@@ -1051,9 +1107,25 @@ class _Handler(BaseHTTPRequestHandler):
             s.close()
 
     def do_GET(self):       # noqa: N802
-        self._send(self.server.gw.handle_get(self.path))
+        self._limited(lambda: self._send(self.server.gw.handle_get(self.path)))
 
     def do_POST(self):      # noqa: N802
+        self._limited(self._post)
+
+    def _limited(self, fn) -> None:
+        """At most `max_handlers` requests at the same time (a held
+        blocking request counts); beyond that 503, recorded as
+        `overloaded` at the rate of refused requests."""
+        slots = self.server.slots
+        if not slots.acquire(blocking=False):
+            self._send(self.server.gw.overloaded())
+            return
+        try:
+            fn()
+        finally:
+            slots.release()
+
+    def _post(self) -> None:
         gw = self.server.gw
         bad = None
         lengths = self.headers.get_all("Content-Length") or []
@@ -1094,9 +1166,10 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = True
     request_queue_size = 128
 
-    def __init__(self, address, gw, family):
+    def __init__(self, address, gw, family, max_handlers: int = MAX_HANDLERS):
         self.address_family = family
         self.gw = gw
+        self.slots = threading.BoundedSemaphore(max_handlers)
         super().__init__(address, _Handler)
 
     def handle_error(self, request, client_address):
@@ -1125,7 +1198,7 @@ def _is_loopback(host: str) -> bool:
 
 def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None = None,
           tls_cert: Path | None = None, tls_key: Path | None = None,
-          poll: float = 0.05) -> int:
+          poll: float = 0.05, max_handlers: int = MAX_HANDLERS) -> int:
     """Run the gateway until SIGTERM or SIGINT. Returns the exit status."""
     host, port = parse_listen(listen)
     if not _is_loopback(host) and tls_cert is None:
@@ -1148,7 +1221,7 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
         raise GatewayError(f"--listen {listen}: {e}") from None
     gw = A2AGateway(**gw_args)
     try:
-        server = _Server((host, port), gw, family)
+        server = _Server((host, port), gw, family, max_handlers)
     except OSError as e:
         gw.stop()
         raise GatewayError(f"cannot listen on {listen}: {e}") from None
@@ -1224,15 +1297,17 @@ def cli_gateway(args) -> int:
                                            else str(args.audit)).with_suffix(".trace.jsonl")
         if Path(trace_out).resolve() == Path(args.audit).resolve():
             raise GatewayError("the trace and the audit log are the same file")
-        if args.poll <= 0 or args.upstream_timeout <= 0:
-            raise GatewayError("--poll and --upstream-timeout must be positive")
+        if args.poll <= 0 or args.upstream_timeout <= 0 or args.max_handlers < 1:
+            raise GatewayError("--poll, --upstream-timeout and --max-handlers must be "
+                               "positive")
         gw_args = dict(file=args.file, agent_actor=args.agent_actor, upstream=args.upstream,
                        client_keys=clients, audit=args.audit, trace_out=trace_out, key=key,
                        inbox=args.approvals, init=init, approver_keys=ring,
                        insecure_approvals=args.insecure_approvals, upstream_token=token,
                        upstream_timeout=args.upstream_timeout, agent_card=card)
         code = serve(gw_args, listen=args.listen, port_file=args.port_file,
-                     tls_cert=args.tls_cert, tls_key=args.tls_key, poll=args.poll)
+                     tls_cert=args.tls_cert, tls_key=args.tls_key, poll=args.poll,
+                     max_handlers=args.max_handlers)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

@@ -174,7 +174,8 @@ HOST_EVENTS = ("method_refused", "unsolicited_response", "unauthorised_approval"
                "unauthorised_rejection", "unauthorised_message", "approval_evidence",
                "approval_unauthenticated", "forward_failed",
                # cadl a2a-gateway (0.3.25)
-               "unauthenticated_request", "task_refused", "invalid_response")
+               "unauthenticated_request", "task_refused", "invalid_response",
+               "task_cancel", "overloaded")
 _HOST_EVENT_KEYS = {"event", "reason", "hold_id", "message"}
 
 

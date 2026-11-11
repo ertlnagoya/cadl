@@ -565,14 +565,14 @@ def headers(**h) -> Headers:
 class Local:
     """A gateway in process with a fake agent function and a fake clock."""
 
-    def __init__(self, tmp_path, answer=None, cadl=CADL, **kw):
+    def __init__(self, tmp_path, answer=None, cadl=CADL, agent="SUMMARIZER", **kw):
         self.t = [0.0]
         self.sent: list[dict] = []
         self.answer = answer
         self.audit = tmp_path / "audit.jsonl"
         self.trace = tmp_path / "audit.trace.jsonl"
         self.cadl = cadl
-        self.gw = A2AGateway(cadl, "SUMMARIZER", "http://127.0.0.1:9/", dict(CLIENT_KEYS),
+        self.gw = A2AGateway(cadl, agent, "http://127.0.0.1:9/", dict(CLIENT_KEYS),
                              self.audit, self.trace, clock=lambda: self.t[0],
                              post_upstream=self._post, **kw)
 
@@ -830,7 +830,8 @@ def test_tls_and_agent_card(tmp_path, capsys):
         pytest.skip("openssl cannot make a certificate")
     card = tmp_path / "card.json"
     card.write_text(json.dumps({"name": "summarizer", "securitySchemes": {
-        "cadl": {"httpAuthSecurityScheme": {"scheme": "CADL-HMAC"}}}}))
+        "cadl": {"httpAuthSecurityScheme": {"scheme": "CADL-HMAC"}}},
+        "capabilities": {"extensions": [{"uri": EXTENSION_URI, "required": True}]}}))
     r = Run(tmp_path, extra=("--tls-cert", str(cert), "--tls-key", str(key),
                              "--agent-card", str(card)))
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -874,6 +875,22 @@ def test_tls_and_agent_card(tmp_path, capsys):
     capsys.readouterr()
 
 
+def workers_file(tmp_path, receiver: str = "SUMMARIZER[*]") -> Path:
+    """The test file with a set SUMMARIZER[1..2] and approval rules whose
+    receiver is `receiver`."""
+    f = tmp_path / "workers.cadl"
+    text = CADL.read_text().replace("- id: SUMMARIZER\n", "- id: SUMMARIZER[1..2]\n")
+    text = text.replace("parties: [OPERATOR, PLANNER, SUMMARIZER]",
+                        'parties: [OPERATOR, PLANNER, "SUMMARIZER[*]"]')
+    text = text.replace("-> SUMMARIZER :", "-> SUMMARIZER[*] :")
+    text = text.replace('"OPERATOR -> SUMMARIZER[*] : approve", creates',
+                        f'"OPERATOR -> {receiver} : approve", creates')
+    text = text.replace('"OPERATOR -> SUMMARIZER[*] : reject",  creates',
+                        f'"OPERATOR -> {receiver} : reject",  creates')
+    f.write_text(text)
+    return f
+
+
 class TestReviewFindings:
     """Defects found by an independent review of the first version."""
 
@@ -906,28 +923,56 @@ class TestReviewFindings:
         loc.stop_and_replay()
 
     def test_approval_rule_with_a_set_receiver(self, tmp_path):
-        """`OPERATOR -> WORKER[*] : approve` creates approval: an A2A
-        message named approve is refused also in front of WORKER[1]."""
-        f = tmp_path / "workers.cadl"
-        text = CADL.read_text().replace("- id: SUMMARIZER\n", "- id: SUMMARIZER[1..2]\n")
-        text = text.replace("parties: [OPERATOR, PLANNER, SUMMARIZER]",
-                            'parties: [OPERATOR, PLANNER, "SUMMARIZER[*]"]')
-        f.write_text(text.replace("-> SUMMARIZER :", "-> SUMMARIZER[*] :"))
-        loc = Local.__new__(Local)
-        loc.t, loc.sent, loc.answer, loc.cadl = [0.0], [], None, f
-        loc.audit, loc.trace = tmp_path / "audit.jsonl", tmp_path / "audit.trace.jsonl"
-        loc.gw = A2AGateway(f, "SUMMARIZER[1]", "http://127.0.0.1:9/", dict(CLIENT_KEYS),
-                            loc.audit, loc.trace, clock=lambda: loc.t[0],
-                            post_upstream=loc._post)
-        assert loc.gw.approval_rules == []            # no concrete receiver
+        """`OPERATOR -> SUMMARIZER[*] : approve` creates approval. In front
+        of SUMMARIZER[1] the gateway names the receiver SUMMARIZER[1]: an
+        approval through the inbox closes the hold, bound to the arguments,
+        and an A2A message named approve is refused."""
+        f = workers_file(tmp_path)
+        approvers = {"OPERATOR": APPROVER_KEYS["OPERATOR"]}
+        loc = Local(tmp_path, cadl=f, agent="SUMMARIZER[1]", inbox=tmp_path / "inbox",
+                    approver_keys=approvers)
+        assert [(e, to, n) for e, _, to, n in loc.gw.approval_rules] == [
+            ("approval", "SUMMARIZER[1]", "approve"), ("rejection", "SUMMARIZER[1]", "reject")]
         held = loc.post(rpc("SendMessage", params("publish", returnImmediately=True)))
-        assert held.body["result"]["task"]["status"]["state"] == "TASK_STATE_SUBMITTED"
+        gw_id = held.body["result"]["task"]["id"]
         reply = loc.post(rpc("SendMessage", params("approve", args=["h-1"])),
                          actor="OPERATOR")
         assert reply.body["result"]["task"]["status"]["state"] == "TASK_STATE_REJECTED"
         assert loc.sent == [] and loc.gw.runtime.hold_state("h-1") == "held"
-        assert ("unauthorised_message", "approval_as_message") in host_events(loc.audit)
+        from cadl.gateway_core import _drop
+        _drop(tmp_path / "inbox", approval_file(tmp_path / "inbox", "h-1", "approve",
+                                                "OPERATOR", approvers["OPERATOR"]))
+        loc.gw.tick()
+        assert loc.gw.runtime.hold_state("h-1") == "approved"
+        wait_for(lambda: loc.gw.tasks[gw_id].upstream_id == "up-1", "the release")
+        assert [m["method"] for m in loc.sent] == ["SendMessage"]
+        events = host_events(loc.audit)
+        assert ("unauthorised_message", "approval_as_message") in events
+        assert [e for e, _ in events].count("approval_evidence") == 1
         loc.stop_and_replay()
+
+    def test_unapprovable_escalation_refused_at_start(self, tmp_path):
+        """A receiver set that does not contain the gateway's actor: the
+        holds of the contract could never be approved, so neither gateway
+        starts."""
+        f = workers_file(tmp_path, receiver="SUMMARIZER[2..2]")
+        with pytest.raises(GatewayError, match="could never be approved"):
+            Local(tmp_path, cadl=f, agent="SUMMARIZER[1]")
+        assert not (tmp_path / "audit.jsonl").exists()
+        Local(tmp_path, cadl=f, agent="SUMMARIZER[2]").gw.stop()    # a member: starts
+        g = tmp_path / "mcp.cadl"
+        g.write_text(ROOT.joinpath("examples", "agents_tool_governance.cadl").read_text()
+                     .replace("- id: PLANNER\n", "- id: PLANNER[1..2]\n")
+                     .replace("parties: [OPERATOR, PLANNER, SUMMARIZER, FILES, TICKETS]",
+                              'parties: [OPERATOR, "PLANNER[*]", SUMMARIZER, FILES, TICKETS]')
+                     .replace("-> PLANNER :", "-> PLANNER[*] :")
+                     .replace("bearer: PLANNER", "bearer: PLANNER[1]")
+                     .replace('"PLANNER ->', '"PLANNER[1] ->')
+                     .replace("to: [PLANNER, SUMMARIZER]", 'to: ["PLANNER[1]", SUMMARIZER]'))
+        from cadl.mcp_gateway import Gateway
+        with pytest.raises(GatewayError, match="could never be approved"):
+            Gateway(g, "PLANNER[1]", "FILES", tmp_path / "m.jsonl", tmp_path / "m.trace.jsonl",
+                    to_client=lambda _: None, to_server=lambda _: None)
 
     def test_unauthenticated_records_are_limited(self, tmp_path):
         loc = Local(tmp_path)
@@ -943,3 +988,123 @@ class TestReviewFindings:
         with pytest.raises(GatewayError, match="port"):
             A2AGateway(CADL, "SUMMARIZER", "http://127.0.0.1:99999/", dict(CLIENT_KEYS),
                        tmp_path / "a.jsonl", tmp_path / "a.trace.jsonl")
+
+
+class TestSecondReview:
+    """Defects and hardening from the second review."""
+
+    def test_close_with_junk_and_half_close(self, tmp_path, capsys):
+        """A client that sends more bytes and then closes, and a client
+        that half-closes (SHUT_WR), both withdraw their held request."""
+        r = Run(tmp_path)
+
+        def held_request(id_):
+            body = json.dumps(rpc("SendMessage", params("publish"), id_)).encode()
+            sock = socket.create_connection(("127.0.0.1", r.client.port))
+            auth = authorization(CLIENT_KEYS["PLANNER"], "PLANNER", r.run_id, body)
+            sock.sendall((f"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                          f"A2A-Version: 1.0\r\nContent-Length: {len(body)}\r\n"
+                          f"Authorization: {auth}\r\n\r\n").encode() + body)
+            return sock
+
+        s1 = held_request(1)
+        h1 = r.wait_hold("h-1")
+        s1.sendall(b"X" * 100)
+        s1.close()
+        wait_for(lambda: not h1.exists(), "the withdrawal after junk")
+        s2 = held_request(2)
+        h2 = r.wait_hold("h-2")
+        s2.shutdown(socket.SHUT_WR)
+        wait_for(lambda: not h2.exists(), "the withdrawal after a half-close")
+        s2.close()
+        r.stop()
+        assert r.agent.sent() == []
+        assert [h["state"] for h in r.replay_check()["holds"]] == ["withdrawn", "withdrawn"]
+        capsys.readouterr()
+
+    def test_cancel_after_the_deadline(self, tmp_path):
+        """CancelTask after the deadline, before the ticker saw it: the hold
+        expired, and the answer says so."""
+        loc = Local(tmp_path)
+        tid = loc.post(rpc("SendMessage", params("publish", returnImmediately=True))).body[
+            "result"]["task"]["id"]
+        loc.t[0] = 601.0
+        task = loc.post(rpc("CancelTask", {"id": tid})).body["result"]
+        assert task["status"]["state"] == "TASK_STATE_REJECTED"
+        assert "expired" in task["status"]["message"]["parts"][0]["text"]
+        assert loc.gw.runtime.hold_state("h-1") == "expired"
+        loc.stop_and_replay()
+
+    def test_cancel_is_recorded(self, tmp_path):
+        loc = Local(tmp_path)
+        up = loc.post(rpc("SendMessage", params("summarize"))).body["result"]["task"]["id"]
+        tid = loc.post(rpc("SendMessage", params("publish", returnImmediately=True))).body[
+            "result"]["task"]["id"]
+        assert loc.post(rpc("CancelTask", {"id": tid})).body["result"]["status"]["state"] \
+            == "TASK_STATE_CANCELED"
+        loc.post(rpc("CancelTask", {"id": up}))
+        recs = [r for r in read_records(loc.audit) if r.get("event") == "task_cancel"]
+        assert [(r["reason"], r["hold_id"]) for r in recs] == [
+            (f"gateway task {tid}", "h-1"), (f"agent task {up} (PLANNER)", None)]
+        assert recs[0]["message"]["name"] == "publish"
+        assert [m["method"] for m in loc.sent] == ["SendMessage", "CancelTask"]
+        loc.stop_and_replay()
+
+    def test_agent_card_declares_the_extension(self, tmp_path):
+        with pytest.raises(GatewayError, match="does not declare the extension"):
+            Local(tmp_path, agent_card={"name": "x"})
+        loc = Local(tmp_path, agent_card={"capabilities": {"extensions": [
+            {"uri": EXTENSION_URI}]}})
+        assert loc.gw.handle_get("/.well-known/agent-card.json").status == 200
+        loc.gw.stop()
+
+    def test_token_over_plain_http(self, tmp_path):
+        with pytest.raises(GatewayError, match="https"):
+            A2AGateway(CADL, "SUMMARIZER", "http://192.0.2.1/", dict(CLIENT_KEYS),
+                       tmp_path / "a.jsonl", tmp_path / "a.trace.jsonl",
+                       upstream_token="secret-token")
+        A2AGateway(CADL, "SUMMARIZER", "https://192.0.2.1/", dict(CLIENT_KEYS),
+                   tmp_path / "b.jsonl", tmp_path / "b.trace.jsonl",
+                   upstream_token="secret-token").stop()
+
+    def test_nonce_limit(self, tmp_path):
+        loc = Local(tmp_path, max_nonces=2)
+        assert loc.post(rpc("SendMessage", params("summarize"))).status == 200
+        assert loc.post(rpc("SendMessage", params("summarize"), 2)).status == 200
+        assert loc.post(rpc("SendMessage", params("summarize"), 3)).status == 401
+        assert host_events(loc.audit)[-1] == ("unauthenticated_request", "nonce_limit")
+        loc.stop_and_replay()
+
+    def test_released_forward_that_raises(self, tmp_path, monkeypatch):
+        loc = Local(tmp_path, inbox=tmp_path / "inbox",
+                    approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]})
+        tid = loc.post(rpc("SendMessage", params("publish", returnImmediately=True))).body[
+            "result"]["task"]["id"]
+
+        def boom(*a, **k):
+            raise RuntimeError("injected")
+        monkeypatch.setattr(loc.gw, "_forward", boom)
+        from cadl.gateway_core import _drop
+        _drop(tmp_path / "inbox", approval_file(tmp_path / "inbox", "h-1", "approve",
+                                                "OPERATOR", APPROVER_KEYS["OPERATOR"]))
+        loc.gw.tick()
+        wait_for(lambda: loc.gw.tasks[tid].state == "TASK_STATE_FAILED", "the failed task")
+        assert ("forward_failed", "RuntimeError: injected") in host_events(loc.audit)
+        loc.stop_and_replay()
+
+
+def test_overloaded(tmp_path, capsys):
+    """Beyond --max-handlers requests at the same time (here 1, taken by a
+    held blocking request), the gateway answers 503 and records it."""
+    r = Run(tmp_path, extra=("--max-handlers", "1"))
+    fut = r.later("PLANNER", "SendMessage", params("publish"))
+    r.wait_hold("h-1")
+    status, headers_, _ = r.client.post("PLANNER", rpc("SendMessage", params("summarize")))
+    assert status == 503 and headers_["Retry-After"] == "1"
+    r.approve("h-1", "reject")
+    assert state(fut.result(timeout=30)) == "TASK_STATE_REJECTED"
+    r.stop()
+    assert any(e == "overloaded" for e, _ in
+               ((x["event"], x["reason"]) for x in read_records(r.audit) if x.get("event")))
+    r.replay_check()
+    capsys.readouterr()

@@ -168,6 +168,8 @@ class Gateway(EnforcementPoint):
         if (decl.agent.protocol or "mcp") != "mcp":
             raise GatewayError(f"{server_actor} speaks {decl.agent.protocol}, not mcp")
         self.tools = list(decl.agent.tools)
+        self.approval_rules = self._approval_rules(self.server)
+        self._check_approvable(self.server)
         self._open(audit, trace_out, key, inbox, init, clock, wall, approver_keys,
                    insecure_approvals, run_id)
 

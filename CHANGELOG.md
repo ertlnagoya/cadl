@@ -109,6 +109,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the inbox of `cadl mcp-message`. Over TLS, a client that closed the
   connection of a held request with close_notify was not seen as gone.
   Unauthenticated requests are recorded at most 20 times a second.
+- Second review of `cadl a2a-gateway`. An approval rule whose receiver is
+  a set or a range now names the gateway's own actor when it is a member
+  (`mcp-approve` works, bound to the arguments), for the A2A and the MCP
+  gateway; a gateway whose actor's contract escalates with no approval
+  rule it can name refuses to start. A client that sends more bytes and
+  then closes, or half-closes, withdraws its held request. A cancellation
+  or disconnect after a deadline that the ticker had not yet observed is
+  answered from the closing record (`expired`). `CancelTask` is recorded
+  (`task_cancel`). A released `returnImmediately` request that cannot be
+  passed on fails its task (`forward_failed`). `--agent-card` has to
+  declare the extension; `--upstream-token` is refused with a plain-HTTP
+  agent off loopback; at most `--max-handlers` (64) requests at a time,
+  more get 503 (`overloaded`); at most 1 000 000 nonces per run.
 
 ### Changed
 - The audit file of `cadl agents-run --audit` has a header line, an end

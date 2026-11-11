@@ -241,6 +241,9 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--upstream-timeout", type=float, default=300.0,
                          metavar="SECONDS", help="Timeout of a request to the agent "
                                                  "(default 300)")
+    a2a_cmd.add_argument("--max-handlers", type=int, default=64, metavar="N",
+                         help="Requests handled at the same time, held blocking "
+                              "requests included (default 64); beyond that 503")
     a2a_cmd.add_argument("--poll", type=float, default=0.05, metavar="SECONDS",
                          help="Interval for the inbox and for deadlines (default 0.05)")
 
