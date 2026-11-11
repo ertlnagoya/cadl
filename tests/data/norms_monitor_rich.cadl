@@ -1,0 +1,121 @@
+# A contract that uses every construct of the norms extension the verdict
+# engine reads: suspend / resume / activate / discharge powers, a power with
+# a trigger, triggers on messages and on predicates, until:, a reparation
+# chain, event, message and temporal contents, counts-as rules with if: and
+# with a predicate, a quantity written without an actor (demand), and state
+# and temporal assume: / guarantee: items.
+# tests/test_norms_monitor.py compares the generated monitor with
+# `cadl norms-eval` on random traces of it.
+
+sos:
+  name: Rich
+  extensions:
+    - sos-dsl: 0.1
+    - norms: 0.1
+  actors:
+    - {id: D, role: d}
+    - {id: "R[1..3]", role: r}
+  contracts:
+    - id: C
+      parties: [D, "R[*]"]
+      assume:
+        - "D.up == true"
+        - "throughout(6s, R[i].load <= 9)"
+      guarantee:
+        - "R[i].temp < 90"
+        - "until(R[i].mode != Broken, R[i].done == true, 12s)"
+        - "within(4s, R[i].ok == true) OR D.override == true"
+      lifecycle:
+        states: [Open, Busy, Closed]
+        initial: Open
+        terminal: [Closed]
+        transitions:
+          - {id: start, from: Open, to: Busy, on: "D -> R[i] : order"}
+          - {id: stop, from: Busy, to: Closed, on: "R[i] -> D : done"}
+      counts_as:
+        - {when: "D -> R[i] : pause", creates: pausing}
+        - {when: "D -> R[i] : go", creates: resuming, if: "D.up == true"}
+        - {when: "R[i].temp > 80", creates: overheat}
+        - {when: "R[*] -> D : stop", creates: stopping}
+        - {when: "demand > 3", creates: surge}
+        - {when: "R[2..3] -> D : ping", creates: pinged}
+      norms:
+        - id: deliver
+          kind: obligation
+          bearer: "R[i]"
+          trigger: "D -> R[i] : order"
+          content: "R[i] -> D : done"
+          deadline: 5s
+          on_violation: {severity: Major, reparation: apologise}
+        - id: apologise
+          kind: obligation
+          bearer: "R[i]"
+          content: "R[i] -> D : sorry(1)"
+          deadline: 2s
+          on_violation: {severity: Critical, transition: Closed}
+        - id: stay_ok
+          kind: obligation
+          bearer: "R[i]"
+          trigger: "R[i].load > request.limit"
+          until: stopping
+          content: "within(3s, R[i].ok == true)"
+          deadline: 4s
+        - id: cool
+          kind: prohibition
+          bearer: "R[i]"
+          content: overheat
+          on_violation: {severity: Critical, sanction: "cool down"}
+        - id: quiet
+          kind: prohibition
+          bearer: "R[i]"
+          trigger: "D -> R[i] : hush"
+          content: "R[i] -> D : noise"
+          deadline: 3s
+        - id: steady
+          kind: prohibition
+          bearer: "R[i]"
+          content: "throughout(2s, R[i].load > 8)"
+          on_violation: {severity: Minor}
+        - id: report
+          kind: obligation
+          bearer: "R[i]"
+          trigger: "state == Busy AND now > 2"
+          content: "R[i].done == true OR R[i].mode IN [Idle, Parked]"
+        - id: may_rest
+          kind: permission
+          bearer: "R[i]"
+          content: "R[i] -> D : rest"
+          until: "R[i].mode == Busy"
+        - id: extra
+          kind: obligation
+          bearer: "R[i]"
+          content: "R[i].done == true"
+          deadline: 6s
+        - id: shed
+          kind: obligation
+          bearer: D
+          trigger: surge
+          content: "demand <= 3 AND demand >= 0"
+          deadline: 4s
+        - id: pong
+          kind: obligation
+          bearer: D
+          trigger: pinged
+          content: "D -> R[*] : pong"
+          deadline: 3s
+        - id: pause
+          kind: power
+          bearer: D
+          content: pausing
+          effects: {suspend: [deliver, quiet, stay_ok, extra]}
+        - id: resume
+          kind: power
+          bearer: D
+          content: resuming
+          effects: {resume: [deliver, quiet, stay_ok, extra], activate: [extra]}
+        - id: abort
+          kind: power
+          bearer: D
+          trigger: "D -> R[i] : arm"
+          content: "D -> R[i] : abort"
+          effects: {discharge: [deliver, apologise, extra, steady]}

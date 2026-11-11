@@ -810,9 +810,9 @@ TARGETS = ["python", "solidity", "opa", "unity-csharp"]
 _TEMPORAL_CALL = __import__("re").compile(r"(?<![\w.])(within|throughout|until)\s*\(")
 
 
-def _generated_text(out: Path) -> str:
+def _generated_text(out: Path, skip: tuple = ()) -> str:
     return "\n".join(p.read_text(encoding="utf-8")
-                     for p in sorted(out.rglob("*")) if p.is_file())
+                     for p in sorted(out.rglob("*")) if p.is_file() and p.name not in skip)
 
 
 class TestCodegen:
@@ -820,7 +820,12 @@ class TestCodegen:
     def test_no_temporal_calls_generated(self, target, tmp_path):
         from cadl.codegen import generate
         generate(parse_file(EXAMPLE), tmp_path, target=target)
-        text = _generated_text(tmp_path)
+        # The Python target monitors the items in norms_monitor.py, which
+        # carries them as data (tests/test_norms_monitor.py); its other
+        # modules leave them out like the other targets.
+        monitor = tmp_path / "norms_monitor.py"
+        assert monitor.exists() == (target == "python")
+        text = _generated_text(tmp_path, skip=("norms_monitor.py",))
         # Only the comments that record the left-out items mention them.
         code_lines = [l for l in text.splitlines()
                       if _TEMPORAL_CALL.search(l) and "not generated" not in l]

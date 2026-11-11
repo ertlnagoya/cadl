@@ -174,6 +174,10 @@ cadl iec62853 examples/smart_city_traffic.cadl --format json
 # 記録済みトレースに対する規範拡張の判定
 cadl norms-eval examples/norms_robot_delivery.cadl --trace examples/traces/norms_robot_delivery_a_fulfilled.jsonl
 
+# 同じ判定を、生成したPythonパッケージのモニタで得る（cadlなしで動く）
+cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
+(cd /tmp/gen && python -m robot_delivery_norms.norms_monitor "$OLDPWD/examples/traces/norms_robot_delivery_a_fulfilled.jsonl" --format text)
+
 # ある版から次の版への改正が規範に及ぼす効果
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
 # 確率モデル拡張：model: ブロックをPRISMへ出力（設計ごとにモデルファイルと性質ファイル）
@@ -237,8 +241,9 @@ CADL処理系は、一般的なコンパイラと同じパイプライン構成�
 | `transitions.py` | 遷移条件を持つ運用モードコントローラ |
 | `metrics.py` | 計算式による評価指標コレクタ |
 | `runtime.py` | 全コンポーネントを結合するオーケストレータ |
+| `norms_monitor.py` | `norms: 0.1` を宣言したファイルの場合のみ：契約の規範、counts-as規則、時相演算子を含む項目をオンラインで監視するモニタ（[後述](#生成したpythonコードの規範モニタ)） |
 
-生成コードは `cadl.codegen.runtime_support` の基底クラスを継承します。
+生成コードは `cadl.codegen.runtime_support` の基底クラスを継承します。`norms_monitor.py` はcadlをインポートしません。
 
 **Solidity** (`--target solidity`):
 
@@ -545,6 +550,62 @@ cadl norms-eval FILE --trace TRACE [--contract ID] [--format text|json]
 `cadl norms-diff OLD NEW [--contract ID] [--format text|json]` は、トレースなしで、この改正が何を引き起こすかを報告します。削除・追加・種別変更された規範、`content` か `deadline:` が変わって引き継がれる規範（F.6が求める報告）、新版にない `transform:` の対象、変更された `counts_as:` 規則です。各所見にはレベル（`error`、`warning`、`info`）があります。JSONは `old`、`new`、`contracts[]`（`id`、`findings[]`：`level`、`kind`、`text` と詳細）、`errors[]`、`ok` からなります。終了ステータスは、改正を妨げるものがなければ0、エラー（`transform:` の対象がない、新版が不正）があれば1、使い方の誤りは2です。
 
 `examples/traces/` には `examples/norms_robot_delivery.cadl` 用のトレースが五つあります。すべての規範が履行される場合（a）、応答の不履行を障害報告で修復する場合（b）、両方とも不履行の場合（c）、配車係の停止により遅配が免責される場合（d）、再割当てにより義務が解除される場合（e）です。`norms_amendment_v1_to_v2.jsonl` は、`examples/norms_amendment_v1.cadl` のトレースで、障害報告の期限内に `examples/norms_amendment_v2.cadl` へ改正されます。
+### 生成したPythonコードの規範モニタ
+
+`norms: 0.1` を宣言したファイルに対して、`cadl codegen -t python` は `norms_monitor.py` も出力します。一つの契約インスタンスをオンラインで監視するモニタです（付録F、F.5）。動作中のシステムが観測を一つずつ渡すと、規範の状態と四値の判定の変化を返します。`contracts.py` から外される、時相演算子を含む `assume:` / `guarantee:` の項目も判定します。
+
+```python
+from robot_delivery_norms.norms_monitor import NormsMonitor   # 生成したパッケージ
+
+m = NormsMonitor("DELIVERY_SLA", bindings={"i": 2})
+m.observe({"t": 0.0, "values": {"DISPATCHER.is_operational": True, "ROBOT[2].status": "Idle"}})
+m.observe({"t": 1.0, "state": "Assigned",
+           "messages": [{"from": "DISPATCHER", "to": "ROBOT[2]", "name": "route_assignment"}]})
+# -> [{"t": 1.0, "kind": "norm", "id": "acknowledge", "state": "active", "verdict": "pending",
+#      "previous_state": "inactive", "previous_verdict": "pending", "reason": "trigger occurred: ..."}]
+m.next_deadline()        # 6.0：acknowledge の期限は有効化の5秒後
+m.next_check()           # 6.000000002：それを検出できる最初の時刻印
+m.observe({"t": 6.5})    # -> acknowledge が violated、report_failure が active
+m.verdicts()             # すべての規範と項目の現在の状態と判定
+m.end()                  # インスタンスの終了：規範を確定する
+m.result()               # すべて。キーは `cadl norms-eval --format json` と同じ
+```
+
+| 呼出し | 意味 |
+|---|---|
+| `NormsMonitor(contract=None, bindings=None, request=None, quantities=None, versions=None)` | 一つの契約インスタンスのモニタ。`norms:` か `counts_as:` を持つ契約が一つなら `contract` は省略できます |
+| `observe(observation)` | 観測を一つ処理します。観測は `cadl norms-eval` のトレース1行と同じキーの辞書です（`t` は必須。`values`、`messages`、`state`、`end`。最初の観測には `bindings` と `request` も書けます）。この手順での変化を返します |
+| `end()` | 最後に受け取った観測でインスタンスを終了し、規範を確定します（F.5の項目6）。`"end": True` か終端の `state` を持つ観測でも終了します |
+| `verdicts()` | `norms`（idごとの `state` と `verdict`）、`assumptions`（`status`）、`guarantees`（`verdict`）、`ok` |
+| `result()` | それまでの観測に対する `cadl norms-eval --format json` の結果（`file` を除く）。終了前は接頭辞に対する結果です |
+| `next_deadline()` | 有効な義務の期限、または有効な禁止の期間が終わる最も早い時刻。なければ `None`。ちょうどこの時刻の観測はまだ期限内です |
+| `next_check()` | 時間の経過だけを待っているものが、観測によって確実に決まる最も早い時刻印。上の期限のほか、区間が終わった時相演算子（入れ子のもの、規範の内容の中のものも含む）が対象です。待っているものがなければ `None` |
+| `started`、`ended`、`contract` | モニタの状態 |
+
+変化は辞書です。規範では `t`、`kind: "norm"`、`id`、`state`、`verdict`、`previous_state`、`previous_verdict`、`reason`（規範と手順ごとに一つで、その手順の後の状態を示します）。項目では `t`、`kind: "guarantee"` または `"assumption"`、`index`、`text`、`verdict`（前提では `status`：`holds`、`failed`）、`previous`、`reason`。
+
+**実装は一つ。** `norms_monitor.py` はcadlをインポートしません。Python 3.9以降の標準ライブラリだけで動き、このファイルだけをコピーして使えます。中身は、ファイルで宣言されたアクターと契約をデータにしたものと、`cadl norms-eval` のエンジン（`cadl/norms_eval.py` の `monitor-runtime` の印の間）とそれが使うASTクラスや補助関数をそのまま写したものです。エンジンがcadlの構文解析器を呼ぶ箇所では、生成時に構文解析器が返した結果を表から引きます。生成器は、モジュールを書き出す前にコンパイルし、使っているグローバルな名前がすべてモジュールの中で定義されていることを検査します。写したコードが写していないものを必要とする場合、`cadl codegen` はその旨のメッセージを出して失敗し、何も書き出しません。生成したパッケージはcadlのない環境でもインポートできます。ほかのモジュールは従来どおり `cadl.codegen.runtime_support` を必要とし、その名前を使った時点でインポートエラーになります。記録済みのトレースは次のように再生します。
+
+```bash
+python -m robot_delivery_norms.norms_monitor TRACE.jsonl [--contract ID] [--format json|text]
+```
+
+同じファイルとトレースに対して `cadl norms-eval` が出力するもの（JSONではキー `file` を除く）を、同じ終了ステータスで出力します。テストでは、cadlをインポートできないプロセスでモニタを動かし、サンプルのトレース、`tests/test_norms_eval.py` のすべてのケース、1,500本のランダムなトレース（アクターの範囲、範囲外のメンバー、宣言されていないアクターを含む）について両者を比較しています。
+
+**オンラインのモニタに分かること。** モニタは、それまでに受け取った観測だけで各観測を判定します。したがって、ある観測の後の `result()` は、量の名前が同じであれば（三つ目の点）、そこまでのトレースを接頭辞（`"end": false`）として `cadl norms-eval` に与えた結果と一致します。トレース全体を読む場合と違う点は三つです。
+
+- 期限切れと、区間が終わったことで偽（`within`、`until`）または真（`throughout`）に決まる時相演算子は、その時刻の後の最初の観測で検出します。違反が `violated` か `excused` かもその時点で決まります。報告することがないホストは、その時刻になったら、時刻だけの観測 `{"t": m.next_check()}` を送ってください。`next_check()` は、期限や区間の終わりよりわずかに後の時刻です。時刻は1e-9秒の許容誤差で比べ、期限ちょうどの内容は期限内とし、大きな時刻では浮動小数点数の刻みが許容誤差より大きくなるからです。期限がなく、内容に時相演算子を含む規範は観測のたびに評価するので、観測のたびに新しい確認時刻が生じます。
+- インスタンスは「最後の行」では終了しません。`end()` を呼ぶか、`"end": True` または終端の `state` を持つ観測を送ってください。終了後の観測は何の効果も持ちません。形式だけを検査し、その数を `result()` の警告に示し、内容は保持しません。
+- アクターを付けずに書いた名前（`ROBOT[1].load` ではなく `load`）は、まだ値がない間、`Delivered` のような記号値と区別できません。`cadl norms-eval` は、量の名前を、トレースの中のインスタンスの観測から取ります。モニタは `quantities=[...]` から取り、そこにない名前は最初の値が届いた後に限って量として扱います。判定が違いうるのはこの点だけで、そのような名前を最初の値の前に文字列の値と比較する場合に限ります（`mode == target` で、`target` の値が後から届く場合）。`quantities=` で名前を与えてください。値のない名前についての警告は、最初に出会った時点で出します。`lifecycle:` のない契約に対する `state` は、届いた時点で警告します。後の観測が契約を改正する場合も同じです（`cadl norms-eval` はその場合、警告しません）。
+
+拒否した観測はモニタをまったく変化させず、モニタはその後も使えます。`observe` は、形式の誤った観測（型の誤り、時刻の逆行、有限でない時刻や絶対値が2**53を超える時刻、`NAME` や `NAME[2]` の形でないアクター、ライフサイクルにない状態）には `TraceError` を、適用できない改正には `ObservationError`（`MonitorError` の一種）を送出します。モニタは渡されたものをコピーして保持します。モニタは自分のインスタンスの観測を保持します（時相演算子と「真になる」の判定に必要です）。契約インスタンスごとにモニタを一つ作り、終了後に捨ててください。スレッドセーフではありません。`cadl norms-eval` と同じく、ライフサイクルの状態は観測から読み、違反が要求する `transition:` は報告するだけで適用しません。
+
+**改正。** `"amend": "NAME"` を持つ観測には新版のモデルが必要です。新しいファイルからもモニタを生成し、その `MODEL` を `NormsMonitor(..., versions={"NAME": new_package.norms_monitor.MODEL})` として渡します。コマンドラインでは `--model-version NAME=MODEL.json` で、このファイルは `python -m NEW_PACKAGE.norms_monitor --dump-model` で書き出します。`versions` の値がそのようなモデルでなければ、コンストラクタが拒否します。モニタが持たない版、その契約を含まない版、現在の状態がライフサイクルにない版を指す観測は拒否します（`ObservationError`）。モニタは構文解析器を持たないので、実行時に `.cadl` ファイルを読むことはできません。`amend` を持つ観測では、新版で新しく加わった規範を `previous_state` が `None` の変化として、削除された規範を `state` が `None` の変化として報告します。項目の `index` は現在の版での位置なので、改正の前後で項目を対応づけるには `text` を使ってください。
+
+**ファイル中の文字列と数値。** モニタが `.cadl` ファイルから受け取るものはすべて `MODEL` にあります。`MODEL` は一つのJSONテキスト（ASCIIのみで、NaNやInfinityを含まない）で、Pythonの文字列リテラル一つに収め、`json.loads` で読みます。コードに文字列として埋め込むものはありません。有限でない数を含むモデルは生成しません（`cadl codegen` がその場所を報告し、何も書き出しません）。`1e999` のように桁あふれする数を含む述語は、`cadl` ではそもそも述語として扱わず、テキストのまま保持します。`cadl codegen` の入力検査は従来どおりファイル全体に適用するので、引用符、バックスラッシュ、制御文字を含む文字列は、何も生成しないうちに拒否します。
+
+SolidityとOPAのターゲットは規範を監視しません。時相演算子を含む項目を外し、そのことを警告で示します。
+
 ### 確率モデル（PRISMへの出力）
 
 `extensions:` で `stochastic: 0.1` を宣言したファイルには、`model:` ブロック（仕様書の付録H）を書けます。これは、有限の状態変数の上のガード付き確率コマンドで書くパラメトリック離散時間マルコフ連鎖で、パラメータを契約の `alpha`・`beta`・`lambda` に束縛できます。`transitions:` の各運用モードが、固有のパラメータ値とコマンドを持つ一つの「設計」になります。例は `examples/stochastic_robot_delivery.cadl` にあります。
@@ -701,6 +762,8 @@ src/cadl/
     transition_gen.py  運用モードコントローラ生成
     metric_gen.py      評価指標コレクタ生成
     runtime_gen.py     オーケストレータ生成
+    norms_monitor_gen.py       規範モニタ生成（Pythonターゲットの norms_monitor.py）
+    norms_monitor_template.py  生成する規範モニタに写すテキスト（インポートしない）
     solidity/
       solidity_expr.py 式AST → Solidityソース変換
       solidity_gen.py  Solidityスマートコントラクト生成
@@ -749,6 +812,8 @@ tests/
   test_expr_parser.py    式文法のテスト
   test_unparse.py        式の往復変換テスト
   test_norms_eval.py     トレースに対する規範の判定（`cadl norms-eval`）
+  test_norms_monitor.py  生成した規範モニタと `cadl norms-eval` の比較（サンプル、記録したケース、ランダムなトレース）
+  norms_monitor_cases.py そのために test_norms_eval.py のケースを記録するpytestプラグイン
   test_name_resolution.py 生成コードでのアクター／状態変数の解決
   test_method_dispatch.py 検証メソッドの振り分けテスト
   test_codegen_safety.py コード生成の入力安全性テスト
@@ -797,6 +862,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | シミュレータIR・設定生成（Python, Unity, Go） | 利用可能 |
 | SoS-DSL拡張（`lifecycle:` / `monitors:`）とUnity C#生成 | 利用可能 |
 | 規範拡張：静的検査と、記録済みトレースに対する判定と改正（`cadl norms-eval`、`cadl norms-diff`） | 利用可能 |
+| 規範拡張：生成したPythonパッケージのオンラインモニタ（`norms_monitor.py`） | 利用可能（Solidity・OPA・Unity C#は規範を監視しない。モデル検査器への変換は未実装） |
 | エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、監査記録。`cadl agents-run`）、Rego / Cedarの境界ポリシー | 利用可能（ランタイムはオフラインの参照実装で、トレースを再生するだけであり、プロトコルには接続しない） |
 | 検証メソッド `model_check` / `simulation` / `proof` | 未対応（未対応である旨を明示的に報告） |
 

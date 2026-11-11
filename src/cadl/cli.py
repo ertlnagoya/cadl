@@ -447,8 +447,14 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
     target = args.target
     output_dir = args.output
     for contract_id, key, text in omitted_temporal_items(sos):
-        print(f"  [WARNING]: {key} item of contract '{contract_id}' has a temporal "
-              f"operator (norms 0.1) and is not generated: {text}", file=sys.stderr)
+        if target == "python":
+            print(f"  [WARNING]: {key} item of contract '{contract_id}' has a temporal "
+                  f"operator (norms 0.1) and is left out of contracts.py; "
+                  f"norms_monitor.py monitors it: {text}", file=sys.stderr)
+        else:
+            print(f"  [WARNING]: {key} item of contract '{contract_id}' has a temporal "
+                  f"operator (norms 0.1) and is not generated (only the python target "
+                  f"generates a monitor for it): {text}", file=sys.stderr)
     try:
         generate(sos, output_dir, target=target)
     except Exception as e:
@@ -462,6 +468,11 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
     print(f"  Protocols: {len(sos.protocols)}")
     if target == "python":
         print(f"  Metrics: {len(sos.metrics)}")
+        from .codegen.norms_monitor_gen import has_norms_monitor
+        if has_norms_monitor(sos):
+            print(f"  Norms monitor: norms_monitor.py "
+                  f"({sum(len(c.norms) for c in sos.contracts)} norm(s), "
+                  f"{sum(len(c.counts_as) for c in sos.contracts)} counts-as rule(s))")
     return 0
 
 

@@ -7,6 +7,62 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `cadl model-check FILE --regime-map ID --certify`: the **certified
+  regime map** of a regime map query (Appendix H, H.9). The result is a
+  set of cells that cover the region, each `decided` with the regimes
+  that are optimal at every valuation of the cell, `infeasible`, or
+  `undecided`, with the undecided fraction and whether `resolution:` is
+  reached. The method is parameter lifting with exact rational arithmetic
+  (new module `cadl.stochastic_regions`, no new dependency): on a cell a
+  design is relaxed to a Markov decision process over the corners of the
+  cell, whose minimal and maximal values bound the design's value on the
+  whole cell; undecided cells are bisected, the largest first.
+  `--max-depth N` (default 24) and `--max-cells N` (default 20000) bound
+  the refinement; a map that stops at a budget is printed and says that
+  the resolution is not reached. Exit status 0 when the resolution is
+  reached, 1 when it is not, 2 on an error. `--format json` gives the
+  cells, counts, fractions, method and budget under `regime_map`.
+  Probabilities that are not multi-affine in the open parameters are
+  enclosed by interval arithmetic; cells that are not graph-preserving
+  are analysed soundly. `--grid N` still prints estimates at sample
+  points, separately; `--grid` and `--certify` cannot be combined.
+  A probability that is not multi-affine and leaves [0, 1] inside the
+  region, where the corner check of S-14 in `cadl check` cannot see it,
+  is reported as an error (exit status 2) when the centre or a corner of
+  a cell shows it.
+- Tests: every `decided` and `infeasible` cell of eight maps is checked
+  at sample points with the exact point evaluator, and, when `stormpy`
+  is installed, the bounds are compared with Storm's parameter lifting
+  on the exported files. New test model
+  `tests/data/stochastic_regions.cadl`.
+- `cadl codegen -t python`: for a file that declares `norms: 0.1` the
+  generated package has a new module `norms_monitor.py`, an online
+  monitor of the norms extension (Appendix F, F.4 and F.5). A running
+  system makes a `NormsMonitor` for a contract instance, feeds it one
+  observation at a time (`observe`, with the content of one trace line
+  of `cadl norms-eval`) and gets back the changes of that observation:
+  which norm instance, guarantee or assumption changed to which state
+  and verdict (`pending`, `fulfilled`, `violated`, `excused`), with time
+  and reason. `end()` settles the norms, `verdicts()` and `result()`
+  give the current state, and `next_deadline()` the next time a deadline
+  of a norm is over. The module needs only the standard library (Python
+  3.9 or later) and does not import cadl. It holds the contracts as data
+  and a verbatim copy of the engine of `cadl norms-eval`, so there is one
+  implementation of F.5; `python -m PACKAGE.norms_monitor TRACE.jsonl`
+  prints what `cadl norms-eval --format json` prints, without the key
+  `file`. Amendments (F.6) work when the model of the new version is
+  given (`versions=`, `--model-version NAME=MODEL.json`). `next_check()`
+  gives the earliest time stamp at which an observation is certain to
+  decide a deadline or a temporal operator that only waits for time. A
+  refused observation (`TraceError`, or `ObservationError` for an
+  amendment that cannot be applied) leaves the monitor as it was. The
+  model is embedded as one JSON text, and the generator compiles the
+  module and checks that it defines every name it uses before it writes
+  anything. See "Norms Monitor in Generated Python Code" in the README,
+  also for what an online monitor cannot know.
+- The generated package of such a file can be imported where cadl is not
+  installed: `NormsMonitor` works, and the other names, which need
+  `cadl.codegen.runtime_support`, raise the import error when used.
 - `cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl]`
   and `cadl.agents_runtime.run`: the reference runtime of the agent
   governance extension (Appendix G, G.5 to G.8). It replays a recorded
@@ -92,26 +148,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   prohibition, create an institutional event, exercise a power, fulfil an
   obligation), and always has the effects that block.
 
-### Fixed
-- `cadl norms-eval`: an actor reference in a `trigger:`, an `until:`, the
-  `when:` of a `counts_as:` rule or a message content matched too many
-  actors. A range (`ROBOT[1..2]`) was read as `ROBOT[*]` and matched
-  `ROBOT[3]`; `ROBOT[*]` and an index that the instance does not bind
-  matched any actor of that name, also outside the declared set
-  (`ROBOT[9]` for `ROBOT[1..3]`). A reference now matches as F.3 of the
-  specification says: a range only its members, `A[*]` and an unbound
-  `A[i]` only members of the declared set, an undeclared actor never. The
-  verdicts on the six bundled traces are unchanged.
-- `cadl norms-eval` and `cadl agents-decide`: a set declared with a
-  symbolic upper bound (`R[1..N]`) has every index from its lower bound
-  on; `R[0]` was taken as a member. The Rego policy of `-t agent-rego`
-  tests the lower bound too: regenerate it.
-- `cadl norms-eval`: a trace is rejected (exit status 2) when `t` is
-  `NaN`, infinite or larger than 2**53 in absolute value, or when another
-  number of a line is `NaN` or infinite. Epoch seconds and epoch
-  milliseconds are within the bound.
-
 ### Changed
+- `cadl codegen`: the warning for an `assume:` / `guarantee:` item with a
+  temporal operator says, for the Python target, that the item is left
+  out of `contracts.py` and monitored by `norms_monitor.py`, and for the
+  other targets that only the Python target generates a monitor for it.
+  `contracts.py` has a second comment line under each left-out item.
+- `cadl/norms_eval.py`: the engine reaches the parser through three
+  functions, reads a trace one observation at a time (`_TraceReader`,
+  which checks an observation completely before it keeps anything of it)
+  and processes one observation per call (`_Engine._step`), so that the
+  generated monitor can use the same code. `run_trace` is what `evaluate`
+  returns. `select_contract` has a third, optional argument for the
+  wording of its error message.
+- `cadl.norms_eval`: the engine can be driven one observation at a time
+  (`_Engine._step`), and a norm can be exempted from the content of one
+  observation; `cadl agents-run` uses both. `cadl norms-eval` and its
+  output are unchanged.
 - `cadl norms-eval`: `from`, `to` and `name` of a message of a trace must
   be written exactly: a concrete actor (`ROBOT[2]`) and an identifier.
   Whitespace inside them is no longer removed, so a trace with
@@ -134,38 +187,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   accepted with such an event has to name the actor as a party. For
   the rules that create `approval` and `rejection`, G-17 makes sure that
   the contract governs the approver's message.
-- `cadl.norms_eval`: the engine can be driven one observation at a time
-  (`_Engine._step`), and a norm can be exempted from the content of one
-  observation; `cadl agents-run` uses both. `cadl norms-eval` and its
-  output are unchanged.
-- `cadl model-check FILE --regime-map ID --certify`: the **certified
-  regime map** of a regime map query (Appendix H, H.9). The result is a
-  set of cells that cover the region, each `decided` with the regimes
-  that are optimal at every valuation of the cell, `infeasible`, or
-  `undecided`, with the undecided fraction and whether `resolution:` is
-  reached. The method is parameter lifting with exact rational arithmetic
-  (new module `cadl.stochastic_regions`, no new dependency): on a cell a
-  design is relaxed to a Markov decision process over the corners of the
-  cell, whose minimal and maximal values bound the design's value on the
-  whole cell; undecided cells are bisected, the largest first.
-  `--max-depth N` (default 24) and `--max-cells N` (default 20000) bound
-  the refinement; a map that stops at a budget is printed and says that
-  the resolution is not reached. Exit status 0 when the resolution is
-  reached, 1 when it is not, 2 on an error. `--format json` gives the
-  cells, counts, fractions, method and budget under `regime_map`.
-  Probabilities that are not multi-affine in the open parameters are
-  enclosed by interval arithmetic; cells that are not graph-preserving
-  are analysed soundly. `--grid N` still prints estimates at sample
-  points, separately; `--grid` and `--certify` cannot be combined.
-  A probability that is not multi-affine and leaves [0, 1] inside the
-  region, where the corner check of S-14 in `cadl check` cannot see it,
-  is reported as an error (exit status 2) when the centre or a corner of
-  a cell shows it.
-- Tests: every `decided` and `infeasible` cell of eight maps is checked
-  at sample points with the exact point evaluator, and, when `stormpy`
-  is installed, the bounds are compared with Storm's parameter lifting
-  on the exported files. New test model
-  `tests/data/stochastic_regions.cadl`.
 
 ### Fixed
 - `cadl model-export`: a transition reward whose action label no command
@@ -174,6 +195,37 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   action the model does not have, so such a file did not load. A reward
   structure left without items gets the item `true : (0);`, because Storm
   rejects an empty structure.
+- `cadl norms-eval`: an actor reference in a `trigger:`, an `until:`, the
+  `when:` of a `counts_as:` rule or a message content matched too many
+  actors. A range (`ROBOT[1..2]`) was read as `ROBOT[*]` and matched
+  `ROBOT[3]`; `ROBOT[*]` and an index that the instance does not bind
+  matched any actor of that name, also outside the declared set
+  (`ROBOT[9]` for `ROBOT[1..3]`). A reference now matches as F.3 of the
+  specification says: a range only its members, `A[*]` and an unbound
+  `A[i]` only members of the declared set, an undeclared actor never. The
+  verdicts on the six bundled traces are unchanged.
+- `cadl norms-eval`: an observation after the end of the contract
+  instance has no effect, as F.5 says. Before, the names of the observed
+  quantities were also taken from such observations, so that a name that
+  got its first value after the end was undefined instead of a symbolic
+  value during the instance, and a verdict could differ from that of the
+  same trace without those lines. The result of a trace without
+  observations after the end is unchanged. A `state` after the end no
+  longer produces the warning about a contract without `lifecycle:`.
+- `cadl norms-eval`: a time `t` written as an integer too large for a
+  floating-point number (more than about 300 digits) is rejected like
+  every time above 2**53 s, instead of ending in an internal error.
+- A number in a predicate that overflows to infinity (`1e999`) is no
+  longer read as infinity: the text is not a predicate (`cadl check`
+  warns that it is kept as text; a norm with it is not evaluated).
+- `cadl norms-eval` and `cadl agents-decide`: a set declared with a
+  symbolic upper bound (`R[1..N]`) has every index from its lower bound
+  on; `R[0]` was taken as a member. The Rego policy of `-t agent-rego`
+  tests the lower bound too: regenerate it.
+- `cadl norms-eval`: a trace is rejected (exit status 2) when `t` is
+  `NaN`, infinite or larger than 2**53 in absolute value, or when another
+  number of a line is `NaN` or infinite. Epoch seconds and epoch
+  milliseconds are within the bound.
 
 ## [0.3.21] — 2026-11-11
 
