@@ -6,6 +6,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.24] — 2026-11-11
+
+Extensions of the norms, strategic model and agents tooling. Wildcard
+and range references such as `ROBOT[*]` are now evaluated as the
+quantifier or comprehension they stand for (F.5), aggregates that only
+grow or only shrink are decided over open domains, and the grounding
+indices are computed at the level of a system of systems. The strategic
+model checker certifies the end points of any strategic model and
+offers the concept `every_reachable_state` (Appendix I). The agent
+runtime keeps a tamper-evident audit log (`cadl audit-verify`) and an
+MCP gateway (`cadl mcp-gateway`) that decides every tool call of an
+agent against the contract, holds calls that need approval, and accepts
+approvals signed with per-approver keys (Appendix G). Each part was
+reviewed independently before the release.
+
+Known limits: the gateway was tested against a test MCP server and
+client written for the purpose, not against a released MCP SDK; the
+approver's tool trusts the description of a held call that the gateway
+publishes; the strategic export was not run through PRISM-games.
+
 ### Added
 - Tamper-evident audit log (Appendix G, G.8, "Integrity of the log"):
   `cadl agents-run --audit` writes a header record (format
