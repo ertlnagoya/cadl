@@ -104,16 +104,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `reward_of: "C.n"` the weight m′ · ℓ (m, m′ the magnitudes of the
   norm, ℓ the parameter bound to `C.lambda`). `cadl check` applies J-10
   (errors), J-11 (warnings) and J-12 (the expected count of each
-  sanction under the compliance profile, per design). Every result of
+  `sanction_of:` and `reward_of:` term under the compliance profile, per
+  design; a `reward_of:` term always breaks condition (ii) of J.7). Every result of
   `cadl game-check` computed with such a term carries the assumption of
   J.7 (`assumptions` in JSON). The IR writes the defined weight and the
   fields `sanction_of` / `reward_of`.
 - **J-14** in `cadl game-check --certify`: in a file that declares
   `grounding: 0.1`, a one-parameter equilibrium map whose parameter
-  occurs only in weights, with a power of at most one, decides a cell
+  (bound to `C.lambda` or not) occurs only in weights, with a power of at
+  most one counted on the text (no cancellation), decides a cell
   that the bounds of I.9 leave undecided from exact evaluations at its
   end points (`method: "endpoints (J-14)"`; deviators only under
-  condition (ii) of J.7). The fuzzer (`tests/games_fuzz.py --j14`) checks
+  condition (ii) of J.7). Every map reports whether J-14 applies, or why
+  not, also in a file without the grounding extension. The fuzzer (`tests/games_fuzz.py --j14`) checks
   these cells and detects three deliberate violations of the conditions.
 - `examples/games_grounding_robot_delivery.cadl`: the example of J.7.
 - `examples/grounding_robot_delivery.cadl`: the example of J.9

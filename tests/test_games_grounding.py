@@ -120,7 +120,7 @@ class TestExample:
         for da, db in zip(a["designs"], b["designs"]):
             assert [c.claim() for c in da["cells"]] == [c.claim() for c in db["cells"]]
             assert [c.box for c in da["cells"]] == [c.box for c in db["cells"]]
-            assert da["j14"]["applicable"] and db["j14"] is None
+            assert da["j14"]["applicable"] and not db["j14"]["applicable"]
         assert a["assumptions"] == [ASSUMPTION]
 
     @pytest.mark.parametrize("design, least", [
@@ -324,6 +324,18 @@ class TestJ12:
         assert ["Design CENTRALIZED" in infos[0], "Design DISTRIBUTED" in infos[1]] == [True, True]
         assert all("'shortcuts'" in i and "is 0" in i for i in infos)
 
+    def test_reward_of_is_reported_and_breaks_condition_ii(self):
+        def mutate(model, sos):
+            norm(sos)["on_fulfilment"] = {"reward": "bonus", "magnitude": 0.5}
+            r_terms(model).append({"reward": "fee", "reward_of": "DELIVERY.no_shortcut"})
+            r_terms(model).pop(0)
+        infos = with_rule(check(mutate).infos, "J-12")
+        rewards = [i for i in infos if "reward_of: DELIVERY.no_shortcut" in i]
+        assert len(rewards) == 2 and len(infos) == 4
+        assert all("breaks condition (ii) of J.7 by the sign of its weight" in i
+                   for i in rewards)
+        assert "is 0.984848 (exact: 7878786117651/8000000000000)" in rewards[0]
+
     def test_compliance_incurs_a_sanction(self):
         infos = with_rule(check(lambda m, s: m.update(compliance="shortcut_first")).infos,
                           "J-12")
@@ -380,8 +392,13 @@ class TestJ14:
         _, _, j14 = game_for(model_of(mutate), "comply_by_lambda", "CENTRALIZED")
         assert not j14["applicable"] and reason in j14["reason"]
 
-    def test_only_in_a_file_that_declares_grounding(self):
-        assert equilibrium_map(PLAIN_MODEL, "comply_by_lambda")["designs"][0]["j14"] is None
+    def test_only_in_a_file_that_declares_grounding(self, capsys):
+        j14 = equilibrium_map(PLAIN_MODEL, "comply_by_lambda")["designs"][0]["j14"]
+        assert not j14["applicable"] and "declares 'grounding: 0.1'" in j14["reason"]
+        status, out, _ = cli(capsys, "game-check", PLAIN, "--certify", "--equilibrium",
+                             "comply_by_lambda", "--regime", "DISTRIBUTED")
+        assert status == 0 and ("J-14 does not apply: J-14 is a rule of the grounding "
+                                "extension") in out
 
     def test_end_point_claims(self):
         game, query, _ = game_for(LINKED_MODEL, "comply_by_lambda", "CENTRALIZED")
@@ -407,6 +424,68 @@ class TestJ14:
         # but (ii) fails for R, so the end points claim no deviator.
         cell = EqCell(box={"lambda": (F(1, 2), F(1))})
         assert not endpoint_verdict(game, query, cell)
+
+
+# ---------------------------------------------------------------------------
+# The reviewer's files: a gain with a hump (J-14 must be refused)
+# ---------------------------------------------------------------------------
+
+HUMP = ROOT / "data" / "games_link" / "hump.cadl"
+PROB_HUMP = ROOT / "data" / "games_link" / "prob_hump.cadl"
+# The gain is max(0, -1/2 + 4λ - 4λ²) (in prob_hump.cadl through the
+# probabilities); it is positive exactly between the roots
+# (1 ± 1/√2)/2, 0.14644... and 0.85355...
+ROOT_LO = (F(1464, 10000), F(1465, 10000))
+ROOT_HI = (F(8535, 10000), F(8536, 10000))
+
+
+class TestHump:
+    def map_of(self, path):
+        model = checked_model(parse_file(path))
+        return equilibrium_map(model, "mp")["designs"][0]
+
+    def check_hump(self, d):
+        assert d["resolution_reached"]
+        assert [c.status for c in d["cells"]] == [
+            "equilibrium", "undecided", "not_equilibrium", "undecided", "equilibrium"]
+        for c in d["cells"]:
+            a, b = c.box["lam"]
+            if c.status == "equilibrium":
+                # No equilibrium cell reaches into the hump.
+                assert b <= ROOT_LO[0] or a >= ROOT_HI[1], (a, b)
+            if c.status == "not_equilibrium":
+                assert a >= ROOT_LO[0] and b <= ROOT_HI[1], (a, b)
+            assert c.method is None
+
+    def test_hump_in_a_weight(self):
+        d = self.map_of(HUMP)
+        assert not d["j14"]["applicable"]
+        assert "power above one, counted on the text" in d["j14"]["reason"]
+        self.check_hump(d)
+        boxes = [tuple(float(x) for x in c.box["lam"]) for c in d["cells"]]
+        assert [round(x, 4) for x in boxes[0] + boxes[2] + boxes[4]] == [
+            0, 0.1455, 0.1475, 0.8496, 0.8574, 1]
+
+    def test_hump_in_the_probabilities(self):
+        d = self.map_of(PROB_HUMP)
+        assert not d["j14"]["applicable"]
+        assert "occurs in the probability 'lam'" in d["j14"]["reason"]
+        self.check_hump(d)
+
+    @pytest.mark.parametrize("path, mutant", [
+        (HUMP, "j14_drop_affine"), (PROB_HUMP, "j14_drop_probability")])
+    def test_the_gate_is_what_keeps_the_hump(self, path, mutant):
+        """With the gate of condition 2 disabled, the end points of the
+        whole region are equilibria and the hump is lost: the test above
+        fails with the mutant."""
+        with games_fuzz.mutation(mutant):
+            d = self.map_of(path)
+        assert d["j14"]["applicable"]
+        with pytest.raises(AssertionError):
+            self.check_hump(d)
+        assert any(c.method == J14_METHOD and c.status == "equilibrium"
+                   and c.box["lam"][0] < ROOT_HI[0] and c.box["lam"][1] > ROOT_LO[1]
+                   for c in d["cells"])
 
 
 # ---------------------------------------------------------------------------

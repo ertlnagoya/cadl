@@ -660,8 +660,7 @@ class _GameAnalyser(_Analyser):
         from .games_eval import EvaluationError, expected_reward_under
         from .stochastic_eval import value_text
         model = self.model
-        terms = [(p, t) for p in model.payoffs for t in p.terms
-                 if t.link is not None and t.link_key == "sanction_of"]
+        terms = [(p, t) for p in model.payoffs for t in p.terms if t.link is not None]
         for payoff, term in terms:
             for design in model.designs:
                 try:
@@ -669,16 +668,23 @@ class _GameAnalyser(_Analyser):
                                                   payoff.player, term.reward)
                 except EvaluationError:
                     continue
-                if value == 0:
+                shown = "0" if value == 0 else f"{value_text(value)} (exact: {value})"
+                if term.link_key == "reward_of":
+                    what = (f"{shown}; a reward_of: term has the weight m'·ℓ with m' > 0, so it "
+                            f"breaks condition (ii) of J.7 by the sign of its weight, whatever "
+                            f"this value")
+                    ref = term.reward_of
+                elif value == 0:
                     what = ("0: compliance incurs no sanction of this term, so condition "
                             "(ii) of J.7 holds for it")
+                    ref = term.sanction_of
                 else:
-                    what = (f"{value_text(value)} (exact: {value}): compliance incurs this sanction with a "
-                            f"positive expected count, so condition (ii) of J.7 does not "
-                            f"hold for it")
+                    what = (f"{shown}: compliance incurs this sanction with a positive "
+                            f"expected count, so condition (ii) of J.7 does not hold for it")
+                    ref = term.sanction_of
                 self.info(f"Design {design.name}: under the compliance profile "
                           f"'{model.compliance}' at the fixed values, the expected value of "
-                          f"'{term.reward}' (the term '{term.sanction_of}' of the payoff of "
+                          f"'{term.reward}' (the term '{term.link_key}: {ref}' of the payoff of "
                           f"player '{payoff.player}') until '{payoff.until_text}' is {what}",
                           "J-12")
 

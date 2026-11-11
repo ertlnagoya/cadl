@@ -713,16 +713,17 @@ def j14_affine_weights(model: Model, name: str) -> str | None:
         for term in payoff.terms:
             weight = term_weight(model, payoff, term)
             if syntactic_degree(weight, name) > 1:
-                return (f"'{name}' occurs with a power above one in the weight of the term "
-                        f"'{term.reward}' of the payoff of '{payoff.player}'")
+                return (f"'{name}' occurs with a power above one, counted on the text (the "
+                        f"powers of the factors of a product add up, no cancellation), in the "
+                        f"weight of the term '{term.reward}' of the payoff of '{payoff.player}'")
     return None
 
 
 def j14_condition_ii(game: Game, profile: str, player: str, name: str) -> bool:
     """Condition 5 of J-14 (condition (ii) of J.7 for p): every term of p
-    in whose weight ℓ occurs has a weight −m·ℓ with m ≥ 0, and its reward
-    structure has the expected value 0 under the profile, computed
-    exactly."""
+    in whose weight ℓ occurs has, at the values used for the other
+    parameters, the weight −m·ℓ with m ≥ 0, and its reward structure has
+    the expected value 0 under the profile, computed exactly."""
     model = game.model
     payoff = payoff_of(model, player)
     point = (game.j14["region"][0],)
@@ -740,7 +741,8 @@ def j14_condition_ii(game: Game, profile: str, player: str, name: str) -> bool:
 
 def j14_setup(game: Game, query: EquilibriumQuery, design: Design) -> dict:
     """Whether J-14 may be used for the map in this design, and the
-    players for whom condition 5 holds."""
+    players for whom condition 5 holds. ℓ is the open parameter of the
+    query, whether or not it is bound to `C.lambda`."""
     out: dict = {"applicable": False, "reason": None, "condition_ii": []}
     if len(query.over) != 1:
         out["reason"] = "the query has more than one open parameter"
@@ -1200,6 +1202,10 @@ def design_map(game: Game, query: EquilibriumQuery, max_depth: int = DEFAULT_MAX
     if use_j14 is None:
         # J-14 is a rule of the grounding extension (J.8).
         use_j14 = game.model.grounding
+        if not use_j14:
+            j14 = {"applicable": False, "condition_ii": [],
+                   "reason": "J-14 is a rule of the grounding extension and is used only in "
+                             "a file that declares 'grounding: 0.1'"}
     if use_j14:
         j14 = j14_setup(game, query, game.model.design(game.design))
     total = _volume(region)
