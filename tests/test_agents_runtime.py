@@ -417,7 +417,9 @@ class TestTwoContracts:
         # G.5: "the running instances are those it has created and not
         # ended"; step 3.1: no running instance denies a tool call.
         r = replay(RICH, trace(
-            (0, m("AG", "T", "read"), {"instances": [
+            # The host creates the first instance of C2 later: the first
+            # line says so (`host_instances`).
+            (0, m("AG", "T", "read"), {"host_instances": ["C2"], "instances": [
                 {"contract": "C1", "instance": "a", "bindings": {"i": 1}},
                 {"contract": "C1", "instance": "b", "bindings": {"i": 2}}]}),
             (1, m("R[1]", "U", "write")),
@@ -819,7 +821,7 @@ def scenario_results() -> list[tuple[str, object, dict]]:
              m("GHOST", "FREE", "read"), m("AG", "T", "bogus")]),
         bindings={"i": 2})))))
     out.append(("rich-instances", rich, run(rich, parse_run_trace(trace(
-        (0, [m("AG", "T", "read"), m("R[1]", "U", "write")], {"instances": [
+        (0, [m("AG", "T", "read"), m("R[1]", "U", "write")], {"host_instances": ["C2"], "instances": [
             {"contract": "C1", "instance": "a", "bindings": {"i": 1}},
             {"contract": "C1", "instance": "b", "bindings": {"i": 2}}]}),
         (1, [m("R[2]", "U", "wipe"), m("R[3]", "U", "write"), m("AG", "T", "wipe")],
@@ -1227,7 +1229,7 @@ def random_host_trace(sos, seed: int, length: int = 300, amend=()) -> list[str]:
     count = 0
     rows = []
     for t, message in random_rows(sos, seed, length):
-        more = {}
+        more = {} if rows else {"host_instances": contracts}
         if not rows or rng.random() < 0.08:
             entries = []
             cid = rng.choice(contracts)
@@ -1304,6 +1306,8 @@ def oracle_trace(rng, spec: dict, n: int) -> list[dict]:
         if rng.random() < .1:
             t += rng.random()
         line, entries = {"t": t}, []
+        if host and k == 0:
+            line["host_instances"] = sorted(host)
         if host and (k == 0 or rng.random() < .12) and made < 6:
             cid = rng.choice(sorted(host))
             made += 1
@@ -1789,7 +1793,8 @@ class TestLifecycleRecords:
 
     def test_instances_start_and_end(self):
         r = replay(RICH, trace(
-            (0, None, {"instances": [dict(contract="C1", instance="a", bindings={"i": 1})]}),
+            (0, None, {"host_instances": ["C2"],
+                       "instances": [dict(contract="C1", instance="a", bindings={"i": 1})]}),
             (1, m("OP", "AG", "grant_write"), {"instances": [dict(contract="C2", instance="x")]}),
             (2, None, {"instances": [dict(contract="C1", instance="a", end=True)]}),
             (3, None)))
@@ -2653,13 +2658,15 @@ class TestDecisionsAreCausal:
 
     def test_with_the_quantity_names_given(self):
         # `locked` is a quantity from the start and has no value at t=1: the
-        # predicate is undefined, an undefined predicate does not occur
-        # (F.5), the prohibition is not triggered, and may_act allows. The
-        # same in both traces, and no warning.
+        # trigger of the prohibition is undefined. By F.5 an undefined
+        # predicate does not occur, and the norm stays inactive; at the
+        # boundary its flag is unknown (sixth review, U1) and the
+        # prohibition applies. The same in both traces.
         sos = review("q_look.cadl")
         for name in ("ql1.jsonl", "ql2.jsonl"):
             r = replay(sos, self.lines(name, quantities=["locked"]))
-            assert decisions(r)[0][2:5] == ("allow", "permission", ["may_act"]), name
+            assert decisions(r)[0][2:5] == ("deny", "prohibition", ["stop_act"]), name
+            assert r["steps"][0]["input"]["instances"][0]["in_force"] == {}
             assert not any("first value" in w for w in r["warnings"])
 
     def test_quantities_key(self):
@@ -2819,3 +2826,241 @@ class TestBindingAgainstEverySet:
         replay(sos, trace((0, None), E_, bindings={"i": 1}))
         with pytest.raises(TraceError, match="not a member of the declared set"):
             replay(sos, trace((0, None), E_, bindings={"i": 99}))
+
+
+# === Findings of the sixth review ================================================================
+
+class TestHostManagedIsKnownAtTheFirstLine:
+    """H1: a later `instances` entry must not change an earlier decision."""
+
+    PING = (1, "AG>OP:ping", "deny", "prohibition", ["no_ping"])
+
+    def lines(self, name: str) -> list[str]:
+        return (REVIEW / name).read_text().splitlines()
+
+    def test_qh1_and_qh2(self):
+        sos = review("q_h.cadl")
+        assert decisions(replay(sos, self.lines("qh1.jsonl")))[0] == self.PING
+        # qh2 creates an instance of C at t=2. C has had its instance
+        # `default` since the first line: a trace error, not another run.
+        with pytest.raises(TraceError, match="line 3: .*'host_instances'"):
+            replay(sos, self.lines("qh2.jsonl"))
+        # Every proper prefix of qh2 is qh1 so far, and decides as qh1 does.
+        assert decisions(replay(sos, self.lines("qh2.jsonl")[:2]))[0] == self.PING
+
+    def test_host_instances_on_the_first_line(self):
+        # Before the first instance: an ordinary message falls to the
+        # default, a tool call has no instance; in a prefix and in the
+        # whole run alike.
+        sos = review("q_h.cadl")
+        rows = [(0, None, {"host_instances": ["C"]}),
+                (1, [m("AG", "OP", "ping"), m("AG", "TOOL", "act")]),
+                (2, None, {"instances": [dict(contract="C", instance="a")]}),
+                (3, [m("AG", "OP", "ping"), m("AG", "TOOL", "act")]),
+                (4, None, {"end": False})]
+        expected = [("allow", "default"), ("deny", "no_instance"),
+                    ("deny", "prohibition"), ("deny", "default")]
+        for cut in (2, 3, 4, 5):
+            r = replay(sos, trace(*rows[:cut]))
+            assert [x[2:4] for x in decisions(r) if x[-1] is None or len(x) == 5] == \
+                expected[:2 * (1 if cut < 4 else 2)], cut
+
+    def test_trace_errors(self):
+        sos = review("q_h.cadl")
+        with pytest.raises(TraceError, match="only on the first line"):
+            parse_run_trace(['{"t": 0}', '{"t": 1, "host_instances": ["C"]}'])
+        with pytest.raises(TraceError, match="list of contract ids"):
+            parse_run_trace(['{"t": 0, "host_instances": "C"}'])
+        with pytest.raises(TraceError, match="not an enforced contract"):
+            replay(sos, ['{"t": 0, "host_instances": ["NOPE"]}'])
+        with pytest.raises(TraceError, match="line 2: .*reserved"):
+            replay(sos, ['{"t": 0, "host_instances": ["C"]}',
+                         '{"t": 1, "instances": [{"contract": "C", "instance": "default"}]}'])
+
+    def test_the_constructor_reads_the_first_line_only(self):
+        import inspect
+        from cadl.agents_runtime import AgentsRuntime
+        source_text = inspect.getsource(AgentsRuntime.__init__)
+        assert "trace.lines[0]" in source_text
+        assert "for line in" not in source_text and "trace.lines)" not in source_text
+        whole = inspect.getsource(AgentsRuntime)
+        # The only loop over the lines is the replay itself.
+        assert whole.count("self.trace.lines") == 1
+
+
+class TestMissingDataIsUnknown:
+    """U1: while a quantity that the trigger of a prohibition or the until
+    of a permission reads has no value, the flag is unknown; nothing is
+    latched."""
+
+    ACT = m("AG", "TOOL", "act")
+
+    def test_ql3_and_ql4(self):
+        sos = review("q_look.cadl")
+        for name, quantity in (("ql3.jsonl", "locked"), ("ql4.jsonl", "AG.mode")):
+            r = replay(sos, (REVIEW / name).read_text().splitlines())
+            assert [x[:5] for x in decisions(r)] == [
+                (1, "AG>TOOL:act", "deny", "prohibition", ["stop_act"]),
+                (3, "AG>TOOL:act", "deny", "prohibition", ["stop_act"])], name
+            first, second = [s["input"]["instances"][0]["in_force"] for s in r["steps"]]
+            assert first == {} and second == {"stop_act": True}
+            assert r["audit"][1]["contracts"] == ["C"]
+            warned = [w for w in r["warnings"] if "had no value" in w]
+            assert len(warned) == 1 and "'stop_act'" in warned[0]
+            assert f"({quantity} has no value yet)" in warned[0]
+
+    def test_nothing_is_latched(self):
+        r = replay(review("q_look.cadl"), trace(
+            (0, None), (1, self.ACT), (2, None, {"values": {"AG.mode": "open"}}),
+            (3, self.ACT), (4, None, {"values": {"AG.mode": "locked"}}), (5, self.ACT),
+            (6, None, {"end": False})))
+        assert [x[2:4] for x in decisions(r)] == [
+            ("deny", "prohibition"), ("allow", "permission"), ("deny", "prohibition")]
+        states = [h["state"] for n in r["instances"][0]["norms"] if n["id"] == "stop_act"
+                  for h in n["history"]]
+        assert states == ["active"]          # activated once, at t=4, by its trigger
+
+    SRC = source(
+        """
+        counts_as:
+          - { when: "OP -> AG : approve", creates: approval, if: "level > 3" }
+        """,
+        norms(
+            perm("p_until", "AG", "AG -> T : read", 'until: "T.load > 5"'),
+            perm("p_trigger", "AG", "AG -> T : write", 'trigger: "T.ready == true"'),
+            proh("no_wipe", "AG", "AG -> T : wipe",
+                 'until: "T.safe == true"\non_denied: { escalate_to: OP }'),
+            perm("p_wipe", "AG", "AG -> T : wipe")))
+
+    def test_permission_until_and_the_cases_that_block_under_f5(self):
+        r = replay(self.SRC, trace(
+            (0, None), (1, [m("AG", "T", "read"), m("AG", "T", "write"), m("AG", "T", "wipe"),
+                            m("OP", "AG", "approve", "h-1")]),
+            (2, None, {"values": {"T.load": 1, "T.ready": True, "T.safe": False, "level": 9}}),
+            (3, [m("AG", "T", "read"), m("AG", "T", "write"), m("AG", "T", "wipe"),
+                 m("OP", "AG", "approve", "h-2")]),
+            (4, None, {"end": False})))
+        got = [x[1:4] for x in decisions(r)]
+        assert got == [
+            # the until of p_until is undefined: the permission does not apply
+            ("AG>T:read", "deny", "default"),
+            # an undefined trigger does not activate a permission (F.5)
+            ("AG>T:write", "deny", "default"),
+            # an undefined until does not end a prohibition (F.5)
+            ("AG>T:wipe", "escalate", "prohibition"),
+            # an undefined `if:` creates no approval: the hold stays held
+            ("OP>AG:approve", "allow", "default"),
+            ("AG>T:read", "allow", "permission"),
+            ("AG>T:write", "allow", "permission"),
+            ("AG>T:wipe", "escalate", "prohibition"),
+            ("OP>AG:approve", "allow", "default"),
+            ("AG>T:wipe", "allow", "approved"),
+        ]
+        assert [h["state"] for h in r["holds"]] == ["held", "approved"]
+        assert norm_states(r)["p_until"][0] == "active"       # not discharged
+        flags = [s["input"]["instances"][0]["in_force"] for s in r["steps"]]
+        assert "p_until" not in flags[0] and flags[4]["p_until"] is True
+        assert sum("'p_until'" in w and "does not apply" in w for w in r["warnings"]) == 1
+
+    @pytest.mark.skipif(OPA is None, reason="the opa binary is not on PATH")
+    def test_generated_rego_agrees_on_the_recorded_inputs(self, tmp_path):
+        runs = [(review("q_look.cadl"), replay(review("q_look.cadl"),
+                                               (REVIEW / n).read_text().splitlines()))
+                for n in ("ql3.jsonl", "ql4.jsonl")]
+        sos = parse(self.SRC)
+        runs.append((sos, replay(sos, trace((0, None), (1, [
+            m("AG", "T", "read"), m("AG", "T", "write"), m("AG", "T", "wipe")]),
+            (2, None, {"end": False})))))
+        for k, (sos, r) in enumerate(runs):
+            out = tmp_path / str(k)
+            generate(sos, out, target="agent-rego")
+            f = out / "inputs.json"
+            f.write_text(json.dumps([s["input"] for s in r["steps"]]))
+            proc = subprocess.run(
+                [OPA, "eval", "--format", "json", "--data", str(out / "agent_policy.rego"),
+                 "--input", str(f),
+                 "[r | x := input[_]; r := data.cadl.agent_policy.result with input as x]"],
+                capture_output=True, text=True, timeout=120)
+            assert proc.returncode == 0, proc.stderr
+            values = json.loads(proc.stdout)["result"][0]["expressions"][0]["value"]
+            assert values == [s["result"] for s in r["steps"]]
+
+
+class TestPrefixHarnessOfTheReview:
+    """prefix.py of the sixth review on q_c.cadl: host-created instances,
+    late values, `quantities`, holds. The audit records of the run on a
+    prefix are the first records of the run on the whole trace."""
+
+    VALS = [("AG.mode", ["locked", "open", "idle"]), ("locked", [0, "locked"]),
+            ("open", ["x"]), ("yes", [1]), ("W[1].ready", ["yes", "no"]),
+            ("W[2].ready", ["yes"]), ("W[1].alarm", [True, False]), ("W[2].alarm", [True]),
+            ("level", [1, 4, 9, 20]), ("limit", [3, 5]), ("phase", ["final", "start"]),
+            ("final", [7])]
+    MSGS = [("AG", "TOOL", "act"), ("AG", "TOOL", "read"), ("AG", "TOOL", "wipe"),
+            ("OP", "AG", "approve"), ("OP", "AG", "reject"), ("OP", "AG", "bless"),
+            ("W[1]", "AG", "hi"), ("OP", "TOOL", "act")]
+
+    def gen(self, rng, n: int, host: bool, quant: bool) -> list[dict]:
+        t, lines, holds, made, live = 0, [], 0, 0, []
+        for k in range(n):
+            t += rng.choice([0, 1, 1, 5, 30, 70, 301])
+            line = {"t": t}
+            if k == 0:
+                if quant:
+                    line["quantities"] = sorted(v for v, _ in self.VALS)
+                if host:
+                    line["host_instances"] = ["C"]
+                else:
+                    line["bindings"] = {"i": rng.choice([1, 2])}
+            entries = []
+            if host and (k == 0 or rng.random() < .15) and made < 5:
+                made += 1
+                entries.append({"contract": "C", "instance": f"i{made}",
+                                "bindings": {"i": rng.choice([1, 2, 3])}})
+                live.append((f"i{made}", k))
+            older = [x for x in live if x[1] < k]
+            if older and rng.random() < .08:
+                x = rng.choice(older)
+                live.remove(x)
+                entries.append({"contract": "C", "instance": x[0], "end": True})
+            if entries:
+                line["instances"] = entries
+            if rng.random() < .45:
+                line["values"] = {v: rng.choice(c) for v, c in
+                                  rng.sample(self.VALS, rng.choice([1, 1, 2, 3]))}
+            msgs = []
+            for _ in range(rng.choice([0, 1, 1, 2])):
+                sender, receiver, name = rng.choice(self.MSGS)
+                msg_ = {"from": sender, "to": receiver, "name": name}
+                if name in ("approve", "reject") and holds:
+                    msg_["args"] = [f"h-{rng.randint(max(1, holds - 2), holds + 1)}"]
+                msgs.append(msg_)
+                holds += 1 if name == "act" and rng.random() < .5 else 0
+            if msgs:
+                line["messages"] = msgs
+            lines.append(line)
+        return lines
+
+    def test_prefix_property(self):
+        import random
+        sos = review("q_c.cadl")
+
+        def audit_of(lines):
+            return run(sos, parse_run_trace([json.dumps(x) for x in lines]))["audit"]
+
+        checks = records = 0
+        kinds = set()
+        for seed in range(18):
+            rng = random.Random(seed)
+            lines = self.gen(rng, 30, host=seed % 2 == 1, quant=seed % 3 == 0)
+            lines.append({"t": lines[-1]["t"] + 1, "end": False})
+            full = audit_of(lines)
+            kinds |= {(a["decision"], a["reason"]) for a in full if "decision" in a}
+            for k in range(1, len(lines)):
+                part = audit_of(lines[:k] + [{"t": lines[k - 1]["t"], "end": False}])
+                assert part == full[:len(part)], (seed, k)
+                checks += 1
+                records += len(part)
+        assert checks == 18 * 30 and records >= 8000
+        assert {("escalate", "prohibition"), ("deny", "prohibition"), ("allow", "permission"),
+                ("allow", "approved"), ("deny", "no_instance")} <= kinds

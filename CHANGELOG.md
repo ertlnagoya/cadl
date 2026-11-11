@@ -69,7 +69,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   name of a predicate is a quantity from the first line on that gives it
   a value (a symbolic value before), or from the start when the first
   line names it under `quantities`; nothing after the end of an instance
-  changes its verdicts. `cadl.agents_runtime.run`
+  changes its verdicts. Whether a contract has host-created instances is
+  fixed on the first line (`instances` there, or the key
+  `host_instances`); a later entry that creates an instance of another
+  contract is a trace error. Missing data is unknown without latching:
+  while the predicate `trigger:` of an inactive prohibition, or the
+  predicate `until:` of an active permission, is undefined for want of a
+  value, the in-force flag is left out of the policy input, so the
+  prohibition applies and the permission does not; the norm states stay
+  those of `cadl norms-eval`. `cadl.agents_runtime.run`
   refuses a file with errors of `cadl check`; `check=False` is an unsafe
   switch for tests. As defence in depth, an occurrence that depends on an
   unbound index is unknown and never has an effect that lets a message

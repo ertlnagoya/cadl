@@ -1,0 +1,5 @@
+{"t":0}
+{"t":1,"messages":[{"from":"AG","to":"TOOL","name":"act"}]}
+{"t":2,"values":{"AG.mode":"locked"}}
+{"t":3,"messages":[{"from":"AG","to":"TOOL","name":"act"}]}
+{"t":4,"end":false}

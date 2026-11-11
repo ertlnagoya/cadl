@@ -32,12 +32,18 @@ Trace format: the JSON Lines of `cadl norms-eval` (keys ``t``,
                With it exactly these names are quantities from the start;
                without it a name is a quantity from the first line on that
                gives it a value, and a symbolic value before (F.5).
+``host_instances`` first line only: the ids of the contracts whose
+               instances a host creates, when the first instance comes on a
+               later line. Whether a contract has host-created instances is
+               fixed on the first line; see ``instances``.
 ``instances``  host-created contract instances. Each entry has
                ``contract`` and ``instance`` and may have ``bindings``,
                ``request``, ``state`` and ``"end": true``. An entry that
                names a new instance creates it at this line. A contract
-               that no entry names with an instance other than ``default``
-               has the single instance ``default`` from the first line.
+               that the first line neither names here with an instance other
+               than ``default`` nor lists under ``host_instances`` has the
+               single instance ``default`` from the first line; a later
+               entry that creates an instance of it is a trace error.
 
 One line is processed in this order: holds whose deadline lies before
 ``t`` expire; instances are created; the time and the ``values`` of the
@@ -63,6 +69,7 @@ from . import agents as G
 from .ast_nodes import ActorRef, SoSDefinition
 from .norms_eval import (
     _EPS,
+    UNKNOWN,
     NormsEvalError,
     Observation,
     Trace,
@@ -103,6 +110,8 @@ class RunTrace:
     path: str | None = None
     # The quantity names of the run when the trace gives them, else None.
     quantities: list[str] | None = None
+    # Contracts whose instances a host creates, from the first line.
+    host_instances: list[str] | None = None
 
 
 def _parse_epoch(text: Any, where: str) -> datetime:
@@ -156,6 +165,7 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
     extras: list[tuple[str | None, list[dict]]] = []
     epoch = None
     quantities = None
+    hosted = None
     for lineno, line in enumerate(lines, start=1):
         if not line.strip():
             plain.append("")
@@ -180,6 +190,15 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
                     not isinstance(q, str) or not q.strip() for q in quantities):
                 raise TraceError(f"{where}: 'quantities' must be a list of names")
             quantities = [q.strip() for q in quantities]
+        if "host_instances" in rec:
+            if extras:
+                raise TraceError(f"{where}: 'host_instances' is allowed only on the "
+                                 f"first line")
+            hosted = rec.pop("host_instances")
+            if not isinstance(hosted, list) or any(
+                    not isinstance(c, str) or not c.strip() for c in hosted):
+                raise TraceError(f"{where}: 'host_instances' must be a list of contract ids")
+            hosted = [c.strip() for c in hosted]
         entries = _check_instances(rec.pop("instances", []), where)
         if "bindings" in rec and isinstance(rec["bindings"], dict):
             _check_bindings(rec["bindings"], where)
@@ -201,7 +220,7 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
         lines=[Line(obs=o, state=s, instances=e, lineno=n)
                for o, (s, e, n) in zip(base.observations, extras)],
         bindings=base.bindings, request=base.request, epoch=epoch, path=path,
-        quantities=quantities)
+        quantities=quantities, host_instances=hosted)
 
 
 def load_run_trace(path) -> RunTrace:
@@ -372,6 +391,8 @@ class _BoundaryEngine(_Engine):
         self.created: list[dict] = []
         # Violated prohibitions that are still in force at the boundary.
         self.kept: dict[str, dict] = {}
+        # Norm id -> (key, predicate) while the flag is unknown for missing data.
+        self.pending: dict[str, tuple] = {}
         self._mark = 0
         self._harden()
 
@@ -492,6 +513,46 @@ class _BoundaryEngine(_Engine):
                     and norm.until.occurs(n, self.created)):
                 k["on"] = False
 
+    def undefined(self, term, n: int) -> bool:
+        """Whether a predicate has no value at observation n because a
+        quantity it reads has none (F.5: undefined)."""
+        if term is None or term.kind != "predicate" or term.error or n < 0:
+            return False
+        if isinstance(term, _BoundaryTerm) and term.unbound_in_predicate():
+            return False                # unknown by an unbound index: resolved there
+        return self.ev.holds(term.expr, n, n) is UNKNOWN
+
+    def missing(self, term, n: int) -> list[str]:
+        """The quantities that a predicate reads and that have no value at
+        observation n."""
+        import dataclasses
+        from .ast_nodes import MemberAccess
+        values, out = self.obs[n].values, []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, MemberAccess) and isinstance(node.obj, ActorRef):
+                if node.obj.name == "request" and node.obj.index is None:
+                    return
+                key = f"{self.ev.actor(node.obj, n)[0]}.{node.member}"
+                plain = f"{node.obj.name}.{node.member}"
+                if values.get(key) is None and values.get(plain) is None:
+                    out.append(key)
+            elif isinstance(node, ActorRef):
+                if node.index is None and node.name in self.ev.known \
+                        and node.name not in self.ev.bindings \
+                        and values.get(node.name) is None:
+                    out.append(node.name)
+            elif dataclasses.is_dataclass(node) and not isinstance(node, type):
+                for f in dataclasses.fields(node):
+                    if f.name != "loc":
+                        walk(getattr(node, f.name))
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    walk(item)
+
+        walk(term.expr)
+        return list(dict.fromkeys(out))
+
     def in_force(self, nid: str):
         """The in-force flag of G.5: True, False, or None for unknown."""
         norm = self.by_id.get(nid)
@@ -499,6 +560,21 @@ class _BoundaryEngine(_Engine):
             return False
         if norm.frozen:
             return None
+        # Missing data: while the predicate that would bring a prohibition
+        # into force, or end a permission, has no value, the enforcement
+        # point cannot determine the flag. Nothing is latched: the state of
+        # the norm is not changed.
+        kind, last = norm.d.kind, len(self.obs) - 1
+        if kind == "prohibition" and norm.state == "inactive":
+            if self.undefined(norm.trigger, last):
+                self.pending[nid] = ("trigger", norm.trigger.text,
+                                     self.missing(norm.trigger, last))
+                return None
+        if kind == "permission" and norm.state == "active":
+            if self.undefined(norm.until, last):
+                self.pending[nid] = ("until", norm.until.text,
+                                     self.missing(norm.until, last))
+                return None
         if norm.state == "active":
             return True
         if norm.d.kind == "prohibition" and norm.state == "violated":
@@ -565,22 +641,20 @@ class AgentsRuntime:
                     self._bare |= G.bare_names(expr)
         self._bare -= set(self.policy["actors"]) | {"now", "state", "request"}
         self._valued: set[str] = set()
+        # Which contracts have host-created instances is known at the first
+        # line and not later: a contract that the first line names in
+        # `instances` with another instance than `default`, or lists under
+        # `host_instances`. Every other enforced contract has the instance
+        # `default` from the start. Nothing here reads a later line.
         ids = [c["id"] for c in self.policy["contracts"]]
-        named = {}
-        for line in trace.lines:
-            for e in line.instances:
-                if e["contract"] not in ids:
-                    raise TraceError(f"'instances' names '{e['contract']}', which is not an "
-                                     f"enforced contract of the file")
-                named.setdefault(e["contract"], set()).add(e["instance"])
-        # A contract whose instances the host creates has no instance
-        # `default`; every other enforced contract has only that one.
-        self.host_managed = {c for c, names in named.items() if names != {DEFAULT_INSTANCE}}
-        for c in self.host_managed:
-            if DEFAULT_INSTANCE in named[c]:
-                raise TraceError(f"the instances of {c} are created by the trace; the name "
-                                 f"'{DEFAULT_INSTANCE}' is reserved for a contract without "
-                                 f"host-created instances")
+        head = trace.lines[0]
+        self.host_managed = {e["contract"] for e in head.instances
+                             if e["instance"] != DEFAULT_INSTANCE}
+        for cid in trace.host_instances or []:
+            if cid not in ids:
+                raise TraceError(f"line {head.lineno}: 'host_instances' names '{cid}', "
+                                 f"which is not an enforced contract of the file")
+            self.host_managed.add(cid)
 
     # --- small helpers --------------------------------------------------------
 
@@ -938,10 +1012,23 @@ class AgentsRuntime:
         for c in self.policy["contracts"]:
             for inst in self._running(c["id"]):
                 in_force = {}
+                inst.engine.pending.clear()
                 for nid in c["non_static"]:
                     flag = inst.engine.in_force(nid)
                     if flag is not None:           # a missing entry is unknown
                         in_force[nid] = flag
+                for nid, (key, text, names) in inst.engine.pending.items():
+                    kind = "prohibition" if key == "trigger" else "permission"
+                    effect = ("the prohibition is taken as in force" if key == "trigger"
+                              else "the permission does not apply")
+                    warning = (
+                        f"{c['id']}/{inst.name}: a message was decided while the {key}: "
+                        f"'{text}' of the {kind} '{nid}' had no value "
+                        f"({', '.join(names) or 'a quantity it reads'} has no value yet); "
+                        f"the flag is unknown and {effect} (G.5). Give initial values on "
+                        f"the first line")
+                    if warning not in self.warnings:
+                        self.warnings.append(warning)
                 derived = [{"norm": d.norm, "holder": d.holder, "chain": list(d.chain)}
                            for nid in c["delegations"]
                            for d in inst.derived.get(nid, []) if self._valid(inst, c, d)]
@@ -1218,7 +1305,24 @@ class AgentsRuntime:
                              e.get("bindings", self.trace.bindings),
                              e.get("request", self.trace.request), t)
         by_key = {i.key: i for i in self.instances}
+        ids = [c["id"] for c in self.policy["contracts"]]
         for key, e in entries.items():
+            if key[0] not in ids:
+                raise TraceError(f"line {line.lineno}: 'instances' names '{key[0]}', "
+                                 f"which is not an enforced contract of the file")
+            hosted = key[0] in self.host_managed
+            if hosted and key[1] == DEFAULT_INSTANCE:
+                raise TraceError(
+                    f"line {line.lineno}: the instances of {key[0]} are created by the "
+                    f"trace; the name '{DEFAULT_INSTANCE}' is reserved for a contract "
+                    f"without host-created instances")
+            if not hosted and key[1] != DEFAULT_INSTANCE:
+                raise TraceError(
+                    f"line {line.lineno}: 'instances' creates instance {key[1]} of "
+                    f"{key[0]}, but {key[0]} has had its instance '{DEFAULT_INSTANCE}' "
+                    f"since the first line. Declare on the first line that a host creates "
+                    f"the instances of {key[0]}: name it in 'instances' there, or list it "
+                    f"under 'host_instances'")
             inst = by_key.get(key)
             if inst is None:
                 if e.get("end"):

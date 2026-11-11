@@ -1,4 +1,4 @@
-{"t": 0, "messages": [{"from": "LEAD", "to": "REPO", "name": "push_change"}]}
+{"t": 0, "quantities": [], "messages": [{"from": "LEAD", "to": "REPO", "name": "push_change"}]}
 {"t": 10, "messages": [{"from": "OWNER", "to": "LEAD", "name": "freeze"}]}
 {"t": 20, "messages": [{"from": "LEAD", "to": "REPO", "name": "push_change"}]}
 {"t": 30, "messages": [{"from": "LEAD", "to": "REPO", "name": "force_push"}]}

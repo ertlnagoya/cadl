@@ -196,8 +196,10 @@ def index_uses(expr: Any) -> set[tuple]:
     found: set[tuple] = set()
 
     def is_var(name: Any, bound: frozenset) -> bool:
+        # `now` and `state` are reserved names with a value of their own
+        # (E.4), not variables: `W[now]` reads the time as an index.
         return isinstance(name, str) and name != "*" and not name.isdigit() \
-            and name not in bound
+            and name not in bound and name not in ("now", "state")
 
     def index_of(ref: ActorRef, bound: frozenset) -> None:
         index = ref.index

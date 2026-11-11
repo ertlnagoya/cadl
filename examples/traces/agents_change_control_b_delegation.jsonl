@@ -1,4 +1,4 @@
-{"t": 0, "messages": [{"from": "WORKER[1]", "to": "REPO", "name": "read_repo"}]}
+{"t": 0, "quantities": [], "messages": [{"from": "WORKER[1]", "to": "REPO", "name": "read_repo"}]}
 {"t": 1, "messages": [{"from": "OWNER", "to": "LEAD", "name": "grant_read"}]}
 {"t": 2, "messages": [{"from": "LEAD", "to": "WORKER[1]", "name": "grant_read"}]}
 {"t": 3, "messages": [{"from": "OWNER", "to": "WORKER[1]", "name": "grant_read"}]}
