@@ -223,18 +223,17 @@ class TestGeneration:
         assert temporal_names(solidity_ir(sos, sos.contracts[0])) == ["flag"]
         assert "temporalName[keccak256" in generate_norms_monitor_sol(sos, sos.contracts[0])
 
-    def test_cli_warns_about_the_gas_of_temporal_contents(self, tmp_path):
-        proc = subprocess.run(
-            [sys.executable, "-m", "cadl.cli", "codegen", str(RICH), "-t", "solidity",
-             "-o", str(tmp_path / "out")], capture_output=True, text=True)
-        assert proc.returncode == 0, proc.stderr
-        gas = [l for l in proc.stderr.splitlines() if "4 x 10^4 gas" in l]
-        assert {l.split("norm '")[1].split("'")[0] for l in gas} == {"stay_ok", "steady"}
-        assert all("cannot record any further observation" in l for l in gas)
-        proc = subprocess.run(
-            [sys.executable, "-m", "cadl.cli", "codegen", str(RICH), "-t", "opa",
-             "-o", str(tmp_path / "out2")], capture_output=True, text=True)
-        assert "4 x 10^4 gas" not in proc.stderr
+    @pytest.mark.parametrize("content", ["within(3s, A.x > 1) OR A.y == 1",
+                                         "NOT throughout(2s, A.x > 1)"])
+    def test_solidity_wants_a_temporal_content_to_be_one_operator(self, content):
+        """The Solidity monitor decides the candidates of a temporal
+        content together, from the operator and its operands, so the
+        operator is the whole content; OPA monitors the rest too."""
+        sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
+                     f"content: \"{content}\"}}\n")
+        generate_norms_monitor_rego(sos, sos.contracts[0])
+        with pytest.raises(NormsTargetUnsupported, match="not the whole content"):
+            generate_norms_monitor_sol(sos, sos.contracts[0])
 
     def test_rego_carries_the_contract_as_one_json_text(self):
         """No text of the .cadl file is Rego code: the model is one JSON
@@ -684,6 +683,8 @@ def test_evm_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
         if case["versions"] or any('"amend"' in l for l in case["lines"]):
             continue
         sos = pickle.loads(base64.b64decode(case["sos"]))
+        if not S.six_decimals(case["lines"]):
+            continue                    # its host cannot pass such a number
         try:
             contract = select_contract(sos, case["contract"])
             text = generate_norms_monitor_sol(sos, contract)
@@ -790,3 +791,91 @@ def test_rego_refuses_division():
     sos = _small("      guarantee:\n        - \"A.x / 2 > 3\"\n        - \"A.x > 3\"\n")
     [m] = norms_monitors(sos, "opa")
     assert m["text"] is not None and [p for _, p, _, _ in m["left_out"]] == [1]
+
+
+# === Temporal contents: bounded cost per observation (Solidity) ======================
+
+WINDOWS = """\
+      norms:
+        - {id: w, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(3s, A.x > 5)", deadline: 6s}
+        - {id: th, kind: prohibition, bearer: A, content: "throughout(2s, A.x > 8)"}
+        - {id: un, kind: obligation, bearer: A, trigger: "B -> A : start",
+           content: "until(A.ok == true, A.done == true, 4s)", deadline: 5s}
+        - {id: th2, kind: obligation, bearer: A, content: "throughout(1s, A.y == 1)",
+           deadline: 8s}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [w, th, un, th2]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [w, th, un, th2]}}
+"""
+
+
+def _window_trace(rng: random.Random) -> list:
+    t, lines = 0.0, []
+    for k in range(rng.randint(2, 24)):
+        rec: dict = {"t": t}
+        values = {}
+        for name, choices in (("A.x", [0, 3, 6, 9, 10, None]), ("A.ok", [True, True, False, None]),
+                              ("A.done", [False, False, True, None]), ("A.y", [1, 1, 1, 0, None])):
+            if rng.random() < (0.8 if k == 0 else 0.35):
+                values[name] = rng.choice(choices)
+        if values:
+            rec["values"] = values
+        msgs = [{"from": "B", "to": "A", "name": rng.choice(["go", "start", "pause", "resume"])}
+                for _ in range(rng.choice([0, 0, 0, 1, 1, 2]))]
+        if msgs:
+            rec["messages"] = msgs
+        lines.append(json.dumps(rec))
+        t = round(t + rng.choice([0, 0.5, 1, 1, 1.5, 2, 3, 4, 7]), 3)
+    if rng.random() < 0.3:
+        rec = json.loads(lines[-1])
+        rec["end"] = False
+        lines[-1] = json.dumps(rec)
+    return lines
+
+
+@needs_evm
+def test_evm_temporal_contents(tmp_path, monkeypatch):
+    """within, throughout and until as contents, with deadlines and
+    suspension: the candidates decided from the summaries of their
+    windows give what norms-eval gives."""
+    _memoize_parser(monkeypatch)
+    sos = _small(WINDOWS)
+    rng = random.Random(20261201)
+    traces = [_window_trace(rng) for _ in range(_count(12))]
+    refs, got = _evm(sos, traces, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+@needs_opa
+def test_opa_temporal_contents(tmp_path, monkeypatch):
+    _memoize_parser(monkeypatch)
+    sos = _small(WINDOWS)
+    rng = random.Random(20261202)
+    traces = [_window_trace(rng) for _ in range(_count(150))]
+    refs = [S.reference(sos, l) for l in traces]
+    got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]), monitor_package("C"),
+                    traces, refs, tmp_path, steps=24)
+    assert S.compare(refs, got) == []
+    seen = _seen(refs)
+    assert {"fulfilled", "violated", "suspended", "discharged"} <= seen["states"]
+
+
+@needs_evm
+def test_evm_gas_of_a_temporal_content_is_bounded(tmp_path):
+    """gas2 of the review: a prohibition with content throughout(1000s, ...)
+    at one observation per second. Each observation adds a candidate; the
+    cost of an observation stays the same (it grew by 4 x 10^4 gas per
+    candidate before)."""
+    sos = _small("      norms:\n        - {id: p, kind: prohibition, bearer: A, "
+                 "content: \"throughout(1000s, A.x >= 0)\"}\n")
+    contract = sos.contracts[0]
+    lines = [json.dumps({"t": k, "values": {"A.x": k}}) for k in range(320)]
+    compiled = S.compile_solidity(generate_norms_monitor_sol(sos, contract),
+                                  monitor_name(contract.id), tmp_path)
+    run = S.sol_run(lines, ["A.x"])
+    run["steps"] = [s for s in run["steps"] if "finish" not in s]
+    [raw] = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", [run], tmp_path)
+    gas = [r["gas"] for r in raw]
+    assert max(gas[20:]) < 1.05 * min(gas[20:]) and max(gas) < 500_000, (min(gas), max(gas))

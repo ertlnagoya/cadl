@@ -8,6 +8,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The Solidity norms monitor decides the candidates of a norm whose
+  content is one temporal operator together: a queue of the candidates,
+  oldest first, and what the observations since the last judgement say
+  about the operands (the first time `within`'s operand is true, the
+  first time `throughout`'s is false or undefined, the first observation
+  at which `until`'s `q` is true or `p` is not), compared with the times
+  of the candidates by binary search; decided candidates are deleted a
+  few per observation (library `CadlNormsWindows`). The gas of an
+  observation no longer grows with the observations inside a window:
+  `throughout(1000s, …)` at one observation per second costs 3.8 x 10^5
+  gas at the 320th observation and 3.9 x 10^5 at the 1000th (1.3 x 10^7
+  at the 320th before), and the warning of `cadl codegen` about it is
+  gone. In a content the temporal operator must now be the whole
+  content (refused otherwise, with the reason); nesting is refused as
+  before.
 - Numbers and times are exact (Appendix F, F.5). `cadl norms-eval`, the
   generated `norms_monitor.py` and `cadl agents-run` read a number of a
   trace as the decimal number it is written as (a float of the API as

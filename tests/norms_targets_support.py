@@ -375,6 +375,23 @@ def compile_solidity(source: str, name: str, tmp: Path, runs: int = 1) -> dict:
     return out
 
 
+def six_decimals(lines: list) -> bool:
+    """Whether every number of the trace, as written, has at most six
+    decimals (what a host of the Solidity monitor can pass)."""
+    def ok(v) -> bool:
+        if isinstance(v, Decimal):
+            return (v * 10 ** 6) == (v * 10 ** 6).to_integral_value()
+        if isinstance(v, dict):
+            return all(ok(x) for x in v.values())
+        if isinstance(v, list):
+            return all(ok(x) for x in v)
+        return True
+    try:
+        return all(ok(json.loads(line, parse_float=Decimal)) for line in lines if line.strip())
+    except ValueError:
+        return True
+
+
 def fixed(value, what: str) -> int:
     d = Decimal(repr(value)) if isinstance(value, float) else Decimal(value)
     v = d * 10 ** 6
@@ -425,7 +442,7 @@ def sol_run(lines: list, quantities: list) -> dict:
 
 
 def run_evm(compiled: dict, monitor: str, runs: list, tmp: Path) -> list:
-    libs = [k for k in ("Monitor.sol:CadlNormsValues", "Monitor.sol:CadlNormsEval")]
+    libs = ["Monitor.sol:CadlNormsValues", "Monitor.sol:CadlNormsEval", "Monitor.sol:CadlNormsWindows"]
     job = {"contracts": compiled, "libraries": libs, "monitor": monitor, "runs": runs}
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / "job.json").write_text(json.dumps(job), encoding="utf-8")

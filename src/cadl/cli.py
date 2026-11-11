@@ -790,12 +790,6 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
                   f"for the {target} target, so its norms, counts-as rules and items are "
                   f"not monitored ({'; '.join(m['reasons'])}); the python target "
                   f"monitors them (norms_monitor.py)", file=sys.stderr)
-        for norm in m.get("gas", []) if m["text"] is not None else []:
-            print(f"  [WARNING]: contract '{m['contract']}', norm '{norm}': its content has a "
-                  f"temporal operator; in {m['file']} each observation inside an open window "
-                  f"of it costs about 4 x 10^4 gas on every later observation until the window "
-                  f"closes; keep such observations well below the block gas limit (a monitor "
-                  f"that reaches it cannot record any further observation)", file=sys.stderr)
         for key, pos, text, reason in m["left_out"]:
             print(f"  [WARNING]: {key} item {pos} of contract '{m['contract']}' is not "
                   f"monitored by {m['file']} ({reason}): {text}", file=sys.stderr)
