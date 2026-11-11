@@ -39,6 +39,7 @@ V1 = EXAMPLES / "norms_amendment_v1.cadl"
 V2 = EXAMPLES / "norms_amendment_v2.cadl"
 RICH = Path(__file__).parent / "data" / "norms_monitor_rich.cadl"
 QUANT = Path(__file__).parent / "data" / "norms_monitor_quant.cadl"
+QUANT_V2 = Path(__file__).parent / "data" / "norms_monitor_quant_v2.cadl"
 
 # Runs in a process started with -I -S: no site-packages, no PYTHONPATH, no
 # current directory, so cadl (and lark, yaml, z3) cannot be imported.
@@ -602,6 +603,7 @@ RANDOM_SETS = [
     ("amendment", V1, _ROBOT, V2, 400, 20261112),
     ("rich", RICH, _RICH, None, 700, 20261113),
     ("quantifiers", QUANT, _QUANT, None, 300, 20261115),
+    ("quantifiers_amended", QUANT, _QUANT, QUANT_V2, 200, 20261116),
 ]
 
 

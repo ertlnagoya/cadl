@@ -26,12 +26,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `until:` is missing data (G.5); the limit of G.13 that a prohibition
   with a quantified trigger always applies is gone for quantifiers. A
   wildcard or range reference outside a domain (`ROBOT[*].battery > 10`)
-  is still not evaluated.
+  is still not evaluated. A closed domain is enumerated up to 10 000
+  members (`MAX_DOMAIN`); a larger one, which a single value of `N` in a
+  trace could ask for, is evaluated as an open domain with a warning. A
+  domain stays open while a member beyond the value of its bound has
+  been named (F.3 makes it a member). A quantifier variable never hides
+  a declared symbolic bound, and a reference such as `R[j+1]` with an
+  index outside the set is undefined.
 - `examples/norms_no_double_assignment.cadl` with three traces: the same
   delivery must not be assigned to two robots at once.
 - `cadl check` warns about a prohibition whose message `trigger:` is
   also an occurrence of its message `content:`, which violates it at the
-  observation that activates it (N-13).
+  observation that activates it (N-13; also through an institutional
+  event that a counts_as rule creates from the trigger message, and
+  with arguments compared by value), and about a quantifier or
+  comprehension variable named like a symbolic bound of a declared set
+  (N-14).
 
 ## [0.3.22] — 2026-11-11
 

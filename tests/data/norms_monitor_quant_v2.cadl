@@ -1,0 +1,61 @@
+# Version 2 of norms_monitor_quant.cadl, the target of amendments in the
+# random traces of tests/test_norms_monitor.py and
+# tests/test_norms_quantifiers.py. Its norms and counts-as rules write no
+# S[i], so after an amendment a binding of i no longer names a member, and
+# windows, ranges and deadlines change.
+
+sos:
+  name: Quant
+  extensions:
+    - sos-dsl: 0.1
+    - norms: 0.1
+  actors:
+    - {id: D, role: d}
+    - {id: "S[1..N]", role: s}
+  contracts:
+    - id: C
+      parties: [D, "S[*]"]
+      assume:
+        - "D.up == true"
+      guarantee:
+        - "for all j in S: S[j].load < 9"
+        - "within(5s, exists j in S: S[j].job == 7)"
+      lifecycle:
+        states: [Open, Closed]
+        initial: Open
+        terminal: [Closed]
+        transitions:
+          - {id: close, from: Open, to: Closed, on: "D -> S[i] : release"}
+      counts_as:
+        - {when: "exists j in S: S[j].load > 8", creates: overload}
+        - {when: "D -> S[1] : assign", creates: assigned, if: "count(S[j].job == 7 for j in S) < 2"}
+      norms:
+        - id: double
+          kind: prohibition
+          bearer: D
+          content: "exists j in S: exists k in S: j != k AND S[j].job == 7 AND S[k].job == 7"
+          deadline: 8s
+          on_violation: {severity: Critical}
+        - id: busy_ack
+          kind: obligation
+          bearer: D
+          trigger: overload
+          content: "D -> S[1] : ack"
+          deadline: 4s
+        - id: may_assign
+          kind: permission
+          bearer: D
+          content: "D -> S[1] : assign"
+          until: "for all j in S: S[j].job == 0"
+        - id: all_light
+          kind: prohibition
+          bearer: D
+          trigger: "exists j in S[2..N]: S[j].job == 7"
+          content: "for all j in S[1..2]: S[j].load < 6"
+          deadline: 3s
+        - id: settle
+          kind: obligation
+          bearer: D
+          trigger: assigned
+          content: "exists j in S: within(3s, S[j].job == 0 AND S[j].load <= 5)"
+          deadline: 8s

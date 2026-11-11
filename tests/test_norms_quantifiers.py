@@ -201,9 +201,12 @@ class TestSymbolicBound:
         obs2 = obs + [{"t": 1, "values": {"N": 2}}]
         assert value("exists j in S: S[j].x == 1", obs2, k=0) is None
         assert value("exists j in S: S[j].x == 1", obs2, k=1) is False
-        # a member beyond N is not in the domain; N = 0 is an empty domain
+        # a member named beyond N keeps the domain open (F.3 makes it a
+        # member); N = 0 is an empty domain
         obs3 = [{"t": 0, "values": {"S[1].x": 0, "S[2].x": 0, "S[3].x": 1, "N": 2}}]
-        assert value("exists j in S: S[j].x == 1", obs3) is False
+        assert value("exists j in S: S[j].x == 1", obs3) is True
+        assert value("for all j in S: S[j].x == 0", obs3) is False
+        assert value("exists j in S: S[j].x == 7", obs3) is None
         assert value("for all j in S: S[j].x == 1", [{"t": 0, "values": {"N": 0}}]) is True
 
     def test_bound_that_is_not_an_integer_leaves_the_domain_open(self):
@@ -239,6 +242,57 @@ class TestSymbolicBound:
         ev = evaluator(obs, bindings={"i": 5})
         ev.bound_refs = {("S", "i")}
         assert sorted(ev.known_members(0)["S"]) == [1, 5]
+
+
+# === Review: large domains, bounds, members beyond the bound ====================
+
+class TestReviewFixes:
+    def test_huge_bound_is_evaluated_as_an_open_domain(self):
+        import time
+        obs = [{"t": 0, "values": {"N": 10 ** 7, "S[2].x": 1, "S[3].x": 0}}]
+        ev = evaluator(obs)
+        start = time.perf_counter()
+        assert ev.holds(_rule("exists j in S: S[j].x == 1"), 0, 0) is True
+        assert ev.holds(_rule("for all j in S: S[j].x == 1"), 0, 0) is False
+        assert ev.holds(_rule("exists j in S: S[j].x == 7"), 0, 0) is UNKNOWN
+        assert ev.holds(_rule("sum(S[j].x for j in S) > 0"), 0, 0) is UNKNOWN
+        assert time.perf_counter() - start < 2
+        assert any("10000000 members, more than 10000" in w for w in ev.warnings)
+        # MAX_DOMAIN members are still a closed domain
+        values = {f"S[{i}].x": 0 for i in range(1, 10 ** 4 + 1)}
+        assert value("exists j in S: S[j].x == 1", [{"t": 0, "values": dict(values, N=10 ** 4)}]) is False
+        assert value("exists j in S: S[j].x == 1",
+                     [{"t": 0, "values": dict(values, N=10 ** 4 + 1)}]) is None
+
+    def test_variable_does_not_hide_a_declared_bound(self):
+        obs = [{"t": 0, "values": {"S[1].x": 0, "S[2].x": 0, "S[3].x": 1}}]
+        assert value("for all N in S: exists j in S: S[j].x == 1", obs, bindings={"N": 3}) is True
+        assert value("for all N in S: N <= 3", obs, bindings={"N": 3}) is True
+        sos = parse(ACTORS.replace("parties: [D, \"R[*]\", \"S[*]\"]",
+                                   "parties: [D, \"R[*]\", \"S[*]\"]\n      guarantee:\n"
+                                   "        - \"for all N in S: S[N].x == 1\""))
+        warnings = [str(w) for w in type_check(sos).warnings if "N-14" in str(w)]
+        assert len(warnings) == 1 and "'N'" in warnings[0]
+
+    def test_member_named_beyond_the_bound_keeps_the_domain_open(self):
+        obs = [{"t": 0, "values": {"N": 3, "S[1].x": 0, "S[2].x": 0, "S[3].x": 0},
+                "messages": [{"from": "S[5]", "to": "D", "name": "hi"}]}]
+        assert value("exists j in S: j == 5", obs) is True
+        assert value("exists j in S: S[j].x == 1", obs) is None
+        ev = evaluator(obs)
+        ev.holds(_rule("exists j in S: j == 5"), 0, 0)
+        assert any("S[5] is named but the bound 'N' of S is 3" in w for w in ev.warnings)
+        assert value("exists j in S: S[j].x == 1",
+                     [{"t": 0, "values": {"N": 3, "S[1].x": 0, "S[2].x": 0, "S[3].x": 0}}]) is False
+
+    def test_index_outside_the_set_is_undefined(self):
+        obs = [{"t": 0, "values": {"R[1].x": 1, "R[2].x": 1, "R[3].x": 1, "R[4].x": 1}}]
+        assert value("for all j in R: R[j+1].x > 0", obs) is None
+        assert value("for all j in R[1..2]: R[j+1].x > 0", obs) is True
+
+    def test_count_counts_true_and_nonzero_elements(self):
+        obs = [{"t": 0, "values": {"R[1].x": 5, "R[2].x": 0, "R[3].x": 7}}]
+        assert number("count(R[j].x for j in R)", obs) == 2
 
 
 # === Aggregates =================================================================
@@ -393,26 +447,32 @@ class TestExample:
 # === Causality: the prefix property ===============================================
 
 QUANT = ROOT / "tests" / "data" / "norms_monitor_quant.cadl"
+QUANT_V2 = ROOT / "tests" / "data" / "norms_monitor_quant_v2.cadl"
 
-def test_prefix_property(monkeypatch):
+@pytest.mark.parametrize("amend", [False, True], ids=["plain", "amended"])
+def test_prefix_property(amend, monkeypatch):
     """Random traces over a contract with quantified triggers, contents and
-    untils over a set with a symbolic bound: the verdicts after every
-    prefix are those of the full trace (a decided verdict never changes,
-    and the history of a prefix is a prefix of the full history)."""
+    untils over a set with a symbolic bound, also amended to a version
+    whose references `S[i]` are gone (the members a binding names and the
+    member cache are rebuilt): the verdicts after every prefix are those
+    of the full trace (a decided verdict never changes, and the history of
+    a prefix is a prefix of the full history)."""
     from cadl.parser import parse_file
     from tests.test_norms_monitor import _QUANT, _memoize_parser, _prefix, _random_trace
     _memoize_parser(monkeypatch)
     sos = parse_file(QUANT)
     assert type_check(sos).ok
-    rng = random.Random(20261114)
+    versions = {"v2": parse_file(QUANT_V2)} if amend else None
+    rng = random.Random(20261114 + amend)
     seen = set()
-    compared = 0
-    for _ in range(150):
-        lines = _random_trace(rng, _QUANT)
-        full = evaluate(sos, parse_trace(lines))
+    compared = amended = 0
+    for _ in range(100 if amend else 150):
+        lines = _random_trace(rng, _QUANT, "v2" if amend else None)
+        full = evaluate(sos, parse_trace(lines), versions=versions)
+        amended += bool(full["amendments"])
         ended = full["instance"]["observations"]
         for k in range(min(len(lines), ended) - 1):
-            part = evaluate(sos, parse_trace(_prefix(lines, k)))
+            part = evaluate(sos, parse_trace(_prefix(lines, k)), versions=versions)
             for p in part["norms"]:
                 f = next(x for x in full["norms"] if x["id"] == p["id"])
                 assert f["history"][:len(p["history"])] == p["history"], (k, lines)
@@ -422,6 +482,9 @@ def test_prefix_property(monkeypatch):
         for f in full["norms"]:
             seen.add((f["id"], f["state"]))
     assert compared >= 1000
+    if amend:
+        assert amended >= 25
+        return
     # the quantified norms reach every state they can have
     for nid, state in [("double", "violated"), ("double", "fulfilled"),
                        ("busy_ack", "violated"), ("busy_ack", "fulfilled"),
@@ -486,6 +549,15 @@ class TestAgentsRuntime:
         assert any("trigger: 'exists j in R" in w and "a member of R not yet named" in w
                    for w in r["warnings"])
 
+    def test_missing_data_names_the_remedy_and_the_keys(self):
+        from tests.test_agents_runtime import m, replay, trace
+        r = replay(AGENTS, trace((0, m("OP", "T", "write"), {"values": {"R[1].alarm": False}})))
+        assert any("Give the bound of the set a value" in w for w in r["warnings"])
+        r = replay(AGENTS, trace((0, m("OP", "T", "write"),
+                                  {"values": {"N": 2, "R[1].alarm": False}})))
+        assert any("(R[2].alarm has no value yet)" in w and "initial values" in w
+                   for w in r["warnings"]), r["warnings"]
+
     def test_undefined_until_does_not_let_a_permission_apply(self):
         from tests.test_agents_runtime import decisions, m, replay, trace
         r = replay(AGENTS, trace(
@@ -544,6 +616,17 @@ class TestAgentsRuntime:
 # === N-13: a prohibition that its own trigger violates ==============================
 
 class TestN13:
+    @pytest.mark.parametrize("rule, warned", [
+        ('{when: "D -> R[*] : go", creates: going}', True),
+        ('{when: "D -> R[*] : go", creates: going, if: "D.up == true"}', False),
+        ('{when: "D -> R[1] : go", creates: going}', False),
+    ])
+    def test_institutional_event_content(self, rule, warned):
+        sos = make_sos(f'counts_as:\n  - {rule}\nnorms:\n  - {{id: p, kind: prohibition, '
+                       f'bearer: D, trigger: "D -> R[i] : go", content: going}}\n')
+        assert any("N-13" in str(w) for w in type_check(sos).warnings) is warned
+
+
     @pytest.mark.parametrize("trigger, content, warned", [
         ("D -> R[i] : go", "D -> R[*] : go", True),
         ("D -> R[i] : go", "D -> R[i] : go", True),
@@ -554,6 +637,11 @@ class TestN13:
         ("D -> R[i] : go", "D -> R[i] : stop", False),
         ("D -> R[i] : go", "R[i] -> D : go", False),
         ("R[1].x > 1", "R[1].x > 1", False),
+        ("D -> R[i] : go", "D -> R[1..3] : go", True),
+        ("D -> R[i] : go", "D -> R[1..2] : go", False),
+        ("D -> R[i] : go(1)", "D -> R[i] : go(1.0)", True),
+        ("D -> R[i] : go(1)", "D -> R[i] : go(2)", False),
+        ("D -> S[i] : go", "D -> S[1..9] : go", False),
     ])
     def test_warning(self, trigger, content, warned):
         sos = make_sos(f'norms:\n  - {{id: p, kind: prohibition, bearer: D, '

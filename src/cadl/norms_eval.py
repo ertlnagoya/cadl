@@ -211,6 +211,9 @@ def declared_actors(sos: SoSDefinition) -> dict[str, tuple]:
 _INDEXED_REF_RE = re.compile(r"([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*)\s*\]")
 # A value key or a message actor that names a member: `A[3].x` or `A[3]`.
 _MEMBER_KEY_RE = re.compile(r"^([A-Za-z_]\w*)\[(0|[1-9][0-9]*)\](?:\.|$)")
+# The largest domain of a quantifier or comprehension that is enumerated;
+# a larger one is evaluated as an open domain (F.5).
+MAX_DOMAIN = 10000
 # The aggregate functions of a comprehension (A.10) that the engine evaluates.
 AGGREGATES = ("sum", "count", "min", "max", "avg")
 
@@ -569,6 +572,12 @@ class _Evaluator:
                 return self._lookup(f"{group}[{index}].{expr.member}", k,
                                     f"{group}.{expr.member}")
             text, _ = self.actor(obj, k)
+            if self._scope and self._uses_scope(obj.index):
+                # `A[x+1]`: the member with that index, and no member when
+                # the index lies outside the set (F.5)
+                m = _ACTOR_RE.match(text)
+                if not m or not self.is_member(obj.name, m.group(2)):
+                    return UNKNOWN
             stripped = f"{obj.name}.{expr.member}" if obj.index is not None else None
             return self._lookup(f"{text}.{expr.member}", k, stripped)
         if isinstance(expr, UnaryOp):
@@ -722,8 +731,13 @@ class _Evaluator:
     def _bound_value(self, name: str, k: int) -> int | None:
         """The value of a symbolic bound at observation k: a binding of the
         instance or an observed quantity with an integer value; None when
-        it has none."""
-        v = self._name(name, k)
+        it has none. A bound is read outside every quantifier: a variable
+        of the same name does not hide it."""
+        scope, self._scope = self._scope, {}
+        try:
+            v = self._name(name, k)
+        finally:
+            self._scope = scope
         if isinstance(v, float) and v.is_integer():
             v = int(v)
         if isinstance(v, int) and not isinstance(v, bool):
@@ -737,7 +751,11 @@ class _Evaluator:
         """The domain of a quantifier or comprehension at observation k:
         (set or None, indices in increasing order, closed), or UNKNOWN.
         A domain that is not closed is open: it holds the members known so
-        far, and further members may exist."""
+        far, and further members may exist. A domain is closed when every
+        bound has an integer value, no member beyond the value of the
+        declared symbolic bound of the set has been named, and it has at
+        most MAX_DOMAIN members."""
+        declared = None                 # the symbolic upper bound of the declaration
         if isinstance(dom, RangeExpr):
             group, lo, uppers = None, dom.start, [dom.end]
         else:
@@ -749,7 +767,10 @@ class _Evaluator:
                               f"aggregate over it is undefined")
                     return UNKNOWN
                 lo = decl[1]
-                uppers.append(decl[2] if decl[2] is not None else decl[3])
+                if decl[2] is not None:
+                    uppers.append(decl[2])
+                elif decl[3] is not None:
+                    declared = decl[3]
             if isinstance(dom.index, RangeExpr):
                 lo = dom.index.start if lo is None else max(lo, dom.index.start)
                 uppers.append(dom.index.end)
@@ -761,13 +782,52 @@ class _Evaluator:
             if isinstance(b, int):
                 hi = b if hi is None else min(hi, b)
         start = 0 if lo is None else lo
+        known = None
+        if declared is not None:
+            value = self._bound_value(declared, k)
+            if value is None:
+                unknown = True
+            else:
+                known = self.known_members(k).get(group, ())
+                beyond = sorted(i for i in known if i > value and i >= start)
+                if beyond:
+                    # F.3 makes every index from the lower bound on a member:
+                    # a named member beyond the bound keeps the domain open.
+                    self.warn(f"{group}[{beyond[0]}] is named but the bound '{declared}' of "
+                              f"{group} is {value}; the domain of {group} stays open")
+                    unknown = True
+                else:
+                    hi = value if hi is None else min(hi, value)
         if not unknown and hi is not None:
-            return group, list(range(start, hi + 1)), True
+            if hi - start + 1 <= MAX_DOMAIN:
+                return group, list(range(start, hi + 1)), True
+            self.warn(f"the domain {group or 'range'} [{start}..{hi}] has "
+                      f"{hi - start + 1} members, more than {MAX_DOMAIN}; it is evaluated "
+                      f"as an open domain (known members only)")
         if group is None:
             return None, [], False
-        known = self.known_members(k).get(group, ())
+        if known is None:
+            known = self.known_members(k).get(group, ())
         return group, sorted(i for i in known
                              if i >= start and (hi is None or i <= hi)), False
+
+    def _uses_scope(self, node: Any) -> bool:
+        """Whether an index expression uses a variable of a quantifier or
+        comprehension being evaluated."""
+        if isinstance(node, str):
+            return node in self._scope
+        if isinstance(node, ActorRef):
+            return (node.index is None and node.name in self._scope) or (
+                node.index is not None and self._uses_scope(node.index))
+        if isinstance(node, MemberAccess):
+            return self._uses_scope(node.obj)
+        if isinstance(node, UnaryOp):
+            return self._uses_scope(node.operand)
+        if isinstance(node, BinaryOp):
+            return self._uses_scope(node.left) or self._uses_scope(node.right)
+        if isinstance(node, FunctionCall):
+            return any(self._uses_scope(a) for a in node.args)
+        return False
 
     def _with(self, var: str, member: tuple, fn: Any) -> Any:
         """fn() with the variable `var` bound to `member` (set, index);
@@ -784,9 +844,9 @@ class _Evaluator:
                 del self._scope[var]
 
     def _open_domain(self, group: str) -> None:
-        self.warn(f"the set {group} has a symbolic bound without a value: members that the "
-                  f"trace has not named yet may exist, so a quantifier over it that no known "
-                  f"member decides, and an aggregate over it, are undefined")
+        self.warn(f"the domain of {group} is open: members that the trace has not named yet "
+                  f"may exist, so a quantifier over it that no known member decides, and an "
+                  f"aggregate over it, are undefined")
 
     def _quantified(self, q: QuantifiedExpr, k: int, n: int) -> Any:
         """Kleene's for all / exists over the domain at observation k; on an

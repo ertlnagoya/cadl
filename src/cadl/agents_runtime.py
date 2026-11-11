@@ -580,26 +580,42 @@ class _BoundaryEngine(_Engine):
         from .ast_nodes import Comprehension, MemberAccess, QuantifiedExpr
         values, out = self.obs[n].values, []
 
-        def domain(dom: Any) -> None:
-            # the members of an open domain that the trace has not named yet
+        def domain(dom: Any) -> Any:
+            # an open domain: the members that the trace has not named yet
             d = self.ev.domain(dom, n)
             if d is not UNKNOWN and not d[2]:
                 out.append(f"a member of {d[0]} not yet named" if d[0] is not None
                            else "the bound of a range")
+            return d
 
-        def walk(node: Any, bound: frozenset) -> None:
+        def walk(node: Any, bound: dict) -> None:
             if isinstance(node, (QuantifiedExpr, Comprehension)):
-                domain(node.domain)
+                d = domain(node.domain)
                 inner = node.predicate if isinstance(node, QuantifiedExpr) else node.element
-                walk(inner, bound | {node.variable})
+                walk(inner, {**bound, node.variable: d})
             elif isinstance(node, MemberAccess) and isinstance(node.obj, ActorRef):
                 if node.obj.name == "request" and node.obj.index is None:
                     return
                 index = node.obj.index
                 if isinstance(index, ActorRef) and index.index is None:
                     index = index.name
-                if node.obj.name in bound or index in bound:
-                    return              # a quantity of each member: see domain()
+                var = node.obj.name if node.obj.index is None and node.obj.name in bound \
+                    else index if isinstance(index, str) and index in bound else None
+                if var is not None:
+                    # a quantity of each member of a closed domain: name the
+                    # keys without a value (an open domain: see domain())
+                    d = bound[var]
+                    if d is UNKNOWN or not d[2]:
+                        return
+                    group = d[0] if var == node.obj.name else node.obj.name
+                    for m in d[1]:
+                        key = f"{group}[{m}].{node.member}"
+                        if values.get(key) is None and \
+                                values.get(f"{group}.{node.member}") is None:
+                            out.append(key)
+                    return
+                if node.obj.name in bound or self._scoped(index, bound):
+                    return              # an index expression with a variable
                 key = f"{self.ev.actor(node.obj, n)[0]}.{node.member}"
                 plain = f"{node.obj.name}.{node.member}"
                 if values.get(key) is None and values.get(plain) is None:
@@ -617,8 +633,21 @@ class _BoundaryEngine(_Engine):
                 for item in node:
                     walk(item, bound)
 
-        walk(term.expr, frozenset())
+        walk(term.expr, {})
         return list(dict.fromkeys(out))
+
+    @staticmethod
+    def _scoped(index: Any, bound: dict) -> bool:
+        """Whether an index expression uses a variable of `bound`."""
+        import dataclasses
+        if isinstance(index, str):
+            return index in bound
+        if isinstance(index, ActorRef) and index.index is None:
+            return index.name in bound
+        if dataclasses.is_dataclass(index) and not isinstance(index, type):
+            return any(_BoundaryEngine._scoped(getattr(index, f.name), bound)
+                       for f in dataclasses.fields(index) if f.name != "loc")
+        return False
 
     def in_force(self, nid: str):
         """The in-force flag of G.5: True, False, or None for unknown."""
@@ -1096,8 +1125,11 @@ class AgentsRuntime:
                         f"{c['id']}/{inst.name}: a message was decided while the {key}: "
                         f"{text} of the {kind} '{nid}' had no value "
                         f"({', '.join(names) or 'a quantity it reads'} has no value yet); "
-                        f"the flag is unknown and {effect} (G.5). Give initial values on "
-                        f"the first line")
+                        f"the flag is unknown and {effect} (G.5). "
+                        + ("Give the bound of the set a value (a binding or a quantity)"
+                           if any(" not yet named" in q or q == "the bound of a range"
+                                  for q in names)
+                           else "Give initial values on the first line"))
                     if (inst.key, nid) not in self._warned_missing:    # once per norm
                         self._warned_missing.add((inst.key, nid))
                         self.warnings.append(warning)
