@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -102,6 +103,10 @@ class Line:
     state: str | None = None            # `state` as written on this line
     instances: list[dict] = field(default_factory=list)
     lineno: int = 0
+    # Holds that the host withdraws at this line (`withdraw`).
+    withdraw: list[str] = field(default_factory=list)
+    # Event records of the host at this line (`host_events`).
+    host_events: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -115,6 +120,8 @@ class RunTrace:
     quantities: list[str] | None = None
     # Contracts whose instances a host creates, from the first line.
     host_instances: list[str] | None = None
+    # The run id of the first line, or None.
+    run_id: str | None = None
 
 
 def _parse_epoch(text: Any, where: str) -> datetime:
@@ -161,12 +168,56 @@ def _check_instances(value: Any, where: str) -> list[dict]:
     return out
 
 
+HOST_EVENTS = ("method_refused", "unsolicited_response", "unauthorised_approval",
+               "unauthorised_rejection", "unauthorised_message", "approval_evidence")
+_HOST_EVENT_KEYS = {"event", "reason", "hold_id", "message"}
+
+
+def _check_host_events(value: Any, where: str) -> list[dict]:
+    if not isinstance(value, list):
+        raise TraceError(f"{where}: 'host_events' must be a list")
+    out = []
+    for e in value:
+        if not isinstance(e, dict) or set(e) - _HOST_EVENT_KEYS \
+                or e.get("event") not in HOST_EVENTS:
+            raise TraceError(f"{where}: an entry of 'host_events' is an object with 'event' "
+                             f"({', '.join(HOST_EVENTS)}) and optional reason, hold_id, "
+                             f"message")
+        for key in ("reason", "hold_id"):
+            if e.get(key) is not None and not isinstance(e[key], str):
+                raise TraceError(f"{where}: '{key}' of a host event must be a string")
+        m = e.get("message")
+        if m is not None and (not isinstance(m, dict) or set(m) != {"from", "to", "name"}
+                              or any(not isinstance(v, str) for v in m.values())):
+            raise TraceError(f"{where}: 'message' of a host event has from, to and name")
+        out.append({"event": e["event"], "reason": e.get("reason"),
+                    "hold_id": e.get("hold_id"), "message": m})
+    return out
+
+
 def _first_line_keys(rec: dict, where: str, first: bool) -> tuple:
     """Take the keys of the first line (`epoch`, `quantities`,
-    `host_instances`) and `instances` out of one record and check them.
-    Returns (epoch, quantities, host_instances, entries, state); the first
-    three are None when the line does not give them."""
+    `host_instances`, `run_id`) and `instances`, `withdraw` and
+    `host_events` out of one record and check them. Returns (epoch,
+    quantities, host_instances, entries, state, more); the first three are
+    None when the line does not give them, and `more` has `run_id`,
+    `withdraw` and `host_events`."""
     epoch = quantities = hosted = None
+    more: dict[str, Any] = {"run_id": None, "withdraw": [], "host_events": []}
+    if "run_id" in rec:
+        if not first:
+            raise TraceError(f"{where}: 'run_id' is allowed only on the first line")
+        run_id = rec.pop("run_id")
+        if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
+            raise TraceError(f"{where}: 'run_id' is 32 lowercase hexadecimal digits")
+        more["run_id"] = run_id
+    if "withdraw" in rec:
+        withdraw = rec.pop("withdraw")
+        if not isinstance(withdraw, list) or any(not isinstance(h, str) for h in withdraw):
+            raise TraceError(f"{where}: 'withdraw' must be a list of hold ids")
+        more["withdraw"] = list(withdraw)
+    if "host_events" in rec:
+        more["host_events"] = _check_host_events(rec.pop("host_events"), where)
     if "epoch" in rec:
         if not first:
             raise TraceError(f"{where}: 'epoch' is allowed only on the first line")
@@ -192,7 +243,7 @@ def _first_line_keys(rec: dict, where: str, first: bool) -> tuple:
     if "bindings" in rec and isinstance(rec["bindings"], dict):
         _check_bindings(rec["bindings"], where)
     state = rec.get("state") if isinstance(rec.get("state"), str) else None
-    return epoch, quantities, hosted, entries, state
+    return epoch, quantities, hosted, entries, state, more
 
 
 def _check_epoch_range(epoch: datetime | None, t: float, lineno: int) -> None:
@@ -216,6 +267,7 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
     epoch = None
     quantities = None
     hosted = None
+    run_id = None
     for lineno, line in enumerate(lines, start=1):
         if not line.strip():
             plain.append("")
@@ -228,20 +280,22 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
         if not isinstance(rec, dict):
             plain.append(line)              # reported by parse_trace
             continue
-        e, q, h, entries, state = _first_line_keys(rec, where, not extras)
+        e, q, h, entries, state, more = _first_line_keys(rec, where, not extras)
         epoch = e if e is not None else epoch
         quantities = q if q is not None else quantities
         hosted = h if h is not None else hosted
-        extras.append((state, entries, lineno))
+        run_id = more["run_id"] if more["run_id"] is not None else run_id
+        extras.append((state, entries, lineno, more))
         plain.append(json.dumps(rec))
     base = parse_trace(plain, path=path)
-    for o, (_, _, lineno) in zip(base.observations, extras):
+    for o, (_, _, lineno, _) in zip(base.observations, extras):
         _check_epoch_range(epoch, o.t, lineno)
     return RunTrace(
-        lines=[Line(obs=o, state=s, instances=e, lineno=n)
-               for o, (s, e, n) in zip(base.observations, extras)],
+        lines=[Line(obs=o, state=s, instances=e, lineno=n, withdraw=x["withdraw"],
+                    host_events=x["host_events"])
+               for o, (s, e, n, x) in zip(base.observations, extras)],
         bindings=base.bindings, request=base.request, epoch=epoch, path=path,
-        quantities=quantities, host_instances=hosted)
+        quantities=quantities, host_instances=hosted, run_id=run_id)
 
 
 class RunTraceReader:
@@ -269,15 +323,17 @@ class RunTraceReader:
         except ValueError as e:
             raise TraceError(f"{where}: not JSON ({e})") from None
         first = not self.trace.lines
-        epoch, quantities, hosted, entries, state = _first_line_keys(rec, where, first)
+        epoch, quantities, hosted, entries, state, more = _first_line_keys(rec, where, first)
         obs = self._reader.add(rec, where)
         self._lineno = lineno
         trace = self.trace
         if first:
             trace.epoch, trace.quantities, trace.host_instances = epoch, quantities, hosted
             trace.bindings, trace.request = self._base.bindings, self._base.request
+            trace.run_id = more["run_id"]
         _check_epoch_range(trace.epoch, obs.t, lineno)
-        line = Line(obs=obs, state=state, instances=entries, lineno=lineno)
+        line = Line(obs=obs, state=state, instances=entries, lineno=lineno,
+                    withdraw=more["withdraw"], host_events=more["host_events"])
         trace.lines.append(line)
         return line
 
@@ -1472,6 +1528,13 @@ class AgentsRuntime:
         self._lineno = line.lineno
         self._snapshot = o.values
         self._expire(t)
+        for hold_id in line.withdraw:               # the host withdraws a held message
+            hold = next((h for h in self.holds if h.hold_id == hold_id), None)
+            if hold is not None and hold.state == "held":
+                self._close(hold, "withdrawn", t)
+        for e in line.host_events:
+            self._event(t, e["event"], e["message"], [], hold_id=e["hold_id"],
+                        reason=e["reason"])
         amendment = self._prepare_amendment(o.amend, t) if o.amend else None
 
         entries = {(e["contract"], e["instance"]): e for e in line.instances}
@@ -1664,8 +1727,14 @@ class AgentsRuntime:
         """The holds that are `held`, with their deadline as a time of the
         trace (`t`), for a host that has to observe their expiry."""
         return [{"hold_id": h.hold_id, "deadline_t": h.deadline,
-                 "message": self._head(h.message), "approver": h.approver}
+                 "message": self._head(h.message), "approver": h.approver,
+                 "time": self._time(h.time),
+                 "deadline": None if h.deadline is None else self._time(h.deadline)}
                 for h in self.holds if h.state == "held"]
+
+    def hold_state(self, hold_id: str) -> str | None:
+        """The state of a hold, or None when there is no such hold."""
+        return next((h.state for h in self.holds if h.hold_id == hold_id), None)
 
     def result(self) -> dict:
         instances = []
@@ -1712,7 +1781,7 @@ class AgentsRuntime:
             "messages": len(self.steps),
             "allow": decisions.count("allow"), "deny": decisions.count("deny"),
             "escalate": decisions.count("escalate"),
-            "holds": {s: sum(1 for h in self.holds if h.state == s) for s in HOLD_STATES},
+            "holds": _hold_counts(self.holds),
             "released": sum(1 for h in self.holds if h.released),
             "audit_records": len(self.audit),
         }
@@ -1730,6 +1799,17 @@ class AgentsRuntime:
             "amendments": self.amendments,
             "warnings": self.warnings,
         }
+
+
+def _hold_counts(holds) -> dict:
+    """The number of holds per state. `withdrawn` (a host withdrew the held
+    message) is listed only when it occurs, so that the summary of a run
+    without it is that of `cadl` 0.3.23."""
+    out = {s: sum(1 for h in holds if h.state == s) for s in HOLD_STATES}
+    withdrawn = sum(1 for h in holds if h.state == "withdrawn")
+    if withdrawn:
+        out["withdrawn"] = withdrawn
+    return out
 
 
 def _unique(items) -> list:
@@ -1863,7 +1943,8 @@ def format_text(result: dict) -> str:
         lines += [f"  {w}" for w in result["warnings"]]
 
     held = s["holds"]
-    closed = ", ".join(f"{held[k]} {k}" for k in HOLD_STATES if held[k])
+    closed = ", ".join(f"{held[k]} {k}" for k in HOLD_STATES + ("withdrawn",)
+                       if held.get(k))
     lines += ["", f"Result: {s['messages']} message(s): {s['allow']} allow, {s['deny']} deny, "
                   f"{s['escalate']} escalate"
                   + (f"; holds: {closed}" if closed else "")

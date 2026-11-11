@@ -112,6 +112,12 @@ def main(argv: list[str] | None = None) -> int:
                              help="Accept a log without end record (a running "
                                   "gateway); truncation of its tail is then not "
                                   "detected")
+    averify_cmd.add_argument("--run-id", default=None, metavar="HEX",
+                             help="Also require this run id in the header")
+    averify_cmd.add_argument("--anchor", default=None, metavar="DIGEST",
+                             help="Also require this digest of the last line, kept "
+                                  "outside the log (detects a rewritten or cut log "
+                                  "without a key)")
     averify_cmd.add_argument("--format", choices=["text", "json"], default="text",
                              help="Output format (default: text)")
 
@@ -148,8 +154,18 @@ def main(argv: list[str] | None = None) -> int:
                              "path with the suffix .trace.jsonl)")
     gw_cmd.add_argument("--approvals", type=Path, default=None, metavar="DIR",
                         help="Inbox directory for approvals, rejections and other "
-                             "messages (mcp-approve, mcp-message); without it no "
-                             "hold can be approved")
+                             "messages (mcp-approve, mcp-message); a directory of this "
+                             "user that nobody else can write. Without it no hold can "
+                             "be approved")
+    gw_cmd.add_argument("--approver-keys", type=Path, default=None, metavar="FILE",
+                        help="JSON object from actor to the key file (or {\"hex\": ...}) "
+                             "with which its inbox files are authenticated "
+                             "(HMAC-SHA256); required with --approvals")
+    gw_cmd.add_argument("--insecure-approvals", action="store_true",
+                        help="Read the inbox without authentication (for tests only)")
+    gw_cmd.add_argument("--allow-method", action="append", default=[], metavar="NAME",
+                        help="Also pass this method (repeatable); methods other than "
+                             "tools/call are not decided by the norms")
     gw_cmd.add_argument("--init", type=Path, default=None, metavar="FILE.json",
                         help="Keys for the first line of the trace: bindings, "
                              "request, values, quantities, instances, "
@@ -174,6 +190,9 @@ def main(argv: list[str] | None = None) -> int:
     approve_cmd.add_argument("decision", choices=["approve", "reject"])
     approve_cmd.add_argument("--as", dest="actor", required=True, metavar="ACTOR",
                              help="The actor who approves or rejects")
+    approve_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
+                             help="The key of the actor (HMAC-SHA256); the gateway "
+                                  "requires it unless it runs with --insecure-approvals")
 
     # mcp-message command
     msg_cmd = subparsers.add_parser(
@@ -188,6 +207,8 @@ def main(argv: list[str] | None = None) -> int:
                          help="The message, e.g. 'OPERATOR -> PLANNER : grant_read'")
     msg_cmd.add_argument("--arg", action="append", default=[], metavar="VALUE",
                          help="An argument of the message (repeatable; strings)")
+    msg_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
+                         help="The key of the sender (HMAC-SHA256)")
 
     # regime-map command
     regime_cmd = subparsers.add_parser("regime-map", help="Analyze regime transitions and build a regime map")
@@ -1026,7 +1047,8 @@ def _cmd_agents_run(args: argparse.Namespace) -> int:
         log = None
         if args.audit is not None:
             log = "".join(line + "\n" for line in chain_lines(
-                result["audit"], file_sha256(args.file), epoch_text(trace.epoch), key))
+                result["audit"], file_sha256(args.file), epoch_text(trace.epoch), key,
+                trace.run_id))
         report = (json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False)
                   if args.format == "json" else format_text(result))
     except TraceError as e:
@@ -1062,7 +1084,8 @@ def _cmd_audit_verify(args: argparse.Namespace) -> int:
                 raise AuditKeyError(f"cannot read {args.source}: {e.strerror or e}") from None
         if not args.audit.is_file():
             raise AuditKeyError(f"File not found: {args.audit}")
-        result = verify(args.audit, key=key, source_sha256=source, allow_open=args.open)
+        result = verify(args.audit, key=key, source_sha256=source, allow_open=args.open,
+                        run_id=args.run_id, anchor=args.anchor)
     except (AuditKeyError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

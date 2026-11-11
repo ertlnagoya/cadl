@@ -86,13 +86,39 @@ class TestChainFormat:
         with pytest.raises(ValueError):
             canonical({"x": float("nan")})
 
+    def test_canonical_numbers_and_strings(self):
+        """G.8: integers in decimal, other numbers as the shortest decimal
+        without exponent; keys by code point; only the escapes of JSON."""
+        assert canonical([1e-07, 2.0, 0.1, 123.456, -0.5, 10 ** 15 + 0.5]) == \
+            b"[0.0000001,2,0.1,123.456,-0.5,1000000000000000.5]"
+        assert canonical({"\u00e9": 1, "z": 2, "Z": 3, "a\u2028": 4}) == \
+            '{"Z":3,"a\u2028":4,"z":2,"\u00e9":1}'.encode("utf-8")
+        assert canonical("a\"\\\n\x01/\u0085") == '"a\\"\\\\\\n\\u0001/\u0085"'.encode()
+        for bad in (2 ** 53 + 1, -(2 ** 53) - 1, 1e300, "\ud800", {1: 2}):
+            with pytest.raises(ValueError):
+                canonical(bad)
+        assert canonical(2 ** 53) == b"9007199254740992"
+
     def test_deterministic(self, tmp_path, capsys):
-        a = write_log(tmp_path, name="a.jsonl").read_bytes()
-        b = write_log(tmp_path, name="b.jsonl").read_bytes()
-        assert a == b
-        k1 = write_log(tmp_path, key=KEY, name="k1.jsonl").read_bytes()
-        k2 = write_log(tmp_path, key=KEY, name="k2.jsonl").read_bytes()
+        """With a run id on the first line of the trace, the log is the same
+        bytes every time; without it, agents-run draws a random run id, and
+        only the header and the digests differ."""
+        trace = tmp_path / "t.jsonl"
+        lines = REJECTED.read_text().splitlines()
+        first = json.loads(lines[0])
+        first["run_id"] = "0123456789abcdef0123456789abcdef"
+        trace.write_text("\n".join([json.dumps(first)] + lines[1:]) + "\n")
+        a = write_log(tmp_path, trace, name="a.jsonl").read_bytes()
+        b = write_log(tmp_path, trace, name="b.jsonl").read_bytes()
+        assert a == b and b"0123456789abcdef0123456789abcdef" in a
+        k1 = write_log(tmp_path, trace, key=KEY, name="k1.jsonl").read_bytes()
+        k2 = write_log(tmp_path, trace, key=KEY, name="k2.jsonl").read_bytes()
         assert k1 == k2 and k1 != a
+        r1 = write_log(tmp_path, name="r1.jsonl")
+        r2 = write_log(tmp_path, name="r2.jsonl")
+        h1, h2 = (json.loads(p.read_text().splitlines()[0]) for p in (r1, r2))
+        assert h1["run_id"] != h2["run_id"]
+        assert read_records(r1) == read_records(r2) == read_records(tmp_path / "a.jsonl")
         capsys.readouterr()
 
     def test_keyed(self, tmp_path, capsys):
@@ -283,3 +309,58 @@ class TestAuditVerifyCommand:
         assert "give its key" in err and "File not found" in err
         assert main(["agents-run", str(EXAMPLE), "--trace", str(REJECTED),
                      "--audit-key", str(tmp_path / "audit.jsonl.key")]) == 2
+
+
+class TestLimitsAndAnchors:
+    """What the chain does not show by itself (G.8), and the run id and the
+    anchor that close the gaps."""
+
+    def test_a_keyed_log_rewritten_as_plain_verifies_without_key(self, tmp_path, capsys):
+        """The header's `hash` is not authenticated: a verifier has to know
+        from outside the log that it is keyed. With the key it fails."""
+        keyed = write_log(tmp_path, key=KEY)
+        capsys.readouterr()
+        head = json.loads(lines_of(keyed)[0])
+        records = read_records(keyed)
+        records[1]["reason"] = "rewritten"
+        fake = tmp_path / "fake.jsonl"
+        fake.write_text("".join(x + "\n" for x in chain_lines(
+            records, head["source_sha256"], head["epoch"], None, head["run_id"])))
+        assert check(fake)["valid"]
+        assert not check(fake, KEY)["valid"]
+
+    def test_run_id_and_anchor(self, tmp_path, capsys):
+        a = write_log(tmp_path, name="a.jsonl")
+        b = write_log(tmp_path, name="b.jsonl")
+        capsys.readouterr()
+        ra, rb = check(a), check(b)
+        assert ra["run_id"] != rb["run_id"]
+        assert check(a, run_id=ra["run_id"], anchor=ra["last_digest"])["valid"]
+        assert not check(a, run_id=rb["run_id"])["valid"]
+        # a log that ends earlier, with a recomputed end record, verifies
+        # without a key; the anchor shows it
+        records = read_records(a)[:-2]
+        head = json.loads(lines_of(a)[0])
+        cut = tmp_path / "cut.jsonl"
+        cut.write_text("".join(x + "\n" for x in chain_lines(
+            records, head["source_sha256"], head["epoch"], None, head["run_id"])))
+        assert check(cut)["valid"]
+        r = check(cut, anchor=ra["last_digest"])
+        assert not r["valid"] and "anchor" in r["error"]["what"]
+        # the lines of another run do not fit: a different run id in the
+        # header changes every digest after it
+        put(tmp_path / "splice.jsonl", lines_of(a)[:3] + lines_of(b)[3:])
+        assert not check(tmp_path / "splice.jsonl")["valid"]
+
+    def test_header_needs_a_run_id_and_no_duplicate_keys(self, tmp_path, capsys):
+        log = write_log(tmp_path)
+        capsys.readouterr()
+        lines = lines_of(log)
+        dup = lines[2][:-1] + b', "time": "x"}'
+        put(tmp_path / "dup.jsonl", lines[:2] + [dup] + lines[3:])
+        r = check(tmp_path / "dup.jsonl")
+        assert not r["valid"] and "duplicate" in r["error"]["what"]
+        head = json.loads(lines[0])
+        del head["run_id"]
+        put(tmp_path / "norun.jsonl", [json.dumps(head).encode()] + lines[1:])
+        assert "run id" in check(tmp_path / "norun.jsonl")["error"]["what"]

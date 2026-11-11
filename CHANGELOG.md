@@ -37,12 +37,41 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `cadl agents-run` replays to the same decisions and the same audit log,
   byte for byte.
 
+### Security
+- `cadl mcp-gateway` after an independent review. A client could hide a
+  complete `tools/call` inside another message with bare carriage
+  returns, and a server that reads with universal newlines executed it;
+  lines are now parsed strictly (no CR other than one trailing CRLF, no
+  duplicate keys, no NaN, no lone surrogates) and forwarded as the
+  re-serialised object with every non-ASCII character escaped, never as
+  received. Methods pass by an allowlist in both directions (`tools/call`
+  decided; lifecycle, discovery and `tools/list` passed; anything else
+  refused and recorded as `method_refused` unless `--allow-method`);
+  responses pass only for a request in flight (`unsolicited_response`).
+  Names are matched in full (`"read_file\n"` stopped the gateway). The
+  inbox must be a 0700 directory of the user, and only regular files with
+  one link of that user are read. Approvals are authenticated: HMAC-SHA256
+  per approver (`--approver-keys`, `cadl mcp-approve --key`), bound to the
+  run, the hold, the held message, its time and a nonce; without keys the
+  inbox is refused unless `--insecure-approvals`. A cancelled held call is
+  withdrawn (hold state `withdrawn`). Lone surrogates in a trace are a
+  trace error (`agents-run`, `norms-eval`) instead of a crash.
+- Audit log: a random `run_id` in the header (and on the first line of
+  the gateway's trace); numbers in the canonical form are integers or
+  decimals without exponent; integers beyond 2**53 are refused;
+  `audit-verify --run-id` and `--anchor`.
+
 ### Changed
 - The audit file of `cadl agents-run --audit` has a header line, an end
   line, and three integrity fields at the end of every record line. The
   records themselves, their fields and their order are unchanged; read
   them with `cadl.audit_log.read_records`. `--format json` and the text
-  report are unchanged.
+  report are unchanged. The header has a random run id unless the trace
+  gives `run_id`, so two runs of the same trace differ in the header and
+  the digests.
+- Trace keys `run_id` (first line), `withdraw` and `host_events` for
+  `cadl agents-run`; hold state `withdrawn` (counted in `summary.holds`
+  only when it occurs).
 
 ## [0.3.23] — 2026-11-11
 

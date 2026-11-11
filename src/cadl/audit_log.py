@@ -13,17 +13,23 @@ fields of its record:
             key of the log, over the canonical JSON of the line without
             its ``digest`` field, as lowercase hexadecimal.
 
-Canonical JSON: the object with its keys sorted, no whitespace outside
-strings (separators ``,`` and ``:``), strings as UTF-8 without ``\\u``
-escapes for non-ASCII characters, numbers as Python's ``json`` module
-writes them, NaN and infinities refused (``allow_nan=False``).
+Canonical JSON (G.8): the keys of every object sorted by Unicode code
+point; no whitespace outside strings (separators ``,`` and ``:``);
+strings in UTF-8 with only the escapes that JSON requires (``\\"``,
+``\\\\``, ``\\b``, ``\\f``, ``\\n``, ``\\r``, ``\\t``, and ``\\u00xx`` in
+lowercase hexadecimal for the other characters below U+0020); a number
+that is integral as an integer in decimal, at most 2**53 in absolute
+value; any other number as the shortest decimal that reads back to the
+same binary64 value, written without exponent (``0.0000001``); no NaN,
+no infinity, no lone surrogate, no duplicate key.
 
-A line is written as ``json.dumps(line, ensure_ascii=False)``: the
+A line is written in the same way with the fields in their order (the
 fields of the record in the order of G.8, then ``seq``, ``prev`` and
-``digest``. A verifier reads the line, recomputes the digest from its
-values, and also requires the line to be exactly this written form, so
-that a change of whitespace or of an escape that leaves the values equal
-is detected as well.
+``digest``) and the separators ``, `` and ``: ``. A verifier reads the
+line, recomputes the digest from its values, and also requires the line
+to be exactly this written form, so that a change of whitespace, of an
+escape or of the form of a number that leaves the values equal is
+detected as well.
 
 Without a key the chain detects accidental and partial changes: any
 change of a byte, a deleted, inserted or reordered line, and a changed
@@ -43,6 +49,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
+import re
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -58,15 +67,111 @@ class AuditKeyError(ValueError):
     """A key file that cannot be used."""
 
 
+MAX_INT = 2 ** 53
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+_RUN_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def number_text(value: Any) -> str:
+    """A number of the canonical form: an integer when integral (at most
+    2**53 in absolute value), otherwise the shortest decimal that reads
+    back to the same binary64 value, without exponent."""
+    from .stochastic import decimal_text
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"not a number: {value!r}")
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("NaN and infinities are not allowed")
+        if value.is_integer():
+            value = int(value)
+        else:
+            return decimal_text(Fraction(repr(value)))
+    if abs(value) > MAX_INT:
+        raise ValueError(f"the integer {value} is larger than 2**53 in absolute value")
+    return str(value)
+
+
+def _string_text(text: str) -> str:
+    if _SURROGATE_RE.search(text):
+        raise ValueError("a string has a lone surrogate")
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _encode(obj: Any, sort: bool, item_sep: str, key_sep: str) -> str:
+    if obj is None:
+        return "null"
+    if obj is True:
+        return "true"
+    if obj is False:
+        return "false"
+    if isinstance(obj, str):
+        return _string_text(obj)
+    if isinstance(obj, (int, float)):
+        return number_text(obj)
+    if isinstance(obj, (list, tuple)):
+        return "[" + item_sep.join(_encode(x, sort, item_sep, key_sep) for x in obj) + "]"
+    if isinstance(obj, dict):
+        keys = list(obj)
+        if any(not isinstance(k, str) for k in keys):
+            raise ValueError("a key is not a string")
+        if sort:
+            keys = sorted(keys)
+        return "{" + item_sep.join(_string_text(k) + key_sep
+                                   + _encode(obj[k], sort, item_sep, key_sep)
+                                   for k in keys) + "}"
+    raise ValueError(f"not a JSON value: {type(obj).__name__}")
+
+
 def canonical(obj: Any) -> bytes:
     """The canonical JSON of a value, as UTF-8 bytes."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                      allow_nan=False).encode("utf-8")
+    return _encode(obj, True, ",", ":").encode("utf-8")
 
 
 def written(obj: Any) -> str:
     """The written form of a line (without the newline)."""
-    return json.dumps(obj, ensure_ascii=False, allow_nan=False)
+    return _encode(obj, False, ", ", ": ")
+
+
+def new_run_id() -> str:
+    """A random 128-bit run id, as 32 lowercase hexadecimal digits."""
+    import secrets
+    return secrets.token_hex(16)
+
+
+def is_run_id(text: Any) -> bool:
+    return isinstance(text, str) and _RUN_ID_RE.fullmatch(text) is not None
+
+
+def loads_unique(text: str) -> Any:
+    """`json.loads` that rejects duplicate keys at any depth, NaN and
+    infinities, and lone surrogates; raises ValueError."""
+    def pairs(items):
+        out = {}
+        for k, v in items:
+            if k in out:
+                raise ValueError(f"duplicate key {k!r}")
+            out[k] = v
+        return out
+
+    def bad_constant(name: str):
+        raise ValueError(f"{name} is not JSON")
+    obj = json.loads(text, object_pairs_hook=pairs, parse_constant=bad_constant)
+    check_surrogates(obj)
+    return obj
+
+
+def check_surrogates(obj: Any) -> None:
+    """Raise ValueError when a string or a key has a lone surrogate."""
+    if isinstance(obj, str):
+        if _SURROGATE_RE.search(obj):
+            raise ValueError("a string has a lone surrogate (not UTF-8)")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            check_surrogates(k)
+            check_surrogates(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            check_surrogates(v)
 
 
 def read_key(path) -> bytes:
@@ -108,7 +213,13 @@ class AuditChain:
     every record of G.8, then `end()` for a complete log. Each call returns
     one line without the newline."""
 
-    def __init__(self, source_sha256: str, epoch: str | None, key: bytes | None = None):
+    def __init__(self, source_sha256: str, epoch: str | None, key: bytes | None = None,
+                 run_id: str | None = None):
+        if run_id is None:
+            run_id = new_run_id()
+        if not is_run_id(run_id):
+            raise ValueError("a run id is 32 lowercase hexadecimal digits")
+        self.run_id = run_id
         self.key = key
         self.source_sha256 = source_sha256
         self.epoch = epoch
@@ -138,6 +249,7 @@ class AuditChain:
             "audit_format": FORMAT,
             "hash": "sha256" if self.key is None else "hmac-sha256",
             "key_id": None if self.key is None else key_id(self.key),
+            "run_id": self.run_id,
             "source_sha256": self.source_sha256,
             "epoch": self.epoch,
         })
@@ -171,9 +283,9 @@ def epoch_text(epoch) -> str | None:
 
 
 def chain_lines(records: list[dict], source_sha256: str, epoch: str | None,
-                key: bytes | None = None) -> list[str]:
+                key: bytes | None = None, run_id: str | None = None) -> list[str]:
     """A complete log: header, records, end record."""
-    chain = AuditChain(source_sha256, epoch, key)
+    chain = AuditChain(source_sha256, epoch, key, run_id)
     return [chain.header()] + [chain.record(r) for r in records] + [chain.end()]
 
 
@@ -202,29 +314,33 @@ class _Invalid(Exception):
         self.line, self.what, self.expected, self.found = line, what, expected, found
 
 
-def _loads(text: str) -> Any:
-    def bad_constant(name: str):
-        raise ValueError(f"{name} is not JSON")
-    return json.loads(text, parse_constant=bad_constant)
-
-
 def verify(path, key: bytes | None = None, source_sha256: str | None = None,
-           allow_open: bool = False) -> dict:
+           allow_open: bool = False, run_id: str | None = None,
+           anchor: str | None = None) -> dict:
     """Verify a log. Returns a dict with `valid`, `error` (None, or `line`
     (1-based), `what`, `expected`, `found`), and what was read: `lines`,
     `records`, `hash`, `key_id`, `source_sha256`, `epoch`, `complete`
-    (an end record closes the log) and `last_digest`.
+    (an end record closes the log), `run_id` and `last_digest`.
+
+    `run_id` requires the run id of the header; `anchor` requires the
+    digest of the last line, kept outside the log.
 
     Raises AuditKeyError when the log is keyed and no key is given (the
     chain cannot be checked: a usage error)."""
     data = Path(path).read_bytes()
     out: dict[str, Any] = {
         "file": str(path), "valid": False, "error": None, "lines": 0, "records": 0,
-        "hash": None, "key_id": None, "source_sha256": None, "epoch": None,
-        "complete": False, "last_digest": None,
+        "hash": None, "key_id": None, "run_id": None, "source_sha256": None,
+        "epoch": None, "complete": False, "last_digest": None,
     }
     try:
         _verify(data, key, source_sha256, allow_open, out)
+        if run_id is not None and out["run_id"] != run_id:
+            raise _Invalid(1, "the log has another run id", run_id, out["run_id"])
+        if anchor is not None and out["last_digest"] != anchor:
+            raise _Invalid(out["lines"], "the digest of the last line is not the anchor "
+                                         "(the log was cut, extended or rewritten)",
+                           anchor, out["last_digest"])
         out["valid"] = True
     except _Invalid as e:
         out["error"] = {"line": e.line, "what": e.what, "expected": e.expected,
@@ -251,7 +367,7 @@ def _verify(data: bytes, key, source_sha256, allow_open, out) -> None:
         except UnicodeDecodeError as e:
             raise _Invalid(n, f"not UTF-8 ({e.reason})") from None
         try:
-            obj = _loads(text)
+            obj = loads_unique(text)
         except ValueError as e:
             raise _Invalid(n, f"not JSON ({e})") from None
         if not isinstance(obj, dict):
@@ -262,8 +378,8 @@ def _verify(data: bytes, key, source_sha256, allow_open, out) -> None:
             raise _Invalid(n, f"not in the written form ({e})") from None
         if form != text:
             raise _Invalid(n, "the line is not in the written form (its bytes differ from "
-                              "json.dumps of its values: whitespace, escapes, a number "
-                              "format or a duplicate key were changed)")
+                              "the written form of its values: whitespace, escapes or the "
+                              "form of a number were changed)")
         for name in INTEGRITY_FIELDS:
             if name not in obj:
                 raise _Invalid(n, f"the field '{name}' is missing")
@@ -280,11 +396,14 @@ def _verify(data: bytes, key, source_sha256, allow_open, out) -> None:
             if obj.get("audit_format") != FORMAT:
                 raise _Invalid(1, "the first line is not a header of " + FORMAT,
                                FORMAT, obj.get("audit_format"))
+            if not is_run_id(obj.get("run_id")):
+                raise _Invalid(1, "the header has no run id (32 hexadecimal digits)",
+                               "a run id", obj.get("run_id"))
             algorithm = obj.get("hash")
             if algorithm not in ALGORITHMS:
                 raise _Invalid(1, "unknown hash algorithm", " or ".join(ALGORITHMS),
                                algorithm)
-            out.update(hash=algorithm, key_id=obj.get("key_id"),
+            out.update(hash=algorithm, key_id=obj.get("key_id"), run_id=obj.get("run_id"),
                        source_sha256=obj.get("source_sha256"), epoch=obj.get("epoch"))
             if algorithm == "hmac-sha256" and key is None:
                 raise AuditKeyError("the log is keyed (hmac-sha256, key id "
@@ -332,6 +451,7 @@ def format_verify_text(result: dict) -> str:
             + (", end record)" if result["complete"] else ")"),
             f"  hash: {result['hash']}" + (f" (key id {result['key_id']})"
                                            if result["key_id"] else ""),
+            f"  run id: {result['run_id']}",
             f"  source sha256: {result['source_sha256']}",
             f"  epoch: {result['epoch']}",
             f"  state: {state}",
