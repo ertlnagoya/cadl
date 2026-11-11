@@ -28,12 +28,22 @@ Trace format: the JSON Lines of `cadl norms-eval` (keys ``t``,
 ``epoch``      first line only: the time of ``t = 0`` as an ISO 8601 time
                stamp. With it the times of the audit records and ``now``
                are time stamps; without it they are the numbers of ``t``.
+``quantities`` first line only: the names that are quantities, as a list.
+               With it exactly these names are quantities from the start;
+               without it a name is a quantity from the first line on that
+               gives it a value, and a symbolic value before (F.5).
+``host_instances`` first line only: the ids of the contracts whose
+               instances a host creates, when the first instance comes on a
+               later line. Whether a contract has host-created instances is
+               fixed on the first line; see ``instances``.
 ``instances``  host-created contract instances. Each entry has
                ``contract`` and ``instance`` and may have ``bindings``,
                ``request``, ``state`` and ``"end": true``. An entry that
                names a new instance creates it at this line. A contract
-               that no entry names with an instance other than ``default``
-               has the single instance ``default`` from the first line.
+               that the first line neither names here with an instance other
+               than ``default`` nor lists under ``host_instances`` has the
+               single instance ``default`` from the first line; a later
+               entry that creates an instance of it is a trace error.
 
 One line is processed in this order: holds whose deadline lies before
 ``t`` expire; instances are created; the time and the ``values`` of the
@@ -59,6 +69,7 @@ from . import agents as G
 from .ast_nodes import ActorRef, SoSDefinition
 from .norms_eval import (
     _EPS,
+    UNKNOWN,
     NormsEvalError,
     Observation,
     Trace,
@@ -97,6 +108,10 @@ class RunTrace:
     request: dict[str, Any] = field(default_factory=dict)
     epoch: datetime | None = None
     path: str | None = None
+    # The quantity names of the run when the trace gives them, else None.
+    quantities: list[str] | None = None
+    # Contracts whose instances a host creates, from the first line.
+    host_instances: list[str] | None = None
 
 
 def _parse_epoch(text: Any, where: str) -> datetime:
@@ -149,6 +164,8 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
     plain: list[str] = []
     extras: list[tuple[str | None, list[dict]]] = []
     epoch = None
+    quantities = None
+    hosted = None
     for lineno, line in enumerate(lines, start=1):
         if not line.strip():
             plain.append("")
@@ -165,6 +182,23 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
             if extras:
                 raise TraceError(f"{where}: 'epoch' is allowed only on the first line")
             epoch = _parse_epoch(rec.pop("epoch"), where)
+        if "quantities" in rec:
+            if extras:
+                raise TraceError(f"{where}: 'quantities' is allowed only on the first line")
+            quantities = rec.pop("quantities")
+            if not isinstance(quantities, list) or any(
+                    not isinstance(q, str) or not q.strip() for q in quantities):
+                raise TraceError(f"{where}: 'quantities' must be a list of names")
+            quantities = [q.strip() for q in quantities]
+        if "host_instances" in rec:
+            if extras:
+                raise TraceError(f"{where}: 'host_instances' is allowed only on the "
+                                 f"first line")
+            hosted = rec.pop("host_instances")
+            if not isinstance(hosted, list) or any(
+                    not isinstance(c, str) or not c.strip() for c in hosted):
+                raise TraceError(f"{where}: 'host_instances' must be a list of contract ids")
+            hosted = [c.strip() for c in hosted]
         entries = _check_instances(rec.pop("instances", []), where)
         if "bindings" in rec and isinstance(rec["bindings"], dict):
             _check_bindings(rec["bindings"], where)
@@ -185,7 +219,8 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
     return RunTrace(
         lines=[Line(obs=o, state=s, instances=e, lineno=n)
                for o, (s, e, n) in zip(base.observations, extras)],
-        bindings=base.bindings, request=base.request, epoch=epoch, path=path)
+        bindings=base.bindings, request=base.request, epoch=epoch, path=path,
+        quantities=quantities, host_instances=hosted)
 
 
 def load_run_trace(path) -> RunTrace:
@@ -240,7 +275,6 @@ class _Instance:
         self.request = request
         self.started = started
         self.ended: float | None = None
-        self.end_line: int | None = None
         self.running = True
         self.state: str | None = None
         self.engine: _BoundaryEngine = None       # type: ignore[assignment]
@@ -289,6 +323,32 @@ class _BoundaryTerm(_Term):
             return []
         return sorted(G.predicate_index_vars(self.expr) - set(self.ev.bindings))
 
+    def unbound_in_arguments(self) -> list[str]:
+        """The free index variables in the arguments of a message event
+        that the contract instance does not bind."""
+        if self.kind != "message" or not self.msg_args:
+            return []
+        names = {v for a in self.msg_args for v in G.predicate_index_vars(a)}
+        return sorted(names - set(self.ev.bindings))
+
+    def matching_messages(self, k: int) -> list[dict]:
+        names = self.unbound_in_arguments()
+        if not names:
+            return super().matching_messages(k)
+        # Whether the arguments are those of the event is unknown: the
+        # messages that match in sender, receiver and name occur, or none.
+        args, self.msg_args = self.msg_args, None
+        try:
+            candidates = super().matching_messages(k)
+        finally:
+            self.msg_args = args
+        if candidates:
+            self.ev.warn(
+                f"the index '{names[0]}' in the arguments of '{self.text}' is not bound: "
+                f"its occurrence is unknown and is resolved fail-closed (G.5), here as "
+                f"{'occurring' if self.unknown_as else 'not occurring'}")
+        return candidates if self.unknown_as else []
+
     def _unknown_predicate(self) -> bool:
         names = self.unbound_in_predicate()
         if names:
@@ -331,6 +391,8 @@ class _BoundaryEngine(_Engine):
         self.created: list[dict] = []
         # Violated prohibitions that are still in force at the boundary.
         self.kept: dict[str, dict] = {}
+        # Norm id -> (key, predicate) while the flag is unknown for missing data.
+        self.pending: dict[str, tuple] = {}
         self._mark = 0
         self._harden()
 
@@ -451,6 +513,46 @@ class _BoundaryEngine(_Engine):
                     and norm.until.occurs(n, self.created)):
                 k["on"] = False
 
+    def undefined(self, term, n: int) -> bool:
+        """Whether a predicate has no value at observation n because a
+        quantity it reads has none (F.5: undefined)."""
+        if term is None or term.kind != "predicate" or term.error or n < 0:
+            return False
+        if isinstance(term, _BoundaryTerm) and term.unbound_in_predicate():
+            return False                # unknown by an unbound index: resolved there
+        return self.ev.holds(term.expr, n, n) is UNKNOWN
+
+    def missing(self, term, n: int) -> list[str]:
+        """The quantities that a predicate reads and that have no value at
+        observation n."""
+        import dataclasses
+        from .ast_nodes import MemberAccess
+        values, out = self.obs[n].values, []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, MemberAccess) and isinstance(node.obj, ActorRef):
+                if node.obj.name == "request" and node.obj.index is None:
+                    return
+                key = f"{self.ev.actor(node.obj, n)[0]}.{node.member}"
+                plain = f"{node.obj.name}.{node.member}"
+                if values.get(key) is None and values.get(plain) is None:
+                    out.append(key)
+            elif isinstance(node, ActorRef):
+                if node.index is None and node.name in self.ev.known \
+                        and node.name not in self.ev.bindings \
+                        and values.get(node.name) is None:
+                    out.append(node.name)
+            elif dataclasses.is_dataclass(node) and not isinstance(node, type):
+                for f in dataclasses.fields(node):
+                    if f.name != "loc":
+                        walk(getattr(node, f.name))
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    walk(item)
+
+        walk(term.expr)
+        return list(dict.fromkeys(out))
+
     def in_force(self, nid: str):
         """The in-force flag of G.5: True, False, or None for unknown."""
         norm = self.by_id.get(nid)
@@ -458,6 +560,21 @@ class _BoundaryEngine(_Engine):
             return False
         if norm.frozen:
             return None
+        # Missing data: while the predicate that would bring a prohibition
+        # into force, or end a permission, has no value, the enforcement
+        # point cannot determine the flag. Nothing is latched: the state of
+        # the norm is not changed.
+        kind, last = norm.d.kind, len(self.obs) - 1
+        if kind == "prohibition" and norm.state == "inactive":
+            if self.undefined(norm.trigger, last):
+                self.pending[nid] = ("trigger", norm.trigger.text,
+                                     self.missing(norm.trigger, last))
+                return None
+        if kind == "permission" and norm.state == "active":
+            if self.undefined(norm.until, last):
+                self.pending[nid] = ("until", norm.until.text,
+                                     self.missing(norm.until, last))
+                return None
         if norm.state == "active":
             return True
         if norm.d.kind == "prohibition" and norm.state == "violated":
@@ -514,26 +631,30 @@ class AgentsRuntime:
         self._snapshot: dict[str, Any] = {}
         self._lineno = 0
         self._checked: set[str] = set()
-        # (contract, instance) -> index of the line at which the instance
-        # ended, from a first replay; None while that replay runs.
-        self._ends: dict | None = None
-        self._k = 0
+        # Names that predicates of the enforced contracts use as values,
+        # and the names that have had a value so far: for the warning about
+        # a name whose first value comes after a decision.
+        self._bare: set[str] = set()
+        for c in sos.contracts:
+            if c.enforcement is not None:
+                for _, expr, _ in G.contract_expressions(c):
+                    self._bare |= G.bare_names(expr)
+        self._bare -= set(self.policy["actors"]) | {"now", "state", "request"}
+        self._valued: set[str] = set()
+        # Which contracts have host-created instances is known at the first
+        # line and not later: a contract that the first line names in
+        # `instances` with another instance than `default`, or lists under
+        # `host_instances`. Every other enforced contract has the instance
+        # `default` from the start. Nothing here reads a later line.
         ids = [c["id"] for c in self.policy["contracts"]]
-        named = {}
-        for line in trace.lines:
-            for e in line.instances:
-                if e["contract"] not in ids:
-                    raise TraceError(f"'instances' names '{e['contract']}', which is not an "
-                                     f"enforced contract of the file")
-                named.setdefault(e["contract"], set()).add(e["instance"])
-        # A contract whose instances the host creates has no instance
-        # `default`; every other enforced contract has only that one.
-        self.host_managed = {c for c, names in named.items() if names != {DEFAULT_INSTANCE}}
-        for c in self.host_managed:
-            if DEFAULT_INSTANCE in named[c]:
-                raise TraceError(f"the instances of {c} are created by the trace; the name "
-                                 f"'{DEFAULT_INSTANCE}' is reserved for a contract without "
-                                 f"host-created instances")
+        head = trace.lines[0]
+        self.host_managed = {e["contract"] for e in head.instances
+                             if e["instance"] != DEFAULT_INSTANCE}
+        for cid in trace.host_instances or []:
+            if cid not in ids:
+                raise TraceError(f"line {head.lineno}: 'host_instances' names '{cid}', "
+                                 f"which is not an enforced contract of the file")
+            self.host_managed.add(cid)
 
     # --- small helpers --------------------------------------------------------
 
@@ -633,13 +754,18 @@ class AgentsRuntime:
                     f"of an enforced contract binds every index of its parties "
                     f"('bindings')")
             value = bindings[var]
-            member = {"name": ref["name"], "index": value, "text": f"{ref['name']}[{value}]"}
-            if isinstance(value, bool) or not isinstance(value, int) \
-                    or not G.is_member(self.policy, ref["name"], member):
-                raise TraceError(
-                    f"line {self._lineno}: instance {name} of {cid} binds the index "
-                    f"'{var}' of its party {ref['text']} to {value!r}, which is not a "
-                    f"member of the declared set {ref['name']}")
+            # Every declared set that the variable indexes in the contract:
+            # the party's own, and any other (`SUP[i]` beside a party `W[i]`).
+            sets = [ref["name"]] + sorted(
+                G.contract_index_sets(self._ast(cid)).get(var, set()) - {ref["name"]})
+            for set_name in sets:
+                member = {"name": set_name, "index": value, "text": f"{set_name}[{value}]"}
+                if isinstance(value, bool) or not isinstance(value, int) \
+                        or not G.is_member(self.policy, set_name, member):
+                    raise TraceError(
+                        f"line {self._lineno}: instance {name} of {cid} binds the index "
+                        f"'{var}' of its party {ref['text']} to {value!r}, which is not "
+                        f"a member of the declared set {set_name}")
         for var in bindings:
             if var not in party_vars:
                 text = (f"{cid}/{name}: the binding of '{var}' is ignored for the "
@@ -667,16 +793,14 @@ class AgentsRuntime:
         return {"contract": inst.contract, "instance": inst.name}
 
     def _known_names(self, inst: _Instance) -> set[str]:
-        """The quantity names of an instance (F.5): the names that have a
-        value in an observation of the instance. `values` stay until they
-        change, so these are the names of the snapshot at its last line. A
-        line after the end of the instance adds nothing."""
-        lines = self.trace.lines
-        last = len(lines) - 1
-        if self._ends is not None:
-            end = self._ends.get(inst.key)
-            last = last if end is None else end
-        return set(lines[last].obs.values)
+        """The quantity names of a new instance (F.5). The runtime decides
+        every message on what was observed up to it, so without the names
+        from the trace (`quantities`) a name is a quantity from the first
+        observation on that gives it a value: this set grows with every
+        observation of the instance (`_push`) and never looks ahead."""
+        if self.trace.quantities is not None:
+            return set(self.trace.quantities)
+        return set(self._snapshot)
 
     def _build_until(self, inst: _Instance) -> None:
         inst.until_terms = {}
@@ -704,7 +828,6 @@ class AgentsRuntime:
         are cancelled; G.7 (c): its derived instances are discharged."""
         inst.running = False
         inst.ended = t
-        inst.end_line = self._k
         terminal = (inst.engine.end_reason or "").startswith("terminal state")
         self._event(t, "instance_end", None, [self._where(inst)],
                     reason="terminal_state" if terminal else "end")
@@ -722,6 +845,8 @@ class AgentsRuntime:
         if exempt:
             eng._exempt[n] = set(exempt)
         before = len(eng.unauthorised)
+        if self.trace.quantities is None:
+            eng.ev.known.update(o.values)       # names valued up to now
         ended = eng.push(o)
         inst.state = eng.obs[n].state_after
         for u in eng.unauthorised[before:]:          # F.5, item 7
@@ -887,10 +1012,23 @@ class AgentsRuntime:
         for c in self.policy["contracts"]:
             for inst in self._running(c["id"]):
                 in_force = {}
+                inst.engine.pending.clear()
                 for nid in c["non_static"]:
                     flag = inst.engine.in_force(nid)
                     if flag is not None:           # a missing entry is unknown
                         in_force[nid] = flag
+                for nid, (key, text, names) in inst.engine.pending.items():
+                    kind = "prohibition" if key == "trigger" else "permission"
+                    effect = ("the prohibition is taken as in force" if key == "trigger"
+                              else "the permission does not apply")
+                    warning = (
+                        f"{c['id']}/{inst.name}: a message was decided while the {key}: "
+                        f"'{text}' of the {kind} '{nid}' had no value "
+                        f"({', '.join(names) or 'a quantity it reads'} has no value yet); "
+                        f"the flag is unknown and {effect} (G.5). Give initial values on "
+                        f"the first line")
+                    if warning not in self.warnings:
+                        self.warnings.append(warning)
                 derived = [{"norm": d.norm, "holder": d.holder, "chain": list(d.chain)}
                            for nid in c["delegations"]
                            for d in inst.derived.get(nid, []) if self._valid(inst, c, d)]
@@ -1167,7 +1305,24 @@ class AgentsRuntime:
                              e.get("bindings", self.trace.bindings),
                              e.get("request", self.trace.request), t)
         by_key = {i.key: i for i in self.instances}
+        ids = [c["id"] for c in self.policy["contracts"]]
         for key, e in entries.items():
+            if key[0] not in ids:
+                raise TraceError(f"line {line.lineno}: 'instances' names '{key[0]}', "
+                                 f"which is not an enforced contract of the file")
+            hosted = key[0] in self.host_managed
+            if hosted and key[1] == DEFAULT_INSTANCE:
+                raise TraceError(
+                    f"line {line.lineno}: the instances of {key[0]} are created by the "
+                    f"trace; the name '{DEFAULT_INSTANCE}' is reserved for a contract "
+                    f"without host-created instances")
+            if not hosted and key[1] != DEFAULT_INSTANCE:
+                raise TraceError(
+                    f"line {line.lineno}: 'instances' creates instance {key[1]} of "
+                    f"{key[0]}, but {key[0]} has had its instance '{DEFAULT_INSTANCE}' "
+                    f"since the first line. Declare on the first line that a host creates "
+                    f"the instances of {key[0]}: name it in 'instances' there, or list it "
+                    f"under 'host_instances'")
             inst = by_key.get(key)
             if inst is None:
                 if e.get("end"):
@@ -1214,21 +1369,26 @@ class AgentsRuntime:
         """Replay every line. Messages after an `end` are still decided:
         an ended instance does not come back, so a tool call of its
         contract is denied with `no_instance`."""
-        if self._ends is None:
-            # A first replay finds the line at which each instance ends; it
-            # does not depend on the names (an end comes from the trace).
-            probe = AgentsRuntime(self.sos, self.trace, self.versions, self.check)
-            probe._ends = {}
-            probe._replay()
-            self._ends = {i.key: i.end_line for i in probe.instances}
-        self._replay()
-        return self.result()
-
-    def _replay(self) -> None:
         lines = self.trace.lines
         for k, line in enumerate(lines):
-            self._k = k
+            self._late_names(line)
             self._line(line, k == 0, k == len(lines) - 1)
+        return self.result()
+
+    def _late_names(self, line: Line) -> None:
+        """Warn when a name that a predicate uses as a value gets its first
+        value after a decision: until then it was read as a symbolic value."""
+        new = set(line.obs.values) - self._valued
+        self._valued |= new
+        if self.trace.quantities is not None or not self.steps:
+            return
+        late = sorted(new & self._bare)
+        if late:
+            self.warnings.append(
+                f"line {line.lineno}: {', '.join(late)} get(s) a first value after "
+                f"earlier messages were decided; until then a predicate read the name as "
+                f"a symbolic value (F.5). Give the quantity names of the run with "
+                f"'quantities' on the first line to make them quantities from the start")
 
     # --- result ---------------------------------------------------------------------------------------
 

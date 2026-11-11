@@ -183,37 +183,191 @@ def is_static(contract: ContractDef, norm: NormDef) -> bool:
     return all(r["kind"] != "var" for r in refs)
 
 
-def predicate_index_vars(expr: Any) -> set[str]:
-    """The index variables of the actor references of a parsed predicate
-    (`W[j].alarm == true` gives ``{"j"}``), without those that a quantifier
-    of the predicate binds (`for_all j in ...: ...`)."""
+def index_uses(expr: Any) -> set[tuple]:
+    """The free variables of a parsed expression that are used as an index
+    or inside an index expression, as pairs (set, variable): the set is the
+    actor name when the variable is the whole index (`W[j]` gives
+    ``("W", "j")``) and None when it stands inside an index expression
+    (`W[j+1]` gives ``(None, "j")``). A variable is not free when a
+    quantifier (`exists j in W: ...`) or a comprehension
+    (`sum(W[j].load for j in W)`) of the expression binds it."""
     import dataclasses
-    from .ast_nodes import ActorRef, QuantifiedExpr
+    from .ast_nodes import ActorRef, Comprehension, MemberAccess, QuantifiedExpr, RangeExpr
+    found: set[tuple] = set()
+
+    def is_var(name: Any, bound: frozenset) -> bool:
+        # `now` and `state` are reserved names with a value of their own
+        # (E.4), not variables: `W[now]` reads the time as an index.
+        return isinstance(name, str) and name != "*" and not name.isdigit() \
+            and name not in bound and name not in ("now", "state")
+
+    def index_of(ref: ActorRef, bound: frozenset) -> None:
+        index = ref.index
+        if isinstance(index, ActorRef) and index.index is None:
+            index = index.name
+        if isinstance(index, str):
+            if is_var(index, bound):
+                found.add((ref.name, index))
+        elif index is not None and not isinstance(index, (int, RangeExpr)):
+            walk(index, bound, True)
+
+    def walk(node: Any, bound: frozenset, inside: bool) -> None:
+        if isinstance(node, QuantifiedExpr):
+            walk(node.domain, bound, inside)
+            walk(node.predicate, bound | {node.variable}, inside)
+        elif isinstance(node, Comprehension):
+            walk(node.domain, bound, inside)
+            walk(node.element, bound | {node.variable}, inside)
+        elif isinstance(node, MemberAccess):
+            if isinstance(node.obj, ActorRef):
+                index_of(node.obj, bound)       # `A.x`: A is no variable
+            else:
+                walk(node.obj, bound, inside)
+        elif isinstance(node, ActorRef):
+            if node.index is None:
+                if inside and is_var(node.name, bound):
+                    found.add((None, node.name))
+            else:
+                index_of(node, bound)
+        elif dataclasses.is_dataclass(node) and not isinstance(node, type):
+            for f in dataclasses.fields(node):
+                if f.name != "loc":
+                    walk(getattr(node, f.name), bound, inside)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item, bound, inside)
+
+    walk(expr, frozenset(), False)
+    return found
+
+
+def predicate_index_vars(expr: Any) -> set[str]:
+    """The free index variables of a parsed expression (see `index_uses`)."""
+    return {var for _, var in index_uses(expr)}
+
+
+def bare_names(expr: Any) -> set[str]:
+    """The names that a parsed predicate uses as a value (`locked` in
+    `AG.mode == locked`): a quantity when the trace gives it a value, a
+    symbolic value otherwise (F.5)."""
+    import dataclasses
+    from .ast_nodes import ActorRef, MemberAccess
     found: set[str] = set()
 
-    def walk(node: Any, bound: frozenset) -> None:
-        if isinstance(node, QuantifiedExpr):
-            walk(node.domain, bound)
-            walk(node.predicate, bound | {node.variable})
+    def walk(node: Any) -> None:
+        if isinstance(node, MemberAccess):
             return
         if isinstance(node, ActorRef):
-            index = node.index
-            if isinstance(index, ActorRef) and index.index is None:
-                index = index.name
-            if isinstance(index, str):
-                if index != "*" and not index.isdigit() and index not in bound:
-                    found.add(index)
-                return
+            if node.index is None:
+                found.add(node.name)
+            return
         if dataclasses.is_dataclass(node) and not isinstance(node, type):
             for f in dataclasses.fields(node):
                 if f.name != "loc":
-                    walk(getattr(node, f.name), bound)
+                    walk(getattr(node, f.name))
         elif isinstance(node, (list, tuple)):
             for item in node:
-                walk(item, bound)
+                walk(item)
 
-    walk(expr, frozenset())
+    walk(expr)
     return found
+
+
+def message_args(text: str | None) -> list:
+    """The parsed arguments of a message event (`lock(W[j].level)`)."""
+    from .ast_nodes import FunctionCall
+    from .parser import parse_expr
+    m = _MESSAGE_EVENT_RE.match(text.strip()) if text and "->" in text else None
+    if not m:
+        return []
+    try:
+        call = parse_expr(m.group(3).strip())
+    except Exception:
+        return []
+    return list(call.args) if isinstance(call, FunctionCall) else []
+
+
+def contract_expressions(contract: ContractDef) -> list[tuple]:
+    """Every expression of a contract that the norms engine or the decision
+    function evaluates, parsed, as (where, expression, is predicate): the
+    predicates and the arguments of the message events of `trigger:`,
+    `until:` and `content:` of the norms, of `when:` and `if:` of the
+    `counts_as:` rules and of `until:` of the delegations, and the
+    `assume:` and `guarantee:` items."""
+    from .ast_nodes import StringLiteral
+    from .parser import parse_rule
+    events = {r.creates for r in contract.counts_as if r.creates}
+    texts = []
+    for n in contract.norms:
+        texts += [(f"{key}: of norm '{n.id}'", getattr(n, key))
+                  for key in ("trigger", "until", "content")]
+    for r in contract.counts_as:
+        texts.append((f"when: of the counts_as rule that creates '{r.creates}'", r.when))
+        texts.append((f"if: of the counts_as rule that creates '{r.creates}'", r.if_))
+    for d in contract.delegations:
+        texts.append((f"until: of the delegation of '{d.norm}'", d.until))
+    for key, items in (("assume", contract.assume), ("guarantee", contract.guarantee)):
+        texts += [(f"{key}: item {pos}", item) for pos, item in enumerate(items, start=1)]
+    out = []
+    for where, text in texts:
+        if isinstance(text, StringLiteral):
+            text = text.value
+        if text is None or (isinstance(text, str) and (
+                not text.strip() or text.strip() in events)):
+            continue
+        if not isinstance(text, str):
+            out.append((where, text, True))
+        elif "->" in text and _MESSAGE_EVENT_RE.match(text.strip()):
+            out += [(where, arg, False) for arg in message_args(text)]
+        else:
+            try:
+                out.append((where, parse_rule(text), True))
+            except Exception:
+                pass
+    return out
+
+
+def contract_index_sets(contract: ContractDef) -> dict[str, set[str]]:
+    """For each index variable of a contract, the declared sets that it
+    indexes anywhere in the contract (`{"i": {"W", "SUP"}}`)."""
+    out: dict[str, set[str]] = {}
+
+    def add(ref: dict | None) -> None:
+        if ref is not None and ref["kind"] == "var":
+            out.setdefault(ref["var"], set()).add(ref["name"])
+
+    def ref_of(text: str | None) -> dict | None:
+        try:
+            return parse_ref(text) if text else None
+        except Exception:
+            return None
+
+    for p in contract.parties:
+        try:
+            add(_party_ref(p))
+        except Exception:
+            pass
+    events = []
+    for n in contract.norms:
+        od = n.on_denied
+        for text in (n.bearer, n.counterparty, od.escalate_to if od else None,
+                     od.notify if od else None):
+            add(ref_of(text))
+        events += [n.trigger, n.until, n.content, od.fallback if od else None]
+    events += [r.when for r in contract.counts_as] + [d.until for d in contract.delegations]
+    for text in events:
+        try:
+            m = parse_message_event(text)
+        except Exception:
+            m = None
+        if m is not None:
+            add(m.sender)
+            add(m.receiver)
+    for _, expr, _ in contract_expressions(contract):
+        for name, var in index_uses(expr):
+            if name is not None:
+                out.setdefault(var, set()).add(name)
+    return out
 
 
 def ref_covered(ref: dict, parties: list, actors: dict | None = None) -> bool:

@@ -1,4 +1,4 @@
-{"t": 0, "epoch": "2026-11-10T09:00:00Z", "messages": [{"from": "OPERATOR", "to": "PLANNER", "name": "grant_read"}]}
+{"t": 0, "quantities": [], "epoch": "2026-11-10T09:00:00Z", "messages": [{"from": "OPERATOR", "to": "PLANNER", "name": "grant_read"}]}
 {"t": 2, "messages": [{"from": "PLANNER", "to": "SUMMARIZER", "name": "grant_read"}]}
 {"t": 3, "messages": [{"from": "SUMMARIZER", "to": "PLANNER", "name": "grant_read"}]}
 {"t": 5, "messages": [{"from": "SUMMARIZER", "to": "FILES", "name": "read_file"}]}

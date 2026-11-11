@@ -1,0 +1,18 @@
+sos:
+  name: "QP"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - { id: OP, role: "approver", agent: { kind: human } }
+    - { id: "W[1..3]", role: "workers", agent: { kind: llm_agent } }
+    - { id: AG, role: "agent", agent: { kind: llm_agent } }
+    - { id: TOOL, role: "tool", agent: { kind: tool_server, tools: [act, read] } }
+  contracts:
+    - id: C
+      parties: [OP, "W[*]", AG, TOOL]
+      enforcement: {}
+      norms:
+        - { id: may_read, kind: permission, bearer: AG, until: "W[*].alarm == true", content: "AG -> TOOL : read" }
+        - { id: may_act, kind: permission, bearer: AG, content: "AG -> TOOL : act" }
+        - { id: stop_act, kind: prohibition, bearer: AG, trigger: "W[*].alarm == true", content: "AG -> TOOL : act" }
