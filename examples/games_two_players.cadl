@@ -1,0 +1,122 @@
+# Strategic model extension (Appendix I, games 0.1): the second example of I.12.
+#
+# As examples/games_robot_delivery.cadl, and the dispatcher (player D)
+# chooses too: before the first attempt it decides whether to `monitor`
+# the robot, at a cost kappa, or to `trust` it. A careless attempt is
+# sanctioned only when the dispatcher monitors. `comply_if_watched` (D
+# monitors; R is careful when watched and takes the shortcut when not) is
+# a Nash equilibrium exactly when lambda >= lambda* and kappa <= kappa*.
+#
+#   cadl check      examples/games_two_players.cadl
+#   cadl game-check examples/games_two_players.cadl
+#   cadl game-check examples/games_two_players.cadl --certify --partition 4 --no-merge
+sos:
+  name: "RobotDeliveryMonitoring"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+    - games: 0.1
+
+  actors:
+    - { id: DISPATCHER,    role: "Assigns and replans routes" }
+    - { id: "ROBOT[1..N]", role: "Delivers parcels" }
+
+  contracts:
+    - id: DELIVERY
+      parties: [DISPATCHER, "ROBOT[*]"]
+      information: { alpha: 0.9 }
+      authority:   { decision_holder: DISPATCHER, beta: 0.9 }
+      incentives:  { lambda: 0.1 }
+
+  transitions:
+    - { from: CENTRALIZED, to: DISTRIBUTED, condition: "loss_rate > 0.3" }
+    - { from: DISTRIBUTED, to: CENTRALIZED, condition: "loss_rate <= 0.2" }
+
+  model:
+    kind: smg
+    parameters:
+      - { id: p_fail,  range: [0, 0.5], value: 0.05 }
+      - { id: p_loss,  range: [0, 0.5], value: 0.1 }
+      - { id: alpha,   from: "DELIVERY.alpha" }
+      - { id: beta,    from: "DELIVERY.beta" }
+      - { id: lambda,  from: "DELIVERY.lambda" }
+      - { id: q_local, range: [0, 1],   value: 0.6 }
+      - { id: kappa,   range: [0, 1],   value: 0.05 }   # cost of monitoring
+    variables:
+      - { id: watch,    type: "{Open, On, Off}",      init: Open }
+      - { id: task,     type: "{Pending, Delivered}", init: Pending }
+      - { id: attempts, type: "[0..3]",               init: 0 }
+      - { id: settled,  type: bool,                   init: false }
+    labels:
+      delivered: "task == Delivered"
+    players:
+      - { id: R, actors: ["ROBOT[*]"] }
+      - { id: D, actors: [DISPATCHER] }
+    commands:
+      - action: monitor
+        owner: D
+        guard: "watch == Open AND task == Pending AND attempts == 0"
+        updates:
+          - set: { watch: "On" }
+      - action: trust
+        owner: D
+        guard: "watch == Open AND task == Pending AND attempts == 0"
+        updates:
+          - set: { watch: "Off" }
+      - action: careful
+        owner: R
+        guard: "watch != Open AND task == Pending AND attempts < 3"
+        updates:
+          - prob: "beta * alpha * (1 - p_fail) * (1 - p_loss) + (1 - beta) * q_local"
+            set: { task: Delivered, attempts: "attempts + 1" }
+          - prob: rest
+            set: { attempts: "attempts + 1" }
+      - action: careless
+        owner: R
+        guard: "watch != Open AND task == Pending AND attempts < 3"
+        updates:
+          - prob: "0.5 * (beta * alpha * (1 - p_fail) * (1 - p_loss) + (1 - beta) * q_local)"
+            set: { task: Delivered, attempts: "attempts + 1" }
+          - prob: rest
+            set: { attempts: "attempts + 1" }
+      - action: settle
+        guard: "watch != Open AND (task == Delivered OR attempts == 3) AND NOT settled"
+        updates:
+          - set: { settled: true }
+    regimes:
+      CENTRALIZED: { parameters: { beta: 0.9 } }
+      DISTRIBUTED: { parameters: { beta: 0.1 } }
+    rewards:
+      - { id: fee,        items: [ { action: settle, guard: "task == Delivered", value: 1 } ] }
+      - { id: effort,     items: [ { action: careful,  value: 1 } ] }
+      - { id: shortcuts,  items: [ { action: careless, guard: "watch == On", value: 1 } ] }
+      - { id: monitoring, items: [ { action: monitor,  value: 1 } ] }
+    profiles:
+      comply:
+        - { choose: monitor }
+        - { choose: careful }
+      comply_if_watched:
+        - { choose: monitor }
+        - { guard: "watch == Off AND attempts == 0", choose: careless }
+        - { choose: careful }
+    compliance: comply
+    payoffs:
+      - player: R
+        until: "settled"
+        terms:
+          - { reward: fee,       weight: 10 }
+          - { reward: effort,    weight: -1 }
+          - { reward: shortcuts, weight: "-2 * lambda" }
+      - player: D
+        until: "settled"
+        terms:
+          - { reward: fee,        weight: 5 }
+          - { reward: monitoring, weight: "-kappa" }
+    equilibria:
+      - { id: comply_nash }
+      - { id: watched_nash, profile: comply_if_watched }
+      - id: watched_map
+        profile: comply_if_watched
+        regimes: [CENTRALIZED]
+        over: { lambda: [0, 0.4], kappa: [0, 0.4] }
+        resolution: 0.25

@@ -180,6 +180,11 @@ cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
 
 # What an amendment from one version to the next does to the norms
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
+
+# Grounding extension: the derived indices of information sharing and of the
+# concentration of powers, and the incentive coverage, of each contract
+cadl norms-indices examples/grounding_robot_delivery.cadl
+cadl norms-indices examples/grounding_robot_delivery.cadl --format json
 # Stochastic model extension: export the model: block to PRISM, one model
 # file and one properties file per design
 cadl model-export examples/stochastic_robot_delivery.cadl -o prism_out/
@@ -190,6 +195,11 @@ cadl model-check examples/stochastic_robot_delivery.cadl --regime-map best_for_d
 
 # Certified regime map: which regime is best in which cell of the parameter space
 cadl model-check examples/stochastic_robot_delivery.cadl --regime-map best_for_delivery --certify
+
+# Strategic model extension (games 0.1): is the compliance profile a Nash
+# equilibrium, and in which cells of a parameter region is it one?
+cadl game-check examples/games_robot_delivery.cadl
+cadl game-check examples/games_robot_delivery.cadl --certify --equilibrium comply_by_lambda
 
 # Generate CADL from natural language (requires ANTHROPIC_API_KEY)
 cadl ai "A fleet of 5 autonomous drones surveying farmland, coordinated by a ground station"
@@ -608,6 +618,70 @@ A refused observation leaves the monitor exactly as it was, and the monitor stay
 
 The Solidity and OPA targets do not monitor norms; they leave the temporal items out and say so in a warning.
 
+### Grounding of the Institutional Parameters (grounding 0.1)
+
+The grounding extension (Appendix J of the specification) relates the declared `alpha`, `beta` and `lambda` of a contract to its norms. A file declares `grounding: 0.1` together with `norms: 0.1`, which it requires, and may then use four keys:
+
+```yaml
+contracts:
+  - id: DELIVERY_SLA
+    parties: [DISPATCHER, "ROBOT[*]", "CUSTOMER[*]"]
+    authority:   { decision_holder: DISPATCHER, beta: 0.9 }
+    information:
+      alpha: 0.6
+      sharing: ["DISPATCHER -> ROBOT[*] : route"]
+    incentives:  { lambda: 0.5 }
+    grounding:
+      items: { route: DISPATCHER, battery: "ROBOT[*]" }   # information item: its origin
+      tolerance: 0.25                                      # default 0.25
+    norms:
+      - id: may_return_to_charge
+        kind: permission
+        bearer: "ROBOT[i]"
+        content: "ROBOT[i] -> DISPATCHER : charging_request"
+        shares: [battery]                                  # the message conveys these items
+      - id: no_low_battery_driving
+        kind: prohibition
+        bearer: "ROBOT[i]"
+        content: "ROBOT[i].battery < 10 AND ROBOT[i].status == InTransit"
+        on_violation: { sanction: "removed from the pool", magnitude: 4 }
+        on_fulfilment: { reward: "bonus", magnitude: 1 }
+```
+
+`cadl norms-indices FILE [--contract ID] [--format text|json]` computes three quantities for every contract, each an exact ratio of two counts, or undefined when its denominator is zero (J.4):
+
+| Quantity | Ratio | Reported with it |
+|---|---|---|
+| **alpha^**, information sharing | pairs (item, party other than its origin) that a sharing entry, an obligation or a permission gives to the whole party / all such pairs | the pairs given in each of the three ways, the pairs not given, and the entries and norms whose target is member-specific (`ROBOT[3]`), which give no pair |
+| **beta^**, concentration of powers | largest number of powers borne by one single actor / powers | the powers per bearer, the number of norms each power names in `effects:`, and the share of the `decision_holder` |
+| **chi**, incentive coverage | obligations and prohibitions with a sanction text, a reward text or a magnitude greater than zero / obligations and prohibitions | the norms with a reparation only, and the norms with a `transition:` |
+
+```console
+$ cadl norms-indices examples/grounding_robot_delivery.cadl
+Contract DELIVERY_SLA (tolerance 0.25)
+  alpha^ (information sharing) = 5/8 = 0.625  given pairs / pairs
+    declared alpha: 0.6, declared - index = -0.025
+    pairs given by a sharing entry: 3, by an obligation: 1, by a permission: 1
+    ...
+  beta^ (concentration of powers) = 1/2 = 0.5  largest number of powers of one single actor / powers
+    declared beta: 0.9, declared - index = 0.4
+    ...
+  chi (incentive coverage) = 1/3 = 0.333333  norms that carry an incentive / obligations and prohibitions
+    declared lambda: 0.5 (a scale; not compared with chi)
+    ...
+  warning  contract 'DELIVERY_SLA' declares beta: 0.9, but the index of concentration of powers is 1/2 = 0.5 ...; they differ by 0.4, more than the tolerance 0.25 (J-7)
+```
+
+JSON has `file`, `grounding`, `contracts[]` (`id`, `items`, `tolerance`, and `alpha`, `beta`, `coverage`, each with `defined`, `numerator`, `denominator`, `exact`, `value` or `undefined` with the reason, and the counts above; `diagnostics[]`) and `designs[]` (the diagnostics of J-9). The exit status is 0 when the indices were reported, whatever the warnings, and 2 on a usage error (no file, a type-check error, or a file that does not declare `grounding: 0.1` with `norms: 0.1`).
+
+The indices are evidence about the norms, not the meaning of the parameters: `cadl check` compares the declared `alpha` and `beta` with them and only warns (item 15 under Type Checks). `lambda` is a scale and is not compared with a number. Declaring `grounding: 0.1` never makes a file invalid that declares `norms: 0.1` and uses none of the new keys.
+
+**Annotations only.** `shares:`, `on_fulfilment:` and the magnitudes change no verdict: `cadl norms-eval`, `cadl agents-run` and the generated `norms_monitor.py` give the same results with and without them, and the generated monitor does not carry them. The code generators do not write them either, so a reward text may contain a quote. The IR (`cadl sim-ir`) carries them for a file that declares the extension: each contract gains `grounding` (`items`, `tolerance`, and `indices` with the counts of `alpha`, `beta` and `coverage`, `null` for an undefined quantity) and each norm `shares`, `on_violation_magnitude`, `on_fulfilment_reward` and `on_fulfilment_magnitude` (J.10). The IR of a file that does not declare the extension is unchanged.
+
+**Two versions.** `cadl norms-diff OLD NEW` also reports a changed `on_violation.magnitude`, `on_fulfilment:`, `shares:`, `grounding.items` and `grounding.tolerance` and each changed index, lists the magnitude, `on_fulfilment:` and `shares:` of a norm added in the new version, and warns when a declared `alpha` or `beta` and its index move in opposite directions between the versions (J-13); when only one version declares the extension, the indices are not compared and the report says so, for example when `beta` is raised while the amendment gives a power to the robots.
+
+**For strategic models.** In a strategic model (Appendix I; see Strategic Model below), a payoff term may name a norm instead of giving a weight: `{ reward: shortcuts, sanction_of: "DELIVERY.no_shortcut" }`. Its weight is then −m · ℓ (`reward_of:`: +m′ · ℓ), with m the `on_violation.magnitude` (m′ the `on_fulfilment.magnitude`) of the norm and ℓ the parameter bound by `from: "C.lambda"` (J.7). `cadl.grounding.norm_payoff_link(sos, "C.n", "sanction_of" | "reward_of")` resolves the reference: the magnitude (exact), the bearer, the source name `C.lambda`, or a description of why the reference cannot be used. See `examples/games_grounding_robot_delivery.cadl`.
+
 ### Stochastic Model (PRISM Export)
 
 A file that declares `stochastic: 0.1` under `extensions:` may carry a `model:` block (Appendix H of the specification): a parametric discrete-time Markov chain written as guarded probabilistic commands over finite state variables, in which parameters can be bound to `alpha`, `beta`, or `lambda` of a contract. Each regime of `transitions:` is a *design* with its own parameter values and commands. See `examples/stochastic_robot_delivery.cadl`.
@@ -637,6 +711,36 @@ cadl model-check examples/stochastic_robot_delivery.cadl --regime-map best_for_d
 - Limits of the certified map: the bounds of the designs are compared with each other, not the difference of their values, so cells next to a boundary stay `undecided` although no boundary crosses them, and regimes that tie are listed together only when the bounds prove it (equal constant bounds, or designs with the same model). A probability that is not multi-affine in the open parameters (`p * p`) is enclosed by interval arithmetic, which is coarser and decides well-definedness on a cell only where the intervals stay within `[0, 1]`. Cells that are not graph-preserving are analysed, not declined; there an expected reward has a finite upper bound only when every choice of corners reaches the target with probability 1. The cost grows with the number of open parameters, cells and states (exact linear solves, at most 2 000 unknowns).
 - Limits of this implementation: rules S-7 and S-9 are decided by enumerating the full state space, and a model with more than 200 000 states is refused; the evaluator refuses a linear system with more than 2 000 unknowns and a grid with more than 10 000 points.
 - `cadl model-export` leaves out a transition reward whose action label no command of the design has (PRISM and Storm reject such an item) and writes `true : (0);` in a reward structure that would otherwise be empty.
+
+### Strategic Model (Equilibrium Checks and Maps)
+
+A file that declares `stochastic: 0.1` and `games: 0.1` may give its `model:` block `kind: smg` (Appendix I of the specification): a turn-based stochastic game on the model of Appendix H. `players:` declares the players, `owner:` on a command says who chooses it, `profiles:` names profiles of memoryless deterministic strategies as ordered rules `{guard, choose}`, `compliance:` names the profile the contracts ask for, `payoffs:` gives every player a signed weighted sum of expected rewards accumulated until a target, and `equilibria:` asks whether a profile is a Nash equilibrium (or an ε-equilibrium) against unilateral deviations. See `examples/games_robot_delivery.cadl` (a robot that may skip the handling procedure, sanctioned in proportion to λ) and `examples/games_two_players.cadl` (the dispatcher also chooses whether to monitor).
+
+```bash
+# Equilibrium checks at the fixed parameter values (entries of model.equilibria without over:)
+cadl game-check examples/games_robot_delivery.cadl
+cadl game-check examples/games_robot_delivery.cadl --equilibrium comply_nash --regime CENTRALIZED --set lambda=0.2 --format json
+
+# Equilibrium maps (entries with over:): cells certified as equilibrium / not_equilibrium, or undecided
+cadl game-check examples/games_robot_delivery.cadl --certify
+cadl game-check examples/games_robot_delivery.cadl --certify --equilibrium comply_by_lambda --max-cells 500 --format json
+
+# Start from a uniform partition and report the cells as analysed (the 16 cells of I.12)
+cadl game-check examples/games_two_players.cadl --certify --equilibrium watched_map --partition 4 --no-merge
+
+# Properties and regime maps of a strategic model are evaluated under a profile (default: compliance)
+cadl model-check examples/games_robot_delivery.cadl
+# The game in the model language of PRISM-games (model file only)
+cadl model-export examples/games_robot_delivery.cadl --output prism_out/
+```
+
+- An **equilibrium check** reports, per design and player, the payoff under the profile, the best-response value, the deviation gain, and the canonical best response (the profile's command wherever it is optimal, otherwise the first optimal command in declaration order), as exact rational numbers; then the `status` (`equilibrium` or `not_equilibrium` with the `deviators`), and `from_every_state` (whether no player gains from any state it can reach; only with `equilibrium` and ε = 0). The best response is computed by policy iteration with exact linear solves on the Markov decision process of one player against the others' fixed strategies; because a profile must be *admissible* (no single player can keep the game away from the target of its payoff), a memoryless deterministic best response is optimal among all strategies, also those with memory and randomisation (I.7).
+- An **equilibrium map** covers the region of `over:` with cells. `equilibrium` and `not_equilibrium` are claims about **every** valuation of a cell and are certified: on a cell, the game of each player against the profile is relaxed (every state chooses, per allowed command, a distribution at a corner of the cell; an exact interval enclosure for a probability that is not multi-affine), and the cell is decided by the sufficient conditions N, E1 and E2 of I.9 from the exact optimal values of the relaxed processes. A cell is decided only when every policy of every player's relaxed process reaches the target with probability 1 and the design is shown to be well-defined on the cell; anything else is `undecided`, with a `reason` (`bounds`, `not_admissible`, `not_well_defined`). The largest undecided cell is bisected until the undecided fraction is at most `resolution:` or a budget (`--max-depth`, default 24; `--max-cells`, default 20 000) is exhausted; cells that carry the same claim are then joined (`--no-merge` keeps them as analysed). No floating-point number is used.
+- Exit status of `cadl game-check` (I.13): **0** when every requested result was computed, whatever the answers; **1** when a map did not reach its resolution or a query was not evaluated; **2** when nothing can be claimed (a static error, a usage error, a design that is not well-defined or a profile that is not admissible at the values used). `--set` rechecks these conditions at the values it uses and cannot set a parameter that an evaluated map opens. Without `--certify` the maps are not computed, and the output says so.
+- `cadl model-check` on a strategic model evaluates each property, and each regime map, in the Markov chain of its `profile:` (default: the compliance profile). `cadl model-export` writes one model file per design with `smg` and one `player … endplayer` construct per player that owns a command of the design, and no properties file (I.11). **These files have not been run through PRISM-games.** `cadl sim-ir` carries the game in `stochastic_model` (I.13).
+- **The link to norms (Appendix J, J.7).** In a file that also declares `norms: 0.1` and `grounding: 0.1`, a payoff term `sanction_of: "C.n"` has the weight −m · ℓ and a term `reward_of: "C.n"` the weight m′ · ℓ, with m (m′) the `on_violation.magnitude` (`on_fulfilment.magnitude`) of the norm and ℓ the parameter bound by `from: "C.lambda"`; `cadl sim-ir` writes the defined weight (`"-2 * lambda"`) with the fields `sanction_of` and `reward_of`. Every result computed with such a term carries the assumption of J.7 ("the reward structure r is taken to count the violations of C.n"), in the text and in the JSON (`assumptions`). `cadl check` reports, per design, the expected count of each `sanction_of:` and `reward_of:` term under the compliance profile at the fixed values (J-12): for a `sanction_of:` term, 0 means that compliance incurs no sanction of the term, which is condition (ii) of J.7; a `reward_of:` term breaks condition (ii) by the sign of its weight whatever its count. Without `grounding: 0.1` such a term is an error (I-7); a term whose weight is not defined is never read with a default weight, and its queries report `not_evaluated` (exit status 1).
+- **End-point certification (J-14).** In a file that declares `grounding: 0.1`, for an equilibrium map with one open parameter ℓ (whether or not it is bound to `C.lambda`) that occurs in no probability and no reward value and with a power of at most one in every weight, counted on the text (the powers of the factors of a product add up, no cancellation), a cell [a, b] that the conditions of I.9 leave undecided is `equilibrium` when the profile is an ε-equilibrium at a and at b (exact evaluations; the gains are convex in ℓ), and a player p is a deviator on it when its gain at b exceeds ε and condition (ii) of J.7 holds for p: at the values used for the other parameters, every weight of p in which ℓ occurs is −m·ℓ with m ≥ 0, and its reward structure has the expected value 0 under the profile (the gain is then non-increasing). Such cells carry `method: "endpoints (J-14)"`; the map reports whether J-14 applies and, if not, why (`j14`; in a file that does not declare `grounding: 0.1` the reason is that J-14 is a rule of that extension). No other claim follows from the end points.
+- Limits. Strategies named in a file are memoryless and deterministic; there are no mixed equilibria, no concurrent moves, and no partial observation (I.1). The conditions of a map are sufficient, not necessary: cells next to the boundary of the equilibrium region stay `undecided` however fine the partition; a cell on which the relaxed process of some player has a policy that never reaches the target (for example a cell that contains a valuation at which a probability becomes 0 and a cycle closes) stays `undecided` although the profile is admissible on it; the deviation tried for `not_equilibrium` is the canonical best response at the centre of the cell. A cell lists the deviators that are established for the whole cell, so a coarse cell may list fewer than its parts would. I-3 forbids a player id that is a keyword of Appendix H, but the examples of I.12 name a player `R`; this processor admits `F`, `U`, `P`, and `R` as player ids (they are renamed in the export, as H.11 says).
 
 ### AI Integration
 
@@ -668,6 +772,10 @@ The type checker (`cadl check`) validates:
 12. **Stochastic model static semantics** (Appendix H, H.10; only when the file declares `stochastic: 0.1`) — `model:` has `variables:` and `commands:`, and `kind:` is `dtmc` (S-1); ids, label names, enumeration literals, and action labels are identifiers, are no keywords, and are declared once in their namespace, a label is not named `init` or `deadlock`, and the exported names `x_L` of enumeration literals are distinct from every declared name and from each other (S-2); `from:` names `alpha`, `beta`, or `lambda` of a declared contract or a numeric entry of `context.environment` (S-3); `range:` is `[lo, hi]`, required except for a parameter bound to a contract, and every value lies in it (S-4); a variable is `bool`, `"[lo..hi]"`, or `"{A, B}"` with an `init:` of its domain (S-5); every state predicate conforms to the grammar and is well typed (S-6); an update assigns declared variables values of their type that stay in the domain wherever the guard is true (S-7); probabilities are numbers, expressions over parameters, or `rest`, at most one `rest` per command, and they sum to exactly 1 (S-8); at most one command is enabled in any state of any design (S-9); `model.regimes:` and `when:` name regimes of the file, and need `transitions:` (S-10); every parameter has a fixed value under every design, where probabilities lie in `[0, 1]` and rewards are not negative (S-11); a reward structure has items whose `action:` labels a command and whose `value:` mentions no parameter opened by a regime map (S-12); a property conforms to the property grammar, with `R` only over `F` without a step bound and thresholds in range (S-13); a regime map has one to four open parameters, at least two regimes, one objective that is a query, a threshold constraint, a resolution in `(0, 1)`, and designs that are well-defined at the corner points of its region (S-14). S-7 and S-9 enumerate the state space (at most 200 000 states). Warnings: two parameters with the same source (S-3) and a regime without an entry in `model.regimes:` (S-10). Informational: the keys and values reserved for a later version (S-15). Without the declaration, `model:` gets one warning as an undeclared extension key and is not checked, lowered to the IR, or exported
 
 13. **Agent governance static semantics** (Appendix G, G.9; only when the file declares `agents: 0.1`) — the file also declares `norms: 0.1` (G-1); `agent:` has a `kind:` of `llm_agent`, `tool_server`, `human`, or `service` and a `protocol:` that is a name (G-2); `tools:` belongs to a tool server, which lists at least one, and tool names are unique identifiers (G-3); a message event whose receiver is a tool server names one of its tools (G-4; a warning for a protocol step); `enforcement.default` is `deny` or `allow` and `enforcement.point` is `caller`, `receiver`, or `gateway` (G-5); in an enforced contract the sender of the message content of a permission or prohibition is its bearer (G-6); `on_denied:` belongs to a prohibition with a message content in an enforced contract, has at least one key, and its `timeout:` is a duration greater than zero that requires `escalate_to:` (G-7); `escalate_to:` and `notify:` name single declared actors, and `escalate_to:` names a party other than the bearer (G-8); a contract with `escalate_to: A` has a `counts_as:` rule that creates `approval` from a message of `A`, and `approval` and `rejection` are reserved in an enforced contract (G-9); a `fallback:` is a message event of the bearer to a declared actor that differs from the prohibited message (G-10); `delegations:` belongs to an enforced contract, and each entry names one permission with a message content whose bearer has no bound index (G-11), lists declared actors other than tool servers under `to:`, and has a `max_depth:` of at least 1 (G-12); `grant:` and `revoke:` are identifiers that differ from each other, from `approval` and `rejection`, and from the tools of the parties (G-13); in an enforced contract the sender and the receiver of every message event (`trigger:`, `until:` and `content:` of a norm, `when:` of a `counts_as:` rule, `until:` of a delegation) are covered by one reference in the parties, because the contract observes only the messages it governs, and name only declared members (G-17), and every index variable of the contract (in bearers, counterparties, `escalate_to:`, `notify:`, `fallback:`, the senders, receivers and arguments of its message events, and its predicates, also inside an index expression such as `ROBOT[j+1]`) is bound: by a party (`i` for a party `ROBOT[i]`), by a quantifier, or by a comprehension (G-18). Warnings: an institutional event created under an `if:` that is the trigger of a prohibition or the `until:` of a permission (G-19), `escalate_to:` without `timeout:` (G-7), an approver that is not `human` (G-8), no rule for `rejection` (G-9), the bearer listed under `to:` (G-12), a permission or prohibition whose content is not a message event or has arguments (G-14), tools left open by `default: allow` and a tool server that is a party of no enforced contract (G-15), and a message the contract needs but would itself deny (G-16). Without the declaration, `agent:`, `enforcement:`, `delegations:`, and `on_denied:` get one warning as undeclared extension keys and are neither checked nor lowered to the IR
+
+14. **Strategic model static semantics** (Appendix I, I.10; only when the file declares `games: 0.1`) — the file also declares `stochastic: 0.1` (I-1); `kind:` is `dtmc` or `smg`, a model with `kind: smg` has `players:`, `profiles:`, `compliance:`, and `payoffs:`, and any other model has none of the keys of the extension (I-2); player ids are unique identifiers and every player lists declared actors, none of which stands behind two players (I-3); `owner:` names a player, an owned command has an action label, and the commands with one label have one owner or none (I-4); in every state of every design the enabled commands are at most one, or all belong to one player and have different labels (I-5, which replaces S-9); profile names are unique identifiers, a rule chooses the label of an owned command under a guard without labels, every profile selects a command wherever two or more are enabled, and `compliance:` names a profile (I-6); every player has exactly one payoff, with a boolean target, at least one term, declared reward structures used at most once, and weights over declared parameters; a term with `sanction_of:` or `reward_of:` needs `grounding: 0.1` (I-7); every profile is admissible in every design at the fixed values (I-8); an entry of `equilibria:` has an id that is unique among properties and regime maps, a profile, designs, an `epsilon:` that is not negative, and, for a map, one to four open parameters within their ranges that no regime assigns and no reward value mentions, a `resolution:` in `(0, 1)`, designs that are well-defined at the corners of the region, and a profile that is admissible at the centre of every face of the region (I-9); `profile:` of a property or regime map names a profile (I-10). I-5 and I-6 are decided by enumerating the state space, I-8 and I-9 on the reachable game. Warnings: a profile rule that is the first applicable rule in no state (I-6); a payoff whose target holds in the initial state (I-7). Informational: reserved keys and values (I-11); the keys of the extension in a file that does not declare `games: 0.1`, which is then read by Appendix H (I.15). A file that declares `games: 0.1` without `stochastic: 0.1` gets the error of I-1
+
+15. **Grounding static semantics** (Appendix J, J.8; only when the file declares `grounding: 0.1`) — the file also declares `norms: 0.1` (J-1); the keys of `grounding.items` are identifiers, not reserved words, and their values actor references to a party of the contract, and `tolerance:` is a number in `[0, 1]` (J-2); `shares:` belongs to an obligation or a permission whose content is a message event and lists at least one declared item, each once (J-3); a magnitude is a finite number that is not negative, and `on_fulfilment:` belongs to an obligation or a prohibition and has a `reward:` (a text) or a `magnitude:` (J-4). Warnings, never errors: a sharing norm that gives an item to its origin, a target that is not a party or is the bare name of an actor set, a sharing entry with an undeclared item, and a sharing entry with more than one item or with arguments, which gives no pair (J-3); a magnitude of zero next to a sanction or reward text (J-4); `alpha: 0` with a given pair or, when the index is undefined, with a sharing entry, `alpha: 1` with a pair that is not given, `beta: 1` with a power that the single actor with the most powers does not bear, `beta: 0` with a single actor that bears more than an even share (J-6); a declared `alpha` or `beta` other than 0 and 1 farther from its index than the tolerance, and a decision holder with fewer powers than another actor (J-7); for a contract with norms, `lambda` greater than zero while no obligation or prohibition carries a sanction or a reward, and `lambda: 0` while one does (J-8). Informational, in a file that also declares `stochastic: 0.1`: a design in which a parameter bound to `C.alpha` or `C.beta` is farther from the index than the tolerance, unless J-6 or J-7 already reports the same declared value (J-9). The comparisons are exact (decimals as written, ratios as fractions). Without the declaration, `grounding:`, `shares:`, `on_fulfilment:` and `on_violation.magnitude` get one warning as undeclared extension keys, are not interpreted, and no index is computed (J.12). In a strategic model (Appendix I): a term has at most one of `weight:`, `sanction_of:`, `reward_of:`; the reference names an obligation or a prohibition of a declared contract with a magnitude greater than zero for the key; the model has exactly one parameter bound to `C.lambda`; a player that stands for the bearer of the norm owns the payoff (an actor reference that covers the bearer); and a norm is named at most once per key (J-10, errors). Warnings: a norm of a linked contract with a magnitude, a bearer that a player stands for, and no term that names it; a written weight with the parameter bound to `C.lambda` (J-11). Informational: the expected count of each `sanction_of:` and `reward_of:` term under the compliance profile, per design (J-12). J-14 is used by `cadl game-check --certify`
 
 It also reports, without failing the check, a `codegen:` target that `cadl codegen` cannot emit (warning), an extension name it does not know, and a `motivation:` block, which it keeps and passes on in `cadl sim-ir` but does not interpret (informational).
 
@@ -715,6 +823,7 @@ This generates the IR JSON, the Unity C# tree, and drops the latter into the Uni
 | `raspimouse_mcp_sos.cadl` | Raspimouse swarm (MCP-SoS) | Acknowledged | LLM-controlled via MCP tools, Static/Dynamic path modes, 3 regimes |
 | `sos_dsl_robot_delivery.cadl` | Robot delivery with the SoS-DSL extension | Acknowledged | Contract lifecycle (7 states), 3 monitors; the example used by the hands-on course |
 | `agents_tool_governance.cadl` | LLM planner, sub-agent and two tool servers (agents 0.1) | — | Enforced contract, escalation to a human, delegation with provenance; sample inputs in `agents_inputs/`, traces for `cadl agents-run` in `traces/` |
+| `grounding_robot_delivery.cadl` | Robot delivery with norms and the grounding extension (grounding 0.1) | Acknowledged | The example of Appendix J, J.9: information items, `shares:`, a sanction magnitude; indices 5/8, 1/2 and coverage 1/3 with `cadl norms-indices` |
 | `agents_change_control.cadl` | Owner, lead agent, two workers and a repository (agents 0.1) | — | A prohibition in force between a trigger and an `until:`, delegation with `max_depth: 1` and `until:`; traces for `cadl agents-run` in `traces/` |
 
 ### Demo Scripts
@@ -752,6 +861,7 @@ src/cadl/
   norms_eval.py        Verdicts of the norms extension on a recorded trace
   agents_runtime.py    Runtime of the agent governance extension: decisions, holds, delegations and audit records on a trace
   norms_diff.py        Effect of an amendment on the norms (two versions compared)
+  grounding.py         Grounding extension: derived indices, rules J-1 to J-9 and J-13
   cli.py               Command-line interface
   codegen/
     __init__.py        Public generate() API (multi-target dispatch)
@@ -814,6 +924,7 @@ tests/
   test_expr_parser.py    Expression grammar tests
   test_unparse.py        Expression round-trip tests
   test_norms_eval.py     Norm verdicts on a trace (`cadl norms-eval`)
+  test_grounding_extension.py  Grounding extension: indices, rules, IR, `cadl norms-indices`
   test_norms_monitor.py  Generated norms monitor against `cadl norms-eval` (examples, recorded and random traces)
   norms_monitor_cases.py pytest plugin that records the cases of test_norms_eval.py for it
   test_name_resolution.py Actor vs state-variable resolution in generated code
@@ -865,6 +976,8 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | SoS-DSL extension (`lifecycle:` / `monitors:`) and Unity C# generation | Available |
 | Norms extension: static checks, and verdicts and amendments on a recorded trace (`cadl norms-eval`, `cadl norms-diff`) | Available |
 | Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available (Solidity, OPA and Unity C# do not monitor norms; no translation to a model checker) |
+| Grounding extension (grounding 0.1), norms side: derived indices and incentive coverage (`cadl norms-indices`), rules J-1 to J-9, IR, comparison of two versions (J-13 in `cadl norms-diff`) | Available |
+| Strategic model extension (games 0.1): equilibrium checks and certified equilibrium maps (`cadl game-check`), with the link to norms of Appendix J (`sanction_of:` / `reward_of:`, J-10 to J-12, J-14) | Available (the export for PRISM-games has not been run through PRISM-games) |
 | Agent governance extension (agents 0.1): checks, decision function, runtime on a recorded trace (holds, delegations, audit records; `cadl agents-run`), Rego / Cedar boundary policies | Available (the runtime is an offline reference: it replays a trace and is not connected to a protocol) |
 | `model_check` / `simulation` / `proof` verification methods | Not supported yet (reported explicitly) |
 
