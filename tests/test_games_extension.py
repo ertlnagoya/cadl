@@ -434,7 +434,8 @@ class TestPayoffs:
 
     def grounded(self, key="sanction_of"):
         def mutate(model, sos):
-            sos["extensions"].append({"grounding": 0.1})
+            # grounding 0.1 requires norms 0.1 (J-1).
+            sos["extensions"] += [{"norms": 0.1}, {"grounding": 0.1}]
             model["payoffs"][0]["terms"][1] = {"reward": "cost", key: "C.n"}
         return mutate
 

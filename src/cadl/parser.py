@@ -1294,6 +1294,10 @@ def _build_sos(data: dict) -> SoSDefinition:
     contracts_data = _get(sos_data, 'contracts', [])
     if isinstance(contracts_data, list):
         sos.contracts = [_build_contract(c) for c in contracts_data if isinstance(c, dict)]
+        # Grounding extension (Appendix J): its keys are kept as written,
+        # apart from the norms; interpreted only when it is declared (J.12).
+        from .grounding import read_raw
+        sos.grounding = read_raw(contracts_data)
 
     # Protocols
     protocols_data = _get(sos_data, 'protocols', [])

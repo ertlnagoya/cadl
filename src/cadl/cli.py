@@ -145,6 +145,18 @@ def main(argv: list[str] | None = None) -> int:
     diff_cmd.add_argument("--format", choices=["text", "json"], default="text",
                           help="Output format (default: text)")
 
+    # norms-indices command (grounding extension, Appendix J)
+    nidx_cmd = subparsers.add_parser("norms-indices",
+        help="Report the derived indices of information sharing and concentration of "
+             "powers and the incentive coverage of each contract (grounding 0.1, "
+             "Appendix J, J.4)")
+    nidx_cmd.add_argument("file", type=Path,
+                          help="CADL file that declares norms: 0.1 and grounding: 0.1")
+    nidx_cmd.add_argument("--contract", default=None, metavar="ID",
+                          help="Contract to report (default: every contract)")
+    nidx_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                          help="Output format (default: text)")
+
     # model-export command (stochastic extension, Appendix H)
     mexp_cmd = subparsers.add_parser("model-export",
         help="Export the model: block (stochastic 0.1) to PRISM, one model file "
@@ -259,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_norms_eval(args)
     elif args.command == "norms-diff":
         return _cmd_norms_diff(args)
+    elif args.command == "norms-indices":
+        return _cmd_norms_indices(args)
     elif args.command == "model-export":
         return _cmd_model_export(args)
     elif args.command == "model-check":
@@ -761,6 +775,14 @@ def _ir_to_dict(ir) -> dict:
                 for key in ("on_denied_escalate_to", "on_denied_timeout_ms",
                             "on_denied_fallback", "on_denied_notify"):
                     n.pop(key, None)
+    # Likewise the fields of the grounding extension (Appendix J, J.10).
+    if not d.pop("grounding_extension", False):
+        for c in d.get("institution", {}).get("contracts", []):
+            c.pop("grounding", None)
+            for n in c.get("norms", []):
+                for key in ("shares", "on_violation_magnitude", "on_fulfilment_reward",
+                            "on_fulfilment_magnitude"):
+                    n.pop(key, None)
     # Rename lambda_ back to lambda for readability
     for c in d.get("institution", {}).get("contracts", []):
         gov = c.get("governance", {})
@@ -919,6 +941,43 @@ def _cmd_norms_diff(args: argparse.Namespace) -> int:
     else:
         print(format_diff_text(result))
     return 0 if result["ok"] else 1
+
+
+def _cmd_norms_indices(args: argparse.Namespace) -> int:
+    """Exit status: 0 when the indices were reported (warnings of J-6 to
+    J-8 do not fail), 2 on a usage error: no file, a parse or type-check
+    error, or a file that does not declare grounding 0.1 with norms 0.1."""
+    from .grounding import GroundingError, format_report_text, report
+    from .parser import parse_file
+    from .type_checker import type_check
+
+    path = args.file
+    if not path.exists():
+        print(f"Error: File not found: {path}", file=sys.stderr)
+        return 2
+    try:
+        sos = parse_file(path)
+    except Exception as e:
+        print(f"Parse error: {e}", file=sys.stderr)
+        return 2
+    try:
+        result = report(sos, args.contract)
+    except GroundingError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    check = type_check(sos)
+    if not check.ok:
+        print(f"Error: {path} has {len(check.errors)} type-check error(s):", file=sys.stderr)
+        for error in check.errors:
+            print(f"  {error}", file=sys.stderr)
+        return 2
+    result = {"file": str(path), **result}
+    if args.format == "json":
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_report_text(result))
+    return 0
 
 
 def _load_stochastic_model(path: Path):

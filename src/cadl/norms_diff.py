@@ -161,6 +161,10 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition,
                 f"the new version has no contract '{c.id}'; its instances cannot be amended")]
         else:
             findings = _diff_contract(c, new_by[c.id])
+            # Grounding extension (Appendix J, J-13); nothing unless a
+            # version declares it.
+            from .grounding import diff_contract as _diff_grounding
+            findings += _diff_grounding(old, c, new, new_by[c.id])
         contracts.append({"id": c.id, "findings": findings})
     errors = [f"{c['id']}: {f['text']}" for c in contracts for f in c["findings"]
               if f["level"] == "error"]

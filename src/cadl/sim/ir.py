@@ -123,6 +123,12 @@ class NormSpecIR:
     on_denied_timeout_ms: int | None = None
     on_denied_fallback: str | None = None
     on_denied_notify: str | None = None
+    # Grounding extension (Appendix J, J.10); serialized only for a file
+    # that declares it. Magnitudes are None when absent.
+    shares: list[str] = field(default_factory=list)
+    on_violation_magnitude: Any = None
+    on_fulfilment_reward: str | None = None
+    on_fulfilment_magnitude: Any = None
 
 
 @dataclass
@@ -167,6 +173,9 @@ class ContractSpec:
     enforcement_default: str | None = None
     enforcement_point: str | None = None
     delegations: list[DelegationSpecIR] = field(default_factory=list)
+    # Grounding extension (Appendix J, J.10): items, tolerance and the
+    # derived indices; serialized only for a file that declares it.
+    grounding: Any = None
 
 
 @dataclass
@@ -329,3 +338,7 @@ class SimIR:
     # `model:` block, or None (serialized as null) when the file has none
     # or does not declare `stochastic: 0.1`.
     stochastic_model: Any = None
+    # True when the source declares the grounding extension (`grounding:
+    # 0.1` with `norms: 0.1`). Not serialized: the fields of Appendix J
+    # (J.10) are part of the serialized IR only when it is set.
+    grounding_extension: bool = False

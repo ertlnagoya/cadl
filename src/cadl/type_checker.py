@@ -14,6 +14,8 @@ Checks performed (per spec §6.2.2):
    when the file declares `agents: 0.1` (which requires `norms: 0.1`)
 9. Stochastic model static semantics, rules S-1 to S-15 (Appendix H §H.10),
    when the file declares `stochastic: 0.1`
+10. Grounding static semantics, rules J-1 to J-9 (Appendix J §J.8), when the
+   file declares `grounding: 0.1` (which requires `norms: 0.1`)
 """
 
 from __future__ import annotations
@@ -64,7 +66,8 @@ CODEGEN_TARGETS = ("python", "solidity", "opa", "unity-csharp",
 SIM_TARGETS = ("unity", "go")
 # Extensions this processor implements, with the versions it knows
 KNOWN_EXTENSIONS = {"sos-dsl": ("0.1",), "norms": ("0.1",), "agents": ("0.1",),
-                    "stochastic": ("0.1",), "games": ("0.1",)}
+                    "stochastic": ("0.1",), "games": ("0.1",),
+                    "grounding": ("0.1",)}
 
 
 @dataclass
@@ -141,7 +144,19 @@ class TypeChecker:
         if self.agents_active:
             self._check_ungoverned_tool_servers(sos)
         self._check_stochastic_model(sos)
+        self._check_grounding(sos)
         return self.result
+
+    # --- Grounding extension (Appendix J, J.8) ---
+
+    def _check_grounding(self, sos: SoSDefinition) -> None:
+        """Rules J-1 to J-9, when the file declares `grounding: 0.1` with
+        `norms: 0.1`; one warning for an undeclared use of the keys (J.12)."""
+        from .grounding import check
+        add = {"error": self.result.add_error, "warning": self.result.add_warning,
+               "info": self.result.add_info}
+        for level, message in check(sos):
+            add[level](message, sos.loc)
 
     # --- Stochastic model extension (Appendix H, H.10) ---
 

@@ -180,6 +180,10 @@ cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
 
 # ある版から次の版への改正が規範に及ぼす効果
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
+
+# 根拠付け拡張：契約ごとの情報共有の導出指標、権限集中の導出指標、インセンティブ被覆率
+cadl norms-indices examples/grounding_robot_delivery.cadl
+cadl norms-indices examples/grounding_robot_delivery.cadl --format json
 # 確率モデル拡張：model: ブロックをPRISMへ出力（設計ごとにモデルファイルと性質ファイル）
 cadl model-export examples/stochastic_robot_delivery.cadl -o prism_out/
 
@@ -610,6 +614,70 @@ python -m robot_delivery_norms.norms_monitor TRACE.jsonl [--contract ID] [--form
 
 SolidityとOPAのターゲットは規範を監視しません。時相演算子を含む項目を外し、そのことを警告で示します。
 
+### 制度パラメータの根拠付け（grounding 0.1）
+
+根拠付け拡張（仕様書の付録J）は、契約に宣言した `alpha`・`beta`・`lambda` を、その契約の規範と関係づけます。ファイルは `grounding: 0.1` を、それが必要とする `norms: 0.1` とともに宣言し、次の四つのキーを使えます。
+
+```yaml
+contracts:
+  - id: DELIVERY_SLA
+    parties: [DISPATCHER, "ROBOT[*]", "CUSTOMER[*]"]
+    authority:   { decision_holder: DISPATCHER, beta: 0.9 }
+    information:
+      alpha: 0.6
+      sharing: ["DISPATCHER -> ROBOT[*] : route"]
+    incentives:  { lambda: 0.5 }
+    grounding:
+      items: { route: DISPATCHER, battery: "ROBOT[*]" }   # 情報項目: その出所
+      tolerance: 0.25                                      # 既定値 0.25
+    norms:
+      - id: may_return_to_charge
+        kind: permission
+        bearer: "ROBOT[i]"
+        content: "ROBOT[i] -> DISPATCHER : charging_request"
+        shares: [battery]                                  # このメッセージが伝える項目
+      - id: no_low_battery_driving
+        kind: prohibition
+        bearer: "ROBOT[i]"
+        content: "ROBOT[i].battery < 10 AND ROBOT[i].status == InTransit"
+        on_violation: { sanction: "removed from the pool", magnitude: 4 }
+        on_fulfilment: { reward: "bonus", magnitude: 1 }
+```
+
+`cadl norms-indices FILE [--contract ID] [--format text|json]` は、契約ごとに三つの量を計算します。どれも二つの個数の正確な比で、分母が0のときは未定義です（J.4）。
+
+| 量 | 比 | あわせて報告するもの |
+|---|---|---|
+| **alpha^**（情報共有） | 共有エントリ・義務・許可のいずれかが当事者全体に与える対（項目、出所以外の当事者）の数 / そのような対の総数 | 三つの与え方ごとの対の数、与えられていない対、宛先が特定のメンバー（`ROBOT[3]`）であるために対を与えないエントリと規範 |
+| **beta^**（権限の集中） | 一つの単一アクターが担う権限の最大数 / 権限の数 | 担い手ごとの権限の数、各権限が `effects:` に挙げる規範の数、`decision_holder` の占める割合 |
+| **chi**（インセンティブ被覆率） | 制裁の文言、報酬の文言、0より大きい大きさのいずれかを持つ義務と禁止の数 / 義務と禁止の数 | 修復だけを持つ規範、`transition:` を持つ規範 |
+
+```console
+$ cadl norms-indices examples/grounding_robot_delivery.cadl
+Contract DELIVERY_SLA (tolerance 0.25)
+  alpha^ (information sharing) = 5/8 = 0.625  given pairs / pairs
+    declared alpha: 0.6, declared - index = -0.025
+    pairs given by a sharing entry: 3, by an obligation: 1, by a permission: 1
+    ...
+  beta^ (concentration of powers) = 1/2 = 0.5  largest number of powers of one single actor / powers
+    declared beta: 0.9, declared - index = 0.4
+    ...
+  chi (incentive coverage) = 1/3 = 0.333333  norms that carry an incentive / obligations and prohibitions
+    declared lambda: 0.5 (a scale; not compared with chi)
+    ...
+  warning  contract 'DELIVERY_SLA' declares beta: 0.9, but the index of concentration of powers is 1/2 = 0.5 ...; they differ by 0.4, more than the tolerance 0.25 (J-7)
+```
+
+JSONには `file`、`grounding`、`contracts[]`（`id`、`items`、`tolerance` と、`alpha`・`beta`・`coverage`。それぞれ `defined`、`numerator`、`denominator`、`exact`、`value`、または理由つきの `undefined` と、上の個数を持ちます。ほかに `diagnostics[]`）、`designs[]`（J-9の診断）があります。終了ステータスは、指標を報告できれば警告の有無にかかわらず0、使い方の誤り（ファイルがない、型検査のエラーがある、`grounding: 0.1` と `norms: 0.1` を宣言していない）では2です。
+
+導出指標は規範についての証拠であり、パラメータの意味そのものではありません。`cadl check` は宣言された `alpha` と `beta` を指標と比較し、食い違いを警告するだけです（「型検査の内容」の15）。`lambda` は尺度であり、数値とは比較しません。`norms: 0.1` を宣言していて新しいキーを使っていないファイルは、`grounding: 0.1` を宣言しても不正になりません。
+
+**注釈にすぎない。** `shares:`、`on_fulfilment:`、大きさは判定を変えません。`cadl norms-eval`、`cadl agents-run`、生成した `norms_monitor.py` は、これらがあってもなくても同じ結果を返し、生成したモニタはこれらを持ちません。コード生成器もこれらを書き出さないので、報酬の文言に引用符があっても構いません。IR（`cadl sim-ir`）は、拡張を宣言したファイルについてこれらを持ちます。各契約に `grounding`（`items`、`tolerance`、`alpha`・`beta`・`coverage` の個数を持つ `indices`。未定義の量は `null`）が、各規範に `shares`、`on_violation_magnitude`、`on_fulfilment_reward`、`on_fulfilment_magnitude` が加わります（J.10）。拡張を宣言していないファイルのIRは変わりません。
+
+**二つの版。** `cadl norms-diff OLD NEW` は、`on_violation.magnitude`、`on_fulfilment:`、`shares:`、`grounding.items`、`grounding.tolerance` の変更と、変化した指標、新しい版で追加された規範の大きさ・`on_fulfilment:`・`shares:` も報告します。片方の版だけが拡張を宣言している場合は、指標を比較せず、その旨を報告します。宣言された `alpha` または `beta` と、その指標が二つの版の間で逆向きに動くときは警告します（J-13）。たとえば、改正でロボットに権限を与えながら `beta` を上げる場合です。
+
+**戦略モデル向け。** 付録Iの利得項 `sanction_of:` / `reward_of:` は、ここでは実装していません。`cadl.grounding.norm_payoff_link(sos, "C.n", "sanction_of" | "reward_of")` は、そのような項が名指す規範について必要なものを返します。大きさ（正確な値）、担い手、出所の名前 `C.lambda`、または参照を使えない理由の説明です。
+
 ### 確率モデル（PRISMへの出力）
 
 `extensions:` で `stochastic: 0.1` を宣言したファイルには、`model:` ブロック（仕様書の付録H）を書けます。これは、有限の状態変数の上のガード付き確率コマンドで書くパラメトリック離散時間マルコフ連鎖で、パラメータを契約の `alpha`・`beta`・`lambda` に束縛できます。`transitions:` の各運用モードが、固有のパラメータ値とコマンドを持つ一つの「設計」になります。例は `examples/stochastic_robot_delivery.cadl` にあります。
@@ -697,9 +765,12 @@ cadl model-export examples/games_robot_delivery.cadl --output prism_out/
 10. **SoS-DSLの静的意味論**（付録E、E.4） — `lifecycle:` の初期状態・終端状態・`from`・`to`・`on_violation.transition` が `states` に列挙されていること、終端状態が存在し到達可能であること（L-1、L-2、L-3、L-5）。モニタの `on_match.transition` が同じ契約の状態であること（M-3）。状態名・遷移id・モニタidが識別子であり、idが重複していないこと。`on:` のメッセージイベントのアクターと、`observe:` の各項目の対象が定義済みであること（M-1）。`deadline:` が期間（整数に `ms`・`s`・`min`・`h` を付けたもの）であり、`sampling:` が `event` か `periodic(<期間>)` であること。読めない値はエラーとします。寛容な形式として、負でない秒数（`2.5`）、単位の前の空白（`5 s`、`periodic( 500ms )`）、マッピング `{kind: periodic, period_ms: <整数>}` を受け付けます。警告：`on_violation:` のない `deadline:`（L-4）、付録Eの規則として読めない `on:` / `when:` / `rule:`
 11. **規範拡張の静的意味論**（付録F、F.7。`norms: 0.1` を宣言したファイルのみ） — 規範のidが識別子であり、契約内で重複せず、`creates:` が名付ける制度的事象と異なること（N-1）。`kind:` が `obligation` / `permission` / `prohibition` / `power` のいずれかであること（N-2）。`bearer:` と `counterparty:` がワイルドカードや範囲を含まない定義済みのアクターであること（N-3）。`deadline:` が期間であり、`deadline:` と `on_violation:` は義務と禁止にだけ書けること（N-4）。`effects:` は権能にだけ書け、権能には一つ以上必要で、契約内のほかの規範を名指すこと（N-5）。`reparation:` がトリガのない義務か禁止であり、`reparation:` をたどって循環しないこと（N-6）。`on_violation.transition` が契約の `lifecycle:` の状態であること（N-7）。メッセージイベントのアクターが定義済みであり、権能はメッセージから作られる制度的事象か担い手が送るメッセージで行使されること（N-9）。`within(d, p)`・`throughout(d, p)`・`until(p, q, d)` の `d` が0より大きい期間リテラルであり、`assume:`・`guarantee:`・規範の `content:` にだけ現れること（N-10）。`on_amendment: {transform: X}` が識別子を名指すこと（N-11）。警告：`trigger:` / `until:` / `content:` 全体として使われた規範のid（N-8）、担い手と内容が同じ許可と禁止（N-12）、契約の当事者でない担い手・相手方（N-3）、担い手以外が送るメッセージを内容とする義務・禁止（N-9）。宣言がない場合、`norms:` と `counts_as:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換もしません
 12. **確率モデル拡張の静的意味論**（付録H、H.10。`stochastic: 0.1` を宣言したファイルのみ） — `model:` に `variables:` と `commands:` があり、`kind:` が `dtmc` であること（S-1）。id・ラベル名・列挙リテラル・アクションラベルが識別子であり、キーワードでなく、それぞれの名前空間で一度だけ宣言されること、ラベル名が `init`・`deadlock` でないこと、列挙リテラルの出力名 `x_L` が宣言済みのどの名前とも、また互いにも異なること（S-2）。`from:` が定義済みの契約の `alpha`・`beta`・`lambda`、または `context.environment` の数値の項目を指すこと（S-3）。`range:` が `[lo, hi]` であり、契約に束縛したパラメータ以外では必須で、すべての値がその範囲に入ること（S-4）。変数の型が `bool`・`"[lo..hi]"`・`"{A, B}"` のいずれかで、`init:` が定義域の値であること（S-5）。状態述語が文法に従い、型が正しいこと（S-6）。更新が宣言済みの変数にその型の値を代入し、ガードが真になるすべての状態で値が定義域に収まること（S-7）。確率が数値・パラメータの式・`rest` のいずれかで、`rest` はコマンドごとに一つ以下、合計がちょうど1であること（S-8）。どの設計のどの状態でも、有効なコマンドが一つ以下であること（S-9）。`model.regimes:` と `when:` がファイルの運用モードを指し、`transitions:` があること（S-10）。すべてのパラメータがすべての設計で固定値を持ち、そこで確率が `[0, 1]` に入り報酬が負でないこと（S-11）。報酬構造に項目があり、その `action:` がコマンドのアクションラベルであり、`value:` が運用モードマップの開いたパラメータを含まないこと（S-12）。性質が性質の文法に従い、`R` は歩数の上限のない `F` にだけ使い、しきい値が範囲内であること（S-13）。運用モードマップが、1〜4個の開いたパラメータ、2個以上の運用モード、問い合わせである目的関数一つ、しきい値性質である制約、`(0, 1)` の分解能を持ち、領域の頂点で各設計が適切に定義されること（S-14）。S-7とS-9は状態空間を列挙して判定します（200 000状態まで）。警告：出所が同じ二つのパラメータ（S-3）、`model.regimes:` に項目のない運用モード（S-10）。情報：将来の版のために予約されたキーと値（S-15）。宣言がない場合、`model:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換も出力もしません
-14. **戦略モデル拡張の静的意味論**（付録I、I.10。`games: 0.1` を宣言したファイルのみ） — `stochastic: 0.1` も宣言していること（I-1）。`kind:` が `dtmc` か `smg` であり、`kind: smg` のモデルに `players:`・`profiles:`・`compliance:`・`payoffs:` があり、それ以外のモデルに本拡張のキーがないこと（I-2）。プレイヤーのidが一意な識別子であり、各プレイヤーが宣言済みのアクターを挙げ、一つのアクターを2人のプレイヤーが代表しないこと（I-3）。`owner:` がプレイヤーを指し、所有されたコマンドがアクションラベルを持ち、同じラベルのコマンドの所有者が一つであるか、どれも所有者を持たないこと（I-4）。どの設計のどの状態でも、有効なコマンドが一つ以下であるか、すべて1人のプレイヤーのものでラベルが互いに異なること（I-5。S-9に代わる）。プロファイルの名前が一意な識別子であり、規則がラベルを使わないガードのもとで所有されたコマンドのラベルを選び、二つ以上のコマンドが有効などの状態でもどのプロファイルもコマンドを選び、`compliance:` がプロファイルを指すこと（I-6）。どのプレイヤーにも利得がちょうど一つあり、その目標が真偽値の述語で、項が一つ以上あり、宣言済みの報酬構造を一度ずつ使い、重みが宣言済みのパラメータの式であること。`sanction_of:` または `reward_of:` をもつ項には `grounding: 0.1` の宣言が要ること（I-7）。どのプロファイルも、どの設計でも、固定値で許容であること（I-8）。`equilibria:` の項目が、性質と運用モードマップの中で一意なid、プロファイル、設計、負でない `epsilon:` を持つこと。マップでは、範囲内にあって、どの運用モードも値を割り当てず、どの報酬の値にも現れない1〜4個の開いたパラメータと、`(0, 1)` の `resolution:` を持ち、領域の頂点で設計が適切に定義され、領域のすべての面の中心でプロファイルが許容であること（I-9）。性質と運用モードマップの `profile:` がプロファイルを指すこと（I-10）。I-5とI-6は状態空間を列挙して判定し、I-8とI-9は到達可能なゲームの上で判定します。警告：どの状態でも最初に適用される規則にならないプロファイルの規則（I-6）、目標が初期状態で成り立つ利得（I-7）。情報：予約されたキーと値（I-11）、`grounding: 0.1` を宣言したファイルの `sanction_of:`・`reward_of:` をもつ項（その利得は評価しません）、`games: 0.1` を宣言していないファイルにある本拡張のキー（そのファイルは付録Hに従って読みます。I.15）。`stochastic: 0.1` なしで `games: 0.1` を宣言したファイルは、I-1の誤りになります
 
 13. **エージェントガバナンス拡張の静的意味論**（付録G、G.9。`agents: 0.1` を宣言したファイルのみ） — ファイルが `norms: 0.1` も宣言していること（G-1）。`agent:` の `kind:` が `llm_agent` / `tool_server` / `human` / `service` のいずれかで、`protocol:` が名前であること（G-2）。`tools:` はツールサーバにだけ書け、ツールサーバには一つ以上必要で、ツール名が重複しない識別子であること（G-3）。受信者がツールサーバであるメッセージイベントがそのツールを名指すこと（G-4。プロトコルのステップでは警告）。`enforcement.default` が `deny` か `allow`、`enforcement.point` が `caller` / `receiver` / `gateway` のいずれかであること（G-5）。執行対象の契約では、許可・禁止の内容であるメッセージの送信者が担い手であること（G-6）。`on_denied:` は執行対象の契約の、メッセージを内容とする禁止にだけ書け、キーが一つ以上あり、`timeout:` が0より大きい期間で `escalate_to:` を伴うこと（G-7）。`escalate_to:` と `notify:` が定義済みの単一のアクターを名指し、`escalate_to:` が担い手以外の当事者であること（G-8）。`escalate_to: A` を持つ契約に、`A` のメッセージから `approval` を作る `counts_as:` ルールがあり、執行対象の契約では `approval` と `rejection` が予約されていること（G-9）。`fallback:` が、担い手から定義済みのアクターへの、禁止されたメッセージとは異なるメッセージイベントであること（G-10）。`delegations:` は執行対象の契約にだけ書け、各項目が、担い手に束縛される添字のない、メッセージを内容とする許可を一つ名指すこと（G-11）。`to:` にツールサーバ以外の定義済みのアクターを並べ、`max_depth:` が1以上であること（G-12）。`grant:` と `revoke:` が識別子で、互いに異なり、`approval`・`rejection` や当事者のツールとも異なること（G-13）、執行対象の契約では、すべてのメッセージイベント（規範の `trigger:`・`until:`・`content:`、`counts_as:` ルールの `when:`、委任の `until:`）の送信者と受信者が当事者の一つの参照に含まれ（契約は自分が統治するメッセージだけを観測するため）、宣言された要素だけを名指すこと（G-17）、契約のすべての添字変数（担い手、相手方、`escalate_to:`、`notify:`、`fallback:`、メッセージイベントの送信者・受信者・引数、述語。`ROBOT[j+1]` のような添字の式の中も含む）が、当事者（当事者 `ROBOT[i]` の `i`）、限量子、または内包表記によって束縛されていること（G-18）。警告：`if:` のもとで作られる制度的事象が、禁止のトリガまたは許可の `until:` であること（G-19）、`timeout:` のない `escalate_to:`（G-7）、`human` でない承認者（G-8）、`rejection` のルールがないこと（G-9）、`to:` に含まれる担い手（G-12）、内容がメッセージイベントでない、または引数を持つ許可・禁止（G-14）、`default: allow` で開いたままのツールと、執行対象の契約の当事者でないツールサーバ（G-15）、契約が必要としながら自ら拒否するメッセージ（G-16）。宣言がない場合、`agent:`・`enforcement:`・`delegations:`・`on_denied:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換もしません
+
+14. **戦略モデル拡張の静的意味論**（付録I、I.10。`games: 0.1` を宣言したファイルのみ） — `stochastic: 0.1` も宣言していること（I-1）。`kind:` が `dtmc` か `smg` であり、`kind: smg` のモデルに `players:`・`profiles:`・`compliance:`・`payoffs:` があり、それ以外のモデルに本拡張のキーがないこと（I-2）。プレイヤーのidが一意な識別子であり、各プレイヤーが宣言済みのアクターを挙げ、一つのアクターを2人のプレイヤーが代表しないこと（I-3）。`owner:` がプレイヤーを指し、所有されたコマンドがアクションラベルを持ち、同じラベルのコマンドの所有者が一つであるか、どれも所有者を持たないこと（I-4）。どの設計のどの状態でも、有効なコマンドが一つ以下であるか、すべて1人のプレイヤーのものでラベルが互いに異なること（I-5。S-9に代わる）。プロファイルの名前が一意な識別子であり、規則がラベルを使わないガードのもとで所有されたコマンドのラベルを選び、二つ以上のコマンドが有効などの状態でもどのプロファイルもコマンドを選び、`compliance:` がプロファイルを指すこと（I-6）。どのプレイヤーにも利得がちょうど一つあり、その目標が真偽値の述語で、項が一つ以上あり、宣言済みの報酬構造を一度ずつ使い、重みが宣言済みのパラメータの式であること。`sanction_of:` または `reward_of:` をもつ項には `grounding: 0.1` の宣言が要ること（I-7）。どのプロファイルも、どの設計でも、固定値で許容であること（I-8）。`equilibria:` の項目が、性質と運用モードマップの中で一意なid、プロファイル、設計、負でない `epsilon:` を持つこと。マップでは、範囲内にあって、どの運用モードも値を割り当てず、どの報酬の値にも現れない1〜4個の開いたパラメータと、`(0, 1)` の `resolution:` を持ち、領域の頂点で設計が適切に定義され、領域のすべての面の中心でプロファイルが許容であること（I-9）。性質と運用モードマップの `profile:` がプロファイルを指すこと（I-10）。I-5とI-6は状態空間を列挙して判定し、I-8とI-9は到達可能なゲームの上で判定します。警告：どの状態でも最初に適用される規則にならないプロファイルの規則（I-6）、目標が初期状態で成り立つ利得（I-7）。情報：予約されたキーと値（I-11）、`grounding: 0.1` を宣言したファイルの `sanction_of:`・`reward_of:` をもつ項（その利得は評価しません）、`games: 0.1` を宣言していないファイルにある本拡張のキー（そのファイルは付録Hに従って読みます。I.15）。`stochastic: 0.1` なしで `games: 0.1` を宣言したファイルは、I-1の誤りになります
+
+15. **根拠付け拡張の静的意味論**（付録J、J.8。`grounding: 0.1` を宣言したファイルのみ） — ファイルが `norms: 0.1` も宣言していること（J-1）。`grounding.items` のキーが識別子であって予約語でなく、値が契約の当事者を指すアクター参照であること、`tolerance:` が `[0, 1]` の数であること（J-2）。`shares:` が、内容がメッセージ事象である義務または許可にあり、宣言された項目を一つ以上、重複なく挙げていること（J-3）。大きさが有限で負でない数であること、`on_fulfilment:` が義務または禁止にあり、`reward:`（文言）か `magnitude:` を持つこと（J-4）。次は警告であり、エラーにはなりません。項目をその出所に与える共有規範、当事者でない宛先やアクター集合の添字なしの名前である宛先、宣言されていない項目を持つ共有エントリ、項目が二つ以上あるか引数を持つために対を与えない共有エントリ（J-3）。制裁や報酬の文言と並ぶ大きさ0（J-4）。与えられた対がある（指標が未定義のときは共有エントリがある）のに `alpha: 0`、与えられていない対があるのに `alpha: 1`、最も多くの権限を担う単一アクターが担っていない権限があるのに `beta: 1`、均等な割合を超えて権限を担う単一アクターがいるのに `beta: 0`（J-6）。0でも1でもない宣言された `alpha` または `beta` が指標から許容差を超えて離れていること、決定権者の権限がほかのアクターより少ないこと（J-7）。規範を持つ契約で、制裁も報酬も持つ義務・禁止がないのに `lambda` が0より大きいこと、持つものがあるのに `lambda: 0` であること（J-8）。`stochastic: 0.1` も宣言したファイルでは、`C.alpha` または `C.beta` に束縛されたパラメータが指標から許容差を超えて離れている設計を、J-6かJ-7が同じ宣言値をすでに報告している場合を除き、情報として報告します（J-9）。比較は正確です（小数は書かれたとおり、比は分数で扱います）。宣言がない場合、`grounding:`、`shares:`、`on_fulfilment:`、`on_violation.magnitude` は未宣言の拡張キーとして警告を一つ出し、解釈せず、指標も計算しません（J.12）。規則J-10からJ-12とJ-14は付録Iの戦略モデルに属し、実装していません
 
 このほか、検査を失敗させずに次を報告します。`cadl codegen` が出力できない `codegen:` のターゲット（警告）、未知の拡張名、`motivation:` ブロック（情報）。`motivation:` ブロックは解釈しませんが、保持して `cadl sim-ir` の出力に引き渡します。
 
@@ -747,6 +818,7 @@ IR JSON と Unity C# ツリーが生成され、後者が [cadl-raspimouse-simul
 | `raspimouse_mcp_sos.cadl` | Raspimouse群ロボット（MCP-SoS） | 認知型 | MCPツールによるLLM制御、Static/Dynamicパスモード、3つの運用モード |
 | `sos_dsl_robot_delivery.cadl` | SoS-DSL拡張を使ったロボット配送 | 認知型 | 契約ライフサイクル（7状態）、3つのモニタ。ハンズオン講座で使うサンプル |
 | `agents_tool_governance.cadl` | LLMプランナ、サブエージェント、2つのツールサーバ（agents 0.1） | — | 執行対象の契約、人へのエスカレーション、来歴つきの委任。サンプル入力は `agents_inputs/`、`cadl agents-run` 用のトレースは `traces/` |
+| `grounding_robot_delivery.cadl` | 規範と根拠付け拡張を使ったロボット配送（grounding 0.1） | 認知型 | 付録J、J.9の例。情報項目、`shares:`、制裁の大きさ。`cadl norms-indices` で指標5/8、1/2、被覆率1/3 |
 | `agents_change_control.cadl` | 所有者、リードエージェント、2つのワーカー、リポジトリ（agents 0.1） | — | トリガから `until:` までの間だけ発効する禁止、`max_depth: 1` と `until:` を持つ委任。`cadl agents-run` 用のトレースは `traces/` |
 
 ### デモスクリプト
@@ -784,6 +856,7 @@ src/cadl/
   norms_eval.py        記録済みトレースに対する規範拡張の判定
   agents_runtime.py    エージェントガバナンス拡張のランタイム：トレース上の判定、保留、委任、監査記録
   norms_diff.py        改正が規範に及ぼす効果（二つの版の比較）
+  grounding.py         根拠付け拡張：導出指標、規則J-1からJ-9とJ-13
   cli.py               コマンドラインインタフェース
   codegen/
     __init__.py        公開generate() API（マルチターゲット対応）
@@ -846,6 +919,7 @@ tests/
   test_expr_parser.py    式文法のテスト
   test_unparse.py        式の往復変換テスト
   test_norms_eval.py     トレースに対する規範の判定（`cadl norms-eval`）
+  test_grounding_extension.py  根拠付け拡張：指標、規則、IR、`cadl norms-indices`
   test_norms_monitor.py  生成した規範モニタと `cadl norms-eval` の比較（サンプル、記録したケース、ランダムなトレース）
   norms_monitor_cases.py そのために test_norms_eval.py のケースを記録するpytestプラグイン
   test_name_resolution.py 生成コードでのアクター／状態変数の解決
@@ -897,6 +971,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | SoS-DSL拡張（`lifecycle:` / `monitors:`）とUnity C#生成 | 利用可能 |
 | 規範拡張：静的検査と、記録済みトレースに対する判定と改正（`cadl norms-eval`、`cadl norms-diff`） | 利用可能 |
 | 規範拡張：生成したPythonパッケージのオンラインモニタ（`norms_monitor.py`） | 利用可能（Solidity・OPA・Unity C#は規範を監視しない。モデル検査器への変換は未実装） |
+| 根拠付け拡張（grounding 0.1）の規範側：導出指標とインセンティブ被覆率（`cadl norms-indices`）、規則J-1からJ-9、IR、二つの版の比較（`cadl norms-diff` のJ-13） | 利用可能（利得項 `sanction_of:` / `reward_of:` と規則J-10からJ-12、J-14は付録Iの戦略モデルに属し、未実装） |
 | エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、監査記録。`cadl agents-run`）、Rego / Cedarの境界ポリシー | 利用可能（ランタイムはオフラインの参照実装で、トレースを再生するだけであり、プロトコルには接続しない） |
 | 検証メソッド `model_check` / `simulation` / `proof` | 未対応（未対応である旨を明示的に報告） |
 
