@@ -162,6 +162,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="JSON object from actor to the key file (or {\"hex\": ...}) "
                              "with which its inbox files are authenticated "
                              "(HMAC-SHA256); required with --approvals")
+    gw_cmd.add_argument("--hold-key", type=Path, default=None, metavar="FILE",
+                        help="Sign every published hold with this key (HMAC-SHA256); "
+                             "approvers verify it with mcp-approve --hold-key")
     gw_cmd.add_argument("--insecure-approvals", action="store_true",
                         help="Read the inbox without authentication (for tests only)")
     gw_cmd.add_argument("--allow-method", action="append", default=[], metavar="NAME",
@@ -219,6 +222,9 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--approver-keys", type=Path, default=None, metavar="FILE",
                          help="The keys of the approvers and other senders of the "
                               "inbox; required with --approvals")
+    a2a_cmd.add_argument("--hold-key", type=Path, default=None, metavar="FILE",
+                         help="Sign every published hold with this key (HMAC-SHA256); "
+                              "approvers verify it with mcp-approve --hold-key")
     a2a_cmd.add_argument("--insecure-approvals", action="store_true",
                          help="Read the inbox without authentication (for tests only)")
     a2a_cmd.add_argument("--init", type=Path, default=None, metavar="FILE.json",
@@ -282,6 +288,10 @@ def main(argv: list[str] | None = None) -> int:
     approve_cmd.add_argument("--show", action="store_true",
                              help="Show the held call and its arguments, and write "
                                   "nothing")
+    approve_cmd.add_argument("--hold-key", type=Path, default=None, metavar="FILE",
+                             help="The gateway's hold key: verify the MAC of the published "
+                                  "hold before showing or signing it; required when the "
+                                  "gateway signs its holds")
     approve_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
                              help="The key of the actor (HMAC-SHA256); the gateway "
                                   "requires it unless it runs with --insecure-approvals")

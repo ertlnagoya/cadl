@@ -148,7 +148,8 @@ class Gateway(EnforcementPoint):
                  approver_keys: dict[str, bytes] | None = None,
                  insecure_approvals: bool = False,
                  allow_methods: tuple = (),
-                 run_id: str | None = None) -> None:
+                 run_id: str | None = None,
+                 hold_key: bytes | None = None) -> None:
         self.to_client = to_client
         self.to_server = to_server
         self.filter_tools = filter_tools
@@ -171,7 +172,7 @@ class Gateway(EnforcementPoint):
         self.approval_rules = self._approval_rules(self.server, self.agent)
         self._check_approvable(self.server)
         self._open(audit, trace_out, key, inbox, init, clock, wall, approver_keys,
-                   insecure_approvals, run_id)
+                   insecure_approvals, run_id, hold_key=hold_key)
 
     # --- client -> server -------------------------------------------------------
 
@@ -567,6 +568,7 @@ def cli_gateway(args) -> int:
                        audit=args.audit, trace_out=trace_out, key=key,
                        inbox=args.approvals, init=init,
                        filter_tools=not args.no_filter_tools, approver_keys=ring,
+                       hold_key=read_key(args.hold_key) if args.hold_key else None,
                        insecure_approvals=args.insecure_approvals,
                        allow_methods=tuple(args.allow_method))
         code = serve(gw_args, server, poll=args.poll)

@@ -1461,3 +1461,120 @@ class TestStreaming:
                    if x.get("event") == "invalid_response")
         r.replay_check()
         capsys.readouterr()
+
+
+HOLD_KEY = b"gateway-hold-key-0123456789abcdef"
+
+
+class TestSignedHolds:
+    """--hold-key: the gateway signs every published hold, and mcp-approve
+    verifies it before it shows or signs it."""
+
+    def _gw(self, tmp_path, hold_key=HOLD_KEY):
+        return Local(tmp_path, inbox=tmp_path / "inbox",
+                     approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]},
+                     hold_key=hold_key)
+
+    def _hold(self, loc, tmp_path):
+        loc.post(rpc("SendMessage", params("publish", "real", returnImmediately=True)))
+        path = tmp_path / "inbox" / "holds" / "h-1.json"
+        return path, json.loads(path.read_text())
+
+    def _approve(self, loc, tmp_path, hold_key):
+        from cadl.gateway_core import _drop
+        obj = approval_file(tmp_path / "inbox", "h-1", "approve", "OPERATOR",
+                            APPROVER_KEYS["OPERATOR"], hold_key)
+        _drop(tmp_path / "inbox", obj)
+        loc.gw.tick()
+
+    def test_signed_hold_verifies(self, tmp_path):
+        from cadl.gateway_core import hold_mac
+        loc = self._gw(tmp_path)
+        path, hold = self._hold(loc, tmp_path)
+        assert hold["kind"] == "hold" and hold["hold_mac"] == hold_mac(HOLD_KEY, hold)
+        run = json.loads((tmp_path / "inbox" / "run.json").read_text())
+        assert run["holds_signed"] is True
+        self._approve(loc, tmp_path, HOLD_KEY)
+        assert loc.gw.runtime.hold_state("h-1") == "approved"
+        loc.stop_and_replay()
+
+    @pytest.mark.parametrize("forge", ["params", "strip_mac", "other_key"])
+    def test_forged_hold_is_refused(self, tmp_path, forge):
+        """Someone who can write the inbox replaces the published hold: other
+        arguments with their own SHA-256, the MAC removed, or a MAC under
+        another key. mcp-approve refuses to show or sign it."""
+        import hashlib
+
+        from cadl.audit_log import canonical
+        from cadl.gateway_core import hold_mac
+        loc = self._gw(tmp_path)
+        path, hold = self._hold(loc, tmp_path)
+        hold["params"]["message"]["parts"] = [{"text": "harmless"}]
+        hold["params_sha256"] = hashlib.sha256(canonical(hold["params"])).hexdigest()
+        if forge == "strip_mac":
+            del hold["hold_mac"]
+        elif forge == "other_key":
+            hold["hold_mac"] = hold_mac(b"x" * 32, hold)
+        path.write_text(json.dumps(hold))
+        with pytest.raises(GatewayError, match="not signed"):
+            approval_file(tmp_path / "inbox", "h-1", "approve", "OPERATOR",
+                          APPROVER_KEYS["OPERATOR"], HOLD_KEY)
+        if forge != "strip_mac":                       # a signed hold needs the key
+            with pytest.raises(GatewayError, match="give --hold-key"):
+                approval_file(tmp_path / "inbox", "h-1", "approve", "OPERATOR",
+                              APPROVER_KEYS["OPERATOR"], None)
+        (tmp_path / "op.key").write_bytes(APPROVER_KEYS["OPERATOR"])
+        (tmp_path / "hold.key").write_bytes(HOLD_KEY)
+        assert main(["mcp-approve", str(tmp_path / "inbox"), "h-1", "approve", "--as",
+                     "OPERATOR", "--key", str(tmp_path / "op.key"), "--hold-key",
+                     str(tmp_path / "hold.key")]) == 2
+        assert loc.gw.runtime.hold_state("h-1") == "held"
+        loc.stop_and_replay()
+
+    def test_shown_arguments_must_match_their_hash(self, tmp_path):
+        """Without --hold-key, mcp-approve still checks that the arguments
+        it shows have the SHA-256 it signs; a forged hold whose arguments
+        and hash agree is signed, and the gateway refuses the approval
+        (wrong_message), because the hash is not that of the held request."""
+        import hashlib
+
+        from cadl.audit_log import canonical
+        loc = self._gw(tmp_path, hold_key=None)
+        path, hold = self._hold(loc, tmp_path)
+        assert "hold_mac" not in hold
+        hold["params"]["message"]["parts"] = [{"text": "harmless"}]
+        path.write_text(json.dumps(hold))
+        with pytest.raises(GatewayError, match="do not have the SHA-256"):
+            approval_file(tmp_path / "inbox", "h-1", "approve", "OPERATOR",
+                          APPROVER_KEYS["OPERATOR"])
+        hold["params_sha256"] = hashlib.sha256(canonical(hold["params"])).hexdigest()
+        path.write_text(json.dumps(hold))
+        self._approve(loc, tmp_path, None)
+        assert loc.gw.runtime.hold_state("h-1") == "held"
+        assert ("unauthorised_approval", "wrong_message") in host_events(loc.audit)
+        loc.stop_and_replay()
+
+    def test_hold_key_options(self, tmp_path):
+        with pytest.raises(GatewayError, match="approver key"):
+            self._gw(tmp_path, hold_key=APPROVER_KEYS["OPERATOR"])
+        with pytest.raises(GatewayError, match="give --approvals"):
+            Local(tmp_path, hold_key=HOLD_KEY)
+
+    def test_mcp_gateway_signs_holds(self, tmp_path):
+        from cadl.gateway_core import _drop
+        from cadl.mcp_gateway import Gateway
+        out: list = []
+        inbox = tmp_path / "inbox"
+        gw = Gateway(ROOT / "examples" / "agents_tool_governance.cadl", "PLANNER", "FILES",
+                     tmp_path / "m.jsonl", tmp_path / "m.trace.jsonl", to_client=out.append,
+                     to_server=out.append, inbox=inbox,
+                     approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]}, hold_key=HOLD_KEY)
+        gw.client_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "delete_file",
+                                              "arguments": {"path": "/x"}}}))
+        assert "hold_mac" in json.loads((inbox / "holds" / "h-1.json").read_text())
+        _drop(inbox, approval_file(inbox, "h-1", "approve", "OPERATOR",
+                                   APPROVER_KEYS["OPERATOR"], HOLD_KEY))
+        gw.tick()
+        assert gw.runtime.hold_state("h-1") == "approved"
+        gw.stop()

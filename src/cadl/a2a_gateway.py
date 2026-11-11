@@ -316,7 +316,8 @@ class A2AGateway(EnforcementPoint):
                  max_nonces: int = MAX_NONCES,
                  max_handlers: int = MAX_HANDLERS,
                  max_handlers_per_actor: int = MAX_HANDLERS_PER_ACTOR,
-                 max_holds_per_actor: int = MAX_HOLDS_PER_ACTOR) -> None:
+                 max_holds_per_actor: int = MAX_HOLDS_PER_ACTOR,
+                 hold_key: bytes | None = None) -> None:
         self._load(file)
         self.receiver = self._actor(agent_actor, "--agent-actor")
         decl = next((a for a in self.sos.actors if a.id.name == self.receiver["name"]), None)
@@ -382,7 +383,7 @@ class A2AGateway(EnforcementPoint):
         self.context_owner: dict[str, str] = {}    # contexts -> actor
         self.upstream_ids = itertools.count(1)
         self._open(audit, trace_out, key, inbox, init, clock, wall, approver_keys,
-                   insecure_approvals, run_id)
+                   insecure_approvals, run_id, hold_key=hold_key)
 
     def _step(self, line: dict, close: bool = False) -> dict:
         """As in the enforcement point; nothing more is decided or recorded
@@ -1815,6 +1816,7 @@ def cli_gateway(args) -> int:
         gw_args = dict(file=args.file, agent_actor=args.agent_actor, upstream=args.upstream,
                        client_keys=clients, audit=args.audit, trace_out=trace_out, key=key,
                        inbox=args.approvals, init=init, approver_keys=ring,
+                       hold_key=read_key(args.hold_key) if args.hold_key else None,
                        insecure_approvals=args.insecure_approvals, upstream_token=token,
                        upstream_timeout=args.upstream_timeout, agent_card=card,
                        max_handlers=args.max_handlers,

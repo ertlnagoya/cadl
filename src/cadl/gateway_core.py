@@ -151,6 +151,15 @@ def denial_text(m: dict | None, rec: dict, what_kind: str = "tool call") -> str:
             f"{what} is not allowed ({'; '.join(parts)}).")
 
 
+def hold_mac(key: bytes, hold: dict) -> str:
+    """The HMAC-SHA256 of a published hold (`--hold-key`): over the
+    canonical JSON (G.8) of the hold without its field `hold_mac`. The hold
+    has the field `kind: "hold"`, which an approval or a message does not
+    have, so the MAC of one cannot stand for the other."""
+    return hmac.new(key, canonical({k: v for k, v in hold.items() if k != "hold_mac"}),
+                    hashlib.sha256).hexdigest()
+
+
 def _valid_id(value: Any) -> bool:
     return isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))
 
@@ -252,10 +261,21 @@ class EnforcementPoint:
     def _open(self, audit: Path, trace_out: Path, key: bytes | None, inbox: Path | None,
               init: dict | None, clock: Callable[[], float], wall: datetime | None,
               approver_keys: dict[str, bytes] | None, insecure_approvals: bool,
-              run_id: str | None, more_first: dict | None = None) -> None:
+              run_id: str | None, more_first: dict | None = None,
+              hold_key: bytes | None = None) -> None:
         """Check the options, create the logs and the inbox, and decide the
         first line of the trace."""
         self.inbox = None if inbox is None else Path(inbox)
+        self.hold_key = hold_key
+        if hold_key is not None:
+            if inbox is None:
+                raise GatewayError("--hold-key signs the holds published in the inbox; "
+                                   "give --approvals")
+            if key is not None and hmac.compare_digest(hold_key, key):
+                raise GatewayError("the hold key is the key of the audit log; use another")
+            if approver_keys and any(hmac.compare_digest(hold_key, k)
+                                     for k in approver_keys.values()):
+                raise GatewayError("the hold key is an approver key; use another")
         self.clock = clock
         self.approver_keys = approver_keys
         self.insecure = insecure_approvals
@@ -303,9 +323,11 @@ class EnforcementPoint:
                  "epoch": stamp, "quantities": []}
         first.update(init or {})
         if self.inbox is not None:          # before anything can be held
-            self._publish("run.json", {"run_id": self.run_id,
-                                       "approver_keys": approver_keys is not None,
-                                       **(more_first or {})})
+            run = {"run_id": self.run_id, "approver_keys": approver_keys is not None,
+                   **(more_first or {})}
+            if hold_key is not None:
+                run["holds_signed"] = True
+            self._publish("run.json", run)
         try:
             self._step(first)
         except Exception as e:      # noqa: BLE001
@@ -507,9 +529,19 @@ class EnforcementPoint:
                 "run_id": self.run_id, "hold_id": hold_id, "message": entry["message"],
                 "hold_time": entry["time"], "approver": entry["approver"],
                 "deadline": entry["deadline"], "params": held.request.get("params"),
-                "params_sha256": held.params_sha256})
+                "params_sha256": held.params_sha256, **self._signed(hold_id, entry, held)})
         except OSError as e:
             self._log(f"cannot publish hold {hold_id}: {e}")
+
+    def _signed(self, hold_id: str, entry: dict, held: "_Held") -> dict:
+        """`kind` and `hold_mac` of a published hold, with `--hold-key`."""
+        if self.hold_key is None:
+            return {}
+        hold = {"run_id": self.run_id, "hold_id": hold_id, "message": entry["message"],
+                "hold_time": entry["time"], "approver": entry["approver"],
+                "deadline": entry["deadline"], "params": held.request.get("params"),
+                "params_sha256": held.params_sha256, "kind": "hold"}
+        return {"kind": "hold", "hold_mac": hold_mac(self.hold_key, hold)}
 
     def _unpublish_hold(self, hold_id: str) -> None:
         if self.inbox is None or not _IDENT_HOLD_RE.fullmatch(hold_id or ""):
@@ -763,11 +795,41 @@ def _read_published(path: Path) -> dict:
     return obj
 
 
+def check_hold(hold: dict, hold_id: str, hold_key: bytes | None) -> bool:
+    """Check a published hold before it is shown or signed: its name, the
+    SHA-256 of the arguments it shows, and with `hold_key` its MAC. A hold
+    that the gateway signed needs the key. Returns whether the hold is
+    authenticated; raises GatewayError otherwise."""
+    if hold.get("hold_id") != hold_id:
+        raise GatewayError(f"the published hold names {hold.get('hold_id')!r}, not {hold_id}")
+    try:
+        digest = hashlib.sha256(canonical(hold.get("params"))).hexdigest()
+    except (ValueError, TypeError) as e:
+        raise GatewayError(f"the arguments of the hold have no canonical form ({e})") \
+            from None
+    if digest != hold.get("params_sha256"):
+        raise GatewayError("the arguments shown in the published hold do not have the "
+                           "SHA-256 it names; it is not signed")
+    mac = hold.get("hold_mac")
+    if hold_key is None:
+        if mac is not None:
+            raise GatewayError("the gateway signs its holds (hold_mac); give --hold-key to "
+                               "verify the hold before it is approved")
+        return False
+    if not isinstance(mac, str) or not _MAC_RE.fullmatch(mac) \
+            or hold.get("kind") != "hold" \
+            or not hmac.compare_digest(mac, hold_mac(hold_key, hold)):
+        raise GatewayError("the published hold is not signed with the hold key (missing "
+                           "or wrong hold_mac); it is not signed")
+    return True
+
+
 def approval_file(inbox: Path, hold_id: str, decision: str, actor: str,
-                  key: bytes | None) -> dict:
+                  key: bytes | None, hold_key: bytes | None = None) -> dict:
     """The content of an approval file: bound to the run, the hold, the
     held message and its time (from DIR/holds/HOLD_ID.json, which the
-    gateway publishes), with a fresh nonce and, with a key, the MAC."""
+    gateway publishes), with a fresh nonce and, with a key, the MAC. The
+    published hold is checked first (`check_hold`)."""
     inbox = Path(inbox)
     if not _IDENT_HOLD_RE.fullmatch(hold_id):
         raise GatewayError(f"{hold_id!r} is not a hold id")
@@ -776,9 +838,10 @@ def approval_file(inbox: Path, hold_id: str, decision: str, actor: str,
     published = inbox / "holds" / f"{hold_id}.json"
     if published.exists():
         hold = _read_published(published)
+        check_hold(hold, hold_id, hold_key)
         obj.update(run_id=hold.get("run_id"), message=hold.get("message"),
                    hold_time=hold.get("hold_time"), params_sha256=hold.get("params_sha256"))
-    elif key is not None:
+    elif key is not None or hold_key is not None:
         raise GatewayError(f"the gateway has published no held call {hold_id} "
                            f"({published} does not exist)")
     obj["nonce"] = secrets.token_hex(16)
@@ -794,7 +857,12 @@ def cli_approve(args) -> int:
     try:
         published = Path(args.inbox) / "holds" / f"{args.hold_id}.json"
         hold = _read_published(published) if published.exists() else None
+        hold_key = read_key(args.hold_key) if getattr(args, "hold_key", None) else None
         if hold is not None:
+            signed = check_hold(hold, args.hold_id, hold_key)
+            if not signed:
+                print("warning: the hold is not signed by the gateway (no --hold-key); "
+                      "what is shown is not authenticated", file=sys.stderr)
             m = hold.get("message") or {}
             print(f"hold {args.hold_id} of run {hold.get('run_id')}: "
                   f"{m.get('from')} -> {m.get('to')} : {m.get('name')} at "
@@ -806,7 +874,8 @@ def cli_approve(args) -> int:
         if args.show:
             return 0
         key = read_key(args.key) if args.key is not None else None
-        obj = approval_file(args.inbox, args.hold_id, args.decision, args.actor, key)
+        obj = approval_file(args.inbox, args.hold_id, args.decision, args.actor, key,
+                            hold_key)
         path = _drop(args.inbox, obj)
     except (GatewayError, AuditKeyError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
