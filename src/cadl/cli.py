@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -85,7 +86,133 @@ def main(argv: list[str] | None = None) -> int:
     run_cmd.add_argument("--format", choices=["text", "json"], default="text",
                          help="Output format (default: text)")
     run_cmd.add_argument("--audit", type=Path, default=None, metavar="OUT.jsonl",
-                         help="Write the audit records (G.8) as JSON Lines")
+                         help="Write the audit records (G.8) as JSON Lines, with a "
+                              "header, an end record and a hash chain")
+    run_cmd.add_argument("--audit-key", type=Path, default=None, metavar="FILE",
+                         help="Key the hash chain of the audit log (HMAC-SHA256) with "
+                              "the key in FILE (at least 16 bytes)")
+
+    # audit-verify command
+    averify_cmd = subparsers.add_parser(
+        "audit-verify",
+        help="Verify the hash chain of an audit log written by agents-run or "
+             "mcp-gateway (agents 0.1, G.8)",
+        description="Verify the integrity fields of an audit log (G.8, integrity "
+                    "of the log): the header, the sequence numbers, the digest of "
+                    "every line and the link to the previous line, and the end "
+                    "record. Reports the first line that does not verify. Exit "
+                    "status: 0 valid, 1 invalid, 2 usage error.")
+    averify_cmd.add_argument("audit", type=Path, metavar="AUDIT.jsonl",
+                             help="Audit log (JSON Lines)")
+    averify_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
+                             help="Key file of a keyed log (HMAC-SHA256)")
+    averify_cmd.add_argument("--source", type=Path, default=None, metavar="FILE.cadl",
+                             help="Also require that the log was written for this "
+                                  "CADL file (SHA-256 of its bytes)")
+    averify_cmd.add_argument("--open", action="store_true",
+                             help="Accept a log without end record (a running "
+                                  "gateway); truncation of its tail is then not "
+                                  "detected")
+    averify_cmd.add_argument("--run-id", default=None, metavar="HEX",
+                             help="Also require this run id in the header")
+    averify_cmd.add_argument("--anchor", default=None, metavar="DIGEST",
+                             help="Also require this digest of the last line, kept "
+                                  "outside the log (detects a rewritten or cut log "
+                                  "without a key)")
+    averify_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                             help="Output format (default: text)")
+
+    # mcp-gateway command
+    gw_cmd = subparsers.add_parser(
+        "mcp-gateway",
+        usage="cadl mcp-gateway FILE --agent ACTOR --server-actor TOOLSERVER "
+              "--audit OUT.jsonl [options] -- SERVER_COMMAND [ARGS...]",
+        help="Run an MCP stdio gateway in front of a tool server that decides "
+             "every tools/call with the enforcement point (agents 0.1)",
+        description="A stdio proxy between an MCP client (the agent ACTOR) and an "
+                    "MCP server (the tool server TOOLSERVER of the file), started "
+                    "as SERVER_COMMAND. Every message is forwarded unchanged, "
+                    "except tools/call, which is decided by the online runtime "
+                    "of agents-run: allowed calls are forwarded, denied calls "
+                    "are answered with a tool result with isError, escalated "
+                    "calls are held until an approval, a rejection or the "
+                    "timeout (see mcp-approve). Writes the audit log and the "
+                    "trace that agents-run replays to the same decisions. Exit "
+                    "status: 0 after the client closed its input, 1 when the "
+                    "tool server or the enforcement point failed, 2 usage error.")
+    gw_cmd.add_argument("file", type=Path, help="CADL file with enforced contracts")
+    gw_cmd.add_argument("--agent", required=True, metavar="ACTOR",
+                        help="The actor that the MCP client is (the sender of tool calls)")
+    gw_cmd.add_argument("--server-actor", required=True, metavar="TOOLSERVER",
+                        help="The tool server of the file that the MCP server is "
+                             "(agent: { kind: tool_server, protocol: mcp })")
+    gw_cmd.add_argument("--audit", type=Path, required=True, metavar="OUT.jsonl",
+                        help="Audit log to create (must not exist)")
+    gw_cmd.add_argument("--audit-key", type=Path, default=None, metavar="FILE",
+                        help="Key the hash chain of the audit log (HMAC-SHA256)")
+    gw_cmd.add_argument("--trace-out", type=Path, default=None, metavar="TRACE.jsonl",
+                        help="Trace to create (must not exist; default: the audit "
+                             "path with the suffix .trace.jsonl)")
+    gw_cmd.add_argument("--approvals", type=Path, default=None, metavar="DIR",
+                        help="Inbox directory for approvals, rejections and other "
+                             "messages (mcp-approve, mcp-message); a directory of this "
+                             "user that nobody else can write. Without it no hold can "
+                             "be approved")
+    gw_cmd.add_argument("--approver-keys", type=Path, default=None, metavar="FILE",
+                        help="JSON object from actor to the key file (or {\"hex\": ...}) "
+                             "with which its inbox files are authenticated "
+                             "(HMAC-SHA256); required with --approvals")
+    gw_cmd.add_argument("--insecure-approvals", action="store_true",
+                        help="Read the inbox without authentication (for tests only)")
+    gw_cmd.add_argument("--allow-method", action="append", default=[], metavar="NAME",
+                        help="Also pass this method (repeatable); methods other than "
+                             "tools/call are not decided by the norms")
+    gw_cmd.add_argument("--init", type=Path, default=None, metavar="FILE.json",
+                        help="Keys for the first line of the trace: bindings, "
+                             "request, values, quantities, instances, "
+                             "host_instances, state")
+    gw_cmd.add_argument("--no-filter-tools", action="store_true",
+                        help="Do not remove undeclared tools from tools/list results")
+    gw_cmd.add_argument("--poll", type=float, default=0.05, metavar="SECONDS",
+                        help="Interval for the inbox and for deadlines (default 0.05)")
+
+    # mcp-approve command
+    approve_cmd = subparsers.add_parser(
+        "mcp-approve",
+        help="Approve or reject a hold of a running mcp-gateway (agents 0.1, G.6)",
+        description="Drop an approval or a rejection into the inbox directory of "
+                    "mcp-gateway. The gateway turns it into the message of the "
+                    "approver that the file's counts_as rule maps to the event "
+                    "approval (rejection), with the hold id as its first "
+                    "argument, and decides that message like any other. Exit "
+                    "status: 0 written, 2 usage error.")
+    approve_cmd.add_argument("inbox", type=Path, metavar="DIR", help="Inbox directory")
+    approve_cmd.add_argument("hold_id", metavar="HOLD_ID", help="Hold id, e.g. h-1")
+    approve_cmd.add_argument("decision", choices=["approve", "reject"])
+    approve_cmd.add_argument("--as", dest="actor", required=True, metavar="ACTOR",
+                             help="The actor who approves or rejects")
+    approve_cmd.add_argument("--show", action="store_true",
+                             help="Show the held call and its arguments, and write "
+                                  "nothing")
+    approve_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
+                             help="The key of the actor (HMAC-SHA256); the gateway "
+                                  "requires it unless it runs with --insecure-approvals")
+
+    # mcp-message command
+    msg_cmd = subparsers.add_parser(
+        "mcp-message",
+        help="Report another governed message to a running mcp-gateway, such as a "
+             "grant between agents (agents 0.1)",
+        description="Drop a message 'FROM -> TO : name' into the inbox directory of "
+                    "mcp-gateway. The gateway decides it at its arrival like any "
+                    "message of a trace. Exit status: 0 written, 2 usage error.")
+    msg_cmd.add_argument("inbox", type=Path, metavar="DIR", help="Inbox directory")
+    msg_cmd.add_argument("message", metavar="'FROM -> TO : name'",
+                         help="The message, e.g. 'OPERATOR -> PLANNER : grant_read'")
+    msg_cmd.add_argument("--arg", action="append", default=[], metavar="VALUE",
+                         help="An argument of the message (repeatable; strings)")
+    msg_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
+                         help="The key of the sender (HMAC-SHA256)")
 
     # regime-map command
     regime_cmd = subparsers.add_parser("regime-map", help="Analyze regime transitions and build a regime map")
@@ -134,6 +261,37 @@ def main(argv: list[str] | None = None) -> int:
                            help="Contract to evaluate (default: the only one with norms)")
     norms_cmd.add_argument("--format", choices=["text", "json"], default="text",
                            help="Output format (default: text)")
+
+    # norms-check command
+    nchk_cmd = subparsers.add_parser("norms-check",
+        help="Check the norms of one contract instance over all behaviours with a model "
+             "checker (Appendix F, F.12)")
+    nchk_cmd.add_argument("file", type=Path, help="CADL file that declares norms: 0.1")
+    nchk_cmd.add_argument("--contract", default=None, metavar="ID",
+                          help="Contract to check (default: the only one with norms)")
+    nchk_cmd.add_argument("--bindings", action="append", default=[], metavar="i=n",
+                          help="Bind an index of the instance (default: the lower bound of "
+                               "its set); may be repeated")
+    nchk_cmd.add_argument("--members", action="append", default=[], metavar="SET=n",
+                          help="Number of members of a set of actors in the instance "
+                               "(default: as declared, else up to the largest bound index)")
+    nchk_cmd.add_argument("--step", default=None, metavar="DURATION",
+                          help="Time between two observations, e.g. 1s or 500ms (default: the "
+                               "greatest common divisor of the durations of the contract)")
+    nchk_cmd.add_argument("--horizon", type=int, default=None, metavar="N",
+                          help="Last observation of an instance (default: from the deadlines "
+                               "and intervals of the norms)")
+    nchk_cmd.add_argument("--export", type=Path, default=None, metavar="DIR",
+                          help="Write the PRISM model, the properties and the witness traces "
+                               "to DIR")
+    nchk_cmd.add_argument("--timeout", type=float, default=600, metavar="SECONDS",
+                          help="Time for all runs of the model checker together; exit status 2 "
+                               "when it is exceeded (default: 600)")
+    nchk_cmd.add_argument("--require-checker", dest="require_checker", action="store_true",
+                          help="Exit with status 2 when PRISM is not on PATH (default: report "
+                               "that nothing was checked and exit with 0)")
+    nchk_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                          help="Output format (default: text)")
 
     # norms-diff command
     diff_cmd = subparsers.add_parser("norms-diff",
@@ -239,7 +397,16 @@ def main(argv: list[str] | None = None) -> int:
     ai_cmd.add_argument("--model", type=str, default=None,
                         help="Override LLM model (default: $CADL_LLM_MODEL, else claude-sonnet-5-5)")
 
+    # `cadl mcp-gateway ... -- SERVER_COMMAND [ARGS...]`: everything after
+    # the first `--` is the command of the MCP server.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    server_cmd = None
+    if argv[:1] == ["mcp-gateway"] and "--" in argv:
+        cut = argv.index("--")
+        argv, server_cmd = argv[:cut], argv[cut + 1:]
     args = parser.parse_args(argv)
+    if args.command == "mcp-gateway":
+        args.server = server_cmd or []
 
     if args.command is None:
         parser.print_help()
@@ -267,8 +434,21 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_sim_gen(args)
     elif args.command == "agents-run":
         return _cmd_agents_run(args)
+    elif args.command == "audit-verify":
+        return _cmd_audit_verify(args)
+    elif args.command == "mcp-gateway":
+        from .mcp_gateway import cli_gateway
+        return cli_gateway(args)
+    elif args.command == "mcp-approve":
+        from .mcp_gateway import cli_approve
+        return cli_approve(args)
+    elif args.command == "mcp-message":
+        from .mcp_gateway import cli_message
+        return cli_message(args)
     elif args.command == "norms-eval":
         return _cmd_norms_eval(args)
+    elif args.command == "norms-check":
+        return _cmd_norms_check(args)
     elif args.command == "norms-diff":
         return _cmd_norms_diff(args)
     elif args.command == "norms-indices":
@@ -905,22 +1085,83 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
     return 0 if result["ok"] else 1
 
 
+def _cmd_norms_check(args: argparse.Namespace) -> int:
+    """Exit status: 0 when the questions were answered without a finding,
+    or when no model checker is on PATH (the model is still exported with
+    --export) unless --require-checker is given; 1 on a finding (a
+    conflict, a norm never activated or violated in every instance, an
+    activation that cannot be kept, a power never exercised); 2 on a usage
+    error, a refusal, a missing PRISM with --require-checker, or when the
+    model checker exceeds --timeout; 3 when a witness is not confirmed by
+    norms-eval (an error of norms-check)."""
+    from .norms_check import check_file, find_checker, format_text
+    from .norms_eval import NormsEvalError
+
+    if args.require_checker and find_checker() is None:
+        print("Error: --require-checker: PRISM (prism) is not on PATH", file=sys.stderr)
+        return 2
+    if not (math.isfinite(args.timeout) and args.timeout > 0):
+        print("Error: --timeout must be a positive finite number of seconds",
+              file=sys.stderr)
+        return 2
+    try:
+        report = check_file(args.file, args.contract, args.bindings, args.members,
+                            args.step, args.horizon, args.export, timeout=args.timeout)
+    except NormsEvalError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        import json
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(format_text(report))
+    if not report.get("checked"):
+        print(f"norms-check: {report.get('skipped')}", file=sys.stderr)
+        return 0
+    if report["unconfirmed"]:
+        return 3
+    return 1 if report["findings"] else 0
+
+
 def _cmd_agents_run(args: argparse.Namespace) -> int:
     """Exit status: 0 when the trace was replayed, whatever the decisions
     are; 2 on a usage error. The audit file is written only after the
     whole trace was replayed, so a failed run leaves no partial log."""
     import json
-    from .agents_runtime import audit_lines, format_text, run_files
-    from .norms_eval import NormsEvalError, TraceError
+    from .agents_runtime import format_text, load_run_trace, run
+    from .audit_log import AuditKeyError, chain_lines, epoch_text, file_sha256, read_key
+    from .norms_eval import NormsEvalError, TraceError, load_version
 
     def no_audit() -> None:
         if args.audit is not None:
             print(f"No audit file was written: the run did not complete "
                   f"({args.audit} was not created or changed).", file=sys.stderr)
 
+    key = None
+    if args.audit_key is not None:
+        if args.audit is None:
+            print("Error: --audit-key needs --audit", file=sys.stderr)
+            return 2
+        try:
+            key = read_key(args.audit_key)
+        except AuditKeyError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            no_audit()
+            return 2
     try:
-        result = run_files(args.file, args.trace)
-        log = "".join(line + "\n" for line in audit_lines(result))
+        if not Path(args.trace).exists():
+            raise NormsEvalError(f"File not found: {args.trace}")
+        sos = load_version(args.file)
+        trace = load_run_trace(args.trace)
+        result = {"file": str(args.file), **run(sos, trace)}
+        log = None
+        if args.audit is not None:
+            log = "".join(line + "\n" for line in chain_lines(
+                result["audit"], file_sha256(args.file), epoch_text(trace.epoch), key,
+                trace.run_id, trace.approvals))
         report = (json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False)
                   if args.format == "json" else format_text(result))
     except TraceError as e:
@@ -939,6 +1180,33 @@ def _cmd_agents_run(args: argparse.Namespace) -> int:
             return 2
     print(report)
     return 0
+
+
+def _cmd_audit_verify(args: argparse.Namespace) -> int:
+    """Exit status: 0 valid, 1 invalid, 2 usage error."""
+    import json
+    from .audit_log import AuditKeyError, file_sha256, format_verify_text, read_key, verify
+
+    try:
+        key = read_key(args.key) if args.key is not None else None
+        source = None
+        if args.source is not None:
+            try:
+                source = file_sha256(args.source)
+            except OSError as e:
+                raise AuditKeyError(f"cannot read {args.source}: {e.strerror or e}") from None
+        if not args.audit.is_file():
+            raise AuditKeyError(f"File not found: {args.audit}")
+        result = verify(args.audit, key=key, source_sha256=source, allow_open=args.open,
+                        run_id=args.run_id, anchor=args.anchor)
+    except (AuditKeyError, OSError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_verify_text(result))
+    return 0 if result["valid"] else 1
 
 
 def _cmd_norms_diff(args: argparse.Namespace) -> int:

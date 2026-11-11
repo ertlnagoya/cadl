@@ -157,9 +157,11 @@ cadl codegen examples/sos_dsl_robot_delivery.cadl --target unity-csharp -o /tmp/
 
 # Agent governance extension (agents 0.1): decide one message at the boundary,
 # replay a recorded sequence of messages (holds, delegations, audit records),
-# and generate the boundary policy as Rego or Cedar
+# verify the hash chain of the audit log, and generate the boundary policy as
+# Rego or Cedar (an MCP gateway is described under Agent Governance below)
 cadl agents-decide examples/agents_tool_governance.cadl --input examples/agents_inputs/delete_file.json
-cadl agents-run examples/agents_tool_governance.cadl --trace examples/traces/agents_tool_governance_a_approved.jsonl
+cadl agents-run examples/agents_tool_governance.cadl --trace examples/traces/agents_tool_governance_a_approved.jsonl --audit /tmp/audit.jsonl
+cadl audit-verify /tmp/audit.jsonl --source examples/agents_tool_governance.cadl
 cadl codegen examples/agents_tool_governance.cadl --target agent-rego -o /tmp/agent_rego
 cadl codegen examples/agents_tool_governance.cadl --target agent-cedar -o /tmp/agent_cedar
 
@@ -180,6 +182,10 @@ cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
 
 # What an amendment from one version to the next does to the norms
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
+
+# Design-time check of the norms of one contract instance over all behaviours
+# (needs PRISM on PATH): violable norms, conflicts, powers never exercised, with witness traces
+cadl norms-check examples/norms_check_conflict.cadl --bindings i=1 --export /tmp/norms-check
 
 # Grounding extension: the derived indices of information sharing and of the
 # concentration of powers, and the incentive coverage, of each contract
@@ -313,12 +319,12 @@ The command is stateless: the in-force flags and the valid derived instances com
 
 #### Runtime on a Recorded Trace
 
-`cadl agents-run` is the reference runtime of the appendix (G.5 to G.8). It replays a recorded sequence of messages through one logical enforcement point over all enforced contracts of the file and computes the decision for every message, the holds and how they end, the delegation state, and the audit records. It is deterministic and offline: it does not run agents or tools, and its only clock is `t` of the trace.
+`cadl agents-run` is the reference runtime of the appendix (G.5 to G.8). It replays a recorded sequence of messages through one logical enforcement point over all enforced contracts of the file and computes the decision for every message, the holds and how they end, the delegation state, and the audit records. It is deterministic (apart from the random run id of the audit header when the trace gives none) and offline: it does not run agents or tools, and its only clock is `t` of the trace.
 
 ```bash
 cadl agents-run examples/agents_tool_governance.cadl \
     --trace examples/traces/agents_tool_governance_a_approved.jsonl
-cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl]
+cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl [--audit-key FILE]]
 ```
 
 For each message, in the order of the trace, the runtime (a) derives the state: the in-force flags of the norms that are not static from the verdict engine of `cadl norms-eval`, the valid derived instances from the grants and revocations seen so far, and the running contract instances with their bindings; (b) calls the decision function of `cadl agents-decide` on the policy input built from that state; (c) applies the decision: an allowed message becomes an observation of the norms engine for the instances of the contracts that govern it, a denied message does not, and an `escalate` creates a hold (`h-1`, `h-2`, ... in the order of creation); (d) appends the audit records. A hold ends when the approver's message creates `approval` or `rejection` through a `counts_as:` rule with the hold id as first argument (`approve("h-1")`), when its timeout passes, or when a contract instance of one of its grounds ends or its contract is amended. An approved message is decided again at the time of the approval and, if nothing denies it, released as the next observation; it does not violate the prohibitions it was held on. In that second decision the approval stands in for the permission and for the grounds only in the contract instances of the grounds: a prohibition that applies anywhere else, a contract instance of a ground that has ended, or another governing contract that no longer allows the message (a revoked delegation, an ended instance, an amendment) denies the release. The file must declare `norms: 0.1` and `agents: 0.1` and pass `cadl check`. The exit status is 0 when the trace was replayed, whatever the decisions are, and 2 on a usage error.
@@ -342,8 +348,12 @@ For each message, in the order of the trace, the runtime (a) derives the state: 
 | `state` | Applies to every running instance of a contract with a `lifecycle:`; an entry of `instances` sets it for one instance. A terminal state ends the instance |
 | `amend` | A new version of the file. Each enforced contract whose definition changed is amended as in `cadl norms-eval`; its held holds are cancelled and its derived instances are tested against the new version (G.7). The set of enforced contracts must stay the same |
 | `end` | `true` ends every running instance; so does the last line, unless it says `"end": false` (holds that are still held then stay `held`). Messages on later lines are still decided and recorded: an ended instance does not come back, so a tool call of its contract is denied with `no_instance` |
+| `run_id` | First line only: the run id of the audit log (32 lowercase hex digits). Without it `--audit` draws a random one |
+| `approvals` | First line only: how the host read approvals, `authenticated`, `insecure` or `none`; copied into the audit header |
+| `withdraw` | Hold ids whose held message the host withdraws at this line (the client cancelled the call): a hold that is still `held` closes as `withdrawn` (closing record `deny`, reason `withdrawn`), and a later approval of it is `not_held` |
+| `host_events` | Event records of the host at this line, written before the line is processed: entries with `event` (`method_refused`, `unsolicited_response`, `unauthorised_approval`, `unauthorised_rejection`, `unauthorised_message`, `approval_evidence`, `approval_unauthenticated`, `forward_failed`) and optional `reason`, `hold_id`, `message`. They change no decision; the MCP gateway writes them |
 
-One line is processed in this order: holds whose deadline lies before `t` expire; instances are created; the time and the `values` of the line (and an `amend`) are one observation without message, so that a deadline or a window that has passed is settled before a message is decided; each message is decided, and an allowed one is one observation; a `state` change and an `end` are a last observation without message.
+One line is processed in this order: holds whose deadline lies before `t` expire; the holds of `withdraw` close; the `host_events` are recorded; instances are created; the time and the `values` of the line (and an `amend`) are one observation without message, so that a deadline or a window that has passed is settled before a message is decided; each message is decided, and an allowed one is one observation; a `state` change and an `end` are a last observation without message.
 
 **Output.** The text report shows the audit log, the holds, the derived instances and the final state of the norms of every contract instance. `--format json` gives one object:
 
@@ -377,7 +387,19 @@ One line is processed in this order: holds whose deadline lies before `t` expire
 {"time": "2026-11-10T09:03:40Z", "message": {"from": "PLANNER", "to": "FILES", "name": "delete_file"}, "instances": [{"contract": "ASSISTED_REPORTING", "instance": "default"}], "decision": "allow", "reason": "approved", "contracts": ["ASSISTED_REPORTING"], "norms": ["ASSISTED_REPORTING.no_delete"], "provenance": [], "escalate_to": "OPERATOR", "timeout": null, "fallback": [], "notify": [], "hold_id": "h-1", "outcome": "approved"}
 ```
 
-The audit file is written only after the whole trace was replayed: when a run fails, no file is written and the error message says so. Changes of the in-force flag of a norm have no record of their own; they follow from the recorded messages, the times, and the `values` of the trace. The log has no integrity protection (no hash chain or signature); G.8 does not ask for one.
+The audit file is written only after the whole trace was replayed: when a run fails, no file is written and the error message says so. Changes of the in-force flag of a norm have no record of their own; they follow from the recorded messages, the times, and the `values` of the trace.
+
+**Integrity of the log.** The audit file is a hash chain (G.8, "Integrity of the log"). Its first line is a header record, `{"audit_format": "cadl-audit/1", "hash": "sha256", "key_id": null, "run_id": ..., "approvals": ..., "source_sha256": ..., "epoch": ...}`: the run id (32 hex digits; the `run_id` of the first line of the trace, or a random one), how the host read approvals (`authenticated`, `insecure`, `none`, or `null` when the trace does not say), the SHA-256 of the bytes of the CADL file, and the `epoch` of the trace or `null`. Then come the records above, with their fields and values unchanged; a complete log ends with `{"audit_end": true, "records": N}`. Every line carries three more fields after its own: `seq` (0 for the header), `prev` (the `digest` of the previous line; 64 zeros in the header) and `digest`, the SHA-256 of the canonical JSON of the line without `digest`. Canonical JSON: keys sorted by code point, separators `,` and `:` without spaces, strings in UTF-8 with only the escapes JSON requires (`\"`, `\\`, `\b`, `\f`, `\n`, `\r`, `\t`, `\u00xx` for other characters below U+0020), integral numbers as integers (at most 2**53 in absolute value), other numbers as the shortest decimal that reads back to the same binary64 value, without exponent (`0.0000001`), no NaN, no lone surrogate, no duplicate key. A line is written in the same way with the fields in their order and the separators `, ` and `: `, and a verifier also requires that form, so a change of whitespace, of an escape or of the form of a number is found too. With `--audit-key FILE` the digests are HMAC-SHA256 with the key in FILE (at least 16 bytes, one trailing line end ignored; never on the command line), the header says `hmac-sha256`, and `key_id` is the first 16 hex digits of HMAC-SHA256(key, `cadl-audit key id`).
+
+What this protects. Without a key: a change of any byte, a deleted, inserted or reordered line, and a cut tail (the end record is missing) are detected; a line from a log of another run does not fit, because the run id in the header changes every digest after it. Not detected without a key: a rewrite of the log from a changed line on, end record included, because anyone can recompute SHA-256. Keep the last digest elsewhere and give it to `audit-verify --anchor`, or use a key. With a key, only a holder of the key can rewrite the log. The `hash` field of the header is not authenticated: a keyed log rewritten as an unkeyed one verifies without `--key`, so the verifier has to know from outside the log whether it is keyed, and give the key. `cadl.audit_log.read_records(path)` gives the records without header, end record and integrity fields. `agents-run` accepts `withdraw` and `host_events` from any trace, so the host's event records in a log replayed from an unkeyed trace prove nothing by themselves; and a replay of a trace without `run_id` draws a new run id, so its log is not byte-reproducible: give `run_id` on the first line of the trace to reproduce it.
+
+```bash
+cadl audit-verify AUDIT.jsonl [--key FILE] [--source FILE.cadl] [--run-id HEX] [--anchor DIGEST] [--open] [--format text|json]
+```
+
+`cadl audit-verify` checks every line and reports the first one that does not verify, with what was expected and found (`--format json`: `valid`, `error` with `line`, `what`, `expected`, `found`, and `lines`, `records`, `hash`, `key_id`, `run_id`, `source_sha256`, `epoch`, `complete`, `last_digest`). `--source` also requires that the log was written for that CADL file, `--run-id` that it is the log of that run, `--anchor` that its last digest is the one kept elsewhere. A log without end record is invalid unless `--open` is given (the log of a gateway that is still running). A keyed log without `--key` is a usage error; `--key` on a log that is not keyed is invalid. Exit status: 0 valid, 1 invalid, 2 usage error.
+
+**Online use.** The same engine can be driven one line at a time: `rt = AgentsRuntime.open(FILE)`, then `rt.observe(line)` for each trace line as a dict (it returns the `steps`, `audit` records and changed `holds` of that line), and `rt.close(t)` at the end, which is the last line `{"t": t}`. `agents-run` is a loop over the same steps, and feeding a trace to `observe` and then `close` gives exactly the result of `agents-run` on the trace followed by `{"t": t}`. After an error, the online runtime refuses every further line.
 
 **Readings.** Where G.5 to G.8 leave a choice, the runtime reads them as follows.
 
@@ -401,6 +423,40 @@ The audit file is written only after the whole trace was replayed: when a run fa
 - An amendment applies to the enforced contracts whose definition differs between the two versions.
 
 `examples/traces/` has three traces for `examples/agents_tool_governance.cadl`: the three calls of G.12, with a call through a delegation chain, an escalation that is approved, and a denial after a revocation (a); a rejection, the fallback, and a hold cancelled at the end (b); an undeclared tool, a timeout, and a late approval (c). `examples/agents_change_control.cadl` has a prohibition that is in force only between a trigger and an `until:`, and a delegation with `max_depth: 1` and an `until:`; its traces show approval, rejection and expiry during a freeze (a), and the depth limit and the end of a delegation (b).
+
+#### MCP Gateway
+
+`cadl mcp-gateway` puts the enforcement point between an MCP client (the agent) and an MCP server (a tool server of the file), over the stdio transport of MCP: JSON-RPC 2.0, one message per line, no embedded newlines ([MCP specification 2026-07-28, stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio)). The client starts the gateway as if it were the server; the gateway starts the server.
+
+```bash
+cadl mcp-gateway FILE --agent ACTOR --server-actor TOOLSERVER --audit OUT.jsonl \
+    [--audit-key FILE] [--approvals DIR --approver-keys KEYS.json] [--trace-out TRACE.jsonl] \
+    [--init FIRST.json] [--allow-method NAME ...] [--no-filter-tools] [--poll SECONDS] \
+    -- SERVER_COMMAND [ARGS...]
+cadl mcp-approve DIR HOLD_ID approve|reject --as ACTOR --key ACTOR.key
+cadl mcp-message DIR 'FROM -> TO : name' [--arg VALUE ...] --key FROM.key
+```
+
+`TOOLSERVER` is an actor of the file with `agent: { kind: tool_server, protocol: mcp, tools: [...] }`.
+
+**What passes.** Every line, in both directions, is parsed strictly before anything is done with it. A line with a carriage return other than one trailing CRLF, invalid UTF-8, a duplicate key at any depth, NaN, an infinity or a number that overflows to one (`1e999`), nesting deeper than 100 arrays or objects, or a lone surrogate is refused (-32700 for a line that is not JSON, -32600 otherwise) and never forwarded. Nothing is forwarded as it was received: the gateway sends the compact JSON of the parsed object with every non-ASCII character escaped, so no reader can split it at a character that it takes as a line end. Methods pass by a list, in both directions:
+
+| Message | What the gateway does |
+|---|---|
+| `tools/call` | The only method that the norms decide. It becomes the message `ACTOR -> TOOLSERVER : name` at the time of its arrival. `allow`: forwarded, and the server's response goes back. `deny`: answered with a tool result with `isError: true` and a text that names the reason, the norms, the hold, the `fallback` and `notify` (MCP calls this a tool execution error, which a client gives to the model so that it can correct itself). `escalate`: held; the client gets no answer yet, and other requests go on. When the hold closes, an approved and released call is forwarded; a rejected, expired or cancelled call, or one whose release is denied (G.6), is answered with a denial |
+| `initialize`, `notifications/initialized`, `ping`, `server/discover`, `notifications/cancelled`, `notifications/progress`, `tools/list` | Passed without a decision: the lifecycle and discovery of MCP 2026-07-28 (`server/discover`) and of the earlier revisions. A `tools/list` result is reduced to the tools that the file declares for `TOOLSERVER` (keep all with `--no-filter-tools`) |
+| Any other method of the client | Refused with -32601 and recorded as the event `method_refused`, unless `--allow-method NAME` names it; an allowed method is passed without a decision |
+| Requests of the server | Refused with -32601 to the server and recorded as `method_refused` (MCP 2026-07-28 does not let a server send requests on stdio; the earlier revisions did, for sampling and elicitation), unless `--allow-method` names them. Notifications of the server pass when they are `notifications/progress`, `notifications/message`, `notifications/cancelled` or `notifications/tools/list_changed` |
+| Responses | Passed only for a request in flight in the other direction; any other response (for a held call, a denied call, an id answered before, or an unknown id) is dropped and recorded as `unsolicited_response` |
+| `notifications/cancelled` for a held call | Withdraws it: the trace gets `withdraw`, the hold closes as `withdrawn`, the call is never sent, and a later approval is `not_held`. For a call that was already sent, the cancellation is passed on and the id stays in flight, because the server may still answer |
+
+Decisions are taken in the order of arrival, one at a time; several calls may be in flight, and a held call does not block the others. Everything that can fail is done before a call is decided: the line that will be sent and the SHA-256 of the canonical JSON (G.8) of its `params`; arguments that have no canonical form (an integer beyond 2**53) are refused with -32602. If sending still fails after an allow or a release, the client gets -32603 and the log the event `forward_failed`. Tool arguments are not decided on and not written to the trace or the log (G.8 has no arguments). The gateway fails closed: when the decision step raises, or the trace or the log cannot be written, the call is denied and so is every later call, held calls are answered with a denial, and the log gets no end record. When the server exits, requests in flight and held calls get the error -32603 and the gateway exits with status 1; when the client closes its input, the gateway stops the server and exits with 0, and held calls stay unanswered.
+
+**Approvals and other messages.** With `--approvals DIR`, the gateway reads JSON files from the inbox directory DIR in the order of their names. DIR must be a directory of the user of the gateway that its group and others cannot write (the gateway creates it with mode 0700 and refuses to start otherwise), and only regular files with one link, owned by that user, are read; a symbolic link, a hard link or a file of another user moves to `DIR/invalid`. The approvals are authenticated: `--approver-keys KEYS.json` maps each actor that may speak through the inbox to its key (`{"OPERATOR": "operator.key"}`, paths relative to KEYS.json, or `{"hex": "..."}`; at least 16 bytes; never the key of the audit log). For every held call the gateway publishes `DIR/holds/h-N.json` with the run id, the held message, the time of the hold, and the arguments of the call (`params`) with their SHA-256, and `DIR/run.json` with the run id. The decision does not depend on the arguments (G.4); they are there for the approver. `cadl mcp-approve DIR h-1 approve --as OPERATOR --key operator.key` shows the held call and its arguments (`--show` only shows them) and writes a file with the hold id, the decision, the actor, the run id, the held message, the time of the hold, the SHA-256 of the arguments, a fresh nonce, and an HMAC-SHA256 with the actor's key over the canonical JSON (G.8) of the rest. The gateway accepts it only when the MAC verifies with the key of that actor, the run id is that of the run, the held message, its time and the digest of its arguments are those of the hold, and the nonce was not used before; otherwise it records `unauthorised_approval` (or `unauthorised_rejection`) with the reason `unauthenticated`, `wrong_run`, `wrong_message` or `replayed`, and the call stays held. An accepted file becomes the approver's message that the file's `counts_as:` rule maps to `approval` (here `OPERATOR -> PLANNER : approve("h-1")`), with the event record `approval_evidence` before its decision, whose `reason` is `file=sha256:…;params=sha256:…;key_id=…;nonce=…` (the file, the arguments, the approver's key id and the nonce); whether it closes the hold is decided by G.6. `cadl mcp-message` writes any other message, such as a grant between agents (`OPERATOR -> PLANNER : grant_read`), authenticated with the key of its sender; an approval or rejection sent that way is refused (`unauthorised_message`, `approval_as_message`). Without `--approver-keys` the gateway refuses `--approvals`; `--insecure-approvals` reads the inbox without authentication and is meant for tests only, and an approval accepted that way is recorded as `approval_unauthenticated`. The trace's first line and the audit header say which mode the run used (`approvals`: `authenticated`, `insecure`, `none`). The keys separate approvers only if they cannot read each other's key files: approvers who share the user account of the gateway can read the whole keyring, so each approver needs an account of their own (with the key readable only there and by the gateway), the agent must not run under the gateway's account, or approvals have to come through a channel that authenticates the approver in another way. The inbox protects only against parties that do not have the key files. A file that cannot be read moves to `DIR/invalid` with a `.why` file and is never an approval.
+
+**Time, trace and replay.** The time `t` is the time since the start of the gateway on a monotonic clock, in seconds rounded to milliseconds; the first line of the trace gives a random `run_id`, the wall-clock time of `t = 0` as `epoch` and `"quantities": []`, plus the keys of `--init FIRST.json` (`bindings`, `request`, `values`, `quantities`, `instances`, `host_instances`, `state`). Every step is written to the trace (`--trace-out`, by default the audit path with `.trace.jsonl`) before it is decided: each decided message, a line `{"t": t}` when the deadline of a hold has passed, `withdraw` and `host_events` lines, and a last line `{"t": t}` when the gateway stops. `cadl agents-run FILE --trace TRACE --audit A.jsonl` on that trace makes the same decisions and writes the same audit log, byte for byte (with the same `--audit-key`). The gateway refuses to start when the audit log or the trace exists. A hold whose timeout is longer than the client's request timeout ends at the client first; choose `timeout:` accordingly.
+
+Not covered: the gateway does not observe `values` (a norm that reads a quantity sees it as missing data, G.5), and it does not create or end host-created contract instances after the first line. Under MCP 2026-07-28 a `tools/call` that a server answers with `input_required` is retried by the client as a new request, which is decided again. The approver's tool trusts the held message that the gateway publishes.
 
 ### Regime Transitions
 
@@ -569,6 +625,24 @@ The file must declare `norms: 0.1` and pass `cadl check`. `--contract` is needed
 `examples/traces/` has five traces for `examples/norms_robot_delivery.cadl`: all norms fulfilled (a), a missed acknowledgement repaired by a failure report (b), both missed (c), a late delivery excused because the dispatcher stopped operating (d), and a reassignment that discharges the obligations (e). `norms_amendment_v1_to_v2.jsonl` is a trace of `examples/norms_amendment_v1.cadl` that is amended to `examples/norms_amendment_v2.cadl` while a failure report is due.
 
 `examples/norms_no_double_assignment.cadl` adds to that contract a prohibition quantified over the robots: the same delivery must not be assigned to two robots at once (`exists j in ROBOT: exists k in ROBOT: j != k AND ROBOT[j].delivery == request.id AND ROBOT[k].delivery == request.id`). Its traces: no double assignment (a, fulfilled), `ROBOT[3]` also gets the delivery at t=3 (b, violated at t=3), and a reassignment to the same robot (c, fulfilled). `N` has no value in them, so the domain is open: the content is true once two named robots carry the delivery, and undefined, which does not violate, while no two do.
+
+### Design-Time Checking of Norms (Model Checking)
+
+`cadl norms-check FILE [--contract ID] [--bindings i=2] [--members ROBOT=2] [--step 1s] [--horizon N] [--export DIR] [--timeout SECONDS] [--require-checker] [--format text|json]` translates the norms of one contract instance into a Markov decision process in the PRISM language (Appendix F, F.12) and asks PRISM questions over all behaviours of the instance, before any trace exists. At each observation the environment chooses which message events occur, a class of values for each quantity (one value per class that the literals of the predicates cut the domain into, plus "no value"), and whether the instance ends. One observation every `--step` (default: the greatest common divisor of the deadlines and intervals), at most `--horizon` + 1 observations (default from the deadlines and intervals); the model is exact for traces with an observation at every step. The classes assume that each quantity takes values of the type of the literals it is compared with (numbers, booleans, or symbols and texts) or no value; the answers do not cover traces with values of another type (a text where numbers are compared can make a predicate false or undefined where the model has it true), and the report says so in a note.
+
+```bash
+cadl norms-check examples/norms_check_conflict.cadl --bindings i=1
+#  report_status / radio_silence: after 1 observation(s) keeping one violates the other
+#  apologise can be activated in a state from which every continuation violates it
+#  the power audit is never exercised
+```
+
+For every translated norm it reports whether it can be activated, violated and fulfilled (the instance may end at any observation), whether it is violated in every instance that runs to the horizon, and whether every activation can be kept; for every pair of obligations and prohibitions whether they are in conflict (a reachable state where each can still be kept alone but every continuation violates one of them); for every power whether it can be exercised; and whether a reparation can be activated. Every "possible" answer comes with a witness: a trace in the `cadl norms-eval` format that the command itself evaluates with the engine of `cadl norms-eval` and marks as confirmed (a conflict has two, one keeping each norm). `--export DIR` writes the model (`<contract>.prism`), the properties (`<contract>_any.props` with `-const early_end=true`, `<contract>_full.props` with `early_end=false`) and the witnesses (`witness_<norm>_<question>.jsonl`). JSON has `instance`, `model`, `norms[]` (per question `answer` and `witness` with `trace`, `choices`, `confirmed`), `conflicts[]`, `findings[]`, `unconfirmed[]`, `assumptions[]`, `rules[]` and `notes[]`.
+
+Translated: message events, counts-as rules, predicates that compare one quantity with literals (`==`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, a boolean quantity alone) with `AND`, `OR`, `NOT`, a content that is one `within` / `throughout` / `until`, deadlines, `until:`, powers and their effects, reparations, and `assume:` items of these forms. Not translated, with the reason in the report: quantifiers, aggregates, wildcard references in predicates, arithmetic, comparisons of two quantities, `request`, `now`, `state`, amendments, and every norm that depends on a norm that is not translated. Refused: more than 1,000 observations, 16 message events, 8,192 choices per observation, or 20,000 combinations of classes of values in one group of predicates. An activation cannot be kept when, before an observation, some choice activates the norm and every activating choice leads to a state from which every continuation violates it (a reparation with a deadline of 0 s; an obligation with a deadline of 0 s triggered by a message can be kept, since the content may come in the same observation); the witness confirms with `cadl norms-eval` every choice at that observation and an idle continuation of each activating one, and the report says that the rest rests on the model checker. The time grows with the number of commands of the model (four per choice) and of reachable states: 12 message events (4,096 choices) took more than ten minutes. `--timeout SECONDS` bounds all runs of PRISM together (default 600) and exits with status 2 when it is exceeded; `--export` writes the model before PRISM runs. The exit status is 0 without findings (also when PRISM is not on PATH; the report says nothing was checked, and `--export` still writes the model; with `--require-checker` a missing PRISM exits with status 2), 1 on a finding (a conflict, a norm never activated or violated in every instance, an activation that cannot be kept, a power never exercised), 2 on a usage error, a refusal or a timeout, and 3 when a witness is not confirmed by `cadl norms-eval` (an error of norms-check).
+
+The translation is tested against `cadl norms-eval`: the tests run the generated PRISM text with an interpreter of the subset it uses on random paths of environment choices and on every path of at most two observations of one contract and compare the state of every norm after every observation, the verdicts, the exercises of powers and the activations of reparations (`CADL_NORMS_CHECK_PATHS` raises the number of random paths); the interpreter is compared with paths that the PRISM simulator generates, and the answers of PRISM with explicit fixpoints over the reachable states.
+
 ### Norms Monitor in Generated Python Code
 
 For a file that declares `norms: 0.1`, `cadl codegen -t python` also writes `norms_monitor.py`: an online monitor of one contract instance (Appendix F, F.5). A running system feeds it observations as they happen and gets back the changes of the norm states and of the four-valued verdicts, including those of `assume:` / `guarantee:` items with temporal operators, which `contracts.py` leaves out.
@@ -888,7 +962,10 @@ src/cadl/
   iec62853.py          IEC 62853-oriented dependability summary
   unparse.py           Expression AST back to CADL source text
   norms_eval.py        Verdicts of the norms extension on a recorded trace
-  agents_runtime.py    Runtime of the agent governance extension: decisions, holds, delegations and audit records on a trace
+  norms_check.py       Design-time checking of norms: translation to PRISM, questions, witnesses
+  agents_runtime.py    Runtime of the agent governance extension: decisions, holds, delegations and audit records on a trace, offline or one line at a time
+  audit_log.py         Hash chain of the audit log (SHA-256 or HMAC-SHA256) and its verification (`cadl audit-verify`)
+  mcp_gateway.py       MCP stdio gateway that decides tool calls with the runtime (`cadl mcp-gateway`, `mcp-approve`, `mcp-message`)
   norms_diff.py        Effect of an amendment on the norms (two versions compared)
   grounding.py         Grounding extension: derived indices, rules J-1 to J-9 and J-13
   cli.py               Command-line interface
@@ -958,6 +1035,7 @@ tests/
   test_expr_parser.py    Expression grammar tests
   test_unparse.py        Expression round-trip tests
   test_norms_eval.py     Norm verdicts on a trace (`cadl norms-eval`)
+  test_norms_check.py    Design-time checking of norms, differential tests (`cadl norms-check`)
   test_grounding_extension.py  Grounding extension: indices, rules, IR, `cadl norms-indices`
   test_grounding_sos.py  Grounding extension: the quantities of the SoS over all contracts
   test_norms_wildcards.py Wildcard and range references in predicates (F.5): rewriting, equivalence with the quantified forms, N-15
@@ -977,6 +1055,9 @@ tests/
   test_keyword_boundaries.py      Keywords are not split out of longer names
   test_agents_extension.py        Agent governance extension: G-1 to G-19, decisions, agent-rego / agent-cedar
   test_agents_runtime.py          Runtime of the agent governance extension (`cadl agents-run`): holds, delegations, audit records
+  test_audit_log.py               Hash chain of the audit log: every single-byte change, deletion, insertion, reordering, keyed and unkeyed (`cadl audit-verify`)
+  test_mcp_gateway.py             MCP gateway with a fake server and client: scenarios replayed through `cadl agents-run`, malformed input, crashes, concurrency
+  mcp_fake_server.py              Fake MCP server (stdio) for test_mcp_gateway.py
 
 examples/
   robot_delivery.cadl        Robot delivery SoS (Acknowledged type)
@@ -1015,11 +1096,12 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | Simulator IR and config generation (Python, Unity, Go) | Available |
 | SoS-DSL extension (`lifecycle:` / `monitors:`) and Unity C# generation | Available |
 | Norms extension: static checks, and verdicts and amendments on a recorded trace (`cadl norms-eval`, `cadl norms-diff`) | Available |
-| Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available (no translation to a model checker) |
+| Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available |
 | Norms extension: monitors in generated Rego (step function) and Solidity | Available without quantifiers, aggregates, wildcard references and amendments (refused at generation, with a warning); Unity C# does not monitor norms |
+| Norms extension: design-time checking of one contract instance with PRISM (`cadl norms-check`) | Available (quantified predicates, several instances and amendments are not translated) |
 | Grounding extension (grounding 0.1), norms side: derived indices and incentive coverage (`cadl norms-indices`), rules J-1 to J-9, IR, comparison of two versions (J-13 in `cadl norms-diff`) | Available |
 | Strategic model extension (games 0.1): equilibrium checks and certified equilibrium maps (`cadl game-check`), with the link to norms of Appendix J (`sanction_of:` / `reward_of:`, J-10 to J-12, J-14) | Available (the export for PRISM-games has not been run through PRISM-games) |
-| Agent governance extension (agents 0.1): checks, decision function, runtime on a recorded trace (holds, delegations, audit records; `cadl agents-run`), Rego / Cedar boundary policies | Available (the runtime is an offline reference: it replays a trace and is not connected to a protocol) |
+| Agent governance extension (agents 0.1): checks, decision function, runtime on a recorded trace (holds, delegations, hash-chained audit records; `cadl agents-run`, `cadl audit-verify`), MCP stdio gateway (`cadl mcp-gateway`), Rego / Cedar boundary policies | Available (the gateway is a reference, tested with a fake MCP server and client only; no A2A connection) |
 | `model_check` / `simulation` / `proof` verification methods | Not supported yet (reported explicitly) |
 
 ## Related Projects

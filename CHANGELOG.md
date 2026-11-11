@@ -45,6 +45,142 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `CADL_EVM_PYTHON`) and check that hostile strings stay data. Up to
   0.3.24 these targets left out the norms and the temporal items with a
   warning; the files they generated before are unchanged.
+- `cadl norms-check FILE [--contract ID] [--bindings i=n] [--members SET=n]
+  [--step DURATION] [--horizon N] [--export DIR] [--format text|json]`:
+  design-time checking of the norms of one contract instance by a model
+  checker (Appendix F, F.12; new module `cadl.norms_check`). The norms
+  are translated into an MDP in the PRISM language whose environment
+  chooses, at each observation (one every step, the greatest common
+  divisor of the durations by default), the message events, one class of
+  values per quantity (the classes that the literals of the predicates
+  cut the domain into, and no value) and the end of the instance; one
+  transition is the six steps of F.5. PRISM (`prism` on PATH, explicit
+  engine) answers per norm whether it can be activated, violated and
+  fulfilled, whether it is violated in every instance that runs to the
+  horizon, whether every activation can be kept, which pairs of
+  obligations and prohibitions are in conflict, whether each power can
+  be exercised and each reparation activated. Every "possible" answer
+  comes with a witness trace that the command evaluates with the engine
+  of `cadl norms-eval` (two for a conflict). `--export` writes the model,
+  the two property files and the witnesses. Predicates with
+  quantifiers, aggregates, arithmetic or two quantities, `request`,
+  `now`, `state` and amendments are not translated (the norm, and the
+  norms that depend on it, are reported with the reason). Without PRISM
+  the command reports that nothing was checked (exit status 0). Exit
+  status 1 on a finding, 2 on a usage error, refusal or timeout, 3 when a
+  witness is not confirmed. `--timeout SECONDS` (default 600) bounds all
+  runs of PRISM together; `--require-checker` makes a missing PRISM an
+  error (exit status 2). An activation that cannot be kept is asked in
+  the state before the activating observation, so an obligation with a
+  deadline of 0 s whose content may come at its activation is not
+  reported; its witness is confirmed for every choice at that
+  observation. The classes of values assume values of the type of the
+  literals, which the report notes. `examples/norms_check_conflict.cadl` shows a
+  conflict, a reparation that cannot be kept and a power that is never
+  exercised. The translation is tested differentially against
+  `cadl norms-eval` on random paths and on every path of at most two observations of one contract, with an interpreter
+  of the generated PRISM text that is itself compared with the PRISM
+  simulator.
+
+## [0.3.24] — 2026-11-11
+
+Extensions of the norms, strategic model and agents tooling. Wildcard
+and range references such as `ROBOT[*]` are now evaluated as the
+quantifier or comprehension they stand for (F.5), aggregates that only
+grow or only shrink are decided over open domains, and the grounding
+indices are computed at the level of a system of systems. The strategic
+model checker certifies the end points of any strategic model and
+offers the concept `every_reachable_state` (Appendix I). The agent
+runtime keeps a tamper-evident audit log (`cadl audit-verify`) and an
+MCP gateway (`cadl mcp-gateway`) that decides every tool call of an
+agent against the contract, holds calls that need approval, and accepts
+approvals signed with per-approver keys (Appendix G). Each part was
+reviewed independently before the release.
+
+Known limits: the gateway was tested against a test MCP server and
+client written for the purpose, not against a released MCP SDK; the
+approver's tool trusts the description of a held call that the gateway
+publishes; the strategic export was not run through PRISM-games.
+
+### Added
+- Tamper-evident audit log (Appendix G, G.8, "Integrity of the log"):
+  `cadl agents-run --audit` writes a header record (format
+  `cadl-audit/1`, SHA-256 of the CADL file, epoch, hash algorithm), the
+  records of G.8, and an end record with their count; every line carries
+  `seq`, `prev` (the digest of the previous line) and `digest` (SHA-256
+  of its canonical JSON). `--audit-key FILE` keys the chain with
+  HMAC-SHA256. Standard library only. Without a key the chain detects
+  any changed byte, deleted, inserted or reordered line, changed header
+  and cut tail, but not a rewrite of the whole log; with a key only a
+  holder of the key can rewrite it.
+- `cadl audit-verify AUDIT.jsonl [--key FILE] [--source FILE.cadl]
+  [--open] [--format text|json]`: verifies the chain and reports the
+  first line that fails, with what was expected and found. Exit status
+  0 valid, 1 invalid, 2 usage error.
+- Online runtime: `AgentsRuntime.open(file)`, `.observe(line)` and
+  `.close(t)` drive the enforcement point one trace line at a time;
+  `cadl agents-run` is a loop over the same steps.
+- `cadl mcp-gateway FILE --agent ACTOR --server-actor TOOLSERVER --audit
+  OUT.jsonl [...] -- SERVER_COMMAND`: an MCP stdio proxy (JSON-RPC 2.0,
+  MCP specification 2026-07-28) that decides every `tools/call` with the
+  runtime. Allowed calls are forwarded; denied calls get a tool result
+  with `isError: true` that names the reason and the fallback; escalated
+  calls are held until an approval or rejection (`cadl mcp-approve DIR
+  HOLD_ID approve|reject --as ACTOR`) or the timeout. Other governed
+  messages, such as grants, come in with `cadl mcp-message`. `tools/list`
+  is filtered to the declared tools. Fail-closed on malformed input and
+  on a failure of the decision step. The gateway writes a trace that
+  `cadl agents-run` replays to the same decisions and the same audit log,
+  byte for byte.
+
+### Security
+- `cadl mcp-gateway` after an independent review. A client could hide a
+  complete `tools/call` inside another message with bare carriage
+  returns, and a server that reads with universal newlines executed it;
+  lines are now parsed strictly (no CR other than one trailing CRLF, no
+  duplicate keys, no NaN, no lone surrogates) and forwarded as the
+  re-serialised object with every non-ASCII character escaped, never as
+  received. Methods pass by an allowlist in both directions (`tools/call`
+  decided; lifecycle, discovery and `tools/list` passed; anything else
+  refused and recorded as `method_refused` unless `--allow-method`);
+  responses pass only for a request in flight (`unsolicited_response`).
+  Names are matched in full (`"read_file\n"` stopped the gateway). The
+  inbox must be a 0700 directory of the user, and only regular files with
+  one link of that user are read. Approvals are authenticated: HMAC-SHA256
+  per approver (`--approver-keys`, `cadl mcp-approve --key`), bound to the
+  run, the hold, the held message, its time and a nonce; without keys the
+  inbox is refused unless `--insecure-approvals`. A cancelled held call is
+  withdrawn (hold state `withdrawn`). Lone surrogates in a trace are a
+  trace error (`agents-run`, `norms-eval`) instead of a crash.
+- Second review of `cadl mcp-gateway`. A number that overflows to
+  infinity (`1e999`) passed the parser and made forwarding fail after the
+  decision, so the log showed an allowed call that was never sent; such
+  numbers, and nesting deeper than 100, are now refused, the line to send
+  and the digest of the arguments are made before deciding, a failure to
+  send is recorded (`forward_failed`), and the held calls that a failure
+  denies are withdrawn in the runtime too. The approver sees the
+  arguments of a held call (`DIR/holds/h-N.json`, `mcp-approve --show`),
+  and an approval is bound to their SHA-256. The approvals mode
+  (`authenticated`, `insecure`, `none`) is in the first trace line and the
+  audit header; accepted approvals record the key id and the nonce, and an
+  insecure one is `approval_unauthenticated`.
+- Audit log: a random `run_id` in the header (and on the first line of
+  the gateway's trace); numbers in the canonical form are integers or
+  decimals without exponent; integers beyond 2**53 are refused;
+  `audit-verify --run-id` and `--anchor`.
+
+### Changed
+- The audit file of `cadl agents-run --audit` has a header line, an end
+  line, and three integrity fields at the end of every record line. The
+  records themselves, their fields and their order are unchanged; read
+  them with `cadl.audit_log.read_records`. `--format json` and the text
+  report are unchanged. The header has a random run id unless the trace
+  gives `run_id`, so two runs of the same trace differ in the header and
+  the digests.
+- Trace keys `run_id` (first line), `withdraw` and `host_events` for
+  `cadl agents-run`; hold state `withdrawn` (counted in `summary.holds`
+  only when it occurs).
+
 - Wildcard and range references in predicates (Appendix F, F.5,
   "Wildcard and range references"). `A[*]` or `A[lo..hi]` outside the
   domain of a quantifier or comprehension is now shorthand: in the
@@ -88,8 +224,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `institution.grounding`. They are not weighted and not compared with
   any declared value; tied single actors are all named, sorted, so the
   report does not depend on the order of the contracts. The output for each contract is unchanged.
-
-### Changed
 
 - `cadl agents-run`: a norm whose `trigger:`, `until:` or `content:` has
   a wildcard or range reference outside a quantifier is now judged (it
