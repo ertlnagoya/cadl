@@ -574,8 +574,8 @@ class TestComparisons:
         # only above an even share among the single actors that bear a power
         three = norms(power("p", "D"), power("q", "X"), power("r", "R[1]"))
         r = check(auth, three)
-        assert not rule(r.warnings, "J-6")
-        assert len(rule(r.warnings, "J-7")) == 1          # 1/3 is farther than 0.25
+        # J-6 holds the end-point test; J-7 does not apply to beta: 0 (ruling (a))
+        assert not rule(r.warnings, "J-6") and not rule(r.warnings, "J-7")
         w = rule(check(auth, norms(power("p", "D"), power("q", "D"), power("r", "X"))).warnings, "J-6")
         assert len(w) == 1 and "D bears 2 of the 3" in w[0]
         assert not rule(check(auth, norms(power("p", "D"), power("q", "R[i]"))).warnings, "J-6")
@@ -656,10 +656,21 @@ class TestComparisons:
         assert r.ok, [str(e) for e in r.errors]
         infos = rule(r.infos, "J-9")
         # beta^ = 1: CENTRALIZED (0.9) is within the tolerance, DISTRIBUTED (0.1) is not;
-        # alpha^ = 0/1: alpha = 0.9 in both designs
-        assert len(infos) == 3
-        assert sum("DISTRIBUTED" in i and "'beta'" in i for i in infos) == 1
-        assert sum("'alpha'" in i for i in infos) == 2
+        # alpha^ = 0/1: alpha = 0.9 in both designs, which is the declared value that
+        # J-7 already reports, so J-9 does not repeat it (M2)
+        assert len(rule(r.warnings, "J-7")) == 1 and "alpha: 0.9" in rule(r.warnings, "J-7")[0]
+        assert len(infos) == 1
+        assert "DISTRIBUTED" in infos[0] and "'beta'" in infos[0]
+        # with a declared alpha near the index, J-7 is silent and J-9 reports both designs
+        quiet_text = text.replace("information: { alpha: 0.9 }", "information: { alpha: 0.1 }")
+        quiet_text = quiet_text.replace("{ parameters: { beta: 0.9 } }",
+                                        "{ parameters: { beta: 0.9, alpha: 0.9 } }")
+        quiet_text = quiet_text.replace("{ parameters: { beta: 0.1 } }",
+                                        "{ parameters: { beta: 0.1, alpha: 0.9 } }")
+        quiet = type_check(parse(quiet_text))
+        assert quiet.ok, [str(e) for e in quiet.errors]
+        assert not rule(quiet.warnings, "J-7")
+        assert sum("'alpha'" in i for i in rule(quiet.infos, "J-9")) == 2
         assert not rule(r.warnings, "J-9") and not rule(r.errors, "J-9")
         # a larger tolerance silences them
         r = type_check(parse(text.replace("grounding: { items", "grounding: { tolerance: 1, items")))
@@ -1423,3 +1434,192 @@ class TestLemmas:
         two["norms"].append({"id": "p2", "kind": "power", "bearer": "A",
                              "content": "A -> S[i] : m2"})
         assert (_ci(one).beta.value, _ci(two).beta.value) == (F(1, 2), F(2, 3))
+
+
+# --- Fixes after the independent review --------------------------------------------
+
+HUGE = "1" + "0" * 400
+
+
+class TestReviewFixes:
+    # D1: integers of any size, no OverflowError
+    @pytest.mark.parametrize("blocks", [
+        (norms(duty("a", ov="{ magnitude: %s }" % HUGE)),),
+        (norms(duty("a", ful="{ magnitude: %s }" % HUGE)),),
+        ("grounding: { tolerance: %s }\n" % HUGE, norms(duty("a"))),
+    ])
+    def test_d1_huge_integers(self, blocks, capsys, tmp_path):
+        sos = parse(source(*blocks))
+        r = type_check(sos)
+        tol = "tolerance" in blocks[0]
+        assert bool(rule(r.errors, "J-2")) == tol and not rule(r.errors, "J-4")
+        json.dumps(_ir_to_dict(lower_to_ir(sos)))
+        f = tmp_path / "huge.cadl"
+        f.write_text(source(*blocks))
+        assert main(["norms-indices", str(f)]) == (2 if tol else 0)
+        assert main(["sim-ir", str(f), "--format", "json"]) == 0
+        assert "Traceback" not in capsys.readouterr().err
+
+    def test_d1_huge_magnitude_in_link_and_diff(self):
+        sos = parse(source(norms(duty("a", ov="{ magnitude: %s }" % HUGE))))
+        link = G.norm_payoff_link(sos, "C.a")
+        assert link.magnitude == 10 ** 400 and link.magnitude_text == HUGE
+        old = parse(source(norms(duty("a", ov="{ magnitude: 1 }"))))
+        res = diff_versions(old, sos)
+        assert any(f["kind"] == "magnitude_changed" for f in res["contracts"][0]["findings"])
+        json.dumps(res)
+
+    # D2: weights without an exponent, accepted by param_expr of H.2
+    @pytest.mark.parametrize("written, text", [
+        ("1.0e-7", "0.0000001"), ("1.0e+22", "10000000000000000000000"), ("2", "2"),
+        ("2.50", "2.5"), ("0.1", "0.1"), ("3.0", "3"), (HUGE, HUGE),
+    ])
+    def test_d2_weight_text_is_a_param_expr(self, written, text):
+        from cadl.stochastic import parse_param_expr
+        sos = parse(source(norms(duty("a", ov="{ magnitude: %s }" % written,
+                                      ful="{ magnitude: %s }" % written))))
+        assert type_check(sos).ok
+        for key, sign in (("sanction_of", "-"), ("reward_of", "")):
+            link = G.norm_payoff_link(sos, "C.a", key)
+            assert link.magnitude_text == text
+            weight = link.weight_text("lambda")
+            assert weight == f"{sign}{text} * lambda"
+            parse_param_expr(weight)
+
+    # D3: a reward that is not a text
+    @pytest.mark.parametrize("reward", ["[]", "{}", "[1, [2]]", "{a: 1}"])
+    def test_d3_reward_not_a_text(self, reward):
+        r = check(norms(duty("a", ful="{ reward: %s }" % reward)))
+        e = rule(r.errors, "J-4")
+        assert len(e) == 1 and "must be a text" in e[0]
+        c = indices(norms(duty("a", ful="{ reward: %s, magnitude: 0 }" % reward))).coverage
+        assert c.incentive == []
+
+    @pytest.mark.parametrize("reward", ["5", "yes", "0", '"x"'])
+    def test_d3_scalars_are_texts(self, reward):
+        r = check(norms(duty("a", ful="{ reward: %s }" % reward)))
+        assert r.ok
+        assert indices(norms(duty("a", ful="{ reward: %s }" % reward))).coverage.value == 1
+
+    # (g) white space only counts as empty
+    @pytest.mark.parametrize("ov, ful, carries", [
+        ('{ sanction: "   " }', "", False),
+        ('{ sanction: "\\t" }', "", False),
+        ("{ sanction: 0 }", "", True),
+        ("", '{ reward: "  ", magnitude: 1 }', True),
+        ("", '{ reward: "  ", magnitude: 0 }', False),
+    ])
+    def test_g_white_space_is_empty(self, ov, ful, carries):
+        c = indices(norms(duty("a", ov=ov, ful=ful))).coverage
+        assert c.value == int(carries)
+
+    def test_g_on_fulfilment_with_white_space_only(self):
+        e = rule(check(norms(duty("a", ful='{ reward: "  " }'))).errors, "J-4")
+        assert len(e) == 1 and "at least one" in e[0]
+        assert not rule(check(norms(duty("a", ov='{ sanction: " ", magnitude: 0 }'))).warnings,
+                        "J-4")
+
+    # (f) an entry with more than one item, or with arguments, gives no pair
+    @pytest.mark.parametrize("entry", ['"D -> R[*] : route, status"',
+                                       '"D -> R[*] : route(period: 5s)"'])
+    def test_f_lenient_entry_gives_no_pair(self, entry):
+        blocks = (ITEMS, "information:\n  sharing:\n    - %s\n" % entry)
+        a = indices(*blocks).alpha
+        assert a.value == 0 and a.given == {}
+        w = rule(check(*blocks).warnings, "J-3, J.4")
+        assert len(w) == 1 and "single item" in w[0]
+
+    def test_f_a_strict_entry_with_the_same_name_still_gives_the_pair(self):
+        a = indices(ITEMS, 'information:\n  sharing:\n    - "D -> R[*] : route, status"\n'
+                           '    - "D -> R[*] : route"\n').alpha
+        assert a.given_pairs == [("route", "R")]
+        assert [l for _, l in a.given[("route", "R")]] == ["D -> R[*] : route"]
+
+    def test_f_probe_c3(self):
+        sos = parse_file(Path(__file__).parent.parent / "examples" / "grounding_robot_delivery.cadl")
+        text = (EXAMPLE.read_text().replace('"DISPATCHER -> CUSTOMER[*] : status"',
+                                            '"DISPATCHER -> CUSTOMER[*] : status, route"'))
+        sos = parse(text)
+        assert G.contract_indices(sos, sos.contracts[0]).alpha.value == F(4, 8)
+
+    # (a) J-7 does not apply to a declared end point
+    def test_a_beta_0_gets_j6_only(self):
+        powers = norms(power("p", "D"), power("q", "X"), power("r", "R[1]"), power("s", "R[2]"))
+        for beta in ("0", "0.0"):
+            r = check("authority: { beta: %s }\n" % beta, powers)
+            assert not rule(r.warnings, "J-6") and not rule(r.warnings, "J-7")
+        r = check("authority: { beta: 0.05 }\n", norms(power("p", "D"), power("q", "X"),
+                                                      power("r", "X")))
+        assert rule(r.warnings, "J-7")              # intermediate values still compared
+
+    # (j) one version declares the extension
+    def test_j_one_version_declares(self):
+        old = parse(source("authority: { beta: 0.8 }\n",
+                           norms(power("p", "D"), duty("a", ov="{ magnitude: 1 }")),
+                           declare=("norms: 0.1",)))
+        new = parse(source("authority: { beta: 0.9 }\n",
+                           norms(power("p", "D"), power("q", "R[i]"),
+                                 duty("a", ov="{ magnitude: 1 }"))))
+        f = diff_versions(old, new)["contracts"][0]["findings"]
+        by = {x["kind"]: x for x in f}
+        assert "from none to 1" in by["magnitude_changed"]["text"]
+        assert by["indices_not_compared"]["version"] == "old"
+        assert "not compared" in by["indices_not_compared"]["text"]
+        assert "index_opposite" not in by and "index_changed" not in by
+        f = diff_versions(new, old)["contracts"][0]["findings"]
+        assert {x["kind"]: x for x in f}["indices_not_compared"]["version"] == "new"
+
+    def test_j_added_norm_lists_its_keys(self):
+        old = parse(source(ITEMS, norms(duty("a"))))
+        new = parse(source(ITEMS, norms(
+            duty("a"),
+            duty("b", ov="{ sanction: fine, magnitude: 2.5 }", ful="{ reward: bonus }"),
+            SHARE_NORM.format(kind="permission", to="D"),
+            duty("c"))))
+        f = diff_versions(old, new)["contracts"][0]["findings"]
+        added = {x["norm"]: x for x in f if x["kind"] == "norm_added_grounding"}
+        assert set(added) == {"b", "tell"}                 # c has none of the keys
+        assert added["b"]["magnitude"] == 2.5
+        assert added["b"]["on_fulfilment"] == {"reward": "bonus", "magnitude": None}
+        assert "on_violation.magnitude 2.5" in added["b"]["text"]
+        assert added["tell"]["shares"] == ["status"]
+        assert not [x for x in f if x["kind"] == "indices_not_compared"]
+
+    # M1: on_violation created only for a magnitude changes the monitor's model,
+    # not its verdicts
+    def test_m1_magnitude_alone_and_the_monitor(self, tmp_path):
+        from cadl.codegen.norms_monitor_gen import build_model
+        plain_text = (EXAMPLES / "norms_robot_delivery.cadl").read_text()
+        block = ('          on_violation:\n            severity: Critical\n'
+                 '            sanction: "removed from the dispatch pool for one period"\n')
+        assert block in plain_text
+        declared = plain_text.replace("    - norms: 0.1\n",
+                                      "    - norms: 0.1\n    - grounding: 0.1\n")
+        # base: the prohibition without on_violation; with_mag: the same with
+        # an on_violation that has only a magnitude
+        base = parse(declared.replace(block, ""))
+        with_mag = parse(declared.replace(block, "          on_violation: { magnitude: 1 }\n"))
+        assert G.keys_used(with_mag) == ["on_violation.magnitude"]
+        # the model of the monitor changes (null -> a NormViolationSpec with the
+        # default severity Major), as 0.3.22 does for any key of that block ...
+        assert build_model(base) != build_model(with_mag)
+        # ... and no verdict changes; the monitor of each agrees with norms-eval
+        for trace in NORM_TRACES:
+            lines = trace.read_text().splitlines()
+            assert evaluate(base, parse_trace(lines)) == evaluate(with_mag, parse_trace(lines))
+        for sos in (with_mag, parse(_annotated(plain_text))):
+            self._monitor_agrees(sos, tmp_path)
+
+    def _monitor_agrees(self, sos, tmp_path):
+        from cadl.codegen.norms_monitor_gen import generate_norms_monitor_module
+        assert type_check(sos).ok
+        module = tmp_path / "norms_monitor.py"
+        module.write_text(generate_norms_monitor_module(sos))
+        for trace in NORM_TRACES:
+            p = subprocess.run([sys.executable, "-I", str(module), str(trace), "--format",
+                                "json"], capture_output=True, text=True)
+            got = json.loads(p.stdout)
+            want = evaluate(sos, parse_trace(trace.read_text().splitlines()))
+            for key in ("file", "trace"):
+                want.pop(key, None), got.pop(key, None)
+            assert got == want, trace.name

@@ -162,9 +162,22 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _finite(value: Any) -> bool:
+    """A finite number. An integer is finite whatever its size; only a
+    float is tested (`math.isfinite` overflows on a very large int)."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
 def _valid_magnitude(value: Any) -> bool:
     """J-4: a finite number that is not negative."""
-    return _is_number(value) and math.isfinite(value) and value >= 0
+    return _finite(value) and value >= 0
+
+
+def _valid_tolerance(value: Any) -> bool:
+    """J-2: a number in [0, 1]."""
+    return _finite(value) and 0 <= value <= 1
 
 
 def exact(value: Any) -> Fraction:
@@ -177,22 +190,31 @@ def exact(value: Any) -> Fraction:
 
 
 def number_text(value: Any) -> str:
-    """A number as the shortest decimal that round-trips (J.10)."""
-    if isinstance(value, Fraction):
-        value = value.numerator if value.denominator == 1 else float(value)
-    if isinstance(value, float) and value.is_integer() and abs(value) < 1e16:
-        value = int(value)
-    return repr(value)
+    """A number of the file as the shortest decimal that round-trips,
+    without an exponent (J.10; H.2 `param_expr` has no exponent):
+    ``4``, ``2.5``, ``0.0000001``, ``10000000000000000000000``."""
+    from .stochastic import decimal_text
+    return decimal_text(exact(value))
+
+
+def _is_text(value: Any) -> bool:
+    """A `reward:` value that is a text: a YAML scalar (a number or a
+    boolean is the text as written, as for `sanction:`), or null. A list
+    or a mapping is not a text (J-4)."""
+    return not isinstance(value, (list, dict, tuple, set))
 
 
 def _text(value: Any) -> Optional[str]:
-    """A sanction or reward text; an empty text and null count as absent (J.3)."""
-    if value is None:
+    """A sanction or reward text. Null, an empty text and a text of white
+    space only count as absent (J.3); `sanction: 0` is the text "0". A
+    value that is not a text (a list, a mapping) is absent here and an
+    error of J-4 for `reward:`."""
+    if value is None or not _is_text(value):
         return None
     if isinstance(value, bool):
         value = str(value).lower()
     value = str(value)
-    return value if value != "" else None
+    return value if value.strip() != "" else None
 
 
 def _show(value: Any) -> str:
@@ -317,7 +339,7 @@ def annotations(sos: SoSDefinition, contract: ContractDef) -> ContractAnnotation
             if _item_problem(key) is None and _origin_problem(value, names) is None:
                 out.items[key] = re.sub(r"\s+", "", str(value))
     tol = block.get("tolerance")
-    if _is_number(tol) and math.isfinite(tol) and 0 <= tol <= 1:
+    if _valid_tolerance(tol):
         out.tolerance = exact(tol)
     for norm, nraw, ann in zip(contract.norms, raw.norms, out.norms):
         shares = nraw.get("shares")
@@ -406,6 +428,23 @@ class AlphaIndex:
         return "the contract has a single party name, so no item can be shared with another party"
 
 
+def lenient_entries(contract: ContractDef) -> dict:
+    """The entries of ``information.sharing`` that the core parser accepted
+    although their item is not a single identifier (``"A -> B : x, y"``,
+    ``"A -> B : report(5s)"``), as a count per (source, target, kept name)."""
+    from .parser import _parse_actor_ref_str
+    from .unparse import actor_ref_to_source
+    out: dict = {}
+    info = contract.information
+    for text in (info.lenient_sharing if info is not None else []):
+        m = re.match(r'\s*(.+?)\s*->\s*(.+?)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])', text)
+        if m:
+            key = (actor_ref_to_source(_parse_actor_ref_str(m.group(1).strip())),
+                   actor_ref_to_source(_parse_actor_ref_str(m.group(2).strip())), m.group(3))
+            out[key] = out.get(key, 0) + 1
+    return out
+
+
 def sharing_sources(sos: SoSDefinition, contract: ContractDef,
                     ann: ContractAnnotations) -> list:
     """The sharing entries of ``information.sharing`` and the sharing
@@ -414,8 +453,15 @@ def sharing_sources(sos: SoSDefinition, contract: ContractDef,
     from .unparse import actor_ref_to_source
     out = []
     if contract.information is not None:
+        # An entry that is not "S -> T : x" with one identifier item gives no
+        # pair; the core parser keeps such an entry with its first name.
+        skip = lenient_entries(contract)
         for s in contract.information.sharing:
             src, tgt = actor_ref_to_source(s.source), actor_ref_to_source(s.target)
+            key = (src, tgt, s.data)
+            if skip.get(key):
+                skip[key] -= 1
+                continue
             out.append(Source("sharing", f"{src} -> {tgt} : {s.data}", _ref(tgt), [s.data]))
     for norm, a in zip(contract.norms, ann.norms):
         if norm.kind not in ("obligation", "permission") or not a.shares:
@@ -723,7 +769,7 @@ def rule_j2(sos: SoSDefinition, contract: ContractDef) -> list:
                 out.append(("error", f"The item '{key}' of grounding.items of {ctx}: "
                                      f"{problem} (J-2)"))
     tol = raw.block.get("tolerance")
-    if tol is not None and not (_is_number(tol) and math.isfinite(tol) and 0 <= tol <= 1):
+    if tol is not None and not _valid_tolerance(tol):
         out.append(("error", f"grounding.tolerance of {ctx} must be a number in [0, 1], "
                              f"got {_show(tol)} (J-2)"))
     return out
@@ -765,6 +811,11 @@ def rule_j3(sos: SoSDefinition, contract: ContractDef, ci: ContractIndices) -> l
                                      f"contract does not declare (J-3)"))
             seen.append(x)
     a = ci.alpha
+    if contract.information is not None:
+        for text in contract.information.lenient_sharing:
+            out.append(("warning", f"The sharing entry \"{text}\" of {ctx} is not of the form "
+                                   f"\"S -> T : x\" with a single item; it gives no pair "
+                                   f"(J-3, J.4)"))
     for label, item in a.to_origin:
         out.append(("warning", f"Norm '{label}' of {ctx} shares the item '{item}' with "
                                f"{a.origins[item]}, the origin of the item; it gives no "
@@ -826,9 +877,13 @@ def rule_j4(sos: SoSDefinition, contract: ContractDef) -> list:
                                        f"which grounding 0.1 does not define; it is "
                                        f"ignored (J.3)"))
         reward, m = _text(ful.get("reward")), ful.get("magnitude")
-        if reward is None and m is None:
+        if not _is_text(ful.get("reward")):
+            out.append(("error", f"on_fulfilment.reward {of} must be a text, got "
+                                 f"{_show(ful.get('reward'))} (J-4)"))
+        elif reward is None and m is None:
             out.append(("error", f"on_fulfilment: {of} must have at least one of reward: "
-                                 f"and magnitude: (an empty text counts as absent) (J-4)"))
+                                 f"and magnitude: (an empty text or one of white space only "
+                                 f"counts as absent) (J-4)"))
         if m is not None and magnitude(m, f"on_fulfilment.magnitude {of}") and m == 0 \
                 and reward is not None:
             out.append(("warning", f"on_fulfilment {of} has a reward text and the "
@@ -920,7 +975,12 @@ def rule_j6_beta(ci: ContractIndices) -> list:
 
 
 def _far(declared: Optional[Fraction], index: Optional[Fraction], tol: Fraction) -> bool:
-    return declared is not None and index is not None and abs(declared - index) > tol
+    """J-7: an intermediate declared value farther from the index than the
+    tolerance. A declared end point (0 or 1) is tested by J-6 alone, also
+    when J-6 is silent (ruling of the second review)."""
+    if declared is None or index is None or declared in (0, 1):
+        return False
+    return abs(declared - index) > tol
 
 
 def rule_j7_alpha(ci: ContractIndices, j6: bool) -> list:
@@ -1009,9 +1069,20 @@ def rule_j9(sos: SoSDefinition, indices: list) -> list:
         index = (ci.alpha if attr == "alpha" else ci.beta).value
         if index is None:
             continue
+        declared = ci.declared_alpha if attr == "alpha" else ci.declared_beta
+        if attr == "alpha":
+            j6 = rule_j6_alpha(ci)
+            reported = bool(j6 or rule_j7_alpha(ci, bool(j6)))
+        else:
+            j6 = rule_j6_beta(ci)
+            reported = bool(j6 or rule_j7_beta(ci, bool(j6)))
         for design in model.designs:
             value = model.fixed_values(design).get(p.id)
             if value is None or abs(Fraction(value) - index) <= ci.tolerance:
+                continue
+            if reported and Fraction(value) == declared:
+                # J-6 or J-7 already reports the declared value (J.8: one
+                # diagnostic for one fact).
                 continue
             out.append(("info",
                         f"In the design {design.name}, the parameter '{p.id}' (from "
@@ -1338,9 +1409,37 @@ def diff_contract(old_sos: SoSDefinition, old: ContractDef,
                 "info", "shares_changed",
                 f"{d.id}: shares changes from [{', '.join(a.shares)}] to "
                 f"[{', '.join(b.shares)}]", norm=d.id, old=list(a.shares), new=list(b.shares)))
+    old_ids = {d.id for d in old.norms}
+    for d, b in zip(new.norms, n.ann.norms):
+        if d.id in old_ids:
+            continue
+        parts = []
+        if b.sanction_magnitude is not None:
+            parts.append(f"on_violation.magnitude {_num(b.sanction_magnitude)}")
+        if b.has_fulfilment:
+            parts.append("on_fulfilment ("
+                         + (f"reward '{b.reward}'" if b.reward is not None else "no reward text")
+                         + f", magnitude {_num(b.reward_magnitude)})")
+        if b.shares:
+            parts.append(f"shares [{', '.join(b.shares)}]")
+        if parts:
+            out.append(_finding(
+                "info", "norm_added_grounding",
+                f"{d.id}: added with {'; '.join(parts)}", norm=d.id,
+                magnitude=b.sanction_magnitude,
+                on_fulfilment={"reward": b.reward, "magnitude": b.reward_magnitude}
+                if b.has_fulfilment else None,
+                shares=list(b.shares)))
     if not (grounding_active(old_sos) and grounding_active(new_sos)):
         # No quantity is computed for a version that does not declare the
         # extension (J.12), so the indices are not compared.
+        which = "old" if not grounding_active(old_sos) else "new"
+        out.append(_finding(
+            "info", "indices_not_compared",
+            f"the {which} version does not declare 'grounding: 0.1' with 'norms: 0.1', so "
+            f"its keys of the grounding extension are not interpreted (they count as absent "
+            f"above) and the indices of the two versions are not compared (J.12, J-13)",
+            version=which))
         return out
     for key, name in (("alpha", "alpha^"), ("beta", "beta^"), ("coverage", "chi")):
         v0, v1 = getattr(o, key).value, getattr(n, key).value

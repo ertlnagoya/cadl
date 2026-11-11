@@ -27,7 +27,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   14). J-1 to J-4 are errors and concern the new keys only; every
   comparison of a declared `alpha`, `beta` or `lambda` with the norms
   (J-6 to J-8) is a warning, and J-9 is informational. The comparisons
-  are exact. Declaring `grounding: 0.1` in a file that declares
+  are exact; J-7 does not apply to a declared end point (0 or 1), which
+  J-6 tests, and J-9 does not repeat a declared value that J-6 or J-7
+  reports. A sharing entry with more than one item or with arguments
+  gives no pair (warning). A text of white space only counts as empty.
+  Declaring `grounding: 0.1` in a file that declares
   `norms: 0.1` and uses none of the new keys adds no error. The new keys
   in a file that does not declare the extension get one warning as
   undeclared extension keys and are not interpreted (J.12).
@@ -35,7 +39,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `on_violation.magnitude`, `on_fulfilment:`, `shares:`,
   `grounding.items`, `grounding.tolerance` and of each index, and a
   warning when a declared `alpha` or `beta` and its index move in opposite
-  directions between the two versions (J-13).
+  directions between the two versions (J-13). A norm added in the new
+  version is listed with its magnitude, `on_fulfilment:` and `shares:`;
+  when only one version declares the extension, the report says that the
+  indices are not compared.
 - IR (`cadl sim-ir`, J.10), only for a file that declares the extension:
   `grounding` in every contract (`items`, `tolerance`, `indices`) and
   `shares`, `on_violation_magnitude`, `on_fulfilment_reward`,
