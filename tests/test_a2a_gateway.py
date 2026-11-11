@@ -1327,6 +1327,18 @@ def test_peer_key_groups_ipv6_by_prefix():
     assert k(("fe80::1%lo0", 1, 0, 0)) == "fe80::/64"
 
 
+def _open_stream(r: "Run", actor: str, p, id_=1, method="SendStreamingMessage"):
+    """A streamed request on a raw socket, read by the test as it comes."""
+    body = json.dumps(rpc(method, p, id_)).encode()
+    sock = socket.create_connection(("127.0.0.1", r.client.port))
+    auth = authorization(CLIENT_KEYS[actor], actor, r.run_id, body)
+    sock.sendall((f"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  f"A2A-Version: 1.0\r\nContent-Length: {len(body)}\r\n"
+                  f"Authorization: {auth}\r\n\r\n").encode() + body)
+    sock.settimeout(30)
+    return sock
+
+
 def read_sse(r: "Run", actor: str, method: str, p, id_=1, timeout=30.0):
     """A streamed request: the status, the content type, the comments and
     the events (event name, JSON) of the answer."""
@@ -1388,14 +1400,22 @@ class TestStreaming:
 
     def test_held_stream_approved_and_rejected(self, tmp_path, capsys):
         r = Run(tmp_path)
-        fut = r.pool.submit(read_sse, r, "PLANNER", "SendStreamingMessage",
-                            params("publish", "x"))
-        r.wait_hold("h-1")
-        time.sleep(1.3)                        # at least one comment while held
+        sock = _open_stream(r, "PLANNER", params("publish", "x"))
+        seen = b""
+        while b": held as h-1" not in seen:              # wait for state, not time
+            chunk = sock.recv(4096)
+            assert chunk, "the stream ended while held"
+            seen += chunk
         assert r.agent.sent("SendStreamingMessage") == []
         r.approve("h-1")
-        status, _, comments, events = fut.result(timeout=30)
-        assert comments and comments[0].startswith(": held as h-1")
+        while not seen.endswith(b"0\r\n\r\n"):
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            seen += chunk
+        sock.close()
+        events = [(None, json.loads(line[6:])) for line in seen.decode().split("\n")
+                  if line.startswith("data: ")]
         assert events[-1][1]["result"]["statusUpdate"]["status"]["state"] == \
             "TASK_STATE_COMPLETED"
         fut = r.pool.submit(read_sse, r, "PLANNER", "SendStreamingMessage", params("publish"))
@@ -1677,11 +1697,11 @@ class TestLowFindings:
             except socket.timeout:
                 return b"(waiting)"
         first = connect("10.0.0.1")
-        time.sleep(0.2)
+        wait_for(lambda: srv.address_count.get("10.0.0.1") == 1, "the first reader")
         same = connect("10.0.0.1")                      # the same address
         assert status(same) == b"HTTP/1.1 503"
         second = connect("10.0.0.2")                    # same /24 (127.0.0.0/24)
-        time.sleep(0.2)
+        wait_for(lambda: sum(srv.prefix_count.values()) == 2, "the second reader")
         third = connect("10.0.0.3")                     # beyond the /24 cap
         assert status(third) == b"HTTP/1.1 503"
         threads = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
@@ -1691,4 +1711,99 @@ class TestLowFindings:
         srv.shutdown()
         srv.server_close()
         assert sorted(set(_events(loc.audit, "overloaded"))) == ["address", "prefix"]
+        loc.stop_and_replay()
+
+
+
+class TestSixthReview:
+    """The Low findings of the review of 0.3.26."""
+
+    def test_departed_client_of_a_silent_stream(self, tmp_path, capsys):
+        """The agent sends some events and then nothing; the client leaves.
+        The gateway sees it, ends the request to the agent and frees the
+        place of the client (here the only one, --max-handlers-per-actor 1)."""
+        r = Run(tmp_path, extra=("--max-handlers-per-actor", "1"))
+        sock = _open_stream(r, "PLANNER", params("summarize", "stream-wait"))
+        seen = b""
+        while b"artifactUpdate" not in seen:
+            chunk = sock.recv(4096)
+            assert chunk
+            seen += chunk
+        sock.close()
+
+        def served():
+            status, _, body = r.client.post("PLANNER", rpc("SendMessage",
+                                                           params("summarize"), 2))
+            return status == 200 and body
+        body = wait_for(served, "the place of the client to be free")
+        assert body["result"]["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        r.agent.release.set()
+        r.stop()
+        r.replay_check()
+        capsys.readouterr()
+
+    def test_json_answer_to_a_stream_is_strict(self, tmp_path, capsys):
+        r = Run(tmp_path)
+        _, _, _, events = read_sse(r, "PLANNER", "SendStreamingMessage",
+                                   params("summarize", "stream-json-bad"))
+        assert events[-1][0] == "error" and events[-1][1]["error"]["code"] == -32006
+        r.stop()
+        assert any("not UTF-8" in (x["reason"] or "") for x in read_records(r.audit)
+                   if x.get("event") == "invalid_response")
+        r.replay_check()
+        capsys.readouterr()
+
+    def test_hold_key_is_not_a_client_key(self, tmp_path):
+        with pytest.raises(GatewayError, match="client key"):
+            Local(tmp_path, inbox=tmp_path / "inbox",
+                  approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]},
+                  hold_key=CLIENT_KEYS["PLANNER"])
+
+    def test_unsigned_hold_where_holds_are_signed(self, tmp_path):
+        """mac and kind stripped: without --hold-key, mcp-approve refuses it
+        when run.json says holds_signed, and with --require-signed-hold."""
+        loc = Local(tmp_path, inbox=tmp_path / "inbox",
+                    approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]}, hold_key=HOLD_KEY)
+        loc.post(rpc("SendMessage", params("publish", returnImmediately=True)))
+        path = tmp_path / "inbox" / "holds" / "h-1.json"
+        hold = json.loads(path.read_text())
+        del hold["hold_mac"], hold["kind"]
+        hold["deadline"] = "2099-01-01T00:00:00.000Z"
+        path.write_text(json.dumps(hold))
+        with pytest.raises(GatewayError, match="signed hold is required"):
+            approval_file(tmp_path / "inbox", "h-1", "approve", "OPERATOR",
+                          APPROVER_KEYS["OPERATOR"])
+        (tmp_path / "op.key").write_bytes(APPROVER_KEYS["OPERATOR"])
+        assert main(["mcp-approve", str(tmp_path / "inbox"), "h-1", "approve", "--as",
+                     "OPERATOR", "--key", str(tmp_path / "op.key")]) == 2
+        loc.stop_and_replay()
+
+    def test_require_signed_hold_option(self, tmp_path, capsys):
+        loc = Local(tmp_path, inbox=tmp_path / "inbox",
+                    approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]})
+        loc.post(rpc("SendMessage", params("publish", returnImmediately=True)))
+        (tmp_path / "op.key").write_bytes(APPROVER_KEYS["OPERATOR"])
+        args = ["mcp-approve", str(tmp_path / "inbox"), "h-1", "approve", "--as", "OPERATOR",
+                "--key", str(tmp_path / "op.key")]
+        assert main(args + ["--require-signed-hold"]) == 2
+        assert "signed hold is required" in capsys.readouterr().err
+        assert main(args) == 0                          # unsigned gateway: a warning
+        assert "not signed" in capsys.readouterr().err
+        loc.stop_and_replay()
+
+    def test_invisible_characters_are_shown_escaped(self, tmp_path, capsys):
+        from cadl.gateway_core import visible_json
+        text = "rm \u202ecod.exe \x1b[2J\u200b\u2028\x85\U000F0000"
+        shown = visible_json({"t": text})
+        for ch in ("\u202e", "\x1b", "\u200b", "\u2028", "\x85", "\U000F0000"):
+            assert ch not in shown
+        assert "\\u202e" in shown and "\\udb80\\udc00" in shown
+        assert json.loads(shown) == {"t": text}           # the same value
+        loc = Local(tmp_path, inbox=tmp_path / "inbox",
+                    approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]})
+        loc.post(rpc("SendMessage", params("publish", text, returnImmediately=True)))
+        assert main(["mcp-approve", str(tmp_path / "inbox"), "h-1", "approve", "--as",
+                     "OPERATOR", "--show"]) == 0
+        out = capsys.readouterr().out
+        assert "\u202e" not in out and "\\u202ecod.exe" in out
         loc.stop_and_replay()

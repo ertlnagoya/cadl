@@ -295,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
                              help="The gateway's hold key: verify the MAC of the published "
                                   "hold before showing or signing it; required when the "
                                   "gateway signs its holds")
+    approve_cmd.add_argument("--require-signed-hold", action="store_true",
+                             help="Refuse a hold that the gateway did not sign; also the "
+                                  "default when DIR/run.json says holds_signed")
     approve_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
                              help="The key of the actor (HMAC-SHA256); the gateway "
                                   "requires it unless it runs with --insecure-approvals")

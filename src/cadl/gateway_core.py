@@ -817,11 +817,49 @@ def _read_published(path: Path) -> dict:
     return obj
 
 
-def check_hold(hold: dict, hold_id: str, hold_key: bytes | None) -> bool:
+_INVISIBLE = {"Cc", "Cf", "Co", "Cs", "Cn", "Zl", "Zp"}
+
+
+def visible_json(obj: Any) -> str:
+    """JSON for a person to read: indented, with every character that is
+    not shown as itself escaped as \\uXXXX: controls, format characters
+    such as bidirectional overrides and zero-width characters (Cf),
+    private use (Co), surrogates, unassigned code points, and line and
+    paragraph separators. A string cannot then look like other text."""
+    import unicodedata
+    out = []
+    for ch in json.dumps(obj, ensure_ascii=False, indent=2):
+        if ch != "\n" and unicodedata.category(ch) in _INVISIBLE:
+            cp = ord(ch)
+            if cp > 0xFFFF:
+                cp -= 0x10000
+                out.append(f"\\u{0xD800 + (cp >> 10):04x}\\u{0xDC00 + (cp & 0x3FF):04x}")
+            else:
+                out.append(f"\\u{cp:04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def holds_signed(inbox: Path) -> bool:
+    """Whether the gateway of the inbox says that it signs its holds
+    (`holds_signed` in DIR/run.json)."""
+    run = Path(inbox) / "run.json"
+    if not run.exists():
+        return False
+    try:
+        return _read_published(run).get("holds_signed") is True
+    except GatewayError:
+        return False
+
+
+def check_hold(hold: dict, hold_id: str, hold_key: bytes | None,
+               require_signed: bool = False) -> bool:
     """Check a published hold before it is shown or signed: its name, the
     SHA-256 of the arguments it shows, and with `hold_key` its MAC. A hold
-    that the gateway signed needs the key. Returns whether the hold is
-    authenticated; raises GatewayError otherwise."""
+    that the gateway signed needs the key, and with `require_signed` an
+    unsigned hold is refused. Returns whether the hold is authenticated;
+    raises GatewayError otherwise."""
     if hold.get("hold_id") != hold_id:
         raise GatewayError(f"the published hold names {hold.get('hold_id')!r}, not {hold_id}")
     try:
@@ -833,6 +871,9 @@ def check_hold(hold: dict, hold_id: str, hold_key: bytes | None) -> bool:
         raise GatewayError("the arguments shown in the published hold do not have the "
                            "SHA-256 it names; it is not signed")
     mac = hold.get("hold_mac")
+    if require_signed and mac is None:
+        raise GatewayError("the hold is not signed (no hold_mac), and a signed hold is "
+                           "required (--require-signed-hold, or holds_signed in run.json)")
     if hold_key is None:
         if mac is not None:
             raise GatewayError("the gateway signs its holds (hold_mac); give --hold-key to "
@@ -847,7 +888,8 @@ def check_hold(hold: dict, hold_id: str, hold_key: bytes | None) -> bool:
 
 
 def approval_file(inbox: Path, hold_id: str, decision: str, actor: str,
-                  key: bytes | None, hold_key: bytes | None = None) -> dict:
+                  key: bytes | None, hold_key: bytes | None = None,
+                  require_signed: bool | None = None) -> dict:
     """The content of an approval file: bound to the run, the hold, the
     held message and its time (from DIR/holds/HOLD_ID.json, which the
     gateway publishes), with a fresh nonce and, with a key, the MAC. The
@@ -860,7 +902,9 @@ def approval_file(inbox: Path, hold_id: str, decision: str, actor: str,
     published = inbox / "holds" / f"{hold_id}.json"
     if published.exists():
         hold = _read_published(published)
-        check_hold(hold, hold_id, hold_key)
+        if require_signed is None:
+            require_signed = holds_signed(inbox)
+        check_hold(hold, hold_id, hold_key, require_signed)
         obj.update(run_id=hold.get("run_id"), message=hold.get("message"),
                    hold_time=hold.get("hold_time"), params_sha256=hold.get("params_sha256"))
     elif key is not None or hold_key is not None:
@@ -880,8 +924,10 @@ def cli_approve(args) -> int:
         published = Path(args.inbox) / "holds" / f"{args.hold_id}.json"
         hold = _read_published(published) if published.exists() else None
         hold_key = read_key(args.hold_key) if getattr(args, "hold_key", None) else None
+        require = bool(getattr(args, "require_signed_hold", False)) \
+            or holds_signed(args.inbox)
         if hold is not None:
-            signed = check_hold(hold, args.hold_id, hold_key)
+            signed = check_hold(hold, args.hold_id, hold_key, require)
             if not signed:
                 print("warning: the hold is not signed by the gateway (no --hold-key); "
                       "what is shown is not authenticated", file=sys.stderr)
@@ -890,14 +936,14 @@ def cli_approve(args) -> int:
                   f"{m.get('from')} -> {m.get('to')} : {m.get('name')} at "
                   f"{hold.get('hold_time')}, deadline {hold.get('deadline')}")
             print("arguments (params, SHA-256 " + str(hold.get("params_sha256")) + "):")
-            print(json.dumps(hold.get("params"), ensure_ascii=False, indent=2))
+            print(visible_json(hold.get("params")))
         elif args.show:
             raise GatewayError(f"the gateway has published no held call {args.hold_id}")
         if args.show:
             return 0
         key = read_key(args.key) if args.key is not None else None
         obj = approval_file(args.inbox, args.hold_id, args.decision, args.actor, key,
-                            hold_key)
+                            hold_key, require)
         path = _drop(args.inbox, obj)
     except (GatewayError, AuditKeyError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)

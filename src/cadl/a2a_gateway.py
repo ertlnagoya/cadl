@@ -81,6 +81,7 @@ import ipaddress
 import itertools
 import json
 import os
+import queue
 import re
 import secrets
 import signal
@@ -339,6 +340,9 @@ class A2AGateway(EnforcementPoint):
                 raise GatewayError(f"--client-keys: {actor} is not an actor of the file")
             if key is not None and hmac.compare_digest(client_keys[actor], key):
                 raise GatewayError("a client key is the key of the audit log; use other keys")
+        if hold_key is not None and any(hmac.compare_digest(hold_key, k)
+                                        for k in client_keys.values()):
+            raise GatewayError("the hold key is a client key; use another")
         self.client_keys = client_keys
         self.approval_names = self._approval_names()
         parts = urlsplit(upstream)
@@ -821,7 +825,8 @@ class A2AGateway(EnforcementPoint):
                                       "result": {"task": self._task_json(t)}})
         if decision == "allow":
             if stream:
-                return self._stream_reply(self._relay(actor, id_, text, upstream_id, m))
+                return self._stream_reply(self._relay(actor, id_, text, upstream_id, m,
+                                                      closed=closed))
             return self._forward(actor, id_, text, upstream_id, m)
         if stream:
             return self._stream_reply(self._wait_stream(hold_id, h, closed))
@@ -852,7 +857,8 @@ class A2AGateway(EnforcementPoint):
                              f"{h.id!r} ({hold_id}); it is withdrawn")
         kind, rec = h.outcome
         if kind == "allow":
-            yield from self._relay(h.actor, h.id, h.wire, h.upstream_id, h.message)
+            yield from self._relay(h.actor, h.id, h.wire, h.upstream_id, h.message,
+                                   closed=closed)
         elif kind == "stopped":
             yield sse(_error(h.id, INTERNAL_ERROR, f"Internal error: the gateway stopped "
                                                    f"while the request was held "
@@ -933,8 +939,52 @@ class A2AGateway(EnforcementPoint):
                     raise _NoResponse("an SSE event is larger than 16 MiB")
                 data.append(value)
 
+    @staticmethod
+    def _json_answer(resp) -> str:
+        """A plain JSON answer of the agent to a streamed request, read as
+        `_post` reads one: at most 16 MiB, strict UTF-8."""
+        try:
+            data = resp.read(MAX_RESPONSE + 1)
+        except (OSError, http.client.HTTPException) as e:
+            raise _NoResponse(f"{type(e).__name__}: {e}") from None
+        if len(data) > MAX_RESPONSE:
+            raise _NoResponse("the response is larger than 16 MiB")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise _NoResponse("the response is not UTF-8") from None
+
+    @staticmethod
+    def _reader(events, stop: threading.Event) -> "queue.Queue":
+        """The events of the agent, read in a thread of their own, so that
+        the stream can watch its client while the agent is silent."""
+        q: queue.Queue = queue.Queue(maxsize=64)
+
+        def put(item) -> bool:
+            while not stop.is_set():
+                try:
+                    q.put(item, timeout=0.5)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def run() -> None:
+            try:
+                for item in events:
+                    if not put(("event", item)):
+                        return
+                put(("end", None))
+            except _NoResponse as e:
+                put(("error", e))
+            except Exception as e:      # noqa: BLE001
+                put(("error", _NoResponse(f"{type(e).__name__}: {e}")))
+        threading.Thread(target=run, daemon=True).start()
+        return q
+
     def _relay(self, actor: str, id_: Any, text: str, upstream_id: int, m: dict | None,
-               own: str | None = None, upstream_task: str | None = None):
+               own: str | None = None, upstream_task: str | None = None,
+               closed: Callable[[], bool] = lambda: False):
         """The stream of the agent for an allowed or released request (or a
         subscription to a task of the client), event by event: every event
         is parsed strictly, has to be a response to this request, has to
@@ -954,17 +1004,37 @@ class A2AGateway(EnforcementPoint):
             yield sse(self._invalid_body(id_, str(e)[:200], m), error=True)
             return
         task_id = upstream_task
+        stop = threading.Event()
         try:
             ctype = (resp.getheader("Content-Type") or "").split(";")[0].strip().lower()
             if ctype == "application/json":
-                events = iter([("message", resp.read(MAX_RESPONSE + 1).decode("utf-8",
-                                                                             "replace"))])
+                events = iter([("message", self._json_answer(resp))])
             elif ctype == "text/event-stream":
                 events = self._sse_events(resp)
             else:
                 yield sse(self._invalid_body(id_, f"Content-Type {ctype!r}", m), error=True)
                 return
-            for name, data in events:
+            q = self._reader(events, stop)
+            next_comment = time.monotonic() + KEEPALIVE
+            while True:
+                try:
+                    kind, item = q.get(timeout=0.1)
+                except queue.Empty:
+                    # The agent is silent: a client that has gone ends the
+                    # stream and the request to the agent; one that stays
+                    # gets a comment now and then, whose writing also fails
+                    # when it has gone.
+                    if closed():
+                        return
+                    if time.monotonic() >= next_comment:
+                        next_comment = time.monotonic() + KEEPALIVE
+                        yield b": waiting for the agent\n\n"
+                    continue
+                if kind == "end":
+                    return
+                if kind == "error":
+                    raise item
+                name, data = item
                 obj, code, why = parse_json(data)
                 if code is not None or not isinstance(obj, dict) \
                         or obj.get("jsonrpc") != "2.0" or obj.get("id") != upstream_id \
@@ -999,6 +1069,7 @@ class A2AGateway(EnforcementPoint):
         except _NoResponse as e:
             yield sse(self._invalid_body(id_, str(e)[:200], m), error=True)
         finally:
+            stop.set()
             conn.close()
 
     def _stream_result(self, actor: str, result: Any, task_id: str | None):
@@ -1041,18 +1112,20 @@ class A2AGateway(EnforcementPoint):
             if t is not None and t.owner == actor:
                 pass
             elif t is None and self.task_owner.get(tid) == actor:
-                return self._stream_reply(self._subscribe_upstream(actor, id_, tid, None))
+                return self._stream_reply(self._subscribe_upstream(actor, id_, tid, None,
+                                                                   closed))
             else:
                 return self._task_refused("SubscribeToTask", id_, "not a task of the client")
         return self._stream_reply(self._subscribe_gateway(actor, id_, t, closed))
 
-    def _subscribe_upstream(self, actor: str, id_: Any, upstream: str, own: str | None):
+    def _subscribe_upstream(self, actor: str, id_: Any, upstream: str, own: str | None,
+                            closed: Callable[[], bool] = lambda: False):
         with self.lock:
             upstream_id = next(self.upstream_ids)
         text = wire({"jsonrpc": "2.0", "id": upstream_id, "method": "SubscribeToTask",
                      "params": {"id": upstream}})
         yield from self._relay(actor, id_, text, upstream_id, None, own=own,
-                               upstream_task=upstream)
+                               upstream_task=upstream, closed=closed)
 
     def _subscribe_gateway(self, actor: str, id_: Any, t: "_Task",
                            closed: Callable[[], bool]):
@@ -1072,7 +1145,7 @@ class A2AGateway(EnforcementPoint):
                 next_comment = time.monotonic() + KEEPALIVE
             time.sleep(0.02)
         if upstream is not None:
-            yield from self._subscribe_upstream(actor, id_, upstream, t.id)
+            yield from self._subscribe_upstream(actor, id_, upstream, t.id, closed)
         else:
             with self.lock:
                 body = self._task_json(t)

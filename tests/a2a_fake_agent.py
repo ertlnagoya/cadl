@@ -43,6 +43,17 @@ class FakeAgent:
                                            "params": req.get("params"),
                                            "raw": raw.decode("ascii"),
                                            "headers": dict(self.headers)})
+                text0 = ((req.get("params") or {}).get("message") or {}).get(
+                    "parts", [{}])[0].get("text", "")
+                if req.get("method") == "SendStreamingMessage" and text0 == "stream-json-bad":
+                    data = (b'{"jsonrpc":"2.0","id":%d,"error":{"code":-1,"message":"\xff"}}'
+                            % req["id"])
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 if req.get("method") in ("SendStreamingMessage", "SubscribeToTask"):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
