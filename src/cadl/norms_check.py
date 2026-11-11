@@ -86,6 +86,10 @@ MAX_ATOMS = 16
 _UNIT_MS = {"ms": 1, "s": 1000, "min": 60000, "h": 3600000}
 
 
+_ITEM2 = False
+AGGREGATES = ("sum", "count", "min", "max", "avg")
+
+
 class NormsCheckError(NormsEvalError):
     """The request cannot be translated (a usage error or a refusal)."""
 
@@ -519,9 +523,24 @@ class RuleInfo:
 @dataclass
 class Quantity:
     key: str
-    kind: str | None = None            # num | bool | enum
-    consts: set = field(default_factory=set)
-    reps: list = field(default_factory=list)
+    consts: set = field(default_factory=set)    # literals compared with it
+    reps: list = field(default_factory=list)    # one value per class
+
+
+@dataclass
+class Pred:
+    """A state predicate (after desugaring) and the quantities it reads."""
+    expr: Any
+    text: str
+    keys: frozenset
+
+
+def _expr_text(expr: Any) -> str:
+    from .norms import item_text
+    try:
+        return item_text(expr)
+    except Exception:
+        return repr(expr)
 
 
 @dataclass
@@ -537,24 +556,10 @@ class _Refuse(Exception):
     pass
 
 
-def _tv_and(a: str, b: str) -> str:
-    if a == "F" or b == "F":
-        return "F"
-    if a == "U" or b == "U":
-        return "U"
-    return "T"
 
 
-def _tv_or(a: str, b: str) -> str:
-    if a == "T" or b == "T":
-        return "T"
-    if a == "U" or b == "U":
-        return "U"
-    return "F"
 
 
-def _tv_not(a: str) -> str:
-    return {"T": "F", "F": "T", "U": "U"}[a]
 
 
 def _parse_duration_ms(text: str) -> int:
@@ -592,6 +597,7 @@ class Translator:
         self.actors = declared_actors(sos)
         self.bindings = dict(bindings)
         self.given_bindings = set(bindings)
+        self.symbolic_bounds: dict = {}
         self._setup_bindings(members)
         self.events = {r.creates for r in contract.counts_as if r.creates}
         self.atoms: list[Atom] = []
@@ -658,6 +664,20 @@ class Translator:
             if not any(re.search(rf"\b{re.escape(name)}\b", t) for t in texts):
                 self.notes.append(f"--bindings {name}: the contract does not use the name "
                                   f"{name}; the binding has no effect")
+        # a set A[lo..N] has n members in the instance: N is bound to its last
+        # index, as a trace that binds N does (F.5), so that quantifiers and
+        # aggregates over the set range over these members
+        for name, (indexed, lo, hi, symbolic) in self.actors.items():
+            if indexed and symbolic and name in self.members:
+                top = self.members[name][-1]
+                if self.bindings.get(symbolic, top) != top:
+                    raise NormsCheckError(
+                        f"{symbolic} is bound to {self.bindings[symbolic]}, but the instance "
+                        f"has {name}[{self.members[name][0]}..{top}]; give --members or "
+                        f"--bindings consistently")
+                if symbolic not in self.bindings:
+                    self.bindings[symbolic] = top
+                    self.symbolic_bounds[symbolic] = top
         self.universe: list[str] = []
         for name, (indexed, *_rest) in self.actors.items():
             if indexed:
@@ -758,121 +778,240 @@ class Translator:
         return Term(text=text, kind="message", atoms=tuple(atoms))
 
     # --- predicates -----------------------------------------------------------
+    #
+    # A predicate is evaluated by the evaluator of norms-eval itself, on one
+    # valuation of the quantities it reads (`_oracle`). The translation
+    # only decides which quantities a predicate reads and which values
+    # stand for all others: the literals compared with a quantity cut each
+    # type of value (numbers, texts) into classes on which every
+    # comparison of the predicate has the same value (F.12).
 
-    def _quantity(self, expr: MemberAccess) -> Quantity:
-        obj = expr.obj
-        if obj.index is None:
-            if obj.name == "request":
-                raise _Refuse("request fields are not translated")
-            key = f"{obj.name}.{expr.member}"
-        else:
-            if obj.index == "*" or isinstance(obj.index, RangeExpr):
-                raise _Refuse("wildcard and range references are not translated")
-            v = self._index_value(obj.index)
-            if v is None:
-                raise _Refuse(f"the index of {obj.name}[{obj.index}] is not bound")
-            key = f"{obj.name}[{v}].{expr.member}"
+    def _quantity(self, key: str) -> Quantity:
         q = self.quantities.get(key)
         if q is None:
             q = self.quantities[key] = Quantity(key)
         return q
 
-    def _kind(self, q: Quantity, kind: str) -> None:
-        if q.kind is None:
-            q.kind = kind
-        elif q.kind != kind:
-            raise _Refuse(f"the quantity {q.key} is used both as {q.kind} and as {kind}")
+    def _scope_values(self, scope: dict, names: set) -> list:
+        """The assignments of the quantifier variables `names`."""
+        names = sorted(n for n in names if n in scope)
+        out = [{}]
+        for n in names:
+            out = [dict(a, **{n: v}) for a in out for v in scope[n][1]]
+        return out
 
-    def _literal(self, e: Any) -> tuple:
-        """(kind, value) of a literal operand: a number, a boolean, a
-        string, or a name without a value (an enum-like symbol)."""
-        if isinstance(e, BoolLiteral):
-            return ("bool", e.value)
-        if isinstance(e, (IntLiteral, FloatLiteral)):
-            return ("num", e.value)
-        if isinstance(e, StringLiteral):
-            return ("enum", e.value)
-        if isinstance(e, ActorRef) and e.index is None:
-            if e.name in self.bindings:
-                return ("num", self.bindings[e.name])
-            if e.name in ("now", "state"):
-                raise _Refuse(f"'{e.name}' is not translated")
-            return ("sym", e.name)
-        if isinstance(e, UnaryOp) and e.op == "-" and isinstance(e.operand, (IntLiteral, FloatLiteral)):
-            return ("num", -e.operand.value)
-        raise _Refuse("a comparison is translated only between a quantity and a literal")
+    def _index_values(self, idx: Any, scope: dict) -> list:
+        """The integer values an index expression takes, over the variables
+        of the enclosing quantifiers; None for a value that is not an
+        integer member index."""
+        if isinstance(idx, int) and not isinstance(idx, bool):
+            return [idx]
+        if isinstance(idx, IntLiteral):
+            return [idx.value]
+        if isinstance(idx, str):
+            idx = ActorRef(name=idx)
+        if isinstance(idx, ActorRef) and idx.index is None:
+            n = idx.name
+            if n.isdigit():
+                return [int(n)]
+            if n in scope:
+                return list(scope[n][1])
+            if n in self.bindings:
+                return [self.bindings[n]]
+            raise _Refuse(f"the index {n} is not bound (use --bindings {n}=n)")
+        if isinstance(idx, BinaryOp) and idx.op in ("+", "-", "*"):
+            out = []
+            for a in self._index_values(idx.left, scope):
+                for b in self._index_values(idx.right, scope):
+                    out.append(a + b if idx.op == "+" else a - b if idx.op == "-" else a * b)
+            return out
+        raise _Refuse("an index that is not an integer, a bound name or a quantifier variable "
+                      "is not translated")
 
-    def resolve(self, e: Any) -> tuple:
-        """A state predicate as ('const', tv) | ('and'|'or', a, b) | ('not', a)
-        | ('cmp', op, key, value) | ('in', key, values) | ('truth', key)."""
+    def _member_keys(self, e: MemberAccess, scope: dict) -> set:
+        obj = e.obj
+        if obj.index is None:
+            if obj.name in scope:
+                group, values = scope[obj.name]
+                if group is None:
+                    raise _Refuse(f"'{obj.name}' ranges over integers, so "
+                                  f"'{obj.name}.{e.member}' is not evaluable")
+                return {f"{group}[{v}].{e.member}" for v in values}
+            if obj.name == "request":
+                raise _Refuse("request fields are not translated")
+            return {f"{obj.name}.{e.member}"}
+        if obj.index == "*" or isinstance(obj.index, RangeExpr):
+            raise _Refuse("a wildcard or range reference here is not translated")
+        members = self.members.get(obj.name)
+        keys = set()
+        for v in self._index_values(obj.index, scope):
+            if members is None or v in members:
+                keys.add(f"{obj.name}[{v}].{e.member}")
+        return keys
+
+    def _domain_values(self, dom: Any, comprehension: bool) -> tuple:
+        """(set or None, values) of the domain of a quantifier or
+        comprehension in the instance."""
+        if isinstance(dom, RangeExpr):
+            lo = self._index_values(dom.start, {})[0]
+            hi = self._index_values(dom.end, {})[0]
+            return None, list(range(lo, hi + 1))
+        if isinstance(dom, ActorRef):
+            members = self.members.get(dom.name)
+            if members is None:
+                raise _Refuse(f"{dom.name} is not a declared set of actors")
+            if isinstance(dom.index, RangeExpr):
+                lo = self._index_values(dom.index.start, {})[0]
+                end = dom.index.end
+                hi = (self._index_values(end, {})[0]
+                      if not (isinstance(end, str) and end not in self.bindings
+                              and not end.isdigit()) else members[-1])
+                return dom.name, [m for m in members if lo <= m <= hi]
+            return dom.name, list(members)
+        raise _Refuse("the domain of a quantifier or comprehension is not a set or a range")
+
+    def _lit(self, value: Any) -> tuple:
+        return ("lit", (value,))
+
+    def _shape(self, e: Any, scope: dict, info: dict) -> tuple:
+        """The shape of an expression: ("lit", values), ("qty", keys),
+        ("count", n), ("minmax", keys), ("num", keys) for arithmetic and
+        sum/avg, or ("bool",) for a condition. Collects the literals
+        compared with each quantity in info["consts"] and the quantities
+        that arithmetic or another quantity is compared with in
+        info["domain"]."""
+        from .ast_nodes import Comprehension, QuantifiedExpr
         if isinstance(e, BoolLiteral):
-            return ("const", "T" if e.value else "F")
-        if isinstance(e, BinaryOp) and e.op in ("AND", "OR"):
-            return (e.op.lower(), self.resolve(e.left), self.resolve(e.right))
+            return self._lit(e.value)
+        if isinstance(e, (IntLiteral, FloatLiteral, StringLiteral)):
+            return self._lit(e.value)
+        if isinstance(e, UnaryOp) and e.op == "-":
+            s = self._shape(e.operand, scope, info)
+            if s[0] == "lit" and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                     for v in s[1]):
+                return ("lit", tuple(-v for v in s[1]))
+            return ("num", self._keys(s))
         if isinstance(e, UnaryOp) and e.op == "NOT":
-            return ("not", self.resolve(e.operand))
+            self._cond(e.operand, scope, info)
+            return ("bool",)
+        if isinstance(e, ActorRef) and e.index is None:
+            n = e.name
+            if n in scope:
+                return ("lit", tuple(scope[n][1]))
+            if n in self.bindings:
+                return self._lit(self.bindings[n])
+            if n == "now":
+                raise _Refuse("'now' is not translated")
+            if n == "state" and self.contract.lifecycle is not None:
+                raise _Refuse("'state' (the lifecycle state) is not translated")
+            return self._lit(n)                     # a name without a value
+        if isinstance(e, ActorRef):
+            return self._lit(e.name)
         if isinstance(e, MemberAccess):
-            q = self._quantity(e)
-            if q.kind == "num":
-                q.consts.add(0)
-            else:
-                self._kind(q, "bool")
-            return ("truth", q.key)
+            keys = self._member_keys(e, scope)
+            for k in keys:
+                self._quantity(k)
+            info["keys"].update(keys)
+            return ("qty", frozenset(keys))
+        if isinstance(e, BinaryOp) and e.op in ("AND", "OR"):
+            self._cond(e.left, scope, info)
+            self._cond(e.right, scope, info)
+            return ("bool",)
         if isinstance(e, BinaryOp) and e.op == "==" and isinstance(e.right, FunctionCall) \
                 and e.right.name == "__in__":
-            if not isinstance(e.left, MemberAccess):
-                raise _Refuse("IN is translated only with a quantity on the left")
-            q = self._quantity(e.left)
-            lits = [self._literal(a) for a in e.right.args]
-            kinds = {("enum" if k == "sym" else k) for k, _ in lits}
-            if len(kinds) != 1:
-                raise _Refuse("the items of IN must be of one kind")
-            kind = kinds.pop()
-            self._kind(q, kind)
-            vals = tuple(v for _, v in lits)
-            q.consts.update(vals)
-            return ("in", q.key, vals)
+            left = self._shape(e.left, scope, info)
+            items = [self._shape(a, scope, info) for a in e.right.args]
+            for it in items:
+                self._compare(left, it, info)
+            return ("bool",)
         if isinstance(e, BinaryOp) and e.op in ("==", "!=", "<", "<=", ">", ">="):
-            left, right, op = e.left, e.right, e.op
-            if isinstance(right, MemberAccess) and not isinstance(left, MemberAccess):
-                left, right = right, left
-                op = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}.get(op, op)
-            arith = ("+", "-", "*", "/")
-            if any(isinstance(x, BinaryOp) and x.op in arith for x in (left, right)):
-                raise _Refuse("arithmetic in a predicate is not translated (norms-check 0.1 "
-                              "compares one quantity with a literal)")
-            if not isinstance(left, MemberAccess):
-                raise _Refuse("a comparison is translated only between a quantity and a literal")
-            if isinstance(right, MemberAccess):
-                raise _Refuse("a comparison of two quantities is not translated")
-            q = self._quantity(left)
-            kind, value = self._literal(right)
-            if kind == "sym":
-                if op not in ("==", "!="):
-                    raise _Refuse(f"a name without a value compared by {op} is not translated")
-                kind = "enum"
-            if kind in ("enum", "bool") and op not in ("==", "!="):
-                raise _Refuse(f"{op} on a {kind} value is not translated")
-            self._kind(q, kind)
-            q.consts.add(value)
-            return ("cmp", op, q.key, value)
+            self._compare(self._shape(e.left, scope, info), self._shape(e.right, scope, info),
+                          info)
+            return ("bool",)
+        if isinstance(e, BinaryOp) and e.op in ("+", "-", "*", "/"):
+            a, b = self._shape(e.left, scope, info), self._shape(e.right, scope, info)
+            if a[0] == "lit" and b[0] == "lit":
+                vals = []
+                for x in a[1]:
+                    for y in b[1]:
+                        try:
+                            vals.append(x + y if e.op == "+" else x - y if e.op == "-"
+                                        else x * y if e.op == "*" else x / y)
+                        except Exception:
+                            vals.append(None)
+                return ("arith-lit", tuple(vals))
+            return ("num", self._keys(a) | self._keys(b))
+        if isinstance(e, QuantifiedExpr):
+            if not _ITEM2:
+                raise _Refuse("a quantifier in a predicate is not translated")
+            group, values = self._domain_values(e.domain, False)
+            self._cond(e.predicate, {**scope, e.variable: (group, values)}, info)
+            return ("bool",)
+        if isinstance(e, FunctionCall) and e.name in AGGREGATES and len(e.args) == 1 \
+                and isinstance(e.args[0], Comprehension):
+            if not _ITEM2:
+                raise _Refuse(f"the aggregate {e.name}() is not translated")
+            comp = e.args[0]
+            group, values = self._domain_values(comp.domain, True)
+            el = self._shape(comp.element, {**scope, comp.variable: (group, values)}, info)
+            if e.name == "count":
+                return ("count", len(values))
+            if e.name in ("min", "max") and el[0] in ("qty", "lit"):
+                return ("minmax", self._keys(el)) if el[0] == "qty" else el
+            return ("num", self._keys(el))
         if isinstance(e, FunctionCall) and e.name in TEMPORAL_OPERATORS:
             raise _Refuse("a temporal operator is translated only as the whole content of an "
-                          "obligation or prohibition or as a whole assume: item; here it is "
-                          "combined with AND, OR or NOT, or nested in another one")
-        from .ast_nodes import QuantifiedExpr
-        what = ("a quantifier" if isinstance(e, QuantifiedExpr)
-                else f"the function call {e.name}()" if isinstance(e, FunctionCall)
-                else "arithmetic" if isinstance(e, BinaryOp)
+                          "obligation or prohibition or as a whole assume: item")
+        what = (f"the function call {e.name}()" if isinstance(e, FunctionCall)
                 else f"{type(e).__name__}")
-        raise _Refuse(f"{what} in a predicate is not translated (norms-check 0.1 translates "
-                      f"comparisons of a quantity with a literal, AND, OR and NOT)")
+        raise _Refuse(f"{what} in a predicate is not translated")
 
-    def _pred_id(self, resolved: tuple) -> int:
-        if resolved not in self._pred_index:
-            self._pred_index[resolved] = len(self.preds)
-            self.preds.append(resolved)
-        return self._pred_index[resolved]
+    @staticmethod
+    def _keys(s: tuple) -> frozenset:
+        return frozenset(s[1]) if s[0] in ("qty", "minmax", "num") else frozenset()
+
+    def _cond(self, e: Any, scope: dict, info: dict) -> None:
+        s = self._shape(e, scope, info)
+        if s[0] in ("qty",):
+            for k in s[1]:
+                info["consts"].setdefault(k, set()).add(0)       # truth: zero or not
+        elif s[0] in ("num", "minmax"):
+            info["domain"].update(s[1])
+
+    def _compare(self, a: tuple, b: tuple, info: dict) -> None:
+        """Record what a comparison of two shapes needs."""
+        for x, y in ((a, b), (b, a)):
+            if x[0] in ("qty", "minmax"):
+                if y[0] in ("lit", "arith-lit"):
+                    for k in x[1]:
+                        info["consts"].setdefault(k, set()).update(y[1])
+                elif y[0] == "count":
+                    for k in x[1]:
+                        info["consts"].setdefault(k, set()).update(range(y[1] + 1))
+                elif y[0] in ("qty", "minmax", "num"):
+                    info["domain"].update(x[1])
+                    info["domain"].update(y[1])
+            elif x[0] == "num":
+                info["domain"].update(x[1])
+                info["domain"].update(self._keys(y))
+
+    def _pred_id(self, expr: Any) -> int:
+        """The id of a state predicate (its AST after desugaring)."""
+        key = repr(expr)
+        if key in self._pred_index:
+            return self._pred_index[key]
+        info: dict = {"consts": {}, "domain": set(), "keys": set()}
+        self._cond(expr, {}, info)
+        if info["domain"]:
+            self._needs_domain(info["domain"])
+        for k, cs in info["consts"].items():
+            self._quantity(k).consts.update(c for c in cs if c is not None)
+        self._pred_index[key] = len(self.preds)
+        self.preds.append(Pred(expr=expr, text=_expr_text(expr), keys=frozenset(info["keys"])))
+        return self._pred_index[key]
+
+    def _needs_domain(self, keys: set) -> None:
+        raise _Refuse("arithmetic, sum, avg, or a comparison of two quantities is not translated")
 
     def _parse_pred(self, text: str) -> Any:
         from .parser import parse_rule
@@ -916,11 +1055,11 @@ class Translator:
             ms = dur.value * _UNIT_MS.get(dur.unit, 1000)
             if ms != int(ms):
                 raise _Refuse("a duration that is not a whole number of milliseconds")
-            preds = tuple(self._pred_id(self.resolve(a)) for i, a in enumerate(expr.args)
+            preds = tuple(self._pred_id(a) for i, a in enumerate(expr.args)
                           if i != dpos)
             return Term(text=text, kind="temporal", op=expr.name, preds=preds,
                         window_ms=int(ms))
-        pid = self._pred_id(self.resolve(expr))
+        pid = self._pred_id(expr)
         if edge:
             self.edge_preds.add(pid)
         return Term(text=text, kind="pred", pred=pid)
@@ -982,7 +1121,7 @@ class Translator:
             # norms-eval reads a when with no institutional events (F.3)
             info.when = self._term(r.when, set())
             if r.if_:
-                info.cond = self._pred_id(self.resolve(self._parse_pred(r.if_)))
+                info.cond = self._pred_id(self._parse_pred(r.if_))
         except _Refuse as e:
             info.status, info.reason = "untranslated", str(e)
         return info
@@ -1004,13 +1143,13 @@ class Translator:
                 ms = dur.value * _UNIT_MS.get(dur.unit, 1000)
                 if ms != int(ms):
                     raise _Refuse("a duration that is not a whole number of milliseconds")
-                preds = tuple(self._pred_id(self.resolve(a)) for i, a in enumerate(expr.args)
+                preds = tuple(self._pred_id(a) for i, a in enumerate(expr.args)
                               if i != dpos)
                 item["term"] = Term(text=item["text"], kind="temporal", op=expr.name,
                                     preds=preds, window_ms=int(ms))
             else:
                 item["term"] = Term(text=item["text"], kind="pred",
-                                    pred=self._pred_id(self.resolve(expr)))
+                                    pred=self._pred_id(expr))
         except _Refuse as e:
             item["status"], item["reason"] = "untranslated", str(e)
         except Exception:
@@ -1142,91 +1281,54 @@ class Translator:
     # --- the choices of the environment -----------------------------------------
 
     def _reps(self, q: Quantity) -> list:
-        if q.kind in (None, "bool"):
-            reps = [True, False]
-        elif q.kind == "enum":
-            consts = sorted(str(c) for c in q.consts)
-            other = "OTHER"
-            while other in consts:
-                other += "_"
-            reps = consts + [other]
-        else:
-            cs = sorted(set(q.consts))
-            reps = [cs[0] - 1]
-            for i, c in enumerate(cs):
-                reps.append(c)
-                if i + 1 < len(cs):
-                    nxt = cs[i + 1]
-                    if isinstance(c, int) and isinstance(nxt, int) and nxt - c >= 2:
-                        reps.append(c + 1)
-                    else:
-                        mid = (c + nxt) / 2
-                        reps.append(int(mid) if float(mid).is_integer() else mid)
-            reps.append(cs[-1] + 1)
-        return [None] + reps
+        """One value per class of values of a quantity (F.12): no value,
+        true, false, a list (any value of another JSON type), the numbers
+        around the numeric literals compared with it (and 0, the boundary
+        of a number used as a condition, and 1 when a boolean literal is
+        compared with it, since an ordering compares true as 1), the text
+        literals and names compared with it, and one other text."""
+        nums = {c for c in q.consts if isinstance(c, (int, float)) and not isinstance(c, bool)}
+        nums.add(0)
+        if any(isinstance(c, bool) for c in q.consts):
+            nums.update((0, 1))
+        cs = sorted(nums)
+        numbers = [cs[0] - 1]
+        for i, c in enumerate(cs):
+            numbers.append(c)
+            if i + 1 < len(cs):
+                nxt = cs[i + 1]
+                if isinstance(c, int) and isinstance(nxt, int) and nxt - c >= 2:
+                    numbers.append(c + 1)
+                else:
+                    mid = (c + nxt) / 2
+                    numbers.append(int(mid) if float(mid).is_integer() and mid not in cs else mid)
+        numbers.append(cs[-1] + 1)
+        texts = sorted({c for c in q.consts if isinstance(c, str)})
+        other = "OTHER"
+        while other in texts:
+            other += "_"
+        return [None, True, False] + numbers + texts + [other, []]
 
-    @staticmethod
-    def keys_of(p: tuple) -> set:
-        kind = p[0]
-        if kind == "const":
-            return set()
-        if kind in ("and", "or"):
-            return Translator.keys_of(p[1]) | Translator.keys_of(p[2])
-        if kind == "not":
-            return Translator.keys_of(p[1])
-        if kind == "cmp":
-            return {p[2]}
-        return {p[1]}
-
-    @staticmethod
-    def evaluate(p: tuple, values: dict) -> str:
-        """The value (T, F or U) of a resolved predicate for one valuation of
-        its quantities (None: the trace gives no value), by the rules of
-        A.10 and F.5 that norms-eval implements."""
-        kind = p[0]
-        if kind == "const":
-            return p[1]
-        if kind == "and":
-            return _tv_and(Translator.evaluate(p[1], values), Translator.evaluate(p[2], values))
-        if kind == "or":
-            return _tv_or(Translator.evaluate(p[1], values), Translator.evaluate(p[2], values))
-        if kind == "not":
-            return _tv_not(Translator.evaluate(p[1], values))
-        if kind == "truth":
-            v = values.get(p[1])
-            return "U" if v is None else ("T" if bool(v) else "F")
-        if kind == "in":
-            v = values.get(p[1])
-            if v is None:
-                return "U"
-            return "T" if any(_same(v, c) for c in p[2]) else "F"
-        _, op, key, c = p
-        v = values.get(key)
-        if v is None:
-            return "U"
-        if op == "==":
-            r = _same(v, c)
-        elif op == "!=":
-            r = not _same(v, c)
-        elif op == "<":
-            r = v < c
-        elif op == "<=":
-            r = v <= c
-        elif op == ">":
-            r = v > c
-        else:
-            r = v >= c
-        return "T" if r else "F"
+    def _oracle(self, exprs: list, values: dict) -> list:
+        """The values (T, F, U) of state predicates for one valuation of the
+        quantities, computed by the evaluator of norms-eval."""
+        from .norms_eval import UNKNOWN, _Evaluator
+        obs = Observation(t=0.0, values={k: values.get(k) for k in self.quantities},
+                          messages=[], state=None, state_after=None)
+        trace = Trace(observations=[obs], bindings=self.bindings)
+        ev = _Evaluator(trace, self.contract.lifecycle is not None, [])
+        ev.actors = self.actors
+        ev.bound_refs = _bound_refs(self.contract)
+        out = []
+        for e in exprs:
+            v = ev.holds(e, 0, 0)
+            out.append("T" if v is True else "F" if v is False else "U")
+            assert v is True or v is False or v is UNKNOWN, v
+        return out
 
     def _choices(self) -> None:
         for q in self.quantities.values():
             q.reps = self._reps(q)
-        if self.quantities:
-            self.notes.append(
-                "the classes of values assume that each quantity takes values of the type of "
-                "the literals it is compared with (numbers, booleans, or symbols and texts), or "
-                "no value; the answers do not cover traces with values of another type, which "
-                "can give a predicate a value (true, false or undefined) that no class gives it")
         # components of predicates that share quantities
         parent = list(range(len(self.preds)))
 
@@ -1238,7 +1340,7 @@ class Translator:
 
         owner: dict = {}
         for i, p in enumerate(self.preds):
-            for key in self.keys_of(p):
+            for key in p.keys:
                 if key in owner:
                     parent[find(i)] = find(owner[key])
                 else:
@@ -1249,10 +1351,11 @@ class Translator:
         self.constant_preds: dict = {}
         self.components: list = []      # (pred ids, [(vector, valuation)])
         for ids in groups.values():
-            keys = sorted(set().union(*(self.keys_of(self.preds[i]) for i in ids)))
+            keys = sorted(set().union(*(self.preds[i].keys for i in ids)))
+            exprs = [self.preds[i].expr for i in ids]
             if not keys:
-                for i in ids:
-                    self.constant_preds[i] = self.evaluate(self.preds[i], {})
+                for i, v in zip(ids, self._oracle(exprs, {})):
+                    self.constant_preds[i] = v
                 continue
             size = 1
             for k in keys:
@@ -1264,7 +1367,7 @@ class Translator:
             seen: dict = {}
             for combo in itertools.product(*(self.quantities[k].reps for k in keys)):
                 vals = dict(zip(keys, combo))
-                vec = tuple(self.evaluate(self.preds[i], vals) for i in ids)
+                vec = tuple(self._oracle(exprs, vals))
                 if vec not in seen:
                     seen[vec] = vals
             self.components.append((ids, list(seen.items())))
@@ -1288,10 +1391,6 @@ class Translator:
                 self.choices.append(Choice(len(self.choices), msgs, vector, values))
 
 
-def _same(a: Any, b: Any) -> bool:
-    if isinstance(a, bool) != isinstance(b, bool):
-        return False
-    return a == b
 
 
 # === The model =============================================================
@@ -1678,9 +1777,9 @@ class NormsModel:
         tr = self.tr
         lines = [f"// atom {i}: {self._comment(a.text())}" for i, a in enumerate(tr.atoms)]
         for pid, p in enumerate(tr.preds):
-            lines.append(f"// predicate {pid}: {self._comment(_pred_text(p))}")
+            lines.append(f"// predicate {pid}: {self._comment(p.text)}")
         for q in tr.quantities.values():
-            lines.append(self._comment(f"// quantity {q.key}: {q.kind or 'bool'}, values "
+            lines.append(self._comment(f"// quantity {q.key}: values "
                                        f"{', '.join(json.dumps(v) for v in q.reps)}"))
         return lines
 
@@ -1764,19 +1863,6 @@ class NormsModel:
         return f"{msgs}{'; ' + vals if vals else ''}{'; end' if end else ''}"
 
 
-def _pred_text(p: tuple) -> str:
-    kind = p[0]
-    if kind == "const":
-        return "true" if p[1] == "T" else "false"
-    if kind in ("and", "or"):
-        return f"({_pred_text(p[1])} {kind.upper()} {_pred_text(p[2])})"
-    if kind == "not":
-        return f"NOT {_pred_text(p[1])}"
-    if kind == "truth":
-        return p[1]
-    if kind == "in":
-        return f"{p[1]} IN [{', '.join(json.dumps(v) for v in p[2])}]"
-    return f"{p[2]} {p[1]} {json.dumps(p[3])}"
 
 
 # === An interpreter of the generated PRISM text ============================

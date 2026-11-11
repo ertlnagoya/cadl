@@ -6,6 +6,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `cadl norms-check` (F.12) covers values of every type. Each quantity
+  has classes for no value, true, false, numbers (around the numeric
+  literals, 0, and 1 next to a boolean literal), texts (each literal and
+  one other) and lists and objects, and every predicate is evaluated on
+  the representatives by the evaluator of `cadl norms-eval`. A comparison
+  of values of different types now has the value it has in a trace (a
+  boolean is ordered as 0 or 1 but is not equal to 1; a text is not
+  ordered against a number), and the note that the answers assume the
+  type of the literals is gone. Up to 0.3.25 such traces were not
+  covered: a prohibition violated only by `true` was reported as never
+  violated, and a conflict that a text value avoids was reported.
+
 ### Fixed
 
 - `cadl game-check` and `cadl model-check` no longer stop with

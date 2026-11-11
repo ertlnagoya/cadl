@@ -1,0 +1,56 @@
+# Norms Extension Demo: Values of Every Type in Design-Time Checking (F.12)
+#
+# A trace may give a quantity a value of any JSON type: the speed of a
+# robot may arrive as a number, as the text "n/a" or as true. cadl
+# norms-check evaluates every predicate as cadl norms-eval does, so:
+#
+# - report_speed is fulfilled by a speed of true, which an ordering
+#   compares as 1, and a speed reported as the text "n/a" leaves its
+#   content undefined, so it can be violated although a speed arrives;
+# - no_flagged_driving is violated by low_battery == true together with a
+#   positive speed or a speed of true, and not by low_battery = 1, which
+#   is not equal to true.
+#
+#   cadl norms-check examples/norms_check_value_types.cadl --bindings i=1
+
+sos:
+  name: "RobotSpeedReports"
+  type: Acknowledged
+  version: "0.1.0"
+  description: "Speed reports of delivery robots, whose values may have any type."
+  extensions:
+    - norms: 0.1
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities: [monitor_fleet]
+      interface:
+        input:  [speed_report]
+        output: [speed_query]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities: [follow_path, deliver]
+      interface:
+        input:  [speed_query]
+        output: [speed_report]
+
+  contracts:
+    - id: SPEED_REPORTS
+      parties: [DISPATCHER, "ROBOT[*]"]
+
+      norms:
+        - id: report_speed
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: DISPATCHER
+          trigger: "DISPATCHER -> ROBOT[i] : speed_query"
+          content: "ROBOT[i].speed >= 0"
+          deadline: 2s
+        - id: no_flagged_driving
+          kind: prohibition
+          bearer: "ROBOT[i]"
+          content: "ROBOT[i].low_battery == true AND ROBOT[i].speed > 0"

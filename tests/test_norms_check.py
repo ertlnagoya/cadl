@@ -246,7 +246,7 @@ def model_of(name: str, **kw):
     key = (name, json.dumps(kw, sort_keys=True))
     if key not in _MODELS:
         texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS,
-                 "DEADLINE_ZERO": DEADLINE_ZERO}
+                 "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
         _MODELS[key] = (sos, m, PrismModel(m.prism_text(), {"early_end": True}))
@@ -261,6 +261,8 @@ CASES = [
     ("UNTIL", {"bindings": ["i=1"]}),
     ("CONFLICTS", {"bindings": ["i=1"]}),
     ("EVENTS", {"bindings": ["i=1"], "members": ["R=2"]}),
+    ("TYPES", {"bindings": ["i=1"]}),
+    (str(EXAMPLES / "norms_check_value_types.cadl"), {"bindings": ["i=1"]}),
 ]
 
 
@@ -281,9 +283,12 @@ class TestTranslation:
             "DISPATCHER -> ROBOT[2] : replan_command",
         ]
         reps = {q.key: q.reps for q in tr.quantities.values()}
-        assert reps == {"ROBOT[2].battery": [None, 9, 10, 11],
-                        "ROBOT[2].status": [None, "InTransit", "OTHER"],
-                        "DISPATCHER.is_operational": [None, True, False]}
+        # every JSON type: no value, the booleans, the numbers around the
+        # literals (and 0, and 1 next to a boolean literal), the texts, a list
+        assert reps == {
+            "ROBOT[2].battery": [None, True, False, -1, 0, 1, 10, 11, "OTHER", []],
+            "ROBOT[2].status": [None, True, False, -1, 0, 1, "InTransit", "OTHER", []],
+            "DISPATCHER.is_operational": [None, True, False, -1, 0, 0.5, 1, 2, "OTHER", []]}
         # 2**4 message sets, 3 classes of the prohibition's content (true,
         # false, undefined) and 3 of the assumption
         assert len(tr.choices) == 16 * 3 * 3
@@ -291,7 +296,8 @@ class TestTranslation:
         assert m.H == 2 + (5 + 2) + (2 + 2) + 2
         assert all(n.status == "model" for n in tr.norms)
         assert tr.members["ROBOT"] == [1, 2]
-        assert [n for n in tr.notes if "type of the literals" not in n] == []
+        assert tr.bindings == {"i": 2, "N": 2, "M": 1}      # N, M: the members
+        assert tr.notes == []
 
     def test_default_binding_is_reported(self):
         _sos, m, _pm = model_of(str(ROBOT))
@@ -343,14 +349,19 @@ norms:
         with pytest.raises(NormsCheckError, match="distinguishable choices"):
             build_model(sos, bindings={"i": 1})
 
-    def test_three_valued_predicates(self):
-        p = ("and", ("cmp", "<", "R[1].b", 10), ("cmp", "==", "R[1].s", "InTransit"))
-        ev = Translator.evaluate
-        assert ev(p, {"R[1].b": 9, "R[1].s": "InTransit"}) == "T"
-        assert ev(p, {"R[1].b": 11, "R[1].s": None}) == "F"
-        assert ev(p, {"R[1].b": 9, "R[1].s": None}) == "U"
-        assert ev(("not", p), {"R[1].b": 9, "R[1].s": None}) == "U"
-        assert ev(("cmp", "==", "q", True), {"q": 1}) == "F"      # a boolean is not 1
+    def test_predicates_are_evaluated_by_norms_eval(self):
+        _sos, m, _pm = model_of(str(ROBOT), bindings=["i=2"])
+        tr = m.tr
+        p = next(x.expr for x in tr.preds if "battery" in x.text)
+        ev = tr._oracle
+        assert ev([p], {"ROBOT[2].battery": 9, "ROBOT[2].status": "InTransit"}) == ["T"]
+        assert ev([p], {"ROBOT[2].battery": 11, "ROBOT[2].status": None}) == ["F"]
+        assert ev([p], {"ROBOT[2].battery": 9, "ROBOT[2].status": None}) == ["U"]
+        # values of another type: a text is not ordered against 10, a
+        # boolean is (as 0 or 1), a list is neither
+        assert ev([p], {"ROBOT[2].battery": "low", "ROBOT[2].status": "InTransit"}) == ["U"]
+        assert ev([p], {"ROBOT[2].battery": True, "ROBOT[2].status": "InTransit"}) == ["T"]
+        assert ev([p], {"ROBOT[2].battery": 5, "ROBOT[2].status": 3}) == ["U"]
 
     def test_temporal_steps(self):
         # within: decided true at once, false only after the interval
@@ -459,12 +470,15 @@ def test_until_predicate_is_a_rising_edge():
     tr = m.tr
     go = next(i for i, a in enumerate(tr.atoms) if a.name == "go")
 
-    def choice(msgs, level):
+    def choice(msgs, test):
         return next(c.index for c in tr.choices
-                    if c.messages == msgs and c.values.get("R[1].level") == level)
+                    if c.messages == msgs and test(c.values.get("R[1].level")))
 
-    none, low = choice((), None), choice((), 2)
-    path = ([(choice((go,), None), False)] + [(none, False)] * 5
+    def low_number(v):
+        return v is True or (type(v) in (int, float) and v < 3)     # true < 3 as well
+
+    none, low = choice((), lambda v: v is None), choice((), low_number)
+    path = ([(choice((go,), lambda v: v is None), False)] + [(none, False)] * 5
             + [(low, False), (low, False), (none, True)])
     assert not compare_path(m, pm, path)
     states = run_path(pm, path)
@@ -791,7 +805,7 @@ def test_nothing_or_only_powers_translated(body):
 def test_notes_on_bindings_and_value_types():
     _sos, m, _pm = model_of(str(ROBOT), bindings=["i=2", "k=1"])
     assert any("--bindings k" in n for n in m.tr.notes)
-    assert any("type of the literals" in n for n in m.tr.notes)
+    assert not any("type of the literals" in n for n in m.tr.notes)
 
 
 def test_temporal_operator_positions_have_exact_reasons():
@@ -837,6 +851,76 @@ def test_cli_require_checker_and_timeout(tmp_path):
         p = cli(str(CONFLICT), "--bindings", "i=1", "--timeout", bad)
         assert p.returncode == 2 and "--timeout" in p.stderr, bad
         assert "Traceback" not in p.stderr
+
+
+def _random_json(rng, consts):
+    pool = [None, True, False, [], {}, [1], {"a": 1}, "", "x", "OTHER",
+            rng.randint(-30, 30), rng.uniform(-30, 30), rng.choice([0, 0.0, 1, 1.0, -0.0])]
+    for c in consts:
+        pool.append(c)
+        if isinstance(c, (int, float)) and not isinstance(c, bool):
+            pool += [c - 0.5, c + 0.5, c - 1, c + 1, float(c)]
+        if isinstance(c, str):
+            pool.append(c + "x")
+    return rng.choice(pool)
+
+
+@pytest.mark.parametrize("case", CASES, ids=case_id)
+def test_value_classes_cover_every_json_value(case):
+    """Exactness of the classes of values (F.12): for random JSON values of
+    every type (not only the representatives), the values that norms-eval
+    gives the predicates of a group are those of one of the choices."""
+    import random as _random
+    name, kw = case
+    _sos, m, _pm = model_of(name, **kw)
+    tr = m.tr
+    rng = _random.Random(3)
+    for ids, vecs in tr.components:
+        keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+        exprs = [tr.preds[i].expr for i in ids]
+        known = {v for v, _vals in vecs}
+        for _ in range(150):
+            vals = {k: _random_json(rng, tr.quantities[k].consts) for k in keys}
+            assert tuple(tr._oracle(exprs, vals)) in known, vals
+
+
+TYPES = """\
+norms:
+  - id: p
+    kind: prohibition
+    bearer: "R[1]"
+    content: "R[1].v >= 1 AND R[1].v <= 1 AND R[1].v != 1"
+  - id: o
+    kind: obligation
+    bearer: "R[1]"
+    trigger: "D -> R[1] : go"
+    content: "R[1].w != 3"
+    deadline: 1s
+  - id: q
+    kind: prohibition
+    bearer: "R[1]"
+    content: "R[1].w >= 3 OR R[1].w < 3"
+  - id: r
+    kind: prohibition
+    bearer: "R[1]"
+    content: "R[1].u < true AND R[1].u > 0"
+"""
+
+
+@needs_prism
+def test_values_of_another_type():
+    """A boolean is ordered as 0 or 1 but is not equal to 1, so p can be
+    violated (by true); a text is neither ordered nor equal to 3, so o and q
+    are not in conflict: a text fulfils o and leaves q undefined. Both
+    answers were wrong while the classes assumed the type of the literals."""
+    sos = make_sos(TYPES)
+    m = build_model(sos, bindings={"i": 1})
+    report = check(m, PRISM)
+    norms = {n["id"]: n for n in report["norms"]}
+    w = norms["p"]["violable"]["witness"]
+    assert w["confirmed"] and "R[1].v=true" in " ".join(w["choices"])
+    assert report["conflicts"] == []
+    assert norms["o"]["fulfillable"]["answer"] and norms["q"]["violable"]["answer"]
 
 
 def test_cli_refusal():
