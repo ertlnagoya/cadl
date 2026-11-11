@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -349,6 +350,37 @@ def main(argv: list[str] | None = None) -> int:
     norms_cmd.add_argument("--format", choices=["text", "json"], default="text",
                            help="Output format (default: text)")
 
+    # norms-check command
+    nchk_cmd = subparsers.add_parser("norms-check",
+        help="Check the norms of one contract instance over all behaviours with a model "
+             "checker (Appendix F, F.12)")
+    nchk_cmd.add_argument("file", type=Path, help="CADL file that declares norms: 0.1")
+    nchk_cmd.add_argument("--contract", default=None, metavar="ID",
+                          help="Contract to check (default: the only one with norms)")
+    nchk_cmd.add_argument("--bindings", action="append", default=[], metavar="i=n",
+                          help="Bind an index of the instance (default: the lower bound of "
+                               "its set); may be repeated")
+    nchk_cmd.add_argument("--members", action="append", default=[], metavar="SET=n",
+                          help="Number of members of a set of actors in the instance "
+                               "(default: as declared, else up to the largest bound index)")
+    nchk_cmd.add_argument("--step", default=None, metavar="DURATION",
+                          help="Time between two observations, e.g. 1s or 500ms (default: the "
+                               "greatest common divisor of the durations of the contract)")
+    nchk_cmd.add_argument("--horizon", type=int, default=None, metavar="N",
+                          help="Last observation of an instance (default: from the deadlines "
+                               "and intervals of the norms)")
+    nchk_cmd.add_argument("--export", type=Path, default=None, metavar="DIR",
+                          help="Write the PRISM model, the properties and the witness traces "
+                               "to DIR")
+    nchk_cmd.add_argument("--timeout", type=float, default=600, metavar="SECONDS",
+                          help="Time for all runs of the model checker together; exit status 2 "
+                               "when it is exceeded (default: 600)")
+    nchk_cmd.add_argument("--require-checker", dest="require_checker", action="store_true",
+                          help="Exit with status 2 when PRISM is not on PATH (default: report "
+                               "that nothing was checked and exit with 0)")
+    nchk_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                          help="Output format (default: text)")
+
     # norms-diff command
     diff_cmd = subparsers.add_parser("norms-diff",
         help="Report what an amendment from OLD to NEW does to the norms (Appendix F, F.6)")
@@ -506,6 +538,8 @@ def main(argv: list[str] | None = None) -> int:
         return cli_message(args)
     elif args.command == "norms-eval":
         return _cmd_norms_eval(args)
+    elif args.command == "norms-check":
+        return _cmd_norms_check(args)
     elif args.command == "norms-diff":
         return _cmd_norms_diff(args)
     elif args.command == "norms-indices":
@@ -729,15 +763,42 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
     # Generate
     target = args.target
     output_dir = args.output
+    from .codegen import norms_monitors
+    try:
+        monitors = {m["contract"]: m for m in norms_monitors(sos, target)}
+    except Exception as e:
+        print(f"Code generation error: {e}", file=sys.stderr)
+        return 1
     for contract_id, key, text in omitted_temporal_items(sos):
         if target == "python":
             print(f"  [WARNING]: {key} item of contract '{contract_id}' has a temporal "
                   f"operator (norms 0.1) and is left out of contracts.py; "
                   f"norms_monitor.py monitors it: {text}", file=sys.stderr)
+        elif contract_id in monitors and monitors[contract_id]["text"] is not None \
+                and not any(k == key and t == text for k, _, t, _ in monitors[contract_id]["left_out"]):
+            print(f"  [WARNING]: {key} item of contract '{contract_id}' has a temporal "
+                  f"operator (norms 0.1) and is left out of the contract policy; "
+                  f"{monitors[contract_id]['file']} monitors it: {text}", file=sys.stderr)
         else:
             print(f"  [WARNING]: {key} item of contract '{contract_id}' has a temporal "
-                  f"operator (norms 0.1) and is not generated (only the python target "
-                  f"generates a monitor for it): {text}", file=sys.stderr)
+                  f"operator (norms 0.1) and is not generated (no norms monitor of the "
+                  f"{target} target monitors it; the python target does): {text}",
+                  file=sys.stderr)
+    for m in monitors.values():
+        if m["text"] is None:
+            print(f"  [WARNING]: contract '{m['contract']}': no norms monitor is generated "
+                  f"for the {target} target, so its norms, counts-as rules and items are "
+                  f"not monitored ({'; '.join(m['reasons'])}); the python target "
+                  f"monitors them (norms_monitor.py)", file=sys.stderr)
+        for norm in m.get("gas", []) if m["text"] is not None else []:
+            print(f"  [WARNING]: contract '{m['contract']}', norm '{norm}': its content has a "
+                  f"temporal operator; in {m['file']} each observation inside an open window "
+                  f"of it costs about 4 x 10^4 gas on every later observation until the window "
+                  f"closes; keep such observations well below the block gas limit (a monitor "
+                  f"that reaches it cannot record any further observation)", file=sys.stderr)
+        for key, pos, text, reason in m["left_out"]:
+            print(f"  [WARNING]: {key} item {pos} of contract '{m['contract']}' is not "
+                  f"monitored by {m['file']} ({reason}): {text}", file=sys.stderr)
     try:
         generate(sos, output_dir, target=target)
     except Exception as e:
@@ -756,6 +817,11 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
             print(f"  Norms monitor: norms_monitor.py "
                   f"({sum(len(c.norms) for c in sos.contracts)} norm(s), "
                   f"{sum(len(c.counts_as) for c in sos.contracts)} counts-as rule(s))")
+    for m in monitors.values():
+        if m["text"] is not None:
+            c = next(c for c in sos.contracts if c.id == m["contract"])
+            print(f"  Norms monitor: {m['file']} ({len(c.norms)} norm(s), "
+                  f"{len(c.counts_as)} counts-as rule(s))")
     return 0
 
 
@@ -1108,6 +1174,47 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
     else:
         print(format_text(result))
     return 0 if result["ok"] else 1
+
+
+def _cmd_norms_check(args: argparse.Namespace) -> int:
+    """Exit status: 0 when the questions were answered without a finding,
+    or when no model checker is on PATH (the model is still exported with
+    --export) unless --require-checker is given; 1 on a finding (a
+    conflict, a norm never activated or violated in every instance, an
+    activation that cannot be kept, a power never exercised); 2 on a usage
+    error, a refusal, a missing PRISM with --require-checker, or when the
+    model checker exceeds --timeout; 3 when a witness is not confirmed by
+    norms-eval (an error of norms-check)."""
+    from .norms_check import check_file, find_checker, format_text
+    from .norms_eval import NormsEvalError
+
+    if args.require_checker and find_checker() is None:
+        print("Error: --require-checker: PRISM (prism) is not on PATH", file=sys.stderr)
+        return 2
+    if not (math.isfinite(args.timeout) and args.timeout > 0):
+        print("Error: --timeout must be a positive finite number of seconds",
+              file=sys.stderr)
+        return 2
+    try:
+        report = check_file(args.file, args.contract, args.bindings, args.members,
+                            args.step, args.horizon, args.export, timeout=args.timeout)
+    except NormsEvalError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        import json
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(format_text(report))
+    if not report.get("checked"):
+        print(f"norms-check: {report.get('skipped')}", file=sys.stderr)
+        return 0
+    if report["unconfirmed"]:
+        return 3
+    return 1 if report["findings"] else 0
 
 
 def _cmd_agents_run(args: argparse.Namespace) -> int:

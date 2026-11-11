@@ -7,6 +7,102 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+
+- Norms monitors in the generated Rego and Solidity (Appendix F, F.5;
+  Appendix D). For a file that declares `norms: 0.1`, `cadl codegen -t
+  opa` writes `norms_monitor_<contract>.rego` per contract: a step
+  function that takes the previous state of the monitor (plain JSON,
+  whose keys Appendix D lists) and one observation, and returns the next
+  state, the changes of the norm states and verdicts, the violations,
+  institutional events and unauthorised acts, and the verdicts.
+  `cadl codegen -t solidity` writes `<Contract>NormsMonitor.sol`: a
+  contract that keeps that state, with `begin`, `observe` (the time is an
+  argument, fixed-point with 6 decimals) and `finish`, `verdicts()` and
+  events, and two libraries it links to stay under the size limit of
+  EIP-170. Both follow the order of F.5 of `cadl norms-eval`, with
+  message and institutional events, three-valued predicates, triggers,
+  `until:`, deadlines, reparations, powers, counts-as rules and the
+  temporal operators. A contract with a quantifier, an aggregate, a
+  wildcard or range reference or an index expression in a norm, a
+  counts-as rule or an `assume:` item gets no monitor, with a warning
+  that says why; such a `guarantee:` item is left out of the monitor
+  with a warning. Amendments are refused at the observation that has
+  one. The Solidity monitor also refuses `*`, `/`, numbers with more
+  than 6 decimals, nested temporal operators and a monitor whose
+  creation code would exceed the limit of EIP-3860 (in a `guarantee:`
+  item only the item is left out); only its reporter (an address given
+  to the constructor, by default the deployer) may record observations,
+  and an observation costs gas independent of the length of the trace
+  (windows are scanned once, values found by binary search and pruned),
+  except about 4 x 10^4 gas per observation inside an open window of a
+  temporal content, which `cadl codegen` names in a warning; a bare name
+  read inside a temporal operator that becomes a quantity after the
+  first observation is refused (give it in `begin`).
+  A binding must be an integer written as one or a string. The tests compare both with the engine of `cadl
+  norms-eval` after every observation (the example traces, the traces of
+  `tests/test_norms_eval.py` and random traces; OPA with `opa eval`,
+  Solidity on an EVM from PyPI in a separate Python named by
+  `CADL_EVM_PYTHON`) and check that hostile strings stay data. Up to
+  0.3.24 these targets left out the norms and the temporal items with a
+  warning; the files they generated before are unchanged.
+- `cadl norms-check FILE [--contract ID] [--bindings i=n] [--members SET=n]
+  [--step DURATION] [--horizon N] [--export DIR] [--format text|json]`:
+  design-time checking of the norms of one contract instance by a model
+  checker (Appendix F, F.12; new module `cadl.norms_check`). The norms
+  are translated into an MDP in the PRISM language whose environment
+  chooses, at each observation (one every step, the greatest common
+  divisor of the durations by default), the message events, one class of
+  values per quantity (the classes that the literals of the predicates
+  cut the domain into, and no value) and the end of the instance; one
+  transition is the six steps of F.5. PRISM (`prism` on PATH, explicit
+  engine) answers per norm whether it can be activated, violated and
+  fulfilled, whether it is violated in every instance that runs to the
+  horizon, whether every activation can be kept, which pairs of
+  obligations and prohibitions are in conflict, whether each power can
+  be exercised and each reparation activated. Every "possible" answer
+  comes with a witness trace that the command evaluates with the engine
+  of `cadl norms-eval` (two for a conflict). `--export` writes the model,
+  the two property files and the witnesses. Predicates with
+  quantifiers, aggregates, arithmetic or two quantities, `request`,
+  `now`, `state` and amendments are not translated (the norm, and the
+  norms that depend on it, are reported with the reason). Without PRISM
+  the command reports that nothing was checked (exit status 0). Exit
+  status 1 on a finding, 2 on a usage error, refusal or timeout, 3 when a
+  witness is not confirmed. `--timeout SECONDS` (default 600) bounds all
+  runs of PRISM together; `--require-checker` makes a missing PRISM an
+  error (exit status 2). An activation that cannot be kept is asked in
+  the state before the activating observation, so an obligation with a
+  deadline of 0 s whose content may come at its activation is not
+  reported; its witness is confirmed for every choice at that
+  observation. The classes of values assume values of the type of the
+  literals, which the report notes. `examples/norms_check_conflict.cadl` shows a
+  conflict, a reparation that cannot be kept and a power that is never
+  exercised. The translation is tested differentially against
+  `cadl norms-eval` on random paths and on every path of at most two observations of one contract, with an interpreter
+  of the generated PRISM text that is itself compared with the PRISM
+  simulator.
+
+## [0.3.24] — 2026-11-11
+
+Extensions of the norms, strategic model and agents tooling. Wildcard
+and range references such as `ROBOT[*]` are now evaluated as the
+quantifier or comprehension they stand for (F.5), aggregates that only
+grow or only shrink are decided over open domains, and the grounding
+indices are computed at the level of a system of systems. The strategic
+model checker certifies the end points of any strategic model and
+offers the concept `every_reachable_state` (Appendix I). The agent
+runtime keeps a tamper-evident audit log (`cadl audit-verify`) and an
+MCP gateway (`cadl mcp-gateway`) that decides every tool call of an
+agent against the contract, holds calls that need approval, and accepts
+approvals signed with per-approver keys (Appendix G). Each part was
+reviewed independently before the release.
+
+Known limits: the gateway was tested against a test MCP server and
+client written for the purpose, not against a released MCP SDK; the
+approver's tool trusts the description of a held call that the gateway
+publishes; the strategic export was not run through PRISM-games.
+
+### Added
 - Tamper-evident audit log (Appendix G, G.8, "Integrity of the log"):
   `cadl agents-run --audit` writes a header record (format
   `cadl-audit/1`, SHA-256 of the CADL file, epoch, hash algorithm), the

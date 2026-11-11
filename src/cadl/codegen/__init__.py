@@ -49,7 +49,9 @@ def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> No
 
     # With norms 0.1 declared, assume / guarantee items that contain a
     # temporal operator are left out, with a comment (Appendix F, F.7).
-    # The Python target monitors them, and the norms, in norms_monitor.py.
+    # The norms monitor monitors them, and the norms: norms_monitor.py of
+    # the Python target, and for the OPA and Solidity targets one monitor
+    # per contract (`norms_monitors`).
     from ..norms import norms_declared, temporal_items_omitted
     with temporal_items_omitted(norms_declared(sos)):
         _generate_target(sos, output_dir, target)
@@ -68,15 +70,59 @@ def omitted_temporal_items(sos: SoSDefinition) -> list[tuple[str, str, str]]:
     ]
 
 
+def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
+    """The norms monitors that the OPA or Solidity target generates for a
+    file that declares norms 0.1 (Appendix F, F.5; Appendix D), one entry
+    per contract: ``{"contract", "file", "text", "reasons", "left_out"}``.
+    ``text`` is None when the contract cannot be monitored (``reasons``
+    says why); ``left_out`` lists the (key, position, text, reason) of the
+    items the monitor leaves out; ``gas`` (Solidity) lists the norms whose
+    content has a temporal window, whose cost grows with the observations
+    inside it. An empty list for other files and targets."""
+    from ..norms import norms_declared
+    from .norms_ir import NormsTargetUnsupported, build_ir, unsupported_items
+    if target not in ("opa", "solidity") or not norms_declared(sos):
+        return []
+    ir_of = build_ir
+    if target == "opa":
+        from .opa.norms_monitor_rego import generate_norms_monitor_rego as gen
+        from .opa.norms_monitor_rego import monitor_filename
+    else:
+        from .solidity.norms_monitor_sol import generate_norms_monitor_sol as gen
+        from .solidity.norms_monitor_sol import monitor_name, solidity_ir as ir_of
+
+        def monitor_filename(contract_id: str) -> str:
+            return f"{monitor_name(contract_id)}.sol"
+    out = []
+    for contract in sos.contracts:
+        entry = {"contract": contract.id, "file": monitor_filename(contract.id),
+                 "text": None, "reasons": [], "left_out": [], "gas": []}
+        try:
+            ir = ir_of(sos, contract)
+            entry["left_out"] = unsupported_items(ir)
+            if target == "solidity":
+                from .solidity.norms_monitor_sol import windowed_contents
+                entry["gas"] = windowed_contents(ir)
+            entry["text"] = gen(sos, contract)
+        except NormsTargetUnsupported as e:
+            entry["reasons"] = e.reasons
+        out.append(entry)
+    return out
+
+
 def _generate_target(sos: SoSDefinition, output_dir: Path, target: str) -> None:
     if target == "python":
         _generate_python(sos, output_dir)
     elif target == "solidity":
         from .solidity import generate_solidity
+        monitors = norms_monitors(sos, target)
         generate_solidity(sos, output_dir)
+        _write_monitors(output_dir, monitors)
     elif target == "opa":
         from .opa import generate_rego
+        monitors = norms_monitors(sos, target)
         generate_rego(sos, output_dir)
+        _write_monitors(output_dir, monitors)
     elif target == "unity-csharp":
         from .unity_csharp import generate_unity_csharp
         generate_unity_csharp(sos, output_dir)
@@ -86,6 +132,12 @@ def _generate_target(sos: SoSDefinition, output_dir: Path, target: str) -> None:
     elif target == "agent-cedar":
         from .agent_policy import generate_agent_cedar
         generate_agent_cedar(sos, output_dir)
+
+
+def _write_monitors(output_dir: Path, monitors: list[dict]) -> None:
+    for m in monitors:
+        if m["text"] is not None:
+            _write(output_dir / m["file"], m["text"])
 
 
 def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:

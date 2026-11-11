@@ -820,12 +820,16 @@ class TestCodegen:
     def test_no_temporal_calls_generated(self, target, tmp_path):
         from cadl.codegen import generate
         generate(parse_file(EXAMPLE), tmp_path, target=target)
-        # The Python target monitors the items in norms_monitor.py, which
-        # carries them as data (tests/test_norms_monitor.py); its other
-        # modules leave them out like the other targets.
-        monitor = tmp_path / "norms_monitor.py"
-        assert monitor.exists() == (target == "python")
-        text = _generated_text(tmp_path, skip=("norms_monitor.py",))
+        # The norms monitor monitors the items and carries them as data:
+        # norms_monitor.py of the Python target (tests/test_norms_monitor.py),
+        # the monitor of each contract of the OPA and Solidity targets
+        # (tests/test_norms_monitor_targets.py). The other files leave them
+        # out.
+        monitors = {"python": "norms_monitor.py", "opa": "norms_monitor_delivery_sla.rego",
+                    "solidity": "DeliverySlaNormsMonitor.sol"}
+        for name in monitors.values():
+            assert (tmp_path / name).exists() == (monitors.get(target) == name)
+        text = _generated_text(tmp_path, skip=tuple(monitors.values()))
         # Only the comments that record the left-out items mention them.
         code_lines = [l for l in text.splitlines()
                       if _TEMPORAL_CALL.search(l) and "not generated" not in l]

@@ -182,6 +182,10 @@ cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
 # ある版から次の版への改正が規範に及ぼす効果
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
 
+# 1つの契約インスタンスの規範を、すべての振る舞いについて設計時に検査（PATH上にPRISMが必要）：
+# 違反されうる規範、衝突、行使されない権能を、証拠のトレースとともに報告
+cadl norms-check examples/norms_check_conflict.cadl --bindings i=1 --export /tmp/norms-check
+
 # 根拠付け拡張：契約ごとの情報共有の導出指標、権限集中の導出指標、インセンティブ被覆率
 cadl norms-indices examples/grounding_robot_delivery.cadl
 cadl norms-indices examples/grounding_robot_delivery.cadl --format json
@@ -261,6 +265,7 @@ Ethereumスマートコントラクト（`.sol`）を生成：
 - `RegimeController.sol` — enum型で運用モードを表す状態機械
 - メインオーケストレータコントラクト
 - 制度パラメータ（alpha, beta, lambda）をスケーリングされた `uint256` 定数として定義
+- `norms: 0.1` を宣言したファイルでは、契約ごとに規範のモニタ `<Contract>NormsMonitor.sol`（[後述](#生成したregoとsolidityの規範モニタ)）
 
 **OPA/Rego** (`--target opa`):
 
@@ -268,6 +273,7 @@ Open Policy Agentポリシー（`.rego`）を生成：
 - 各CADL `ContractDef` に対応するRegoパッケージ（`assumptions_hold`, `guarantees_hold`, `allow`, `violation` ルール）
 - 全契約を集約するメインポリシーパッケージ
 - 情報共有・権限ポリシールール
+- `norms: 0.1` を宣言したファイルでは、契約ごとに規範のモニタのステップ関数 `norms_monitor_<contract>.rego`（[後述](#生成したregoとsolidityの規範モニタ)）
 
 **Unity C#** (`--target unity-csharp`):
 
@@ -650,6 +656,23 @@ cadl norms-eval FILE --trace TRACE [--contract ID] [--format text|json]
 `examples/traces/` には `examples/norms_robot_delivery.cadl` 用のトレースが五つあります。すべての規範が履行される場合（a）、応答の不履行を障害報告で修復する場合（b）、両方とも不履行の場合（c）、配車係の停止により遅配が免責される場合（d）、再割当てにより義務が解除される場合（e）です。`norms_amendment_v1_to_v2.jsonl` は、`examples/norms_amendment_v1.cadl` のトレースで、障害報告の期限内に `examples/norms_amendment_v2.cadl` へ改正されます。
 
 `examples/norms_no_double_assignment.cadl` は、この契約に、ロボットについて限量した禁止を加えたものです。同じ配送を同時に2台のロボットに割り当ててはなりません（`exists j in ROBOT: exists k in ROBOT: j != k AND ROBOT[j].delivery == request.id AND ROBOT[k].delivery == request.id`）。トレースは、二重割当てがない場合（a、履行）、t=3に `ROBOT[3]` にも同じ配送が割り当てられる場合（b、t=3に違反）、同じロボットへの再割当て（c、履行）です。これらのトレースでは `N` に値がないので、定義域は開いています。名指された2台のロボットが配送を持てば内容は真になり、そうでない間は未定義で、違反にはなりません。
+### 規範の設計時の検査（モデル検査）
+
+`cadl norms-check FILE [--contract ID] [--bindings i=2] [--members ROBOT=2] [--step 1s] [--horizon N] [--export DIR] [--timeout SECONDS] [--require-checker] [--format text|json]` は、1つの契約インスタンスの規範をPRISM言語のマルコフ決定過程に変換し（付録F、F.12）、トレースがまだない段階で、インスタンスのすべての振る舞いについてPRISMに問います。環境は、各観測で、どのメッセージ事象が起こるか、各量の値のクラス（述語のリテラルが定義域を分けるクラスごとに1つの値と「値なし」）、インスタンスがそこで終わるかどうかを選びます。観測は `--step` ごと（既定は期限と区間の最大公約数）、最大で `--horizon` + 1個（既定は期限と区間から決めます）です。ステップごとに観測のあるトレースについて、モデルは厳密です。値のクラスは、量の値がその量と比べるリテラルと同じ型（数、真理値、または記号値とテキスト）であるか、値がないことを前提とします。ほかの型の値を持つトレース（数と比べる量にテキストを与えるもの）では、モデルで真になる述語が偽または未定義になりうるので、答えはそのようなトレースを扱いません。報告もこの前提を注記します。
+
+```bash
+cadl norms-check examples/norms_check_conflict.cadl --bindings i=1
+#  report_status / radio_silence: after 1 observation(s) keeping one violates the other
+#  apologise can be activated in a state from which every continuation violates it
+#  the power audit is never exercised
+```
+
+変換した規範ごとに、発効しうるか、違反されうるか、履行されうるか（インスタンスはどの観測でも終わりえます）、上限まで続くどのインスタンスでも違反されるか、発効するたびに守れるかを報告します。義務と禁止の組ごとに衝突するか（それぞれ単独ではまだ守れるのに、どの続きもどちらかに違反する状態に到達できるか）、権能ごとに行使されうるか、修復が発効しうるかも報告します。「可能」という答えには必ず証拠が付きます。証拠は `cadl norms-eval` の形式のトレースで、このコマンド自身が `cadl norms-eval` のエンジンで評価し、確認済みと示します（衝突には、それぞれの規範を守る2つの証拠があります）。`--export DIR` は、モデル（`<contract>.prism`）、性質（`-const early_end=true` で使う `<contract>_any.props` と、`early_end=false` で使う `<contract>_full.props`）、証拠（`witness_<norm>_<question>.jsonl`）を書き出します。JSONは `instance`、`model`、`norms[]`（問いごとに `answer` と、`trace`、`choices`、`confirmed` を持つ `witness`）、`conflicts[]`、`findings[]`、`unconfirmed[]`、`assumptions[]`、`rules[]`、`notes[]` を持ちます。
+
+変換するもの：メッセージ事象、counts-as規則、1つの量をリテラルと比べる述語（`==`、`!=`、`<`、`<=`、`>`、`>=`、`IN`、単独の真理値の量）と `AND`、`OR`、`NOT`、1つの `within` / `throughout` / `until` からなる内容、期限、`until:`、権能とその効果、修復、これらの形の `assume:` の項目。変換しないもの（理由を報告します）：限量子、集約、述語の中のワイルドカード参照、算術、2つの量の比較、`request`、`now`、`state`、改正、変換しない規範に依存するすべての規範。1,000を超える観測、16を超えるメッセージ事象、観測あたり8,192を超える選択、述語の1つのまとまりについて20,000を超える値のクラスの組合せは拒否します。ある観測の前の状態で、ある選択が規範を発効させ、発効させる選択がどれも、どの続きも規範に違反する状態に至るとき、その発効は守れません（期限0秒の修復がこれに当たります。メッセージを発動条件とする期限0秒の義務は、同じ観測で内容が起こりうるので守れます）。その証拠は、その観測でのすべての選択と、発効させる各選択にメッセージも値もない観測を続けたものを `cadl norms-eval` で確かめ、残りがモデル検査器の答えによることを報告に示します。時間は、モデルのコマンドの数（選択ごとに4つ）と到達可能な状態の数とともに増えます。メッセージ事象が12個（選択が4,096）の場合は10分を超えました。`--timeout SECONDS` はPRISMのすべての実行の時間の合計を制限し（既定は600）、超えたときは終了ステータス2で終わります。`--export` はPRISMを実行する前にモデルを書き出します。終了ステータスは、指摘がなければ0（PATH上にPRISMがない場合も0です。報告は何も検査しなかったことを示し、`--export` はモデルを書き出します。`--require-checker` を指定すると、PRISMがないときは2です）、指摘（衝突、一度も発効しない規範やどのインスタンスでも違反される規範、守れない発効、行使されない権能）があれば1、使い方の誤り、拒否、時間切れは2、証拠が `cadl norms-eval` で確認されなければ3（norms-checkの誤り）です。
+
+変換は `cadl norms-eval` と照合して試験しています。テストは、生成したPRISMのテキストを、それが使う部分を読む解釈器で、環境の選択のランダムな経路と、1つの契約について観測が2個以下のすべての経路について実行し、各観測の後の各規範の状態、判定、権能の行使、修復の発効を比べます（`CADL_NORMS_CHECK_PATHS` でランダムな経路の数を増やせます）。解釈器はPRISMのシミュレータが生成した経路と比べ、PRISMの答えは到達可能な状態についての明示的な不動点計算と比べています。
+
 ### 生成したPythonコードの規範モニタ
 
 `norms: 0.1` を宣言したファイルに対して、`cadl codegen -t python` は `norms_monitor.py` も出力します。一つの契約インスタンスをオンラインで監視するモニタです（付録F、F.5）。動作中のシステムが観測を一つずつ渡すと、規範の状態と四値の判定の変化を返します。`contracts.py` から外される、時相演算子を含む `assume:` / `guarantee:` の項目も判定します。
@@ -704,7 +727,26 @@ python -m robot_delivery_norms.norms_monitor TRACE.jsonl [--contract ID] [--form
 
 **ファイル中の文字列と数値。** モニタが `.cadl` ファイルから受け取るものはすべて `MODEL` にあります。`MODEL` は一つのJSONテキスト（ASCIIのみで、NaNやInfinityを含まない）で、Pythonの文字列リテラル一つに収め、`json.loads` で読みます。コードに文字列として埋め込むものはありません。有限でない数を含むモデルは生成しません（`cadl codegen` がその場所を報告し、何も書き出しません）。`1e999` のように桁あふれする数を含む述語は、`cadl` ではそもそも述語として扱わず、テキストのまま保持します。`cadl codegen` の入力検査は従来どおりファイル全体に適用するので、引用符、バックスラッシュ、制御文字を含む文字列は、何も生成しないうちに拒否します。
 
-SolidityとOPAのターゲットは規範を監視しません。時相演算子を含む項目を外し、そのことを警告で示します。
+### 生成したRegoとSolidityの規範モニタ
+
+`norms: 0.1` を宣言したファイルに対して、`cadl codegen -t opa` は契約ごとに `norms_monitor_<contract>.rego` を、`cadl codegen -t solidity` は `<Contract>NormsMonitor.sol` を出力します（仕様書の付録DとF.5）。規範、counts-as規則、`assume:` / `guarantee:` の項目を監視し、契約のポリシー（`<contract>.rego`、`<Contract>.sol`）が外す `within`・`throughout`・`until` を含む項目も判定します。各ステップは `cadl norms-eval` が実装するF.5の順序に従います。テストは、観測ごとに両者を `cadl norms-eval` のエンジンと比較します。
+
+**扱える範囲。** メッセージイベント（`[*]`・範囲・束縛した添字を持つアクターの指定、引数）、制度的イベント、F.5の三値の読み方による述語（アクターを書かない名前、`A[i].x`、`request.x`、`now`、`state`、比較、`+ - * /`、`IN`、`AND`、`OR`、`NOT`）、トリガ、`until:`、期限、回復義務、権能（`activate`、`suspend`、`resume`、`discharge`）、`if:` を持つcounts-as規則、入れ子を含む時相演算子を扱います。扱わないのは、述語の量化子、集約、ワイルドカードと範囲の参照、式の添字（`A[i+1]`）、改正（F.6。`amend` を持つ観測は拒否します）です。規範、counts-as規則、`assume:` の項目でこれらを使う契約にはモニタを生成せず、`cadl codegen` がその理由を警告で示します（ほかのファイルは生成します。そのような契約はpythonターゲットが監視します）。これらを使う `guarantee:` の項目は、ほかに影響しないので、警告を出したうえでモニタから外します。Solidityのモニタはさらに、`*` と `/`、小数点以下が6桁を超える数、時相演算子の中の時相演算子（区間を観測が届くたびに一度だけ走査するため）、生成時のコードがEIP-3860の49152バイトを超えるモニタ（生成したコンストラクタから見積もります）を拒否します。`guarantee:` の項目でこれらを使う場合は、その項目だけを外します。
+
+**Rego：ステップ関数。** OPAは状態を持たないので、ポリシーは直前の状態と一つの観測からモニタの次の状態を計算します。
+
+```bash
+echo '{"state": null, "observation": {"t": 0, "bindings": {"i": 2}}}' > input.json
+opa eval -d norms_monitor_delivery_sla.rego -i input.json 'data.cadl.norms_monitor.delivery_sla.result'
+```
+
+入力は `{"state": S, "observation": O}`（最初の観測では `S` はnullか省略。`O` は `cadl norms-eval` のトレースの1行）か、`{"state": S, "finish": true}`（最後の観測でインスタンスを終える。Pythonモニタの `end()`）です。最初の観測と並べて `bindings`、`request`、`quantities` を渡せます。`result` は `state`（ホストが保存し、次の観測とともに渡します）、`changes`（Pythonモニタの `observe()` と同じ形。`reason` はありません）、`violations`、`institutional_events`、`powers_exercised`、`unauthorised`、`verdicts`、`ended`、`next_deadline` を持ちます。拒否した観測では `error` と変わらない `state` を返します。状態は普通のJSONです（キーは付録Dにあります）。束縛、request、既知の名前、現在の値、ライフサイクルの状態、規範インスタンス（活性化、活性の時間、判定待ちの候補）、項目、時相演算子と判定待ちの候補がまだ読む観測のバッファ（それより古い観測は捨てます）を持ちます。契約はポリシーの中に一つのJSONテキスト（`model`、`json.unmarshal` で読みます）として入り、述語はリテラルをJSON文字列で書いたRegoの関数になるので、`.cadl` ファイルのテキストがRegoのコードになることはありません。
+
+**Solidity：状態を持つコントラクト。** コンストラクタは報告者のアドレスを受け取ります（`address(0)` ならデプロイした者）。`begin(bindings, request, quantities)`（省略可。最初の観測の前）、`observe(t, values, messages, hasState, state, end)`、`addQuantities(names)`、`finish()` でインスタンスを記録でき、これらを呼べるのは報告者だけです。`verdicts()`（`normIds()` の順）、`ok()`、`nextDeadline()`、`contractId()`、`observations()`、`lastT()`、`ended()`、`ignored()` とイベント `NormChanged`、`ItemChanged`、`Violation`、`InstitutionalEvent`、`PowerExercised`、`Unauthorised` で結果を返します。形の正しくない観測はrevertするので、コントラクトは元のままです。時刻 `t` を含む数は小数点以下6桁の固定小数点数です（`int256` に10**6を掛けた値）。`t` は引数なので記録したトレースを再生でき、運用では `block.timestamp * 10**6` を渡すこともできます。値は `(name, kind, n, s)` で、kindは0（null）、2（真偽値）、3（数）、4（文字列）です。ファイルには、基底コントラクト（コンストラクタがデータとして格納する契約を解釈するもの。テキストは16進リテラル）と、別にデプロイしてリンクする二つのライブラリ `CadlNormsValues` と `CadlNormsEval` が入ります。こうしてそれぞれの実行時コードをEIP-170の上限24 KB未満に収めています。観測一つにかかるガスは、それより前の観測の数とともには増えません。時相演算子の区間は一度だけ走査し、値は二分探索で探し、後のステップが読まない値は新しい値一つにつき数個ずつ削除します。テストでは、例の観測一つに、1秒に一つの観測を320個与えたとき、仮定の300秒の区間が開いている間もその後も約6.4 × 10^5のガスを使います。最も大きいテストの契約では、観測一つに3 × 10^4から3.3 × 10^6（中央値1.3 × 10^6）のガスを使います。内容に時相演算子を持つ規範では、内容の区間が終わる前の観測一つごとに、区間が終わるまでの各観測のガスが約4 × 10^4増えます（1秒に一つの観測で内容が `throughout(1000s, …)` のとき、320個目の観測で1.3 × 10^7）。`cadl codegen` はそのような規範を警告で示します。そのような観測の数はブロックのガス上限より十分小さく保ってください。観測のガスが上限に達したモニターは、それ以降の観測を記録できず、元に戻りません。報告者の鍵を失った場合も同じです。時相演算子の中で読むアクターを付けない名前が量であるとき（`throughout(10s, A.s == flag)` の `flag`）は、`begin` で与えるか最初の観測で観測してください。走査は読んだ値を保持するので、後からその名前を既知にする `observe` と `addQuantities` はrevertします。コンパイルにはsolc 0.8.24以降と `--optimize --optimize-runs 1` を使います（ファイルの先頭にも書いてあります。オプティマイザを使わないと実行時コードがEIP-170の上限を超えます）。
+
+**`cadl norms-eval` との違い。** Pythonモニタと同じく、期限切れは期限の後の最初の観測で検出し、インスタンスは `finish` かインスタンスを終える観測で終わり、アクターを書かない量の名前は `quantities` とそれまでの観測から得ます。算術は十進（OPA）または固定小数点（Solidity）で、`cadl norms-eval` は二進の浮動小数点を使います。そのため `0.1 + 0.2 == 0.3` はモニタでは成り立ち、`cadl norms-eval` では成り立ちません。整数では一致します。時刻は厳密に計算します（Regoは十進数で許容誤差1e-9秒、Solidityはマイクロ秒）。`cadl norms-eval` は浮動小数点数で比べ、小数部を持つエポック秒では数の間隔が許容誤差より大きいので、観測からその間隔以内で終わる期限の判定が異なることがあります。束縛は小数部を持たない整数（`1.0` は拒否します）か文字列、`values` の値はnull・真偽値・数・文字列でなければなりません（リストは `request` でも拒否します。空白だけが違う `values` の二つのキーも拒否します）。Solidityのモニタは、requestを葉の形（`"a.b"`）で、値の名前をASCIIで受け取ります。Regoのモニタは与えられた状態を信頼します（形式と契約だけを検査します）。ホストは保存した状態を改変されないように保ってください。`cadl norms-eval` の理由、警告、タイムラインは返しません。
+
+テスト（`tests/test_norms_monitor_targets.py`）は、Regoを `opa eval` で、SolidityをEVM（eth-testerとpy-evm。`CADL_EVM_PYTHON` で指定する別のPython。solcは `CADL_SOLC`、PATH、`~/.solcx` から）で実行し、入っていないものは飛ばします。サンプルのトレース、`tests/test_norms_eval.py` のトレース（OPA）、ランダムなトレースについて、観測ごとに、各規範の状態と判定、項目、違反、制度的イベント、権限のない行為を比較します。ランダムなトレースの数は `CADL_NORMS_TARGET_TRACES` で変えられます。文字列リテラルやコメントを終わらせる文字を含むファイルの文字列がデータのままであることも確かめます。
 
 ### 制度パラメータの根拠付け（grounding 0.1）
 
@@ -950,6 +992,7 @@ src/cadl/
   iec62853.py          IEC 62853を参考にした要約
   unparse.py           式ASTをCADLのソーステキストに戻す
   norms_eval.py        記録済みトレースに対する規範拡張の判定
+  norms_check.py       規範の設計時の検査：PRISMへの変換、問い、証拠
   agents_runtime.py    エージェントガバナンス拡張のランタイム：トレース上の判定、保留、委任、監査記録。オフラインまたは1行ずつ
   audit_log.py         監査ログのハッシュ連鎖（SHA-256またはHMAC-SHA256）とその検証（`cadl audit-verify`）
   gateway_core.py      ゲートウェイに共通の部分：判定点、トレース、監査ログ、保留、受け箱、`mcp-approve`、`mcp-message`
@@ -971,12 +1014,17 @@ src/cadl/
     runtime_gen.py     オーケストレータ生成
     norms_monitor_gen.py       規範モニタ生成（Pythonターゲットの norms_monitor.py）
     norms_monitor_template.py  生成する規範モニタに写すテキスト（インポートしない）
+    norms_ir.py        契約の規範をデータにしたもの（OPAとSolidityのモニタ用）
     solidity/
       solidity_expr.py 式AST → Solidityソース変換
       solidity_gen.py  Solidityスマートコントラクト生成
+      norms_monitor_sol.py    Solidityターゲットの規範モニタ
+      norms_monitor_base.sol  その基底コントラクトとライブラリ（そのまま写す）
     opa/
       rego_expr.py     式AST → Regoソース変換
       rego_gen.py      OPA/Regoポリシー生成
+      norms_monitor_rego.py   OPAターゲットの規範モニタ
+      norms_monitor_lib.rego  そのステップ関数（そのまま写す）
     agent_policy/
       rego_gen.py      境界ポリシーのRego生成（agents 0.1）
       cedar_gen.py     境界ポリシーのCedar生成と付随する表（agents 0.1）
@@ -1019,11 +1067,16 @@ tests/
   test_expr_parser.py    式文法のテスト
   test_unparse.py        式の往復変換テスト
   test_norms_eval.py     トレースに対する規範の判定（`cadl norms-eval`）
+  test_norms_check.py    規範の設計時の検査と差分テスト（`cadl norms-check`）
   test_grounding_extension.py  根拠付け拡張：指標、規則、IR、`cadl norms-indices`
   test_grounding_sos.py  根拠付け拡張：すべての契約の上のSoSの量
   test_norms_wildcards.py 述語の中のワイルドカード参照と範囲参照（F.5）：書き換え、限量子の形との一致、N-15
   test_norms_monitor.py  生成した規範モニタと `cadl norms-eval` の比較（サンプル、記録したケース、ランダムなトレース）
   norms_monitor_cases.py そのために test_norms_eval.py のケースを記録するpytestプラグイン
+  test_norms_monitor_targets.py  OPAとSolidityのターゲットの規範モニタと `cadl norms-eval` の比較
+  norms_targets_support.py       その参照、OPAのドライバ、EVM用の変換
+  norms_evm_driver.py            SolidityのモニタをEVMで実行する（別のPython。cadlを使わない）
+  conftest.py                    test_norms_eval.py のケースをセッションごとに一度記録する
   test_name_resolution.py 生成コードでのアクター／状態変数の解決
   test_method_dispatch.py 検証メソッドの振り分けテスト
   test_codegen_safety.py コード生成の入力安全性テスト
@@ -1077,7 +1130,9 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | シミュレータIR・設定生成（Python, Unity, Go） | 利用可能 |
 | SoS-DSL拡張（`lifecycle:` / `monitors:`）とUnity C#生成 | 利用可能 |
 | 規範拡張：静的検査と、記録済みトレースに対する判定と改正（`cadl norms-eval`、`cadl norms-diff`） | 利用可能 |
-| 規範拡張：生成したPythonパッケージのオンラインモニタ（`norms_monitor.py`） | 利用可能（Solidity・OPA・Unity C#は規範を監視しない。モデル検査器への変換は未実装） |
+| 規範拡張：生成したPythonパッケージのオンラインモニタ（`norms_monitor.py`） | 利用可能 |
+| 規範拡張：生成したRego（ステップ関数）とSolidityのモニタ | 量化子、集約、ワイルドカード参照、改正を除いて利用可能（生成時に警告して拒否する）。Unity C#は規範を監視しない |
+| 規範拡張：PRISMによる1つの契約インスタンスの設計時の検査（`cadl norms-check`） | 利用可能（限量子を含む述語、複数のインスタンス、改正は変換しない） |
 | 根拠付け拡張（grounding 0.1）の規範側：導出指標とインセンティブ被覆率（`cadl norms-indices`）、規則J-1からJ-9、IR、二つの版の比較（`cadl norms-diff` のJ-13） | 利用可能 |
 | 戦略モデル拡張（games 0.1）：均衡検査と保証付きの均衡マップ（`cadl game-check`）、付録Jの規範との結び付け（`sanction_of:` / `reward_of:`、J-10からJ-12、J-14） | 利用可能（PRISM-games向けの出力はPRISM-gamesで実行していない） |
 | エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、ハッシュ連鎖つきの監査記録。`cadl agents-run`、`cadl audit-verify`）、MCPのstdioゲートウェイ（`cadl mcp-gateway`）、JSON-RPCによるA2Aゲートウェイ（`cadl a2a-gateway`）、Rego / Cedarの境界ポリシー | 利用可能（ゲートウェイは参照実装で、偽のサーバ、エージェント、クライアントでのみ試験している） |
