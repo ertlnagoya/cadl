@@ -33,12 +33,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 - `cadl mcp-approve` refuses a published hold whose shown arguments do
   not have the SHA-256 it names, and, without `--hold-key`, a hold that
-  the gateway signed.
+  the gateway signed. With `--require-signed-hold`, or when `run.json` of
+  the inbox says `holds_signed`, it refuses an unsigned hold. It shows the
+  arguments with every invisible character escaped (controls,
+  bidirectional overrides, zero-width and other format characters,
+  private use, surrogates, unassigned code points, line and paragraph
+  separators).
+- `cadl a2a-gateway` refuses a hold key that is a client key.
 - `cadl a2a-gateway` answers a connection beyond the cap of its address
   with HTTP 503 (it was closed without an answer), and keeps the read
   deadlines of all connections in one thread.
 
 ### Fixed
+- A relayed stream kept its place among the requests handled at the same
+  time after its client had gone, while the agent sent nothing or only
+  comments; the gateway now watches the client while the agent is silent
+  and ends the stream and the request to the agent. A plain JSON answer
+  to a streamed request is read with the size cap and strict UTF-8.
 - An approval rule whose receiver is an index variable (`A[i]`) took the
   first member of the set; it now takes the receiver from the bindings of
   the contract instance of the hold's grounds.
