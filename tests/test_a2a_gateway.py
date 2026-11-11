@@ -1191,7 +1191,8 @@ class TestThirdReview:
         handler slots and ten slow connections, an authenticated client is
         served at once, and the slow connections are closed at the read
         deadline."""
-        r = Run(tmp_path, extra=("--max-handlers", "2", "--read-timeout", "1"))
+        r = Run(tmp_path, extra=("--max-handlers", "2", "--read-timeout", "1",
+                                 "--max-readers-per-address", "64"))
         socks = _slow(r.client.port, 10)
         time.sleep(0.2)
         body = r.call("PLANNER", "SendMessage", params("summarize"))
@@ -1206,10 +1207,11 @@ class TestThirdReview:
         capsys.readouterr()
 
     def test_reader_cap_and_trickle(self, tmp_path, capsys):
-        """More slow connections than readers: the next connection gets 503
-        at once; a slow connection that keeps sending a byte now and then is
+        """More slow connections than readers: the next connection waits a
+        second for a reader slot and gets 503; a slow connection that keeps sending a byte now and then is
         still closed at the deadline, and the client is served after it."""
-        r = Run(tmp_path, extra=("--max-readers", "3", "--read-timeout", "1"))
+        r = Run(tmp_path, extra=("--max-readers", "3", "--read-timeout", "3",
+                                 "--max-readers-per-address", "64"))
         socks = _slow(r.client.port, 3)
         time.sleep(0.2)
         status, _, _ = r.client.post("PLANNER", rpc("SendMessage", params("summarize")))
@@ -1232,19 +1234,85 @@ class TestThirdReview:
         r.replay_check()
         capsys.readouterr()
 
-    def test_held_requests_per_actor(self, tmp_path, capsys):
-        r = Run(tmp_path, extra=("--max-held-per-actor", "1"))
+    def test_handlers_per_actor(self, tmp_path, capsys):
+        """One actor uses at most --max-handlers-per-actor slots (a held
+        blocking request keeps its slot); other actors are served."""
+        r = Run(tmp_path, extra=("--max-handlers-per-actor", "1"))
         fut = r.later("PLANNER", "SendMessage", params("publish"))
         r.wait_hold("h-1")
-        status, _, _ = r.client.post("PLANNER", rpc("SendMessage", params("publish"), 2))
+        status, _, _ = r.client.post("PLANNER", rpc("SendMessage", params("summarize"), 2))
         assert status == 503                         # refused before a decision
-        body = r.call("PLANNER", "SendMessage", params("publish", returnImmediately=True), 3)
-        assert state(body) == "TASK_STATE_SUBMITTED"   # not a blocking request
+        body = r.call("OPERATOR", "SendMessage", params("translate"), 3)
+        assert body["result"]["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
         r.approve("h-1", "reject")
-        r.approve("h-2", "reject")
         assert state(fut.result(timeout=30)) == "TASK_STATE_REJECTED"
+        assert r.call("PLANNER", "SendMessage", params("summarize"), 4)["result"]["task"]
         r.stop()
-        assert _events(r.audit, "overloaded") == ["held_per_actor PLANNER"]
-        result = r.replay_check()
-        assert [h["hold_id"] for h in result["holds"]] == ["h-1", "h-2"]
+        assert _events(r.audit, "overloaded") == ["handlers_per_actor PLANNER"]
+        assert r.agent.sent() == ["translate", "summarize"]
+        r.replay_check()
         capsys.readouterr()
+
+    def test_holds_per_actor(self, tmp_path):
+        """Holds of returnImmediately requests count too: beyond
+        --max-holds-per-actor the actor gets 503 before any decision."""
+        loc = Local(tmp_path, max_holds_per_actor=2)
+        for i in (1, 2):
+            reply = loc.post(rpc("SendMessage", params("publish", returnImmediately=True), i))
+            assert reply.body["result"]["task"]["status"]["state"] == "TASK_STATE_SUBMITTED"
+        reply = loc.post(rpc("SendMessage", params("publish", returnImmediately=True), 3))
+        assert reply.status == 503
+        assert loc.post(rpc("SendMessage", params("summarize"), 4)).status == 503
+        assert loc.post(rpc("SendMessage", params("translate"), 5),
+                        actor="OPERATOR").status == 200
+        assert len(loc.gw.held) == 2 and len(loc.gw.runtime.steps) == 3
+        assert _events(loc.audit, "overloaded") == ["holds_per_actor PLANNER"] * 2
+        loc.stop_and_replay()
+
+    def test_reconnecting_peer_of_one_address(self, tmp_path):
+        """Sixteen threads of one address that reconnect whenever the gateway
+        closes them hold at most four reader slots; the clients of other
+        addresses are served. (All connections come from 127.0.0.1, so the
+        test names the attacker's address by its source ports.)"""
+        import threading
+        from cadl.a2a_gateway import _Server
+        loc = Local(tmp_path)
+        loc.gw.clock = time.monotonic
+        loc.gw.t0 = time.monotonic()
+        attacker_ports: set = set()
+        srv = _Server(("127.0.0.1", 0), loc.gw, socket.AF_INET, max_readers=8,
+                      read_timeout=1.0)
+        srv.peer_key = lambda addr: "attacker" if addr[1] in attacker_ports else addr
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        stop = threading.Event()
+
+        def attacker():
+            while not stop.is_set():
+                try:
+                    s = socket.socket()
+                    s.bind(("127.0.0.1", 0))
+                    attacker_ports.add(s.getsockname()[1])
+                    s.connect(("127.0.0.1", port))
+                    s.sendall(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n")
+                    s.settimeout(3)
+                    s.recv(1)
+                    s.close()
+                except OSError:
+                    pass
+
+        threads = [threading.Thread(target=attacker, daemon=True) for _ in range(16)]
+        for t in threads:
+            t.start()
+        time.sleep(0.5)
+        client = Client(port, loc.gw.run_id)
+        statuses = [client.post("PLANNER", rpc("SendMessage", params("summarize"), i))[0]
+                    for i in range(20)]
+        stop.set()
+        for t in threads:
+            t.join(timeout=10)
+        srv.shutdown()
+        srv.server_close()
+        assert statuses == [200] * 20
+        assert "address" in _events(loc.audit, "overloaded")
+        loc.stop_and_replay()

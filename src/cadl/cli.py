@@ -247,9 +247,16 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--max-readers", type=int, default=64, metavar="N",
                          help="Connections whose request is being read at the same time, "
                               "before authentication (default 64); beyond that 503")
-    a2a_cmd.add_argument("--max-held-per-actor", type=int, default=16, metavar="N",
-                         help="Held blocking requests of one actor (default 16); a "
-                              "further blocking SendMessage gets 503 before its decision")
+    a2a_cmd.add_argument("--max-readers-per-address", type=int, default=4, metavar="N",
+                         help="Of those, connections of one remote address (default 4); "
+                              "beyond that the connection is closed at once")
+    a2a_cmd.add_argument("--max-handlers-per-actor", type=int, default=16, metavar="N",
+                         help="Authenticated requests of one actor handled at the same "
+                              "time, held blocking requests included (default 16); "
+                              "beyond that 503")
+    a2a_cmd.add_argument("--max-holds-per-actor", type=int, default=64, metavar="N",
+                         help="Holds of one actor, blocking or not (default 64); a further "
+                              "SendMessage of that actor gets 503 before its decision")
     a2a_cmd.add_argument("--read-timeout", type=float, default=10.0, metavar="SECONDS",
                          help="Time to read the request line, the headers and the body "
                               "of a request (default 10)")

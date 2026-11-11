@@ -126,12 +126,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `--read-timeout` (10 s) in all (`read_timeout`); at most `--max-readers`
   (64) connections are read before authentication; a `--max-handlers`
   slot is taken only after authentication; one actor may hold at most
-  `--max-held-per-actor` (16) blocking requests. Slow unauthenticated
+  16 blocking requests (later `--max-handlers-per-actor`). Slow unauthenticated
   connections could otherwise lock out every client. Approval rules with
   a set, range or index-variable receiver resolve to the gateway's
   actor, then (MCP) its client, then the first declared member, so files
   that 0.3.24 accepted start again; only an escalation without any
   approval rule is refused. The nonce cap is per actor.
+- Fourth review of `cadl a2a-gateway`. Peers of one address that
+  reconnected at once kept every reader busy: at most
+  `--max-readers-per-address` (4) connections of one address are read at
+  once (more are closed at once), and a connection waits up to one second
+  for a reader before 503. One actor uses at most
+  `--max-handlers-per-actor` (16) handlers, which replaces
+  `--max-held-per-actor` and also covers requests to a slow agent, and
+  has at most `--max-holds-per-actor` (64) holds, `returnImmediately`
+  included (503 before the decision, `overloaded`).
 
 ### Changed
 - The audit file of `cadl agents-run --audit` has a header line, an end
