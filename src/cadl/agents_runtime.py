@@ -448,8 +448,36 @@ class _BoundaryEngine(_Engine):
     # --- hooks ----------------------------------------------------------------
 
     def _counts_as(self, n: int) -> list[dict]:
+        # A rule with a message `when:` and an `if:`: the message is a
+        # one-off. When it arrives while the `if:` has no value, no event
+        # is created and none will be: there is no flag to hold unknown.
+        # Say so when the event would bring a prohibition into force or
+        # end a permission.
+        for rule, when, cond in self.rules:
+            if cond is None or cond.error or when.error or when.kind != "message":
+                continue
+            if rule.creates not in self.blocking_events():
+                continue
+            if when.matching_messages(n) and self.undefined(cond, n):
+                names = ", ".join(self.missing(cond, n)) or "a quantity it reads"
+                self.ev.warn(
+                    f"the message '{when.text}' arrived while the if: '{cond.text}' of "
+                    f"the counts_as rule that creates '{rule.creates}' had no value "
+                    f"({names} has no value yet): the event is not created, and the "
+                    f"norms that it would block are not affected (a known limit, G.13)")
         self.created = super()._counts_as(n)
         return self.created
+
+    def blocking_events(self) -> set[str]:
+        """The institutional events that are the trigger of a prohibition
+        or the `until:` of a permission."""
+        out = set()
+        for norm in self.norms:
+            term = norm.trigger if norm.d.kind == "prohibition" else (
+                norm.until if norm.d.kind == "permission" else None)
+            if term is not None and term.kind == "event":
+                out.add(term.text)
+        return out
 
     def _powers(self, n: int, created: list[dict]) -> None:
         self.owner._after_step1(self.inst, n, created)        # G.6, "after step 1"
@@ -513,6 +541,29 @@ class _BoundaryEngine(_Engine):
                     and norm.until.occurs(n, self.created)):
                 k["on"] = False
 
+    def sources(self, term) -> list:
+        """The predicates on which the occurrence of a trigger or an
+        `until:` depends: the term itself when it is a predicate; when it
+        is an institutional event, the `when:` (and `if:`) of every
+        `counts_as:` rule that creates the event from a predicate. A rule
+        with a message `when:` is a one-off and is not a source."""
+        if term is None or term.error:
+            return []
+        if term.kind == "predicate":
+            return [term]
+        if term.kind != "event":
+            return []
+        out = []
+        for rule, when, cond in self.rules:
+            if rule.creates == term.text and when.kind == "predicate" and not when.error:
+                out.append(when)
+                if cond is not None and not cond.error:
+                    out.append(cond)
+        return out
+
+    def undefined_sources(self, term, n: int) -> list:
+        return [t for t in self.sources(term) if self.undefined(t, n)]
+
     def undefined(self, term, n: int) -> bool:
         """Whether a predicate has no value at observation n because a
         quantity it reads has none (F.5: undefined)."""
@@ -565,16 +616,19 @@ class _BoundaryEngine(_Engine):
         # point cannot determine the flag. Nothing is latched: the state of
         # the norm is not changed.
         kind, last = norm.d.kind, len(self.obs) - 1
+        key, term = None, None
         if kind == "prohibition" and norm.state == "inactive":
-            if self.undefined(norm.trigger, last):
-                self.pending[nid] = ("trigger", norm.trigger.text,
-                                     self.missing(norm.trigger, last))
-                return None
-        if kind == "permission" and norm.state == "active":
-            if self.undefined(norm.until, last):
-                self.pending[nid] = ("until", norm.until.text,
-                                     self.missing(norm.until, last))
-                return None
+            key, term = "trigger", norm.trigger
+        elif kind == "permission" and norm.state == "active":
+            key, term = "until", norm.until
+        open_ = self.undefined_sources(term, last) if term is not None else []
+        if open_:
+            text = f"'{term.text}'" if term.kind == "predicate" else (
+                f"'{term.text}' (an event that the counts_as rule with "
+                f"'{open_[0].text}' creates)")
+            names = [q for t in open_ for q in self.missing(t, last)]
+            self.pending[nid] = (key, text, list(dict.fromkeys(names)))
+            return None
         if norm.state == "active":
             return True
         if norm.d.kind == "prohibition" and norm.state == "violated":
@@ -631,6 +685,7 @@ class AgentsRuntime:
         self._snapshot: dict[str, Any] = {}
         self._lineno = 0
         self._checked: set[str] = set()
+        self._warned_missing: set[tuple] = set()
         # Names that predicates of the enforced contracts use as values,
         # and the names that have had a value so far: for the warning about
         # a name whose first value comes after a decision.
@@ -1023,11 +1078,12 @@ class AgentsRuntime:
                               else "the permission does not apply")
                     warning = (
                         f"{c['id']}/{inst.name}: a message was decided while the {key}: "
-                        f"'{text}' of the {kind} '{nid}' had no value "
+                        f"{text} of the {kind} '{nid}' had no value "
                         f"({', '.join(names) or 'a quantity it reads'} has no value yet); "
                         f"the flag is unknown and {effect} (G.5). Give initial values on "
                         f"the first line")
-                    if warning not in self.warnings:
+                    if (inst.key, nid) not in self._warned_missing:    # once per norm
+                        self._warned_missing.add((inst.key, nid))
                         self.warnings.append(warning)
                 derived = [{"norm": d.norm, "holder": d.holder, "chain": list(d.chain)}
                            for nid in c["delegations"]
