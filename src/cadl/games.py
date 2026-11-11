@@ -52,6 +52,10 @@ GROUNDING_EXTENSION = ("grounding", "0.1")
 GAME_MODEL_KEYS = ("players", "profiles", "compliance", "payoffs", "equilibria")
 # I.1: reserved for a later version (I-11).
 RESERVED_GAME_MODEL_KEYS = ("mediator", "observations")
+# The values of `concept:` of an entry of `equilibria:` (I.7, I.8) and the
+# ones reserved for a later version (I.1).
+CONCEPTS = ("nash", "every_reachable_state")
+RESERVED_CONCEPTS = ("subgame_perfect", "correlated")
 # Keys of a payoff term that Appendix J defines (I-7, J.7).
 GROUNDED_TERM_KEYS = ("sanction_of", "reward_of")
 
@@ -156,6 +160,7 @@ class EquilibriumQuery:
     epsilon: Fraction = Fraction(0)
     over: dict = field(default_factory=dict)        # parameter -> (lo, hi); empty: a check
     resolution: Fraction | None = None
+    concept: str = "nash"                           # nash | every_reachable_state
 
     @property
     def is_map(self) -> bool:
@@ -303,9 +308,11 @@ class _GameAnalyser(_Analyser):
                           f"later version (I.1) and is given no meaning", "I-11")
         entries = self.raw.get("equilibria")
         for i, e in enumerate(entries if isinstance(entries, list) else [], start=1):
-            if isinstance(e, dict) and "concept" in e:
-                self.info(f"'concept' of entry {i} of model.equilibria is reserved for a "
-                          f"later version (I.1) and is not interpreted", "I-11")
+            concept = e.get("concept") if isinstance(e, dict) else None
+            if isinstance(concept, str) and concept in RESERVED_CONCEPTS:
+                self.info(f"the concept '{concept}' of entry {i} of model.equilibria is "
+                          f"reserved for a later version (I.1) and is given no meaning",
+                          "I-11")
 
     # -- I-2 --
     def check_structure(self) -> None:
@@ -751,6 +758,12 @@ class _GameAnalyser(_Analyser):
                                f"must be a finite number that is not negative", "I-9")
                 else:
                     q.epsilon = eps
+            if d.get("concept") is not None:
+                if isinstance(d["concept"], str) and d["concept"] in CONCEPTS:
+                    q.concept = d["concept"]
+                else:
+                    self.error(f"'concept' of {where} is '{_as_text(d['concept'])}'; it "
+                               f"must be one of {', '.join(CONCEPTS)}", "I-9")
             if "over" in d and d["over"] is not None:
                 self.check_over(d["over"], q, where, assigned)
                 q.resolution = Fraction(1, 20)
@@ -1102,6 +1115,7 @@ def game_to_ir(model: Model) -> dict:
             "over": ({k: [_json_number(lo), _json_number(hi)] for k, (lo, hi) in q.over.items()}
                      if q.is_map else None),
             "resolution": _json_number(q.resolution) if q.is_map else None,
+            "concept": q.concept,
         }
         for q in model.equilibria
     ]

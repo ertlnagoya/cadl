@@ -1,0 +1,41 @@
+# A state that only the player's own deviation reaches, with probability p.
+# The profile (stay; bad) is a Nash equilibrium for every p in [0, 1], and an
+# equilibrium from every reachable state only at p = 0: for p > 0 the state
+# loc = 1 is in Reach_A, and there A gains 5 by choosing ok instead of bad.
+sos:
+  name: "Detour"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+    - games: 0.1
+  actors:
+    - { id: X, role: "x" }
+  model:
+    kind: smg
+    parameters:
+      - { id: p, range: [0, 1], value: 0.5 }
+    variables:
+      - { id: loc, type: "[0..2]", init: 0 }
+    players:
+      - { id: A, actors: [X] }
+    commands:
+      - { action: stay,   owner: A, guard: "loc == 0", updates: [ { set: { loc: 2 } } ] }
+      - { action: detour, owner: A, guard: "loc == 0",
+          updates: [ { prob: "p", set: { loc: 1 } }, { prob: rest, set: { loc: 2 } } ] }
+      - { action: bad,    owner: A, guard: "loc == 1", updates: [ { set: { loc: 2 } } ] }
+      - { action: ok,     owner: A, guard: "loc == 1", updates: [ { set: { loc: 2 } } ] }
+    rewards:
+      - { id: rbad, items: [ { action: bad, value: 1 } ] }
+    profiles:
+      s: [ { choose: stay }, { choose: bad } ]
+    compliance: s
+    payoffs:
+      - player: A
+        until: "loc == 2"
+        terms:
+          - { reward: rbad, weight: -5 }
+    equilibria:
+      - { id: nash_check }
+      - { id: every_check, concept: every_reachable_state }
+      - { id: nash_map, over: { p: [0, 1] }, resolution: 0.05 }
+      - { id: every_map, concept: every_reachable_state, over: { p: [0, 1] }, resolution: 0.05 }

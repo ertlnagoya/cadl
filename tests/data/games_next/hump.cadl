@@ -1,0 +1,36 @@
+# The file of tests/data/games_link/hump.cadl without norms and grounding
+# (games 0.1 only): the end-point certification of I.9 must refuse it.
+sos:
+  name: "T"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+    - games: 0.1
+  actors:
+    - { id: X, role: "x" }
+    - { id: Y, role: "y" }
+  model:
+    kind: smg
+    parameters:
+      - { id: lam, range: [0, 1], value: 0.5 }
+      - { id: q, range: [0, 1], value: 0.5 }
+    variables:
+      - { id: loc, type: "[0..1]", init: 0 }
+    players:
+      - { id: A, actors: [X] }
+    commands:
+      - { action: good, owner: A, guard: "loc == 0", updates: [ { set: { loc: 1 } } ] }
+      - { action: bad,  owner: A, guard: "loc == 0", updates: [ { set: { loc: 1 } } ] }
+    rewards:
+      - { id: rg, items: [ { action: good, value: 1 } ] }
+      - { id: rb, items: [ { action: bad, value: 1 } ] }
+    profiles:
+      s: [ { choose: good } ]
+    compliance: s
+    payoffs:
+      - player: A
+        until: "loc == 1"
+        terms:
+          - { reward: rb, weight: "-0.5 + 4 * lam - 4 * lam * lam" }
+    equilibria:
+      - { id: mp, over: { lam: [0, 1] }, resolution: 0.01 }

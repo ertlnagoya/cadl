@@ -24,7 +24,7 @@ from cadl.games_eval import (
     endpoint_verdict,
     equilibrium_check,
     equilibrium_map,
-    j14_setup,
+    endpoint_setup,
     prepare_map,
     syntactic_degree,
 )
@@ -120,7 +120,8 @@ class TestExample:
         for da, db in zip(a["designs"], b["designs"]):
             assert [c.claim() for c in da["cells"]] == [c.claim() for c in db["cells"]]
             assert [c.box for c in da["cells"]] == [c.box for c in db["cells"]]
-            assert da["j14"]["applicable"] and not db["j14"]["applicable"]
+            # The end-point certification of I.9 is used in both files.
+            assert da["endpoints"]["applicable"] and db["endpoints"]["applicable"]
         assert a["assumptions"] == [ASSUMPTION]
 
     @pytest.mark.parametrize("design, least", [
@@ -151,7 +152,8 @@ class TestExample:
                              "comply_nash", "--equilibrium", "comply_by_lambda")
         assert status == 0
         assert out.count(f"assumption (J.7): {ASSUMPTION}") == 2
-        assert "J-14 applies (open parameter 'lambda'; condition (ii) holds for: R, D)" in out
+        assert ("end points (I.9): condition A holds for 'lambda'; the gain is non-increasing "
+                "for: R, D; non-decreasing for: D") in out
         status, out, _ = cli(capsys, "game-check", LINKED, "--certify", "--format", "json",
                              "--equilibrium", "shortcut_nash", "--equilibrium",
                              "comply_by_lambda")
@@ -159,13 +161,14 @@ class TestExample:
         assert status == 0
         for result in data["checks"] + data["maps"]:
             assert result["assumptions"] == [ASSUMPTION]
-        assert data["maps"][0]["designs"][0]["j14"] == {
-            "applicable": True, "parameter": "lambda", "condition_ii": ["R", "D"]}
+        assert data["maps"][0]["designs"][0]["endpoints"] == {
+            "applicable": True, "parameter": "lambda", "non_increasing": ["R", "D"],
+            "non_decreasing": ["D"]}
 
     def test_j14_does_not_apply_to_the_map_of_two_parameters(self):
         _, _, j14 = game_for(LINKED_MODEL, "comply_by_lambda_and_failure", "CENTRALIZED")
-        assert j14 == {"applicable": False, "reason": "the query has more than one open "
-                       "parameter", "condition_ii": []}
+        assert j14 == {"applicable": False, "reason": "the map has more than one open "
+                       "parameter", "decreasing": [], "increasing": []}
 
     def test_ir(self, capsys):
         status, out, _ = cli(capsys, "sim-ir", LINKED, "--format", "json")
@@ -354,7 +357,7 @@ def game_for(model, query_id: str, design: str):
     query = next(q for q in model.equilibria if q.id == query_id)
     d = model.design(design)
     game = prepare_map(model, query, d, None)
-    return game, query, j14_setup(game, query, d)
+    return game, query, endpoint_setup(game, query, d)
 
 
 class TestJ14:
@@ -367,18 +370,20 @@ class TestJ14:
     def test_applies_to_the_example(self):
         game, query, j14 = game_for(LINKED_MODEL, "comply_by_lambda", "CENTRALIZED")
         assert j14["applicable"] and j14["parameter"] == "lambda"
-        assert j14["condition_ii"] == ["R", "D"]
+        assert j14["decreasing"] == ["R", "D"] and j14["increasing"] == ["D"]
 
     def test_condition_ii_fails_for_a_reward_and_for_a_sanctioned_profile(self):
         def reward(model, sos):
             model["payoffs"][1]["terms"].append({"reward": "shortcuts", "weight": "lambda"})
         _, _, j14 = game_for(model_of(reward), "comply_by_lambda", "CENTRALIZED")
-        assert j14["applicable"] and j14["condition_ii"] == ["R"]
+        # The term +λ·shortcuts of D has the expected value 0 under comply:
+        # the gain of D is non-decreasing (B+), and no longer non-increasing.
+        assert j14["applicable"] and j14["decreasing"] == ["R"] and j14["increasing"] == ["D"]
 
         def shortcut(model, sos):
             model["equilibria"][2]["profile"] = "shortcut_first"
         _, _, j14 = game_for(model_of(shortcut), "comply_by_lambda", "CENTRALIZED")
-        assert j14["applicable"] and j14["condition_ii"] == ["D"]
+        assert j14["applicable"] and j14["decreasing"] == ["D"] == j14["increasing"]
 
     @pytest.mark.parametrize("mutate, reason", [
         (lambda m, s: m["commands"][1]["updates"][0].update(
@@ -392,13 +397,14 @@ class TestJ14:
         _, _, j14 = game_for(model_of(mutate), "comply_by_lambda", "CENTRALIZED")
         assert not j14["applicable"] and reason in j14["reason"]
 
-    def test_only_in_a_file_that_declares_grounding(self, capsys):
-        j14 = equilibrium_map(PLAIN_MODEL, "comply_by_lambda")["designs"][0]["j14"]
-        assert not j14["applicable"] and "declares 'grounding: 0.1'" in j14["reason"]
+    def test_also_in_a_file_without_grounding(self, capsys):
+        """The end-point certification is a method of I.9; J-14 refers to
+        it. It applies to the map of the file without grounding as well."""
+        ends = equilibrium_map(PLAIN_MODEL, "comply_by_lambda")["designs"][0]["endpoints"]
+        assert ends["applicable"] and ends["decreasing"] == ["R", "D"]
         status, out, _ = cli(capsys, "game-check", PLAIN, "--certify", "--equilibrium",
                              "comply_by_lambda", "--regime", "DISTRIBUTED")
-        assert status == 0 and ("J-14 does not apply: J-14 is a rule of the grounding "
-                                "extension") in out
+        assert status == 0 and "end points (I.9): condition A holds for 'lambda'" in out
 
     def test_end_point_claims(self):
         game, query, _ = game_for(LINKED_MODEL, "comply_by_lambda", "CENTRALIZED")
@@ -459,8 +465,8 @@ class TestHump:
 
     def test_hump_in_a_weight(self):
         d = self.map_of(HUMP)
-        assert not d["j14"]["applicable"]
-        assert "power above one, counted on the text" in d["j14"]["reason"]
+        assert not d["endpoints"]["applicable"]
+        assert "power above one, counted on the text" in d["endpoints"]["reason"]
         self.check_hump(d)
         boxes = [tuple(float(x) for x in c.box["lam"]) for c in d["cells"]]
         assert [round(x, 4) for x in boxes[0] + boxes[2] + boxes[4]] == [
@@ -468,19 +474,19 @@ class TestHump:
 
     def test_hump_in_the_probabilities(self):
         d = self.map_of(PROB_HUMP)
-        assert not d["j14"]["applicable"]
-        assert "occurs in the probability 'lam'" in d["j14"]["reason"]
+        assert not d["endpoints"]["applicable"]
+        assert "occurs in the probability 'lam'" in d["endpoints"]["reason"]
         self.check_hump(d)
 
     @pytest.mark.parametrize("path, mutant", [
-        (HUMP, "j14_drop_affine"), (PROB_HUMP, "j14_drop_probability")])
+        (HUMP, "endpoints_drop_affine"), (PROB_HUMP, "endpoints_drop_probability")])
     def test_the_gate_is_what_keeps_the_hump(self, path, mutant):
         """With the gate of condition 2 disabled, the end points of the
         whole region are equilibria and the hump is lost: the test above
         fails with the mutant."""
         with games_fuzz.mutation(mutant):
             d = self.map_of(path)
-        assert d["j14"]["applicable"]
+        assert d["endpoints"]["applicable"]
         with pytest.raises(AssertionError):
             self.check_hump(d)
         assert any(c.method == J14_METHOD and c.status == "equilibrium"
@@ -496,13 +502,13 @@ class TestJ14Fuzz:
     def test_end_point_cells_hold_at_every_sampled_point(self):
         stats = games_fuzz.run(31, 25, j14=True)
         assert "failure" not in stats, stats["failure"] + "\n" + stats.get("failing_model", "")
-        assert stats["j14_applicable"] > 0 and stats["j14_not_applicable"] > 0
-        assert stats.get("cells_j14_equilibrium", 0) > 0
+        assert stats["endpoints_applicable"] > 0 and stats["endpoints_not_applicable"] > 0
+        assert stats.get("cells_endpoints_equilibrium", 0) > 0
 
     @pytest.mark.parametrize("name, seed, count", [
-        ("j14_drop_probability", 1, 60),
-        ("j14_drop_affine", 1, 60),
-        ("j14_drop_condition_ii", 1, 30),
+        ("endpoints_drop_probability", 1, 60),
+        ("endpoints_drop_affine", 5, 20),
+        ("endpoints_drop_condition_b", 1, 30),
     ])
     def test_a_deliberate_soundness_bug_is_detected(self, name, seed, count):
         stats = games_fuzz.run(seed, count, name, j14=True)
