@@ -21,7 +21,8 @@ Trace format (JSON Lines, one observation per line, non-decreasing ``t``)::
     {"t": 2.0, "state": "Assigned"}
     {"t": 9.0, "end": true}
 
-``t``         time in seconds (required).
+``t``         time in seconds (required): a finite number of at most
+              1e10 in absolute value (about 317 years).
 ``bindings``  index bindings of the instance (first line only).
 ``request``   fields of ``request`` (first line only).
 ``values``    updates of the snapshot; a value stays until it is changed.
@@ -47,6 +48,7 @@ README under ``cadl norms-eval``.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -75,6 +77,13 @@ _UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "min": 60.0, "h": 3600.0}
 _MESSAGE_EVENT_RE = re.compile(r"^(.+?)\s*->\s*(.+?)\s*:\s*(.+)$")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 _ACTOR_RE = re.compile(r"^([A-Za-z_]\w*)(?:\[(.*)\])?$")
+# A concrete actor of a message and a message name, as written: no
+# whitespace is removed, so `PLAN NER` is not read as `PLANNER`.
+_TRACE_ACTOR_RE = re.compile(r"[A-Za-z_]\w*(?:\[(?:0|[1-9][0-9]*)\])?")
+_TRACE_NAME_RE = re.compile(r"[A-Za-z_]\w*")
+# Largest |t| of a trace, in seconds: far inside the range in which a time
+# can be added to an ISO 8601 epoch without overflow.
+MAX_T = 1e10
 _TRACE_KEYS = {"t", "bindings", "request", "values", "messages", "state", "end", "amend"}
 _MESSAGE_KEYS = {"from", "to", "name", "args"}
 FINAL_STATES = ("fulfilled", "violated", "discharged")
@@ -135,6 +144,37 @@ def _canon_actor(text: str) -> str:
     return re.sub(r"\s+", "", str(text))
 
 
+def _not_json_number(text: str):
+    raise ValueError(f"{text} is not a JSON number")
+
+
+def _finite(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"{text} is not a finite number")
+    return value
+
+
+def loads_strict(line: str) -> Any:
+    """`json.loads` that rejects NaN, Infinity and numbers that overflow
+    to infinity; raises ValueError."""
+    return json.loads(line, parse_constant=_not_json_number, parse_float=_finite)
+
+
+def declared_actors(sos: SoSDefinition) -> dict[str, tuple]:
+    """The declared actors: name -> (indexed, lo, hi); `lo` and `hi` are
+    None when the set has no integer bounds."""
+    out: dict[str, tuple] = {}
+    for a in sos.actors:
+        index = a.id.index
+        if isinstance(index, RangeExpr) and isinstance(index.start, int) \
+                and isinstance(index.end, int):
+            out[a.id.name] = (True, index.start, index.end)
+        else:
+            out[a.id.name] = (index is not None, None, None)
+    return out
+
+
 def parse_trace(lines, path: str | None = None) -> Trace:
     """Read a trace from an iterable of JSON Lines. The lifecycle state is
     left as written; `evaluate` fills in the initial state."""
@@ -147,9 +187,11 @@ def parse_trace(lines, path: str | None = None) -> Trace:
             continue
         where = f"line {lineno}"
         try:
-            rec = json.loads(line)
+            rec = loads_strict(line)
         except json.JSONDecodeError as e:
             raise TraceError(f"{where}: not JSON ({e.msg})") from None
+        except ValueError as e:
+            raise TraceError(f"{where}: not JSON ({e})") from None
         if not isinstance(rec, dict):
             raise TraceError(f"{where}: an observation must be a JSON object")
         unknown = sorted(set(rec) - _TRACE_KEYS)
@@ -158,6 +200,9 @@ def parse_trace(lines, path: str | None = None) -> Trace:
         t = rec.get("t")
         if isinstance(t, bool) or not isinstance(t, (int, float)):
             raise TraceError(f"{where}: 't' must be a number (seconds)")
+        if not math.isfinite(t) or abs(t) > MAX_T:
+            raise TraceError(f"{where}: 't' must be a finite number of at most "
+                             f"{MAX_T:g} seconds in absolute value")
         if prev_t is not None and t < prev_t:
             raise TraceError(f"{where}: time {t:g} is before the previous observation ({prev_t:g})")
         prev_t = t
@@ -184,6 +229,14 @@ def parse_trace(lines, path: str | None = None) -> Trace:
             for key in ("from", "to", "name"):
                 if not isinstance(m.get(key), str) or not m[key].strip():
                     raise TraceError(f"{where}: a message needs a string '{key}'")
+            for key in ("from", "to"):
+                if not _TRACE_ACTOR_RE.fullmatch(m[key]):
+                    raise TraceError(
+                        f"{where}: '{key}' of a message must be a concrete actor such as "
+                        f"PLANNER or ROBOT[2], got {m[key]!r}")
+            if not _TRACE_NAME_RE.fullmatch(m["name"]):
+                raise TraceError(f"{where}: 'name' of a message must be a message name "
+                                 f"(an identifier), got {m['name']!r}")
             args = m.get("args", [])
             if not isinstance(args, list):
                 raise TraceError(f"{where}: 'args' of a message must be a list")
@@ -254,6 +307,23 @@ class _Evaluator:
         for o in self.obs:
             self.known.update(o.values)
         self._cache: dict[tuple[int, int], tuple[Any, Any]] = {}
+        # Declared actors (`declared_actors`); None when they are not known.
+        self.actors: dict[str, tuple] | None = None
+
+    def is_member(self, name: str, index: str | None) -> bool:
+        """Whether `name` (index None) or `name[index]` is a declared actor
+        or a member of a declared set, within its integer bounds."""
+        if self.actors is None:
+            return True
+        decl = self.actors.get(name)
+        if decl is None:
+            return False
+        indexed, lo, hi = decl
+        if not indexed or index is None:
+            return not indexed and index is None
+        if not index.isdigit():
+            return False
+        return lo is None or lo <= int(index) <= hi
 
     def warn(self, text: str) -> None:
         if text not in self._warned:
@@ -576,8 +646,13 @@ class _Term:
                 self.msg_args = msg.args or None
                 for a in msg.args:
                     self.error = self.error or ev.unsupported(a, False)
+            # A range with integer bounds matches its members only; one with
+            # a symbolic bound matches every member of the set.
+            self._ranges: dict[int, tuple[int, int]] = {}
             for ref in (self.sender, self.receiver):
                 if isinstance(ref.index, RangeExpr):
+                    if isinstance(ref.index.start, int) and isinstance(ref.index.end, int):
+                        self._ranges[id(ref)] = (ref.index.start, ref.index.end)
                     ref.index = "*"
         else:
             self.kind = "predicate"
@@ -591,13 +666,25 @@ class _Term:
     # --- messages ---------------------------------------------------------
 
     def _actor_matches(self, ref: ActorRef, actual: str, k: int) -> bool:
+        """An actor reference against a concrete actor: `A` matches the
+        actor A, `A[3]` the member A[3], `A[*]` every member of the declared
+        set A, `A[1..3]` the members A[1] to A[3], and `A[i]` the member the
+        instance binds, or any member when it binds none. An actor that is
+        not declared, or lies outside the bounds of its set, never matches."""
         m = _ACTOR_RE.match(actual)
+        if not m or m.group(1) != ref.name or not self.ev.is_member(ref.name, m.group(2)):
+            return False
+        index = m.group(2)
         if ref.index == "*":
-            return bool(m) and m.group(1) == ref.name
+            bounds = self._ranges.get(id(ref))
+            if index is None:
+                return self.ev.actors is None and bounds is None
+            return bounds is None or (index.isdigit()
+                                      and bounds[0] <= int(index) <= bounds[1])
         text, bound = self.ev.actor(ref, k)
         if bound:
             return actual == text
-        return bool(m) and m.group(1) == ref.name
+        return True
 
     def matching_messages(self, k: int) -> list[dict]:
         out = []
@@ -686,7 +773,8 @@ class _NormInst:
 # === The engine ============================================================
 
 class _Engine:
-    def __init__(self, contract: ContractDef, trace: Trace, loader=None) -> None:
+    def __init__(self, contract: ContractDef, trace: Trace, loader=None,
+                 actors: dict | None = None) -> None:
         self.contract = contract
         self.loader = loader
         self.trace = trace
@@ -696,6 +784,7 @@ class _Engine:
         self.lifecycle = lc
         self._init_states()
         self.ev = _Evaluator(trace, lc is not None, self.warnings)
+        self.ev.actors = actors
         self.events = {r.creates for r in contract.counts_as if r.creates}
         self.norms = [_NormInst(d, self.events, self.ev) for d in contract.norms]
         self.by_id = {n.d.id: n for n in self.norms}
@@ -821,7 +910,8 @@ class _Engine:
         if bound:
             return performer == text
         m = _ACTOR_RE.match(performer)
-        return bool(m) and m.group(1) == norm.bearer_ref.name
+        return bool(m) and m.group(1) == norm.bearer_ref.name \
+            and self.ev.is_member(m.group(1), m.group(2))
 
     # --- amendments (F.6) -----------------------------------------------------
 
@@ -829,6 +919,8 @@ class _Engine:
         """Replace the contract by its new version at observation n."""
         t = self.obs[n].t
         sos = self.loader(name)
+        if self.ev.actors is not None:
+            self.ev.actors = declared_actors(sos)
         new = next((c for c in sos.contracts if c.id == self.contract.id), None)
         if new is None:
             raise NormsEvalError(f"amendment at t={_fmt_t(t)}: {name} has no contract "
@@ -1429,7 +1521,7 @@ def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
         base = Path(trace.path).parent if trace.path else Path(".")
         return load_version(base / name)
 
-    engine = _Engine(contract, trace, loader)
+    engine = _Engine(contract, trace, loader, declared_actors(sos))
     engine.run()
     return engine.result()
 

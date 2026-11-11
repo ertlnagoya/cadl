@@ -797,30 +797,37 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
 
 def _cmd_agents_run(args: argparse.Namespace) -> int:
     """Exit status: 0 when the trace was replayed, whatever the decisions
-    are; 2 on a usage error."""
+    are; 2 on a usage error. The audit file is written only after the
+    whole trace was replayed, so a failed run leaves no partial log."""
+    import json
     from .agents_runtime import audit_lines, format_text, run_files
     from .norms_eval import NormsEvalError, TraceError
 
+    def no_audit() -> None:
+        if args.audit is not None:
+            print(f"No audit file was written: the run did not complete "
+                  f"({args.audit} was not created or changed).", file=sys.stderr)
+
     try:
         result = run_files(args.file, args.trace)
+        log = "".join(line + "\n" for line in audit_lines(result))
+        report = (json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False)
+                  if args.format == "json" else format_text(result))
     except TraceError as e:
         print(f"Trace error: {args.trace}: {e}", file=sys.stderr)
+        no_audit()
         return 2
-    except NormsEvalError as e:
+    except (NormsEvalError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
+        no_audit()
         return 2
     if args.audit is not None:
         try:
-            args.audit.write_text("".join(line + "\n" for line in audit_lines(result)),
-                                  encoding="utf-8")
+            args.audit.write_text(log, encoding="utf-8")
         except OSError as e:
             print(f"Error: cannot write the audit log: {e}", file=sys.stderr)
             return 2
-    if args.format == "json":
-        import json
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-    else:
-        print(format_text(result))
+    print(report)
     return 0
 
 

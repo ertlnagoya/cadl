@@ -11,10 +11,11 @@ define on top of the stateless decision function:
   and revocations seen so far (G.7);
 - holds (G.6): an `escalate` creates a hold; an `approval` or a
   `rejection` of the approver, the timeout, the end of a contract
-  instance or an amendment closes it; an approved message is re-checked
-  and released;
+  instance or an amendment closes it; an approved message is decided
+  again at the time of the approval and released when nothing denies it;
 - the effect of a decision on the trace (G.5): only an allowed or a
-  released message is an observation of the norms engine;
+  released message is an observation of the norms engine, and only for
+  the instances of the contracts that govern it;
 - the audit records (G.8).
 
 The runtime is deterministic and offline: it reads a trace, it does not
@@ -39,7 +40,7 @@ One line is processed in this order: holds whose deadline lies before
 line are observed (one observation without message, which carries an
 ``amend``); the messages are decided one at a time, and each allowed
 message is one observation; a ``state`` change and an ``end`` are a last
-observation without message.
+observation without message. Messages after an ``end`` are still decided.
 
 Readings where the specification leaves a choice are listed in the README
 under ``cadl agents-run``.
@@ -66,7 +67,9 @@ from .norms_eval import (
     _fmt_t,
     _table,
     _Term,
+    declared_actors,
     load_version,
+    loads_strict,
     parse_trace,
 )
 
@@ -151,8 +154,8 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
             continue
         where = f"line {lineno}"
         try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
+            rec = loads_strict(line)
+        except ValueError:
             rec = None
         if not isinstance(rec, dict):
             plain.append(line)              # reported by parse_trace
@@ -168,6 +171,13 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
         extras.append((state, entries))
         plain.append(json.dumps(rec))
     base = parse_trace(plain, path=path)
+    if epoch is not None:
+        for o in base.observations:
+            try:
+                epoch + timedelta(seconds=o.t)
+            except OverflowError:
+                raise TraceError(f"t={_fmt_t(o.t)} added to 'epoch' is not a "
+                                 f"representable time") from None
     return RunTrace(
         lines=[Line(obs=o, state=s, instances=e)
                for o, (s, e) in zip(base.observations, extras)],
@@ -206,7 +216,9 @@ class _Hold:
     norms: list[str]
     fallback: list[str]
     notify: list[str]
-    grounds: list[tuple[str, str]]      # (contract id, norm id)
+    # The grounds: (contract id, norm id, instance), one entry per contract
+    # instance in which a prohibition applied when the hold was created.
+    grounds: list[tuple[str, str, str]]
     instances: list[tuple[str, str]]    # (contract id, instance) of the grounds
     state: str = "held"
     closed_at: float | None = None
@@ -380,6 +392,7 @@ class AgentsRuntime:
         self.holds: list[_Hold] = []
         self.audit: list[dict] = []
         self.steps: list[dict] = []
+        self.releases: list[dict] = []
         self.warnings: list[str] = []
         self.amendments: list[dict] = []
         # Denied and held messages, for the verdict `excused` (G.5).
@@ -419,7 +432,11 @@ class AgentsRuntime:
         """A time of the trace as the audit log writes it."""
         if self.trace.epoch is None:
             return int(t) if float(t).is_integer() else t
-        at = (self.trace.epoch + timedelta(seconds=t)).astimezone(timezone.utc)
+        try:
+            at = (self.trace.epoch + timedelta(seconds=t)).astimezone(timezone.utc)
+        except OverflowError:
+            raise TraceError(f"t={_fmt_t(t)} added to 'epoch' is not a representable "
+                             f"time") from None
         text = at.strftime("%Y-%m-%dT%H:%M:%S")
         if at.microsecond:
             text += f".{at.microsecond:06d}".rstrip("0")
@@ -454,10 +471,16 @@ class AgentsRuntime:
 
     # --- audit records (G.8) ----------------------------------------------------
 
-    def _record(self, t: float, m: dict, result: dict, hold_id: str | None = None,
-                outcome: str | None = None) -> dict:
-        rec = {"time": self._time(t), "message": self._head(m),
-               "instances": self._governing_instances(m)}
+    def _record(self, t: float, m: dict, result: dict, hold: _Hold | None = None,
+                outcome: str | None = None, closing: bool = False) -> dict:
+        """A decision record. A closing record lists the contract instances
+        of the grounds of its hold, running or not."""
+        hold_id = None if hold is None else hold.hold_id
+        if closing:
+            instances = [{"contract": c, "instance": i} for c, i in hold.instances]
+        else:
+            instances = self._governing_instances(m)
+        rec = {"time": self._time(t), "message": self._head(m), "instances": instances}
         rec.update(result)
         rec["hold_id"] = hold_id
         rec["outcome"] = outcome
@@ -484,9 +507,15 @@ class AgentsRuntime:
                       path=self.trace.path)
         inst.engine = _BoundaryEngine(self._ast(cid), trace, self._load, self, inst)
         inst.engine.ev.known = self._known
+        inst.engine.ev.actors = declared_actors(self.sos)
         self._build_until(inst)
         self.instances.append(inst)
+        self._event(t, "instance_start", None, [self._where(inst)])
         return inst
+
+    @staticmethod
+    def _where(inst: _Instance) -> dict:
+        return {"contract": inst.contract, "instance": inst.name}
 
     def _build_until(self, inst: _Instance) -> None:
         inst.until_terms = {}
@@ -510,11 +539,14 @@ class AgentsRuntime:
         are cancelled; G.7 (c): its derived instances are discharged."""
         inst.running = False
         inst.ended = t
+        terminal = (inst.engine.end_reason or "").startswith("terminal state")
+        self._event(t, "instance_end", None, [self._where(inst)],
+                    reason="terminal_state" if terminal else "end")
         for hold in self.holds:
             if hold.state == "held" and inst.key in hold.instances:
                 self._close(hold, "cancelled", t)
         for items in inst.derived.values():
-            self._discharge(items, t, "the contract instance ended")
+            self._end_derived(inst, items, t, "instance_end", "the contract instance ended")
 
     # --- observations -------------------------------------------------------------
 
@@ -530,26 +562,35 @@ class AgentsRuntime:
             self._event(o.t, "unauthorised_act", self._current,
                         [{"contract": inst.contract, "instance": inst.name}],
                         reason="no_power")
+        if ended:
+            self._ended(inst, o.t)
+            return
         for nid, items in inst.derived.items():      # G.7, end (c)
             norm = eng.by_id.get(nid)
             if norm is None or norm.state == "discharged":
-                self._discharge(items, o.t, "the original permission was discharged")
-        if ended:
-            self._ended(inst, o.t)
+                self._end_derived(inst, items, o.t, "original_discharged",
+                                  "the original permission was discharged")
 
     def _observe(self, m: dict | None, t: float, exempt: dict | None = None,
                  amend: dict | None = None) -> None:
-        """One observation of the enforcement point: every running
-        instance sees it. Then the holds approved at it are released."""
+        """One observation of the enforcement point. An observation
+        without message (the time of a line) reaches every running
+        instance; a message reaches the instances of the contracts that
+        govern it (G.5). Then the holds approved at it are released."""
         self._events = []
         self._current = m
+        sender, receiver = self._actors(m) if m else (None, None)
         for inst in list(self.instances):
             if not inst.running:
+                continue
+            if m is not None and not (sender and receiver and G.governs(
+                    self.policy, self._contract(inst.contract), sender, receiver,
+                    m["name"])):
                 continue
             o = Observation(t=t, values=self._snapshot, messages=[m] if m else [],
                             state=inst.state, state_after=inst.state, end=None,
                             amend=(amend or {}).get(inst.contract))
-            self._push(inst, o, (exempt or {}).get(inst.contract, ()))
+            self._push(inst, o, (exempt or {}).get(inst.key, ()))
         self._current = None
         for hold in self._resolve(m, t):             # G.6, "after step 6"
             self._release(hold, t)
@@ -565,7 +606,7 @@ class AgentsRuntime:
                 if m is not None and e["performer"] is not None and m["args"] \
                         and isinstance(m["args"][0], str):
                     hold_id = m["args"][0]          # the first argument (G.6)
-                self._events.append((e["name"], hold_id, e["performer"], inst.contract))
+                self._events.append((e["name"], hold_id, e["performer"], inst.key))
         c = self._contract(inst.contract)
         if m is not None and c["delegations"]:
             sender, receiver = self._actors(m)
@@ -577,7 +618,8 @@ class AgentsRuntime:
                         self._revoke(inst, c, nid, sender, receiver, m, t)
         for nid, term in inst.until_terms.items():
             if term.occurs(n, created):
-                self._discharge(inst.derived.get(nid, []), t, f"until occurred: {term.text}")
+                self._end_derived(inst, inst.derived.get(nid, []), t, "until",
+                                  f"until occurred: {term.text}")
 
     # --- delegation (G.7) -----------------------------------------------------------
 
@@ -611,6 +653,17 @@ class AgentsRuntime:
                 d.state, d.ended_at, d.end_reason = "discharged", t, reason
                 out.append(d.holder)
         return out
+
+    def _end_derived(self, inst: _Instance, items: list[_Derived], t: float,
+                     code: str, text: str) -> None:
+        """End derived instances for another cause than a revoke message,
+        with one event record for each."""
+        for d in items:
+            if d.state == "active":
+                self._discharge([d], t, text)
+                self._event(t, "delegation_end", self._current, [self._where(inst)],
+                            norm=f"{inst.contract}.{d.norm}", chain=d.chain,
+                            holders=[d.holder], reason=code)
 
     def _grant(self, inst, c, nid, deleg, sender, receiver, m, t) -> None:
         norm = self._norm(c, nid)
@@ -699,7 +752,7 @@ class AgentsRuntime:
         else:
             hold = self._hold(m, t, inp, result)
             step["hold_id"] = hold.hold_id
-            self._record(t, m, result, hold_id=hold.hold_id)
+            self._record(t, m, result, hold=hold)
             self.blocks.append({"t": t, "message": m, "contracts": hold.contracts,
                                 "hold": hold})
 
@@ -714,7 +767,8 @@ class AgentsRuntime:
             approver=result["escalate_to"], deadline=deadline,
             contracts=list(result["contracts"]), norms=list(result["norms"]),
             fallback=list(result["fallback"]), notify=list(result["notify"]),
-            grounds=[(p["contract"], p["norm"]["id"]) for p in applying],
+            grounds=[(p["contract"], p["norm"]["id"], name) for p in applying
+                     for name in p["instances"]],
             instances=_unique((p["contract"], name) for p in applying
                               for name in p["instances"]))
         self.holds.append(hold)
@@ -728,7 +782,7 @@ class AgentsRuntime:
         result = G._result("deny", state, contracts=hold.contracts, norms=hold.norms,
                            escalate_to=hold.approver, fallback=hold.fallback,
                            notify=hold.notify)
-        self._record(t, hold.message, result, hold_id=hold.hold_id, outcome=state)
+        self._record(t, hold.message, result, hold=hold, outcome=state, closing=True)
 
     def _expire(self, t: float) -> None:
         """Before each decision and observation later than the deadline of
@@ -743,12 +797,12 @@ class AgentsRuntime:
     def _resolve(self, m: dict | None, t: float) -> list[_Hold]:
         """Apply the approvals and rejections of one observation; returns
         the holds that became approved, in the order of creation."""
-        groups: dict[tuple, list[str]] = {}
-        for name, hold_id, performer, contract in self._events:
-            groups.setdefault((name, hold_id, performer), []).append(contract)
+        groups: dict[tuple, list[tuple[str, str]]] = {}
+        for name, hold_id, performer, key in self._events:
+            groups.setdefault((name, hold_id, performer), []).append(key)
         self._events = []
         approved = []
-        for (name, hold_id, performer), contracts in groups.items():
+        for (name, hold_id, performer), keys in groups.items():
             hold = next((h for h in self.holds if h.hold_id == hold_id), None)
             if hold is None:
                 reason = "unknown_hold"
@@ -756,8 +810,8 @@ class AgentsRuntime:
                 reason = "not_held"
             elif performer != hold.approver:
                 reason = "not_approver"
-            elif not set(contracts) & {c for c, _ in hold.grounds}:
-                reason = "other_contract"
+            elif not set(keys) & set(hold.instances):
+                reason = "other_instance"       # not a contract instance of a ground
             else:
                 if name == "approval":
                     hold.state = "approved"
@@ -766,52 +820,90 @@ class AgentsRuntime:
                     self._close(hold, "rejected", t)
                 continue
             self._event(t, f"unauthorised_{name}", m,
-                        self._governing_instances(None, _unique(contracts)),
+                        [{"contract": c, "instance": i} for c, i in _unique(keys)],
                         hold_id=hold_id if isinstance(hold_id, str) else None,
                         reason=reason)
         return sorted(approved, key=lambda h: h.index)
 
-    def _release(self, hold: _Hold, t: float) -> None:
-        """Re-check an approved message on the current state and let it
-        take effect, or deny it (G.6, Release)."""
+    def _recheck(self, hold: _Hold, t: float) -> dict | None:
+        """Decide an approved message again at the time of the approval
+        (G.6, Release); the denial, or None when it may take effect.
+
+        In a governing contract that has a ground of the hold, the approval
+        stands in for the permission and for the grounds: the contract
+        denies when a contract instance of a ground no longer runs, or when
+        a prohibition applies in a contract instance in which it is not a
+        ground. Every other governing contract decides in full by G.5,
+        step 3, and has to allow."""
         m = hold.message
-        hold.closed_at = t
         sender, receiver = self._actors(m)
+        if G.message_kind(self.policy, receiver, m["name"]) == "undeclared_tool":
+            return G._result("deny", "undeclared_tool")
         inp = self.policy_input(m, t)
         running = {i.key for i in self._running()}
         grounds = set(hold.grounds)
-        denial = None
-        if G.message_kind(self.policy, receiver, m["name"]) == "undeclared_tool":
-            denial = G._result("deny", "undeclared_tool")
-        elif any(key not in running for key in hold.instances):
-            gone = {c for c, name in hold.instances if (c, name) not in running}
-            denial = G._result("deny", "no_instance", contracts=[
-                c["id"] for c in self.policy["contracts"] if c["id"] in gone])
-        else:
-            extra = [p for p in G.applying_prohibitions(self.policy, inp)
-                     if (p["contract"], p["norm"]["id"]) not in grounds]
-            if extra:
-                norms = [p["norm"] for p in extra]
-                timeouts = [n["timeout_ms"] for n in norms if n["timeout_ms"] is not None]
-                denial = G._result(
-                    "deny", "prohibition",
-                    contracts=_unique(p["contract"] for p in extra),
-                    norms=[f"{p['contract']}.{p['norm']['id']}" for p in extra],
-                    timeout=min(timeouts) if timeouts else None,
-                    fallback=_unique(n["fallback"] for n in norms if n["fallback"]),
-                    notify=_unique(n["notify"] for n in norms if n["notify"]))
+        applying = G.applying_prohibitions(self.policy, inp)
+        denials = []
+        for c in self.policy["contracts"]:
+            cid = c["id"]
+            if any(cc == cid for cc, _ in hold.instances):
+                if any(key not in running for key in hold.instances if key[0] == cid):
+                    denials.append(G._result("deny", "no_instance", contracts=[cid]))
+                    continue
+                extra = [p["norm"] for p in applying if p["contract"] == cid and any(
+                    (cid, p["norm"]["id"], name) not in grounds for name in p["instances"])]
+                if extra:
+                    timeouts = [n["timeout_ms"] for n in extra if n["timeout_ms"] is not None]
+                    denials.append(G._result(
+                        "deny", "prohibition", contracts=[cid],
+                        norms=[f"{cid}.{n['id']}" for n in extra],
+                        timeout=min(timeouts) if timeouts else None,
+                        fallback=_unique(n["fallback"] for n in extra if n["fallback"]),
+                        notify=_unique(n["notify"] for n in extra if n["notify"])))
+            elif G.governs(self.policy, c, sender, receiver, m["name"]):
+                # The decision of this contract alone: `decide` over a policy
+                # that has no other contract.
+                alone = G.decide(dict(self.policy, contracts=[c]), inp)
+                if alone["decision"] != "allow":
+                    denials.append(dict(alone, decision="deny", escalate_to=None))
+        if not denials:
+            return None
+        # Combination as in G.5, step 4: every denying contract is listed.
+        reason = next(r for r in ("no_instance", "prohibition", "default")
+                      if any(d["reason"] == r for d in denials))
+        same = [d for d in denials if d["reason"] == reason == "prohibition"]
+        timeouts = [d["timeout"] for d in same if d["timeout"] is not None]
+        return G._result(
+            "deny", reason,
+            contracts=[cid for d in denials for cid in d["contracts"]],
+            norms=[n for d in same for n in d["norms"]],
+            timeout=min(timeouts) if timeouts else None,
+            fallback=_unique(f for d in same for f in d["fallback"]),
+            notify=_unique(a for d in same for a in d["notify"]))
+
+    def _release(self, hold: _Hold, t: float) -> None:
+        """Let an approved message take effect, or deny it (G.6, Release)."""
+        m = hold.message
+        hold.closed_at = t
+        denial = self._recheck(hold, t)
+        self.releases.append({
+            "time": self._time(t), "hold_id": hold.hold_id, "message": dict(m),
+            "input": self.policy_input(m, t),
+            "grounds": [{"contract": c, "norm": n, "instance": i}
+                        for c, n, i in hold.grounds],
+            "released": denial is None})
         if denial is not None:
-            self._record(t, m, denial, hold_id=hold.hold_id, outcome="approved")
+            self._record(t, m, denial, hold=hold, outcome="approved", closing=True)
             self.blocks.append({"t": t, "message": m, "contracts": denial["contracts"],
                                 "hold": None})
             return
         hold.released = True
         result = G._result("allow", "approved", contracts=hold.contracts,
                            norms=hold.norms, escalate_to=hold.approver)
-        self._record(t, m, result, hold_id=hold.hold_id, outcome="approved")
-        exempt: dict[str, set[str]] = {}
-        for c, nid in hold.grounds:
-            exempt.setdefault(c, set()).add(nid)
+        self._record(t, m, result, hold=hold, outcome="approved", closing=True)
+        exempt: dict[tuple[str, str], set[str]] = {}
+        for c, nid, name in hold.grounds:
+            exempt.setdefault((c, name), set()).add(nid)
         # The released message is the immediately following observation,
         # with the time of the approving one; it does not violate its grounds.
         self._observe(m, t, exempt=exempt)
@@ -864,10 +956,13 @@ class AgentsRuntime:
     def _finish_amendment(self, name: str, new, policy, changed: list[str], t: float) -> None:
         self.sos, self.policy = new, policy
         self.amendments.append({"time": self._time(t), "file": name, "contracts": changed})
+        self._event(t, "amendment", None, self._governing_instances(None, changed),
+                    reason=name)
         for hold in self.holds:                    # G.7, rule (1)
-            if hold.state == "held" and any(c in changed for c, _ in hold.grounds):
+            if hold.state == "held" and any(c in changed for c, _ in hold.instances):
                 self._close(hold, "cancelled", t)
         for inst in self._running():               # G.7, rule (2)
+            inst.engine.ev.actors = declared_actors(new)
             if inst.contract not in changed:
                 continue
             c = self._contract(inst.contract)
@@ -875,11 +970,12 @@ class AgentsRuntime:
             for nid, items in inst.derived.items():
                 norm = inst.engine.by_id.get(nid)
                 if nid not in c["delegations"]:
-                    self._discharge(items, t, "amendment: the permission is not delegable "
-                                              "in the new version")
+                    self._end_derived(inst, items, t, "amendment",
+                                      "amendment: the permission is not delegable in the "
+                                      "new version")
                 elif norm is None or norm.state == "discharged":
-                    self._discharge(items, t, "amendment: the original permission was "
-                                              "discharged")
+                    self._end_derived(inst, items, t, "amendment",
+                                      "amendment: the original permission was discharged")
 
     # --- one line of the trace ---------------------------------------------------------------------
 
@@ -942,21 +1038,14 @@ class AgentsRuntime:
                                   state=inst.state, state_after=state or inst.state,
                                   end=True if end else None)
             self._push(inst, closing)
-        if end_all:
-            self._stopped = True
-
-    _stopped = False
 
     def run(self) -> dict:
+        """Replay every line. Messages after an `end` are still decided:
+        an ended instance does not come back, so a tool call of its
+        contract is denied with `no_instance`."""
         lines = self.trace.lines
         for k, line in enumerate(lines):
             self._line(line, k == 0, k == len(lines) - 1)
-            if self._stopped:
-                if k < len(lines) - 1:
-                    self.warnings.append(
-                        f"{len(lines) - 1 - k} line(s) after the end of the enforcement "
-                        f"point (t={_fmt_t(line.obs.t)}) are ignored")
-                break
         return self.result()
 
     # --- result ---------------------------------------------------------------------------------------
@@ -1020,6 +1109,7 @@ class AgentsRuntime:
             "summary": summary,
             "audit": self.audit,
             "steps": self.steps,
+            "releases": self.releases,
             "holds": holds,
             "delegations": delegations,
             "instances": instances,
@@ -1056,7 +1146,7 @@ def run_files(cadl_path, trace_path) -> dict:
 def audit_lines(result: dict) -> list[str]:
     """The audit log as JSON Lines: one record per line, in the order in
     which the enforcement point wrote them."""
-    return [json.dumps(rec, ensure_ascii=False) for rec in result["audit"]]
+    return [json.dumps(rec, ensure_ascii=False, allow_nan=False) for rec in result["audit"]]
 
 
 # === Text report ===========================================================

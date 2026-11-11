@@ -77,12 +77,25 @@ def short(rec: dict) -> tuple:
     return (rec["time"], text, rec["event"], detail)
 
 
+def housekeeping(rec: dict) -> bool:
+    """The records of the start and the end of contract instances, and of
+    the derived instances that end with their contract instance."""
+    return rec.get("event") in ("instance_start", "instance_end") or (
+        rec.get("event") == "delegation_end" and rec["reason"] == "instance_end")
+
+
+def audit(result: dict) -> list[dict]:
+    """The audit log without the housekeeping records, which the scenario
+    tests do not list; TestLifecycleRecords covers them."""
+    return [r for r in result["audit"] if not housekeeping(r)]
+
+
 def decisions(result: dict) -> list[tuple]:
     return [short(r) for r in result["audit"] if "decision" in r]
 
 
 def events(result: dict) -> list[tuple]:
-    return [short(r) for r in result["audit"] if "event" in r]
+    return [short(r) for r in audit(result) if "event" in r]
 
 
 def norm_states(result: dict, instance: int = 0) -> dict:
@@ -102,7 +115,7 @@ class TestExampleOfTheAppendix:
         # approved, call 3 denied after a revocation.
         r = self.run("agents_tool_governance_a_approved.jsonl")
         T = "2026-11-10T09:"
-        assert [short(x) for x in r["audit"]] == [
+        assert [short(x) for x in audit(r)] == [
             (T + "00:00Z", "OPERATOR>PLANNER:grant_read", "allow", "default", []),
             (T + "00:00Z", "OPERATOR>PLANNER:grant_read", "grant", ["PLANNER"]),
             (T + "00:02Z", "PLANNER>SUMMARIZER:grant_read", "allow", "default", []),
@@ -124,7 +137,7 @@ class TestExampleOfTheAppendix:
         by_time = {x["time"]: x for x in r["audit"] if "decision" in x}
         assert by_time[T + "00:05Z"]["provenance"] == [["OPERATOR", "PLANNER", "SUMMARIZER"]]
         # The audit record written out in G.12, field by field and in order.
-        assert json.dumps(r["audit"][7]) == json.dumps({
+        assert json.dumps(audit(r)[7]) == json.dumps({
             "time": "2026-11-10T09:03:00Z",
             "message": {"from": "PLANNER", "to": "FILES", "name": "delete_file"},
             "instances": [{"contract": "ASSISTED_REPORTING", "instance": "default"}],
@@ -171,7 +184,7 @@ class TestExampleOfTheAppendix:
             (T + "30Z", "PLANNER>FILES:delete_file", "deny", "cancelled",
              ["no_delete"], "h-2", "cancelled"),
         ]
-        closing = r["audit"][2]
+        closing = audit(r)[2]
         assert closing["fallback"] == ["PLANNER -> TICKETS : create_ticket"]
         assert closing["notify"] == ["OPERATOR"] and closing["timeout"] is None
         assert closing["escalate_to"] == "OPERATOR"
@@ -184,7 +197,7 @@ class TestExampleOfTheAppendix:
         # as time".
         r = self.run("agents_tool_governance_c_timeout.jsonl")
         T = "2026-11-10T09:"
-        assert [short(x) for x in r["audit"]] == [
+        assert [short(x) for x in audit(r)] == [
             (T + "00:00Z", "PLANNER>FILES:delete_file", "escalate", "prohibition",
              ["no_delete"], "h-1", None),
             (T + "00:05Z", "PLANNER>FILES:format_disk", "deny", "undeclared_tool", []),
@@ -199,9 +212,9 @@ class TestExampleOfTheAppendix:
             (T + "11:50Z", "PLANNER>TICKETS:create_ticket", "allow", "permission",
              ["may_file_ticket"]),
         ]
-        assert r["audit"][1]["contracts"] == [] and r["audit"][1]["instances"] == [
+        assert audit(r)[1]["contracts"] == [] and audit(r)[1]["instances"] == [
             {"contract": "ASSISTED_REPORTING", "instance": "default"}]
-        assert r["audit"][2]["fallback"] == ["PLANNER -> TICKETS : create_ticket"]
+        assert audit(r)[2]["fallback"] == ["PLANNER -> TICKETS : create_ticket"]
         assert r["summary"]["holds"]["expired"] == 1 and r["summary"]["released"] == 0
 
     def test_approval_at_exactly_the_deadline_is_in_time(self):
@@ -239,7 +252,7 @@ class TestExampleOfTheAppendix:
         assert d[5][2:4] == ("allow", "permission")
         assert d[8][2:4] == ("deny", "default")       # SUMMARIZER after the revocation
         assert d[9][2:4] == ("allow", "permission")   # the granter keeps its instance
-        assert r["audit"][-1]["provenance"] == [["OPERATOR", "PLANNER"]]
+        assert audit(r)[-1]["provenance"] == [["OPERATOR", "PLANNER"]]
 
 
 # === The second example: a non-static prohibition, max_depth, until ===============
@@ -273,10 +286,10 @@ class TestChangeControl:
             (430, "WORKER[1]>REPO:delete_branch", "deny", "undeclared_tool", []),
         ]
         assert events(r) == []
-        esc = r["audit"][2]
+        esc = audit(r)[2]
         assert (esc["escalate_to"], esc["timeout"], esc["fallback"], esc["notify"]) == \
             ("OWNER", 300000, ["LEAD -> REPO : open_issue"], ["OWNER"])
-        plain = r["audit"][3]
+        plain = audit(r)[3]
         assert (plain["escalate_to"], plain["timeout"], plain["fallback"]) == (None, None, [])
         # The released push did not violate the prohibition; `until:` ended it.
         assert norm_states(r)["no_push_in_freeze"] == ("discharged", "fulfilled")
@@ -312,10 +325,13 @@ class TestChangeControl:
             (2, "LEAD>WORKER[1]:grant_read", "unauthorised_grant", "max_depth"),
             (3, "OWNER>WORKER[1]:grant_read", "grant", ["WORKER[1]"]),
             (6, "LEAD>WORKER[1]:revoke_read", "revoke", "no_effect"),
+            # The `until:` of the entry: one record per derived instance.
+            (8, "OWNER>LEAD:close_review", "delegation_end", "until"),
+            (8, "OWNER>LEAD:close_review", "delegation_end", "until"),
             # A discharged instance is not revived; a new grant creates a new one.
             (11, "OWNER>WORKER[1]:grant_read", "grant", ["WORKER[1]"]),
         ]
-        assert r["audit"][7]["provenance"] == [["OWNER", "WORKER[1]"]]
+        assert audit(r)[7]["provenance"] == [["OWNER", "WORKER[1]"]]
         ended = [(d["holder"], d["state"], d["ended"], d["end_reason"])
                  for d in r["delegations"]]
         assert ended[:2] == [
@@ -371,7 +387,7 @@ class TestTwoContracts:
             # may_report was discharged by its until: at t=12; C2 denies anyway.
             (16, "deny", "default", ["C1", "C2"], []),
         ]
-        both = r["audit"][8]
+        both = audit(r)[8]
         assert (both["escalate_to"], both["timeout"], both["fallback"], both["notify"]) == \
             (None, 60000, ["AG -> T : read"], ["OP", "SUP"])
         assert r["holds"] == []
@@ -433,7 +449,7 @@ class TestTwoContracts:
             (3, m("OP", "AG", "approve", "h-2")),       # no such hold
             (4, m("OP", "AG", "approve", "h-1")),
             (5, None, {"end": False})))
-        assert [short(x) for x in r["audit"]] == [
+        assert [short(x) for x in audit(r)] == [
             (0, "AG>U:wipe", "escalate", "prohibition", ["no_wipe"], "h-1", None),
             (1, "SUP>AG:approve", "deny", "default", []),
             (2, "AG>OP:approve", "allow", "default", []),
@@ -506,7 +522,7 @@ class TestHolds:
         r = replay(HOLDS, trace((0, m("AG", "T", "read")), (1, None, {"end": False})))
         assert [h["state"] for h in r["holds"]] == ["held"]
         assert r["holds"][0]["closed"] is None
-        assert len(r["audit"]) == 1 and r["instances"][0]["running"]
+        assert len(audit(r)) == 1 and r["instances"][0]["running"]
 
     def test_holds_expire_in_the_order_of_their_deadlines(self):
         # h-1 (grounds a and b, 2 min) is older than h-2 (ground g, 1 s) but
@@ -529,7 +545,7 @@ class TestHolds:
             (3, None, {"end": False})))
         assert decisions(r)[-1] == (2, "AG>T:wipe", "deny", "prohibition", ["later"],
                                     "h-1", "approved")
-        last = r["audit"][-1]
+        last = audit(r)[-1]
         assert (last["escalate_to"], last["timeout"]) == (None, None)
         assert (r["holds"][0]["state"], r["holds"][0]["released"]) == ("approved", False)
 
@@ -696,7 +712,7 @@ class TestDelegation:
         assert d == {5: ("allow", "permission"), 7: ("deny", "default"),
                      8: ("allow", "permission"), 9: ("allow", "permission"),
                      10: ("deny", "default")}
-        assert r["audit"][10]["provenance"] == [["OP", "AG", "SUB", "R[2]"]]
+        assert audit(r)[10]["provenance"] == [["OP", "AG", "SUB", "R[2]"]]
 
     def test_suspended_original_and_discharge(self):
         # G.7: "While the original is suspended, its derived instances are
@@ -718,6 +734,7 @@ class TestDelegation:
         assert events(r) == [
             (0, "OP>AG:grant_write", "grant", ["AG"]),
             (4, "OP>AG:grant_write", "unauthorised_grant", "no_authority"),
+            (7, "OP>AG:halt", "delegation_end", "original_discharged"),
             (9, "OP>AG:grant_write", "unauthorised_grant", "no_authority"),
         ]
         only = r["delegations"][0]
@@ -890,7 +907,7 @@ class TestAuditLog:
         assert r["audit"]
         for rec in r["audit"]:
             assert list(rec) == (DECISION_KEYS if "decision" in rec else EVENT_KEYS)
-            assert list(rec["message"]) == ["from", "to", "name"]
+            assert rec["message"] is None or list(rec["message"]) == ["from", "to", "name"]
         # "An escalate decision gives two records with the same hold_id."
         for h in r["holds"]:
             pair = [x for x in r["audit"] if x.get("hold_id") == h["hold_id"]
@@ -946,10 +963,15 @@ class TestTrace:
         with pytest.raises(TraceError, match=text):
             replay(HOLDS, lines)
 
-    def test_lines_after_the_end_are_ignored(self):
-        r = replay(HOLDS, ['{"t": 0, "end": true}',
-                           '{"t": 1, "messages": [{"from": "AG", "to": "T", "name": "write"}]}'])
-        assert r["steps"] == [] and "1 line(s) after the end" in r["warnings"][0]
+    def test_messages_after_the_end_are_decided(self):
+        # Nothing is skipped: after `"end": true` the instance does not come
+        # back, so a tool call is denied (G.5, step 3.1) and recorded.
+        r = replay(HOLDS, trace((0, None, {"end": True}), (1, m("AG", "T", "write")),
+                                (2, m("OP", "AG", "hello")), (3, m("AG", "T", "bogus"))))
+        assert [x[1:4] for x in decisions(r)] == [
+            ("AG>T:write", "deny", "no_instance"), ("OP>AG:hello", "allow", "default"),
+            ("AG>T:bogus", "deny", "undeclared_tool")]
+        assert r["warnings"] == [] and r["instances"][0]["end"] == 0
 
     def test_file_without_the_extension(self):
         with pytest.raises(NormsEvalError, match="agent governance extension"):
@@ -967,7 +989,7 @@ class TestCli:
         assert "escalate (prohibition)" in out and "closes hold h-1: approved" in out
         assert "OPERATOR > PLANNER > SUMMARIZER" in out
         assert "Result: 8 message(s): 6 allow, 1 deny, 1 escalate; holds: 1 approved; " \
-               "13 audit record(s)" in out
+               "15 audit record(s)" in out
 
     @pytest.mark.parametrize("cadl, path", [(EXAMPLE, p) for p in EXAMPLE_TRACES]
                              + [(CHANGE, p) for p in CHANGE_TRACES],
@@ -1047,7 +1069,10 @@ class TestLifecycleAndValues:
         ]
         inst = r["instances"][0]
         assert (inst["state"], inst["running"], inst["end"]) == ("Closed", False, 2)
-        assert r["audit"][4]["instances"] == [] and r["audit"][4]["contracts"] == ["C"]
+        assert audit(r)[4]["instances"] == [] and audit(r)[4]["contracts"] == ["C"]
+        # A closing record lists the contract instances of the grounds of
+        # its hold, also when they have ended.
+        assert audit(r)[3]["instances"] == [{"contract": "C", "instance": "default"}]
 
     def test_predicate_trigger_follows_the_values_of_the_trace(self):
         # The values of a line are observed before its messages are decided.
@@ -1065,13 +1090,13 @@ class TestLifecycleAndValues:
 
 # === Random traces: invariants, and agreement with OPA on many inputs ==========================
 
-def random_trace(sos, seed: int, length: int = 300) -> list[str]:
+def random_rows(sos, seed: int, length: int = 300) -> list[tuple]:
     """A reproducible trace over the vocabulary of a file. Most messages
     are the message events the file names (contents, triggers, `until:`,
     `counts_as:`), grants and revocations between its actors, and answers
     to recent holds; the rest are arbitrary. Some gaps let holds expire."""
     import random
-    from cadl.agents import parse_message_event
+    from cadl.agents import parse_message_event, parse_ref
     rng = random.Random(seed)
     policy = build_policy(sos)
     actors, agents = ["GHOST"], []
@@ -1087,7 +1112,7 @@ def random_trace(sos, seed: int, length: int = 300) -> list[str]:
     names = {"hello"}
     for decl in policy["actors"].values():
         names.update(decl["tools"])
-    events, answers, deleg = [], [], []
+    events, answers, deleg, chains, held = [], [], [], [], []
     for c in sos.contracts:
         texts = []
         for r in c.counts_as:
@@ -1101,22 +1126,52 @@ def random_trace(sos, seed: int, length: int = 300) -> list[str]:
         for d in c.delegations:
             deleg += [x for x in (d.grant, d.revoke) if x]
             texts.append(d.until)
+            bearer = next((n.bearer for n in c.norms if n.id == d.norm), None)
+            if bearer:
+                chains.append((parse_ref(bearer), [parse_ref(x) for x in d.to], d))
+        held += [e for e in (parse_message_event(n.content) for n in c.norms
+                             if n.kind == "prohibition" and n.on_denied
+                             and n.on_denied.escalate_to) if e is not None]
         events += [e for e in map(parse_message_event, texts) if e is not None and e.name]
     names.update(e.name for e in events)
     names = sorted(names)
 
     def concrete(ref: dict) -> str:
+        # Now and then an actor that the reference must not match: a member
+        # outside the range or the declared set, or an undeclared actor.
+        odd = rng.random()
+        if odd < 0.04:
+            return "GHOST"
         if ref["kind"] == "plain":
             return ref["name"]
-        if ref["kind"] == "index":
+        if odd < 0.12:
+            return f"{ref['name']}[{rng.randint(4, 9)}]"
+        if ref["kind"] == "index" and odd > 0.25:
             return f"{ref['name']}[{ref['index']}]"
         return f"{ref['name']}[{rng.randint(1, 3)}]"
 
     rows, t = [], 0.0
-    for k in range(length):
+    while len(rows) < length:
+        k = len(rows)
         t += rng.choice([0, 1, 1, 1, 2, 2, 5, 30, 400])
         kind = rng.random()
-        if kind < 0.45 and events:
+        if kind < 0.07 and chains and held and answers:
+            # A delegation, a message that is held, something that changes
+            # the state (a revocation or any event of the file), an answer.
+            bearer, to, d = rng.choice(chains)
+            x, y = concrete(bearer), concrete(rng.choice(to))
+            e, a = rng.choice(held), rng.choice(answers)
+            rows.append((t, m(x, y, d.grant)))
+            rows.append((t + 1, m(concrete(e.sender), concrete(e.receiver), e.name)))
+            if d.revoke and rng.random() < 0.6:
+                rows.append((t + 2, m(x, y, d.revoke)))
+            elif events:
+                other = rng.choice(events)
+                rows.append((t + 2, m(concrete(other.sender), concrete(other.receiver),
+                                      other.name)))
+            rows.append((t + 3, m(concrete(a.sender), concrete(a.receiver), a.name, "h-1")))
+            t += 3
+        elif kind < 0.45 and events:
             e = rng.choice(events)
             rows.append((t, m(concrete(e.sender), concrete(e.receiver), e.name)))
         elif kind < 0.6 and deleg:
@@ -1129,7 +1184,61 @@ def random_trace(sos, seed: int, length: int = 300) -> list[str]:
                               f"h-{rng.randint(max(1, est - 3), est + 2)}")))
         else:
             rows.append((t, m(rng.choice(actors), rng.choice(actors), rng.choice(names))))
-    return trace(*rows, bindings={"i": 2})
+    return rows[:length]
+
+
+def aim(sos, lines: list[str], seed: int, versions=None) -> list[str]:
+    """Point most approvals and rejections of a generated trace at a hold
+    that exists when they are sent: replay the trace once, count the holds
+    created before each message, and rewrite the hold id."""
+    import random
+    rng = random.Random(seed + 13)
+    first = run(sos, parse_run_trace(lines), dict(versions or {}))
+    created, out, k = 0, [], 0
+    for line in map(json.loads, lines):
+        for msg_ in line.get("messages", []):
+            if msg_["name"] in ("approve", "reject") and created and rng.random() < 0.8:
+                msg_["args"] = [f"h-{rng.randint(max(1, created - 1), created)}"]
+            created += first["steps"][k]["result"]["decision"] == "escalate"
+            k += 1
+        out.append(json.dumps(line))
+    return out
+
+
+def random_trace(sos, seed: int, length: int = 300) -> list[str]:
+    return aim(sos, trace(*random_rows(sos, seed, length), bindings={"i": 2}), seed)
+
+
+def random_host_trace(sos, seed: int, length: int = 300, amend=()) -> list[str]:
+    """`random_rows` with host-created instances that have different
+    bindings and are created and ended during the trace, and with
+    amendments to the given versions."""
+    import random
+    rng = random.Random(seed + 7)
+    contracts = [c["id"] for c in build_policy(sos)["contracts"]]
+    alive: dict = {}
+    count = 0
+    rows = []
+    for t, message in random_rows(sos, seed, length):
+        more = {}
+        if not rows or rng.random() < 0.08:
+            entries = []
+            cid = rng.choice(contracts)
+            running = [k for k in alive if k[0] == cid and alive[k]]
+            if running and rng.random() < 0.45:
+                key = rng.choice(running)
+                alive[key] = False
+                entries.append({"contract": cid, "instance": key[1], "end": True})
+            else:
+                count += 1
+                alive[(cid, f"n{count}")] = True
+                entries.append({"contract": cid, "instance": f"n{count}",
+                                "bindings": {"i": rng.randint(1, 3)}})
+            more["instances"] = entries
+        if amend and rows and rng.random() < 0.02:
+            more["amend"] = rng.choice(amend)
+        rows.append((t, message, more))
+    return aim(sos, trace(*rows), seed, {n: review(n) for n in amend})
 
 
 def random_runs() -> list[tuple[str, object, dict]]:
@@ -1141,12 +1250,45 @@ def random_runs() -> list[tuple[str, object, dict]]:
         for seed in (1, 2):
             lines = random_trace(sos, 100 * k + seed)
             out.append((f"{name}-{seed}", sos, run(sos, parse_run_trace(lines))))
+    # What hid the defects of the first version: instances with different
+    # bindings, actors outside the declared sets, a ground in one of two
+    # contracts, and revocation or the end of an instance before an approval.
+    more = [("x1", review("x1.cadl"), True), ("x2", review("x2.cadl"), False),
+            ("x2-host", review("x2.cadl"), True), ("x3", review("x3.cadl"), False),
+            ("rich-host", parse(RICH), True), ("c5", parse(C5_SOURCE), False)]
+    for k, (name, sos, host) in enumerate(more):
+        for seed in (1, 2):
+            make = random_host_trace if host else random_trace
+            lines = make(sos, 1000 + 100 * k + seed)
+            out.append((f"{name}-{seed}", sos, run(sos, parse_run_trace(lines))))
     return out
+
+
+def release_is_sound(policy: dict, rel: dict) -> bool:
+    """G.6, Release, checked from the recorded input alone: no prohibition
+    applies outside the grounds, every contract instance of a ground runs,
+    and every governing contract without a ground allows on its own."""
+    from cadl.agents import applying_prohibitions
+    inp = rel["input"]
+    grounds = {(g["contract"], g["norm"], g["instance"]) for g in rel["grounds"]}
+    running = {(i["contract"], i["instance"]) for i in inp["instances"]}
+    if any((c, i) not in running for c, _, i in grounds):
+        return False
+    for p in applying_prohibitions(policy, inp):
+        if any((p["contract"], p["norm"]["id"], i) not in grounds for i in p["instances"]):
+            return False
+    with_ground = {c for c, _, _ in grounds}
+    for c in policy["contracts"]:
+        if c["id"] not in with_ground:
+            alone = decide(dict(policy, contracts=[c]), inp)
+            if alone["decision"] != "allow":
+                return False
+    return decide(policy, inp)["reason"] != "undeclared_tool"
 
 
 class TestRandomTraces:
     def test_invariants(self):
-        seen = set()
+        seen, releases = set(), {True: 0, False: 0}
         for name, sos, r in random_runs():
             policy = build_policy(sos)
             times = [x["time"] for x in r["audit"]]
@@ -1173,8 +1315,84 @@ class TestRandomTraces:
                     assert len(holders) == len(set(holders)), name
             for d in r["delegations"]:
                 assert d["chain"][-1] == d["holder"] and len(set(d["chain"])) == len(d["chain"])
-            # The same trace gives the same log.
+            # A message is released only when the release is sound, and a
+            # sound release is never denied.
+            for rel in r["releases"]:
+                assert release_is_sound(policy, rel) == rel["released"], (name, rel)
+                releases[rel["released"]] += 1
+            # Every derived instance that ended has a record that says why.
+            ended = sum(1 for d in r["delegations"] if d["state"] == "discharged")
+            explained = sum(len(x["holders"]) for x in r["audit"]
+                            if x.get("event") in ("revoke", "delegation_end"))
+            assert ended == explained, name
+            starts = [x for x in r["audit"] if x.get("event") == "instance_start"]
+            assert len(starts) == len(r["instances"]), name
         assert {"approved", "rejected", "expired", "cancelled"} <= seen
+        assert releases[True] >= 50 and releases[False] >= 10, releases
+
+    def test_amendments_between_hold_and_approval(self):
+        # Random amendments of x2 to its variants: after each, the policy
+        # the invariants use is the one in force.
+        names = ["x2_nodeleg.cadl", "x2_to.cadl", "x2_newproh.cadl", "x2_actor.cadl",
+                 "x2.cadl"]
+        versions = {n: review(n) for n in names}
+        denied = amended = 0
+        for seed in range(6):
+            sos = review("x2.cadl")
+            lines = random_host_trace(sos, 2000 + seed, 250, amend=names)
+            r = run(sos, parse_run_trace(lines), dict(versions))
+            times = [x["time"] for x in r["audit"]]
+            assert times == sorted(times)
+            amended += len(r["amendments"])
+            assert [x["reason"] for x in r["audit"] if x.get("event") == "amendment"] == \
+                [a["file"] for a in r["amendments"]]
+            # Replay the releases in order, switching the policy at each
+            # amendment that precedes them.
+            policy = build_policy(sos)
+            changes = [(a["time"], a["file"]) for a in r["amendments"]]
+            for rel in r["releases"]:
+                while changes and changes[0][0] <= rel["time"]:
+                    policy = build_policy(versions[changes.pop(0)[1]])
+                assert release_is_sound(policy, rel) == rel["released"], (seed, rel)
+                denied += not rel["released"]
+        assert amended >= 10 and denied >= 3
+
+    def test_runtime_agrees_with_an_independent_model(self):
+        # tests/agents_oracle.py reads the YAML itself and shares no code
+        # with cadl. Default instance, no bindings; the senders include
+        # actors outside the declared sets and undeclared actors.
+        from .agents_oracle import Model
+        total, kinds = 0, set()
+        files = [EXAMPLE, CHANGE, REVIEW / "x2.cadl", REVIEW / "x3.cadl"]
+        for k, path in enumerate(files):
+            sos = parse_file(path)
+            for seed in range(8):
+                rows = random_rows(sos, 3000 + 100 * k + seed, 150)
+                lines = aim(sos, trace(*rows, (rows[-1][0] + 1, None, {"end": False})),
+                            seed)
+                r = run(sos, parse_run_trace(lines))
+                model = Model(path.read_text())
+                for line in map(json.loads, lines):
+                    for msg_ in line.get("messages", []):
+                        model.message(msg_["from"], msg_["to"], msg_["name"],
+                                      msg_.get("args", []), line["t"])
+                model.tick(rows[-1][0] + 1)
+                got = []
+                for a in r["audit"]:
+                    if "decision" not in a:
+                        continue
+                    h = a["message"]
+                    rec = (a["time"], (h["from"], h["to"], h["name"]), a["decision"],
+                           a["reason"], a["hold_id"], a["outcome"])
+                    if a["provenance"]:
+                        rec += (tuple(map(tuple, a["provenance"])),)
+                    got.append(rec)
+                    kinds.add((a["decision"], a["reason"], a["outcome"]))
+                assert got == [tuple(x) for x in model.out], (path.name, seed)
+                total += len(got)
+        assert total >= 4800
+        assert {("deny", "default", "approved"), ("allow", "approved", "approved"),
+                ("deny", "rejected", "rejected"), ("deny", "expired", "expired")} <= kinds
 
     def test_runs_are_reproducible(self):
         sos = parse(RICH)
@@ -1204,5 +1422,360 @@ class TestRandomTraces:
                 assert value == step["result"], (name, step["message"])
                 kinds.add((value["decision"], value["reason"]))
                 total += 1
-        assert total == 14 * 300
-        assert len(kinds) >= 7
+        assert total == 26 * 300
+        assert len(kinds) >= 8
+
+
+# === Findings of the review of the first version of the runtime ================================
+# Each test fails on the runtime as first committed (7a4a5b3). The files
+# under tests/data/agents_review are the reviewer's reproductions.
+
+REVIEW = Path(__file__).parent / "data" / "agents_review"
+
+
+def review(name: str):
+    sos = parse_file(REVIEW / name)
+    assert type_check(sos).ok, name
+    return sos
+
+
+def c1(name: str, **more) -> dict:
+    return dict(contract="C1", instance=name, **more)
+
+
+class TestReleaseIsDecidedAgain:
+    """G.6, Release: fail-open defects A1 and C1 of the review."""
+
+    def test_a1_prohibition_in_an_instance_created_after_the_hold(self):
+        # Instance a (i = 1) holds the message for OP[1]. Instance b (i = 2)
+        # is created later; there the same prohibition applies and names
+        # OP[2]. The approval of OP[1] covers instance a only.
+        r = replay(review("x1.cadl"), trace(
+            (0, None, {"instances": [c1("a", bindings={"i": 1})]}),
+            (1, m("AG", "TOOL", "act")),
+            (2, None, {"instances": [c1("b", bindings={"i": 2})]}),
+            (4, m("OP[1]", "AG", "approve", "h-1")),
+            (5, None, {"end": False})))
+        assert decisions(r) == [
+            (1, "AG>TOOL:act", "escalate", "prohibition", ["no_act"], "h-1", None),
+            (4, "OP[1]>AG:approve", "allow", "default", []),
+            (4, "AG>TOOL:act", "deny", "prohibition", ["no_act"], "h-1", "approved"),
+        ]
+        assert (r["holds"][0]["state"], r["holds"][0]["released"]) == ("approved", False)
+        # B3: the closing record lists the instance of the ground, not b.
+        assert r["audit"][-1]["instances"] == [{"contract": "C1", "instance": "a"}]
+        assert all(n["state"] == "active" for i in r["instances"] for n in i["norms"])
+
+    def test_a1_release_when_no_other_instance_prohibits(self):
+        r = replay(review("x1.cadl"), trace(
+            (0, None, {"instances": [c1("a", bindings={"i": 1})]}),
+            (1, m("AG", "TOOL", "act")),
+            (2, m("OP[2]", "AG", "approve", "h-1")),
+            (3, m("OP[1]", "AG", "approve", "h-1")),
+            (4, None, {"end": False})))
+        # The rule `OP[i] -> AG : approve` with i = 1 does not match OP[2]:
+        # its message creates no approval at all.
+        assert events(r) == []
+        assert decisions(r)[-1] == (3, "AG>TOOL:act", "allow", "approved", ["no_act"],
+                                    "h-1", "approved")
+
+    def test_a1_approval_counts_in_a_contract_instance_of_a_ground(self):
+        # The approver's message is observed in both instances, but only
+        # instance a has a ground; the hold is approved once.
+        r = replay(review("x1.cadl"), trace(
+            (0, None, {"instances": [c1("a", bindings={"i": 1})]}),
+            (1, m("AG", "TOOL", "act"), {"instances": [c1("a", end=True)]}),
+            (2, None, {"instances": [c1("b", bindings={"i": 1})]}),
+            (3, m("OP[1]", "AG", "approve", "h-1")),
+            (4, None, {"end": False})))
+        assert decisions(r)[1] == (1, "AG>TOOL:act", "deny", "cancelled", ["no_act"],
+                                   "h-1", "cancelled")
+        assert events(r) == [(3, "OP[1]>AG:approve", "unauthorised_approval", "not_held")]
+
+    X2_START = ((0, m("OWNER", "AG", "grant_act")), (1, m("AG", "TOOL", "act")))
+    APPROVE = (4, m("OP", "AG", "approve", "h-1"))
+
+    def closing(self, r: dict) -> tuple:
+        rec = next(x for x in r["audit"] if x.get("outcome"))
+        return rec["decision"], rec["reason"], rec["contracts"], rec["outcome"]
+
+    def test_c1_release_while_the_other_contract_still_permits(self):
+        r = replay(review("x2.cadl"), trace(*self.X2_START, self.APPROVE,
+                                            (5, None, {"end": False})))
+        assert self.closing(r) == ("allow", "approved", ["CA"], "approved")
+        assert r["holds"][0]["released"]
+
+    def test_c1_permission_of_the_other_contract_revoked_before_the_approval(self):
+        # G.7: "an actor cannot obtain ... an authority that its originator
+        # ... no longer has". CB has no ground; it decides in full and denies.
+        r = replay(review("x2.cadl"), trace(
+            *self.X2_START, (2, m("OWNER", "AG", "revoke_act")), self.APPROVE,
+            (5, None, {"end": False})))
+        assert self.closing(r) == ("deny", "default", ["CB"], "approved")
+        assert not r["holds"][0]["released"]
+        assert r["audit"][-1]["escalate_to"] is None
+
+    def test_c1_instance_of_the_other_contract_ended_before_the_approval(self):
+        cb = dict(contract="CB", instance="b1")
+        r = replay(review("x2.cadl"), trace(
+            (0, m("OWNER", "AG", "grant_act"), {"instances": [cb]}),
+            (1, m("AG", "TOOL", "act")),
+            (2, None, {"instances": [dict(cb, end=True)]}),
+            self.APPROVE, (5, None, {"end": False})))
+        assert self.closing(r) == ("deny", "no_instance", ["CB"], "approved")
+
+    @pytest.mark.parametrize("version, expected", [
+        ("x2_nodeleg.cadl", ("deny", "default", ["CB"], "approved")),
+        ("x2_to.cadl", ("deny", "default", ["CB"], "approved")),
+        # Only an actor's role text changed: no contract is amended.
+        ("x2_actor.cadl", ("allow", "approved", ["CA"], "approved")),
+        # The contract of the ground is amended: the hold is cancelled (G.7).
+        ("x2_newproh.cadl", ("deny", "cancelled", ["CA"], "cancelled")),
+        ("x2_noact.cadl", ("deny", "cancelled", ["CA"], "cancelled")),
+    ])
+    def test_c1_amendment_between_hold_and_approval(self, version, expected):
+        r = replay(review("x2.cadl"), trace(
+            *self.X2_START, (2, None, {"amend": version}), self.APPROVE,
+            (5, None, {"end": False})), versions={version: review(version)})
+        assert self.closing(r) == expected
+
+    def test_c1_other_contract_that_would_escalate_denies_the_release(self):
+        # Both contracts prohibit; CB's prohibition starts after the hold
+        # and names another approver. No second hold is created.
+        head = "- id: no_wipe2\n          kind: prohibition\n          bearer: AG\n"
+        assert RICH.count(head) == 1 and RICH.count("enforcement: { default: deny }") == 1
+        src = RICH.replace("enforcement: { default: deny }", "enforcement:")
+        src = src.replace(head, '- { id: p_wipe2, kind: permission, bearer: AG, '
+                                'content: "AG -> T : wipe" }\n        ' + head
+                          + '          trigger: "SUP -> AG : arm"\n')
+        r = replay(src, trace(
+            (0, m("AG", "T", "wipe")), (1, m("SUP", "AG", "arm")),
+            (2, m("OP", "AG", "approve", "h-1")), (3, None, {"end": False})))
+        last = r["audit"][-1]
+        assert (last["decision"], last["reason"], last["contracts"], last["norms"]) == \
+            ("deny", "prohibition", ["C2"], ["C2.no_wipe2"])
+        assert (last["escalate_to"], last["notify"], last["outcome"]) == (None, ["SUP"],
+                                                                         "approved")
+        assert len(r["holds"]) == 1
+
+    def test_release_inputs_are_recorded(self):
+        r = replay(review("x2.cadl"), trace(*self.X2_START, self.APPROVE,
+                                            (5, None, {"end": False})))
+        rel = r["releases"][0]
+        assert (rel["hold_id"], rel["released"], rel["time"]) == ("h-1", True, 4)
+        assert rel["grounds"] == [{"contract": "CA", "norm": "no_act", "instance": "default"}]
+
+
+class TestActorReferencesInEvents:
+    """A2 and C5: actor references in triggers, `until:` and `counts_as`
+    match by the table of G.4, and a contract observes only the messages
+    it governs."""
+
+    E = (9, None, {"end": False})
+
+    def run(self, *rows) -> dict:
+        return replay(review("x3.cadl"), trace(*rows, self.E))
+
+    @pytest.mark.parametrize("sender, reason", [("SUP[3]", "default"), ("SUP[9]", "ungoverned")])
+    def test_trigger_with_a_range_matches_its_members_only(self, sender, reason):
+        r = self.run((0, m(sender, "AG", "enable")), (1, m("AG", "TOOL", "read")))
+        assert [x[2:4] for x in decisions(r)] == [("allow", reason), ("deny", "default")]
+
+    def test_trigger_by_a_member_of_the_range(self):
+        r = self.run((0, m("SUP[2]", "AG", "enable")), (1, m("AG", "TOOL", "read")))
+        assert decisions(r)[1][2:4] == ("allow", "permission")
+
+    @pytest.mark.parametrize("sender", ["SUP[3]", "SUP[9]"])
+    def test_until_with_a_range_does_not_lift_a_prohibition_for_others(self, sender):
+        r = self.run((0, m("SUP[1]", "AG", "freeze")), (1, m("AG", "TOOL", "act")),
+                     (2, m(sender, "AG", "thaw")), (3, m("AG", "TOOL", "act")))
+        assert [x[2] for x in decisions(r)] == ["allow", "escalate", "allow", "escalate"]
+
+    def test_until_of_a_delegation_with_a_range(self):
+        r = self.run((0, m("AG", "SUB", "grant_act")), (1, m("SUP[3]", "AG", "endgrant")),
+                     (2, m("SUB", "TOOL", "act")), (3, m("SUP[2]", "AG", "endgrant")),
+                     (4, m("SUB", "TOOL", "act")))
+        assert [x[2:4] for x in decisions(r) if x[1] == "SUB>TOOL:act"] == [
+            ("allow", "permission"), ("deny", "default")]
+
+    def test_c5_a_contract_observes_only_what_it_governs(self):
+        # `OP -> AG : freeze` is governed by C1 (OP and AG are parties) but
+        # not by C2 (OP is no party of it); a trigger of C2 written with the
+        # same message would be a G.5 leak. Here: X is a declared actor and
+        # no party, so C1 does not govern `X -> AG : stop`; the `until:` of
+        # may_report names OP, and the ungoverned message changes nothing.
+        r = replay(RICH, trace(
+            (0, m("X", "AG", "freeze")), (1, m("AG", "M", "ping")),
+            (2, m("X", "AG", "approve", "h-1")), (3, None, {"end": False})))
+        assert [x[2:4] for x in decisions(r)] == [
+            ("allow", "ungoverned"), ("allow", "default"), ("allow", "ungoverned")]
+        assert events(r) == []                      # no approval event was created
+        for inst in r["instances"]:
+            assert inst["institutional_events"] == []
+
+
+class TestApproverMessageIsGoverned:
+    def test_c4_receiver_of_an_approval_rule_must_be_a_party(self):
+        from .test_agents_extension import check, with_rule
+        res = check(
+            """
+            counts_as:
+              - { when: "OP -> X : approve", creates: approval }
+            """,
+            norms(proh("no_wipe", "AG", "AG -> T : wipe", "on_denied: { escalate_to: OP }")))
+        errors = with_rule(res.errors, "G-9")
+        assert len(errors) == 1 and "receiver 'X'" in errors[0] and "not a party" in errors[0]
+
+    def test_c4_member_outside_an_indexed_party(self):
+        from .test_agents_extension import check, with_rule
+        blocks = (
+            """
+            counts_as:
+              - { when: "OP -> R[3] : approve", creates: approval }
+            """,
+            norms(proh("no_wipe", "AG", "AG -> T : wipe", "on_denied: { escalate_to: OP }")))
+        assert not with_rule(check(*blocks).errors, "G-9")
+        res = check(*blocks, parties='[OP, SUP, AG, SUB, T, "R[1..2]"]')
+        assert len(with_rule(res.errors, "G-9")) == 1
+
+
+class TestTraceValues:
+    """A3, D1, D2 and D4: values that are not well-formed are trace errors."""
+
+    D = '"messages": [{"from": "PLANNER", "to": "FILES", "name": "delete_file"}]'
+
+    @pytest.mark.parametrize("line, text", [
+        ('{"t": NaN, %s}', "not JSON"),
+        ('{"t": Infinity, %s}', "not JSON"),
+        ('{"t": -Infinity, %s}', "not JSON"),
+        ('{"t": 1e999, %s}', "not JSON"),
+        ('{"t": true, %s}', "must be a number"),
+        ('{"t": 1e18, %s}', "at most"),
+        ('{"t": -1e11, %s}', "at most"),
+        ('{"t": 1, "values": {"x": NaN}, %s}', "not JSON"),
+        ('{"t": 1, "messages": [{"from": "PLAN NER", "to": "FILES", "name": "delete_file"}]}',
+         "concrete actor"),
+        ('{"t": 1, "messages": [{"from": "PLANNER", "to": " FILES", "name": "delete_file"}]}',
+         "concrete actor"),
+        ('{"t": 1, "messages": [{"from": "PLANNER", "to": "FILES[01]", "name": "x"}]}',
+         "concrete actor"),
+        ('{"t": 1, "messages": [{"from": "PLANNER", "to": "FILES", "name": "delete file"}]}',
+         "message name"),
+        ('{"t": 1, "messages": [{"from": "PLANNER", "to": "FILES", "name": "x", '
+         '"args": [1e999]}]}', "not JSON"),
+    ])
+    def test_rejected_by_both_trace_readers(self, line, text):
+        from cadl.norms_eval import parse_trace
+        lines = ['{"t": 0}', line % self.D if "%s" in line else line]
+        with pytest.raises(TraceError, match=text):
+            parse_run_trace(lines)
+        with pytest.raises(TraceError, match=text):
+            parse_trace(lines)
+
+    def test_epoch_that_overflows(self):
+        with pytest.raises(TraceError, match="representable"):
+            parse_run_trace(['{"t": 9e9, "epoch": "9990-01-01T00:00:00Z"}'])
+
+    def test_d4_failed_run_writes_no_audit_file(self, capsys, tmp_path):
+        bad = tmp_path / "nan.jsonl"
+        bad.write_text('{"t": 0, %s}\n{"t": NaN, %s}\n' % (self.D, self.D))
+        log = tmp_path / "audit.jsonl"
+        status = main(["agents-run", str(EXAMPLE), "--trace", str(bad), "--audit", str(log)])
+        captured = capsys.readouterr()
+        assert status == 2 and not log.exists() and not captured.out
+        assert "No audit file was written" in captured.err
+        # A failure after the first decisions: still nothing is written.
+        late = tmp_path / "late.jsonl"
+        late.write_text('{"t": 0, %s}\n{"t": 1, "state": "Nowhere", "instances": '
+                        '[{"contract": "NOPE", "instance": "a"}]}\n' % self.D)
+        status = main(["agents-run", str(EXAMPLE), "--trace", str(late), "--audit", str(log)])
+        assert status == 2 and not log.exists()
+        assert "No audit file was written" in capsys.readouterr().err
+
+    def test_no_nan_in_any_output(self, capsys, tmp_path):
+        for path in EXAMPLE_TRACES:
+            assert "NaN" not in "".join(audit_lines(run_files(EXAMPLE, path)))
+
+
+class TestLifecycleRecords:
+    """B2 and B3: every change of what a later decision can return has a
+    record."""
+
+    def test_instances_start_and_end(self):
+        r = replay(RICH, trace(
+            (0, None, {"instances": [dict(contract="C1", instance="a", bindings={"i": 1})]}),
+            (1, m("OP", "AG", "grant_write"), {"instances": [dict(contract="C2", instance="x")]}),
+            (2, None, {"instances": [dict(contract="C1", instance="a", end=True)]}),
+            (3, None)))
+        got = [(x["time"], x["event"], x["instances"][0]["instance"], x["reason"])
+               for x in r["audit"] if "event" in x and x["event"] != "grant"]
+        assert got == [
+            (0, "instance_start", "a", None), (1, "instance_start", "x", None),
+            (2, "instance_end", "a", "end"), (2, "delegation_end", "a", "instance_end"),
+            (3, "instance_end", "x", "end")]
+        ended = next(x for x in r["audit"] if x.get("event") == "delegation_end")
+        assert (ended["norm"], ended["chain"], ended["holders"], ended["message"]) == \
+            ("C1.p_op_write", ["OP", "AG"], ["AG"], None)
+
+    def test_terminal_state_and_amendment(self):
+        r = replay(LIFECYCLE, trace((0, None), (1, m("OP", "AG", "done"), {"state": "Closed"})))
+        assert [(x["event"], x["reason"]) for x in r["audit"] if "event" in x] == [
+            ("instance_start", None), ("instance_end", "terminal_state")]
+        v2 = review("x2_nodeleg.cadl")
+        r = replay(review("x2.cadl"), trace(
+            (0, m("OWNER", "AG", "grant_act")), (2, None, {"amend": "v2"}),
+            (3, None, {"end": False})), versions={"v2": v2})
+        assert [(x["time"], x["event"], x["reason"], x["instances"]) for x in audit(r)
+                if "event" in x and x["event"] != "grant"] == [
+            (2, "amendment", "v2", [{"contract": "CB", "instance": "default"}]),
+            (2, "delegation_end", "amendment", [{"contract": "CB", "instance": "default"}])]
+
+    def test_b3_closing_records_list_the_instances_of_the_grounds(self):
+        r = replay(review("x1.cadl"), trace(
+            (0, None, {"instances": [c1("a", bindings={"i": 1})]}),
+            (1, [m("AG", "TOOL", "act"), m("AG", "TOOL", "act")]),
+            (2, None, {"instances": [c1("a", end=True), c1("b", bindings={"i": 3})]}),
+            (700, None, {"end": False})))
+        closing = [(x["reason"], x["instances"]) for x in r["audit"] if x.get("outcome")]
+        assert closing == [("cancelled", [{"contract": "C1", "instance": "a"}])] * 2
+        r = replay(review("x1.cadl"), trace(
+            (0, None, {"instances": [c1("a", bindings={"i": 1})]}),
+            (1, m("AG", "TOOL", "act")),
+            (2, None, {"instances": [c1("b", bindings={"i": 1})]}),
+            (700, None, {"end": False})))
+        closing = [(x["reason"], x["time"], x["instances"]) for x in r["audit"]
+                   if x.get("outcome")]
+        assert closing == [("expired", 601, [{"contract": "C1", "instance": "a"}])]
+
+
+C5_SOURCE = source(norms(
+    perm("p_read", "AG", "AG -> T : read"),
+    """
+    - id: locked
+      kind: prohibition
+      bearer: AG
+      trigger: "R[*] -> AG : lock"
+      until: "X -> AG : unlock"
+      content: "AG -> T : read"
+    """), parties='[OP, SUP, AG, SUB, T, "R[1..2]"]')
+
+
+class TestGovernedObservations:
+    """C5: an instance of an enforced contract observes a message only when
+    the contract governs it (G.5)."""
+
+    def test_trigger_from_a_declared_actor_that_is_no_party(self):
+        # R[3] is a member of the declared set R[1..3] and matches `R[*]`,
+        # but the parties are R[1..2]: the contract does not govern the
+        # message, so it is ungoverned and no observation for the contract.
+        r = replay(C5_SOURCE, trace(
+            (0, m("R[3]", "AG", "lock")), (1, m("AG", "T", "read")),
+            (2, m("R[2]", "AG", "lock")), (3, m("AG", "T", "read")),
+            (4, m("X", "AG", "unlock")), (5, m("AG", "T", "read")),
+            (6, None, {"end": False})))
+        assert [x[2:4] for x in decisions(r)] == [
+            ("allow", "ungoverned"), ("allow", "permission"),
+            ("allow", "default"), ("deny", "prohibition"),
+            # X is declared but no party: its `unlock` is not observed either.
+            ("allow", "ungoverned"), ("deny", "prohibition")]
+        assert norm_states(r)["locked"][0] == "active"

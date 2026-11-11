@@ -183,6 +183,29 @@ def is_static(contract: ContractDef, norm: NormDef) -> bool:
     return all(r["kind"] != "var" for r in refs)
 
 
+def ref_covered(ref: dict, parties: list) -> bool:
+    """Whether every actor that an actor reference can name matches one of
+    the party references (as `parse_ref` data), as G.5 reads `parties:`:
+    a party `A[i]` or `A[*]` stands for every member of `A`."""
+    for p in parties:
+        if p["name"] != ref["name"]:
+            continue
+        if p["kind"] == "plain" or ref["kind"] == "plain":
+            if p["kind"] == ref["kind"]:
+                return True
+        elif p["kind"] in ("all", "var"):
+            return True
+        elif p["kind"] == "index":
+            if ref["kind"] == "index" and ref["index"] == p["index"]:
+                return True
+        elif ref["kind"] == "index":
+            if p["lo"] <= ref["index"] <= p["hi"]:
+                return True
+        elif ref["kind"] == "range" and p["lo"] <= ref["lo"] and ref["hi"] <= p["hi"]:
+            return True
+    return False
+
+
 # --- Boundary policy ----------------------------------------------------------
 
 def _actor_entry(actor: ActorDef) -> dict:
