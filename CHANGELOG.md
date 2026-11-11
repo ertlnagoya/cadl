@@ -81,6 +81,79 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `cadl norms-eval` on random paths and on every path of at most two observations of one contract, with an interpreter
   of the generated PRISM text that is itself compared with the PRISM
   simulator.
+- `cadl a2a-gateway FILE --agent-actor ACTOR --upstream URL --client-keys
+  KEYS.json --audit OUT.jsonl [...]` (ships in 0.3.25): the A2A mapping of
+  Appendix G, G.11, as an HTTP server for the JSON-RPC binding of A2A
+  1.0.0 in front of one A2A agent. Every request is authenticated with
+  the key of its actor (`Authorization: CADL-HMAC`, an HMAC-SHA256 bound
+  to the run, a nonce used once, the path and the SHA-256 of the body);
+  an unauthenticated request gets HTTP 401 and is recorded
+  (`unauthenticated_request`). A `SendMessage` names its CADL message and
+  arguments with the extension
+  `https://www.ertl.jp/cadl-spec/a2a/agents-message/v0.1` and is decided
+  by the online runtime: allowed requests are passed on re-serialised,
+  denied ones get a task in `TASK_STATE_REJECTED`, escalated ones are held
+  (blocking, or a `TASK_STATE_SUBMITTED` task of the gateway with
+  `returnImmediately`) until an approval through the inbox
+  (`cadl mcp-approve`), a rejection or the timeout. `GetTask` and
+  `CancelTask` pass for the client's own tasks only (`task_refused`);
+  streaming, push notifications, `ListTasks`, `GetExtendedAgentCard`,
+  `tenant` and every other method are refused. A held request is
+  withdrawn when its client cancels the task or closes the connection.
+  Optional HTTPS (`--tls-cert`, `--tls-key`); an address other than
+  loopback needs it. The trace replays through `cadl agents-run` to the
+  same audit log, byte for byte. New host events `unauthenticated_request`,
+  `task_refused` and `invalid_response`, which `agents-run` reads.
+- `cadl.gateway_core`: the enforcement point, trace, audit log, holds,
+  inbox and inbox tools shared by the two gateways, factored out of
+  `cadl.mcp_gateway`, which re-exports its former names.
+
+### Security
+
+- Review of `cadl a2a-gateway` before its release: a context id that the
+  gateway had not seen given to the client was claimed by whoever named it
+  first, also across runs, so a client could continue another client's
+  context; it is now refused. `tenant` could select another tenant's task
+  with the same id; it is refused. An approval rule whose receiver is a
+  set (`OPERATOR -> WORKER[*] : approve`) was not recognised, so an
+  approval could come as an A2A message without the binding to the held
+  arguments; approval names are now taken from every such rule, also for
+  the inbox of `cadl mcp-message`. Over TLS, a client that closed the
+  connection of a held request with close_notify was not seen as gone.
+  Unauthenticated requests are recorded at most 20 times a second.
+- Second review of `cadl a2a-gateway`. An approval rule whose receiver is
+  a set or a range now names the gateway's own actor when it is a member
+  (`mcp-approve` works, bound to the arguments), for the A2A and the MCP
+  gateway; a gateway whose actor's contract escalates with no approval
+  rule it can name refuses to start. A client that sends more bytes and
+  then closes, or half-closes, withdraws its held request. A cancellation
+  or disconnect after a deadline that the ticker had not yet observed is
+  answered from the closing record (`expired`). `CancelTask` is recorded
+  (`task_cancel`). A released `returnImmediately` request that cannot be
+  passed on fails its task (`forward_failed`). `--agent-card` has to
+  declare the extension; `--upstream-token` is refused with a plain-HTTP
+  agent off loopback; at most `--max-handlers` (64) requests at a time,
+  more get 503 (`overloaded`); at most 1 000 000 nonces per run.
+- Third review of `cadl a2a-gateway`. A request has to be read within
+  `--read-timeout` (10 s) in all (`read_timeout`); at most `--max-readers`
+  (64) connections are read before authentication; a `--max-handlers`
+  slot is taken only after authentication; one actor may hold at most
+  16 blocking requests (later `--max-handlers-per-actor`). Slow unauthenticated
+  connections could otherwise lock out every client. Approval rules with
+  a set, range or index-variable receiver resolve to the gateway's
+  actor, then (MCP) its client, then the first declared member, so files
+  that 0.3.24 accepted start again; only an escalation without any
+  approval rule is refused. The nonce cap is per actor.
+- Fourth review of `cadl a2a-gateway`. Peers of one address that
+  reconnected at once kept every reader busy: at most
+  `--max-readers-per-address` (4) connections of one address (an IPv4
+  address or the /64 prefix of an IPv6 address) are read at
+  once (more are closed at once), and a connection waits up to one second
+  for a reader before 503. One actor uses at most
+  `--max-handlers-per-actor` (16) handlers, which replaces
+  `--max-held-per-actor` and also covers requests to a slow agent, and
+  has at most `--max-holds-per-actor` (64) holds, `returnImmediately`
+  included (503 before the decision, `overloaded`).
 
 ## [0.3.24] — 2026-11-11
 
