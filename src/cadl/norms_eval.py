@@ -252,6 +252,68 @@ def _bound_refs(contract: ContractDef) -> set:
 # The variables are named `*1`, `*2`, ...: no written name can hide them.
 
 _COMPARISON_OPS = ("==", "!=", "<", "<=", ">", ">=")
+# Aggregates whose value moves one way when the domain grows (F.5): a
+# comparison of one of them with an operand that binds no variable is
+# decided from the known members when every completion agrees.
+_MONOTONE_AGGREGATES = ("count", "min", "max")
+_FLIPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "==", "!=": "!="}
+
+
+def _has_binder(node: Any) -> bool:
+    """Whether `node` contains a quantifier or a comprehension."""
+    if isinstance(node, (QuantifiedExpr, Comprehension)):
+        return True
+    if isinstance(node, ActorRef):
+        return node.index is not None and not isinstance(node.index, (str, int)) \
+            and _has_binder(node.index)
+    if isinstance(node, MemberAccess):
+        return _has_binder(node.obj)
+    if isinstance(node, UnaryOp):
+        return _has_binder(node.operand)
+    if isinstance(node, BinaryOp):
+        return _has_binder(node.left) or _has_binder(node.right)
+    if isinstance(node, FunctionCall):
+        return any(_has_binder(a) for a in node.args)
+    return False
+
+
+def _monotone_operands(expr: Any) -> Any:
+    """(aggregate call, other operand, operator with the call on the left)
+    of a comparison `count|min|max(e for x in D) op b`, or `b op ...`,
+    whose other operand binds no variable; None for any other node."""
+    if not (isinstance(expr, BinaryOp) and expr.op in _COMPARISON_OPS):
+        return None
+    for call, other, op in ((expr.left, expr.right, expr.op),
+                            (expr.right, expr.left, _FLIPPED[expr.op])):
+        if (isinstance(call, FunctionCall) and call.name in _MONOTONE_AGGREGATES
+                and len(call.args) == 1 and isinstance(call.args[0], Comprehension)
+                and not (isinstance(other, FunctionCall) and other.name == "__in__")
+                and not _has_binder(other)):
+            return call, other, op
+    return None
+
+
+def _interval_decides(op: str, lo: Any, hi: Any, b: Any, integral: bool) -> Any:
+    """`v op b` for every v in [lo, hi] (bounds may be infinite; with
+    `integral`, v ranges over the integers): True when it holds for all,
+    False when for none, None otherwise."""
+    if op in ("==", "!="):
+        inside = lo <= b <= hi and (not integral or float(b).is_integer())
+        if lo == hi == b:
+            equal = True
+        elif not inside:
+            equal = False
+        else:
+            return None
+        return equal if op == "==" else not equal
+    cmp = {"<": lambda v: v < b, "<=": lambda v: v <= b,
+           ">": lambda v: v > b, ">=": lambda v: v >= b}[op]
+    at_lo, at_hi = cmp(lo), cmp(hi)
+    if at_lo and at_hi:
+        return True
+    if not at_lo and not at_hi:
+        return False
+    return None
 
 
 def _wildcard_key(node: Any) -> Any:
@@ -917,6 +979,9 @@ class _Evaluator:
                 if left is marker or right is marker:
                     return marker
             return not stop
+        refined = self._monotone(expr, k, n)
+        if refined is not None:
+            return refined
         left = self.value(expr.left, k, n)
         if (op == "==" and isinstance(expr.right, FunctionCall)
                 and expr.right.name == "__in__"):
@@ -1162,21 +1227,12 @@ class _Evaluator:
             return UNKNOWN
         return not decisive
 
-    def _aggregate(self, name: str, comp: Comprehension, k: int, n: int) -> Any:
-        """sum, count, min, max or avg of a comprehension at observation k;
-        undefined on an open domain or when an element is undefined.
-        `count` counts the members for which the element is true."""
-        dom = self.domain(comp.domain, k)
-        if dom is UNKNOWN:
-            return UNKNOWN
-        group, members, closed = dom
-        if not closed:
-            if group is not None:
-                self._open_domain(group)
-            else:
-                self.warn(f"the range of '{comp.variable}' in {name}() has a bound without "
-                          f"a value; the aggregate is undefined")
-            return UNKNOWN
+    def _elements(self, name: str, comp: Comprehension, group: Any, members: list,
+                  k: int, n: int) -> tuple:
+        """The values of the element of an aggregate for the members of its
+        domain: (values, markers). For `count` a value is a truth value;
+        for the others a number. An element without such a value is
+        UNKNOWN (with a warning)."""
         vals, markers = [], []
         for index in members:
             v = self._with(comp.variable, (group, index),
@@ -1194,6 +1250,24 @@ class _Evaluator:
                 markers.append(v)
             else:
                 vals.append(v)
+        return vals, markers
+
+    def _aggregate(self, name: str, comp: Comprehension, k: int, n: int) -> Any:
+        """sum, count, min, max or avg of a comprehension at observation k;
+        undefined on an open domain or when an element is undefined.
+        `count` counts the members for which the element is true."""
+        dom = self.domain(comp.domain, k)
+        if dom is UNKNOWN:
+            return UNKNOWN
+        group, members, closed = dom
+        if not closed:
+            if group is not None:
+                self._open_domain(group)
+            else:
+                self.warn(f"the range of '{comp.variable}' in {name}() has a bound without "
+                          f"a value; the aggregate is undefined")
+            return UNKNOWN
+        vals, markers = self._elements(name, comp, group, members, k, n)
         worst = self._worst(*markers)
         if worst is not None:
             return worst
@@ -1209,6 +1283,44 @@ class _Evaluator:
         if name == "max":
             return max(vals)
         return sum(vals) / len(vals)
+
+    def _monotone(self, expr: BinaryOp, k: int, n: int) -> Any:
+        """A comparison of `count`, `min` or `max` of a comprehension with
+        an operand that binds no variable, decided from the interval of
+        values that the aggregate can take (F.5): undefined elements, and
+        on an open domain the members not yet named, may take any value.
+        count lies in [true, true + undefined] (no upper bound when open),
+        max in [largest defined value, +inf), min in (-inf, smallest
+        defined value]. True or False when every value of the interval
+        gives it; None (evaluate as usual) otherwise, and when the domain
+        is closed and every element is defined (the exact value)."""
+        found = _monotone_operands(expr)
+        if found is None:
+            return None
+        call, other, op = found
+        comp = call.args[0]
+        dom = self.domain(comp.domain, k)
+        if dom is UNKNOWN:
+            return None
+        group, members, closed = dom
+        if group is None and not closed:
+            return None                     # a range whose bound has no value
+        b = self.value(other, k, n)
+        if isinstance(b, bool) or not isinstance(b, (int, float)):
+            return None
+        vals, markers = self._elements(call.name, comp, group, members, k, n)
+        if any(m is UNDECIDED for m in markers) or (closed and not markers):
+            return None
+        inf = float("inf")
+        if call.name == "count":
+            lo = sum(1 for v in vals if v is True)
+            hi = lo + len(markers) if closed else inf
+            return _interval_decides(op, lo, hi, b, True)
+        if not vals:
+            return None
+        if call.name == "max":
+            return _interval_decides(op, max(vals), inf, b, False)
+        return _interval_decides(op, -inf, min(vals), b, False)
 
     # --- temporal operators (F.4) -------------------------------------------
 

@@ -25,6 +25,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   prefix property apply unchanged. An aggregate argument with two sets
   and a reference in the arguments of a message event stay not
   evaluable. Up to 0.3.23 such a predicate was not evaluated.
+- Monotone aggregates in a comparison (F.5): `count`, `max` and `min`
+  of a comprehension compared with an operand without a quantifier or
+  comprehension are decided from the known members, over an open domain
+  and with undefined elements, when every completion agrees (an
+  interval evaluation: count in [true, true + undefined], unbounded
+  above when open; max from the largest defined value up; min from the
+  smallest down). `count(ROBOT[*].delivery == request.id) >= 2` now
+  detects a double assignment while `N` has no value. `sum` and `avg`
+  are not refined. Up to 0.3.23 such comparisons were undefined.
 - N-15 (`cadl check`, warning): a wildcard or range reference bound
   under `NOT`, two sets in one comparison, the same set in both operands
   of `OR`, and an aggregate argument over two sets.

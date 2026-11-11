@@ -328,3 +328,182 @@ def test_agents_runtime_equals_the_quantified_form():
             allowed += sum(d[2] == "allow" for d in da)
             denied += sum(d[2] == "deny" for d in da)
     assert allowed >= 50 and denied >= 50, (allowed, denied)
+
+
+# === Monotone aggregates over open domains (F.5) =======================================
+
+from .test_norms_quantifiers import value   # noqa: E402
+
+MONOTONE = [
+    "count(S[j].x == 1 for j in S) >= 2",
+    "count(S[j].x == 1 for j in S) > 1",
+    "count(S[j].x == 1 for j in S) <= 1",
+    "count(S[j].x == 1 for j in S) < 2",
+    "count(S[j].x == 1 for j in S) == 1",
+    "count(S[j].x == 1 for j in S) != 1",
+    "2 <= count(S[j].x == 1 for j in S)",
+    "max(S[j].x for j in S) >= 2",
+    "max(S[j].x for j in S) < 2",
+    "max(S[j].x for j in S) == 1",
+    "min(S[j].x for j in S) <= 0",
+    "min(S[j].x for j in S) > 0",
+    "0 < min(S[j].x for j in S)",
+    "count(S[j].x == 1 for j in S[2..N]) >= 2",
+    "max(S[j].x for j in S) > S[1].y",
+]
+
+
+def _member_values(rng, members, choices):
+    values = {}
+    for i in members:
+        v = rng.choice(choices)
+        if v != "absent":
+            values[f"S[{i}].x"] = v
+        values[f"S[{i}].z"] = 0                         # the member is named
+    return values
+
+
+def test_monotone_aggregates_are_sound():
+    """Whenever a comparison of count, max or min over the open domain of
+    S[1..N] is true or false, every completion gives the same value: N gets
+    any value from the largest named index on, every member not yet named
+    any value of x (0, 1, 2 or none). On a closed domain with undefined
+    elements, every assignment of defined values to them gives the decided
+    value too."""
+    import itertools
+    rng = random.Random(20261121)
+    decided = {f: 0 for f in MONOTONE}
+    checks = 0
+    for _ in range(1400):
+        known = sorted(rng.sample(range(1, 5), rng.randint(0, 4)))
+        values = _member_values(rng, known, (0, 1, 1, 2, None, "absent"))
+        values["S[1].y"] = rng.choice((0, 1))
+        text = rng.choice(MONOTONE)
+        base = value(text, [{"t": 0, "values": values}])
+        if base is None:
+            continue
+        decided[text] += 1
+        top = max(known, default=1)
+        for n in range(top, 6):
+            fresh = [i for i in range(1, n + 1) if i not in known]
+            for choice in itertools.product((0, 1, 2, None), repeat=len(fresh)):
+                ext = dict(values, N=n)
+                for i, x in zip(fresh, choice):
+                    ext[f"S[{i}].z"] = 0
+                    if x is not None:
+                        ext[f"S[{i}].x"] = x
+                got = value(text, [{"t": 0, "values": ext}])
+                assert got is base, (text, values, ext, base, got)
+                checks += 1
+                # the completed (closed) domain: fill its undefined elements
+                undef = [i for i in range(1, n + 1) if ext.get(f"S[{i}].x") is None]
+                if got is not None and undef and len(undef) <= 3:
+                    for fill in itertools.product((0, 1, 2), repeat=len(undef)):
+                        full = dict(ext, **{f"S[{i}].x": f for i, f in zip(undef, fill)})
+                        assert value(text, [{"t": 0, "values": full}]) is got
+    assert min(decided.values()) >= 4 and checks >= 10000, (decided, checks)
+
+
+class TestMonotoneAggregates:
+    OPEN = [{"t": 0, "values": {"S[1].x": 1, "S[2].x": 1, "S[3].x": 2}}]
+
+    @pytest.mark.parametrize("text, expected", [
+        ("count(S[j].x == 1 for j in S) >= 2", True),
+        ("count(S[j].x == 1 for j in S) >= 3", None),
+        ("count(S[j].x == 1 for j in S) <= 1", False),
+        ("count(S[j].x == 1 for j in S) == 2", None),    # another member may add one
+        ("count(S[j].x == 1 for j in S) == 1", False),
+        ("max(S[j].x for j in S) >= 2", True),
+        ("max(S[j].x for j in S) < 2", False),
+        ("max(S[j].x for j in S) <= 2", None),
+        ("min(S[j].x for j in S) <= 1", True),
+        ("min(S[j].x for j in S) > 1", False),
+        ("min(S[j].x for j in S) >= 1", None),
+        ("3 > count(S[j].x == 1 for j in S)", None),
+        ("1 < count(S[j].x == 1 for j in S)", True),
+        # not refined: sum and avg; an operand with a binder; arithmetic
+        ("sum(S[j].x for j in S) >= 2", None),
+        ("avg(S[j].x for j in S) >= 1", None),
+        ("count(S[j].x == 1 for j in S) >= count(S[j].x == 2 for j in S)", None),
+        ("count(S[j].x == 1 for j in S) + 1 >= 2", None),
+    ])
+    def test_open_domain(self, text, expected):
+        assert value(text, self.OPEN) is expected
+
+    def test_closed_domain_with_undefined_elements(self):
+        obs = [{"t": 0, "values": {"R[1].x": 1, "R[2].x": 1}}]          # R[3].x: none
+        assert value("count(R[j].x == 1 for j in R) >= 2", obs) is True
+        assert value("count(R[j].x == 1 for j in R) <= 3", obs) is True
+        assert value("count(R[j].x == 1 for j in R) == 2", obs) is None
+        assert value("count(R[j].x == 1 for j in R) > 3", obs) is False
+        assert value("max(R[j].x for j in R) >= 1", obs) is True
+        assert value("sum(R[j].x for j in R) >= 1", obs) is None
+        full = [{"t": 0, "values": {"R[1].x": 1, "R[2].x": 1, "R[3].x": 0}}]
+        assert value("count(R[j].x == 1 for j in R) == 2", full) is True
+
+
+# --- the exercise: a prohibition of a second assignment written with count ----------
+
+EXAMPLE_DOUBLE = Path(__file__).parent.parent / "examples" / "norms_no_double_assignment.cadl"
+COUNT_FORM = "count(ROBOT[*].delivery == request.id) >= 2"
+
+
+def _count_form(text: str) -> str:
+    old = ('content: "exists j in ROBOT: exists k in ROBOT: j != k AND '
+           'ROBOT[j].delivery == request.id AND ROBOT[k].delivery == request.id"')
+    assert old in text
+    return text.replace(old, f'content: "{COUNT_FORM}"')
+
+
+def _no_double(result: dict) -> tuple:
+    n = next(x for x in result["norms"] if x["id"] == "no_double_assignment")
+    return n["state"], n["verdict"], n["time"]
+
+
+EXPECTED_DOUBLE = {"a_ok": ("fulfilled", "fulfilled", 90.0),
+                   "b_double": ("violated", "violated", 3.0),
+                   "c_reassign": ("fulfilled", "fulfilled", 90.0)}
+
+
+def test_count_form_detects_the_double_assignment(tmp_path):
+    """`count(ROBOT[*].delivery == request.id) >= 2` over the open domain of
+    ROBOT[1..N]: the two known robots with the delivery decide it, as the
+    exists form of the bundled example does; offline, in the generated
+    monitor and in agents-run."""
+    import subprocess
+    import sys
+    from cadl.agents_runtime import parse_run_trace, run
+    from cadl.parser import parse
+    from cadl.codegen.norms_monitor_gen import generate_norms_monitor_module
+    text = _count_form(EXAMPLE_DOUBLE.read_text())
+    sos, original = parse(text), parse_file(EXAMPLE_DOUBLE)
+    assert type_check(sos).ok
+    module = tmp_path / "norms_monitor.py"
+    module.write_text(generate_norms_monitor_module(sos))
+    # the same file under agents 0.1: the instance binds i by its party
+    agents = parse(text.replace("    - norms: 0.1\n", "    - norms: 0.1\n    - agents: 0.1\n")
+                   .replace('parties: [DISPATCHER, "ROBOT[*]", "CUSTOMER[*]"]',
+                            'parties: [DISPATCHER, "ROBOT[i]", "CUSTOMER[*]"]\n'
+                            '      enforcement: {}'))
+    assert type_check(agents).ok, [str(e) for e in type_check(agents).errors]
+    traces = Path(__file__).parent.parent / "examples" / "traces"
+    for name, expected in EXPECTED_DOUBLE.items():
+        lines = (traces / f"norms_no_double_assignment_{name}.jsonl").read_text().splitlines()
+        offline = evaluate(sos, parse_trace(lines))
+        assert _no_double(offline) == expected, name
+        assert _no_double(evaluate(original, parse_trace(lines))) == expected, name
+        p = subprocess.run([sys.executable, "-I", "-S", str(module),
+                            str(traces / f"norms_no_double_assignment_{name}.jsonl"),
+                            "--format", "json"], capture_output=True, text=True)
+        got = json.loads(p.stdout)
+        for key in ("file", "trace"):
+            got.pop(key, None), offline.pop(key, None)
+        assert got == offline, name
+        first = json.loads(lines[0])
+        first["instances"] = [{"instance": "d1", "contract": "DELIVERY_SLA",
+                               "bindings": first.pop("bindings"),
+                               "request": first.pop("request")}]
+        r = run(agents, parse_run_trace([json.dumps(first)] + lines[1:]))
+        inst = r["instances"][0]
+        n = next(x for x in inst["norms"] if x["id"] == "no_double_assignment")
+        assert (n["state"], n["verdict"]) == expected[:2], name

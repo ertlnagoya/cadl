@@ -379,6 +379,22 @@ FORMULAS = [
     "for all j in S: exists k in S: S[k].y == S[j].x",
     "count(S[j].x == 1 for j in S) >= 1",
     "sum(S[j].x for j in S) < 3",
+    # monotone aggregates compared with an operand without a binder (F.5)
+    "count(S[j].x == 1 for j in S) >= 2",
+    "count(S[j].x == 1 for j in S) > 1",
+    "count(S[j].x == 1 for j in S) <= 1",
+    "count(S[j].x == 1 for j in S) < 2",
+    "count(S[j].x == 1 for j in S) == 1",
+    "count(S[j].x == 1 for j in S) != 1",
+    "2 <= count(S[j].y == 1 for j in S)",
+    "max(S[j].x for j in S) >= 1",
+    "max(S[j].x for j in S) < 1",
+    "max(S[j].x for j in S) == 0",
+    "min(S[j].y for j in S) <= 0",
+    "min(S[j].y for j in S) > 0",
+    "1 > min(S[j].x for j in S)",
+    "count(S[j].x == 1 for j in S[2..N]) >= 1",
+    "max(S[j].x for j in S) > S[1].y",
 ]
 
 
@@ -390,7 +406,7 @@ def test_open_domain_is_sound():
     arbitrary value of x and y (0, 1 or none)."""
     rng = random.Random(20261111)
     checks = decided = 0
-    for _ in range(260):
+    for _ in range(520):
         known = sorted(rng.sample(range(1, 5), rng.randint(0, 3)))
         values = {}
         for i in known:
@@ -421,7 +437,7 @@ def test_open_domain_is_sound():
                 got = value(text, [{"t": 0, "values": ext}])
                 assert got is base, (text, values, ext, base, got)
                 checks += 1
-    assert decided >= 40 and checks >= 10000, (decided, checks)
+    assert decided >= 120 and checks >= 20000, (decided, checks)
 
 
 # === The bundled example and the traces of the exercise ===========================
