@@ -100,6 +100,31 @@ def yaml_number(value: Any) -> Fraction | None:
     return None
 
 
+def int_text(n: int) -> str:
+    """The decimal digits of an integer of any size.
+
+    ``str`` refuses integers of more than 4300 digits from Python 3.11
+    (and in some patch releases of 3.9 and 3.10); exact results of a
+    long model can have more. The number is split by powers of ten into
+    parts that ``str`` accepts, without changing any limit of the process.
+    """
+    if n < 0:
+        return "-" + int_text(-n)
+    if n.bit_length() <= 12000:          # at most 3613 digits
+        return str(n)
+    half = (n.bit_length() * 30103 // 100000) // 2
+    high, low = divmod(n, 10 ** half)
+    return int_text(high) + int_text(low).rjust(half, "0")
+
+
+def fraction_text(value: Fraction) -> str:
+    """An exact number as an integer or ``n/d`` in lowest terms, of any size."""
+    value = Fraction(value)
+    if value.denominator == 1:
+        return int_text(value.numerator)
+    return f"{int_text(value.numerator)}/{int_text(value.denominator)}"
+
+
 def decimal_text(value: Fraction) -> str:
     """The shortest decimal of an exact number, without an exponent (H.11).
 
@@ -111,13 +136,13 @@ def decimal_text(value: Fraction) -> str:
         while den % p == 0:
             den //= p
     if den != 1:
-        return f"{value.numerator}/{value.denominator}"
+        return fraction_text(value)
     scale = 0
     scaled = value
     while scaled.denominator != 1:
         scaled *= 10
         scale += 1
-    digits = str(abs(scaled.numerator))
+    digits = int_text(abs(scaled.numerator))
     if scale:
         digits = digits.rjust(scale + 1, "0")
         digits = digits[:-scale] + "." + digits[-scale:]

@@ -1502,7 +1502,8 @@ def equilibrium_map(model: Model, query_id: str, regime: str | None = None,
 
 def exact(value: Fraction) -> str:
     """An exact number as a string: an integer, or `n/d` in lowest terms."""
-    return str(Fraction(value))
+    from .stochastic import fraction_text
+    return fraction_text(value)
 
 
 def _concept_json(result: dict) -> dict:

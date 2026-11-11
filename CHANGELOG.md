@@ -6,6 +6,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `cadl game-check` and `cadl model-check` no longer stop with
+  `ValueError: Exceeds the limit (4300 digits) for integer string
+  conversion` when an exact result (I.13, H.8) has a numerator or
+  denominator of more than 4300 digits, as a model with a few hundred
+  steps can have. Exact numbers are now written by
+  `cadl.stochastic.int_text` and `fraction_text`, which split such an
+  integer by powers of ten and leave the limit of the process unchanged;
+  the output is the same as with the limit lifted.
+
 ## [0.3.25] — 2026-11-12
 
 Design-time checking of norms, norms monitors in two more generated
