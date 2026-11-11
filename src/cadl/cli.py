@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -921,8 +922,9 @@ def _cmd_norms_check(args: argparse.Namespace) -> int:
     if args.require_checker and find_checker() is None:
         print("Error: --require-checker: PRISM (prism) is not on PATH", file=sys.stderr)
         return 2
-    if args.timeout <= 0:
-        print("Error: --timeout must be positive", file=sys.stderr)
+    if not (math.isfinite(args.timeout) and args.timeout > 0):
+        print("Error: --timeout must be a positive finite number of seconds",
+              file=sys.stderr)
         return 2
     try:
         report = check_file(args.file, args.contract, args.bindings, args.members,

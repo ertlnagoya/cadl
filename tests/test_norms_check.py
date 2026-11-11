@@ -833,6 +833,11 @@ def test_cli_require_checker_and_timeout(tmp_path):
         assert p.returncode == 2 and "--timeout" in p.stderr
         assert (tmp_path / "STATUS_REPORTING.prism").exists()
 
+    for bad in ("0", "-5", "nan", "inf"):
+        p = cli(str(CONFLICT), "--bindings", "i=1", "--timeout", bad)
+        assert p.returncode == 2 and "--timeout" in p.stderr, bad
+        assert "Traceback" not in p.stderr
+
 
 def test_cli_refusal():
     p = cli(str(ROBOT), "--step", "3s")

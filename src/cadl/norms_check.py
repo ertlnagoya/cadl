@@ -1226,7 +1226,7 @@ class Translator:
                 "the classes of values assume that each quantity takes values of the type of "
                 "the literals it is compared with (numbers, booleans, or symbols and texts), or "
                 "no value; the answers do not cover traces with values of another type, which "
-                "can make a predicate false or undefined where the model has it true")
+                "can give a predicate a value (true, false or undefined) that no class gives it")
         # components of predicates that share quantities
         parent = list(range(len(self.preds)))
 
