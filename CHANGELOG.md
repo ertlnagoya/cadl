@@ -30,8 +30,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `now`, `state` and amendments are not translated (the norm, and the
   norms that depend on it, are reported with the reason). Without PRISM
   the command reports that nothing was checked (exit status 0). Exit
-  status 1 on a finding, 2 on a usage error or refusal, 3 when a witness
-  is not confirmed. `examples/norms_check_conflict.cadl` shows a
+  status 1 on a finding, 2 on a usage error, refusal or timeout, 3 when a
+  witness is not confirmed. `--timeout SECONDS` (default 600) bounds all
+  runs of PRISM together; `--require-checker` makes a missing PRISM an
+  error (exit status 2). An activation that cannot be kept is asked in
+  the state before the activating observation, so an obligation with a
+  deadline of 0 s whose content may come at its activation is not
+  reported; its witness is confirmed for every choice at that
+  observation. The classes of values assume values of the type of the
+  literals, which the report notes. `examples/norms_check_conflict.cadl` shows a
   conflict, a reparation that cannot be kept and a power that is never
   exercised. The translation is tested differentially against
   `cadl norms-eval` on random and exhaustive paths, with an interpreter

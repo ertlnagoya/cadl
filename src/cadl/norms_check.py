@@ -90,6 +90,10 @@ class NormsCheckError(NormsEvalError):
     """The request cannot be translated (a usage error or a refusal)."""
 
 
+class NormsCheckTimeout(NormsCheckError):
+    """The model checker did not finish within --timeout."""
+
+
 # === Expressions of the generated model ====================================
 #
 # A small expression language with folding constructors: ('c', value),
@@ -587,6 +591,7 @@ class Translator:
         self.notes: list[str] = []
         self.actors = declared_actors(sos)
         self.bindings = dict(bindings)
+        self.given_bindings = set(bindings)
         self._setup_bindings(members)
         self.events = {r.creates for r in contract.counts_as if r.creates}
         self.atoms: list[Atom] = []
@@ -646,6 +651,13 @@ class Translator:
                     f"the binding {var}={v} names {set_name}[{v}], which is not among the "
                     f"members of the instance ({set_name}[{self.members[set_name][0]}.."
                     f"{self.members[set_name][-1]}]); use --members {set_name}=n")
+        texts = [t for d in self.contract.norms
+                 for t in (d.bearer, d.counterparty, d.trigger, d.until, d.content) if t]
+        texts += [t for r in self.contract.counts_as for t in (r.when, r.if_) if t]
+        for name in sorted(self.given_bindings):
+            if not any(re.search(rf"\b{re.escape(name)}\b", t) for t in texts):
+                self.notes.append(f"--bindings {name}: the contract does not use the name "
+                                  f"{name}; the binding has no effect")
         self.universe: list[str] = []
         for name, (indexed, *_rest) in self.actors.items():
             if indexed:
@@ -825,6 +837,10 @@ class Translator:
             if isinstance(right, MemberAccess) and not isinstance(left, MemberAccess):
                 left, right = right, left
                 op = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}.get(op, op)
+            arith = ("+", "-", "*", "/")
+            if any(isinstance(x, BinaryOp) and x.op in arith for x in (left, right)):
+                raise _Refuse("arithmetic in a predicate is not translated (norms-check 0.1 "
+                              "compares one quantity with a literal)")
             if not isinstance(left, MemberAccess):
                 raise _Refuse("a comparison is translated only between a quantity and a literal")
             if isinstance(right, MemberAccess):
@@ -841,7 +857,9 @@ class Translator:
             q.consts.add(value)
             return ("cmp", op, q.key, value)
         if isinstance(e, FunctionCall) and e.name in TEMPORAL_OPERATORS:
-            raise _Refuse("a nested temporal operator is not translated")
+            raise _Refuse("a temporal operator is translated only as the whole content of an "
+                          "obligation or prohibition or as a whole assume: item; here it is "
+                          "combined with AND, OR or NOT, or nested in another one")
         from .ast_nodes import QuantifiedExpr
         what = ("a quantifier" if isinstance(e, QuantifiedExpr)
                 else f"the function call {e.name}()" if isinstance(e, FunctionCall)
@@ -866,6 +884,23 @@ class Translator:
             raise _Refuse("it is not a predicate (Appendix A.10)")
         return expr
 
+    @staticmethod
+    def _check_temporal_position(expr: Any) -> None:
+        """Refuse, with the exact reason, a temporal operator that is not the
+        whole predicate (norms-eval does not allow one in a trigger, an
+        until: or a counts-as rule, so those norms are not judged at all)."""
+        from .norms import contains_temporal
+        if isinstance(expr, FunctionCall) and expr.name in TEMPORAL_OPERATORS:
+            if any(contains_temporal(a) for a in expr.args):
+                raise _Refuse(f"a temporal operator nested in {expr.name}() is not translated")
+            return
+        if contains_temporal(expr):
+            what = ("under NOT" if isinstance(expr, UnaryOp)
+                    else "combined with AND or OR" if isinstance(expr, BinaryOp)
+                    and expr.op in ("AND", "OR") else "inside a comparison or call")
+            raise _Refuse(f"a temporal operator {what} is not translated (only a content or an "
+                          f"assume: item that is one temporal operator is)")
+
     def _term(self, text: str, events: set, temporal: bool = False, edge: bool = True) -> Term:
         text = text.strip()
         m = _MESSAGE_EVENT_RE.match(text) if "->" in text else None
@@ -874,6 +909,7 @@ class Translator:
         if m:
             return self._message_term(text, m)
         expr = self._parse_pred(text)
+        self._check_temporal_position(expr)
         if temporal and isinstance(expr, FunctionCall) and expr.name in TEMPORAL_OPERATORS:
             nargs, dpos = TEMPORAL_OPERATORS[expr.name]
             dur = expr.args[dpos]
@@ -961,6 +997,7 @@ class Translator:
         try:
             expr = parse_rule(e.value) if isinstance(e, StringLiteral) else e
             expr = desugar_wildcards(expr)
+            self._check_temporal_position(expr)
             if isinstance(expr, FunctionCall) and expr.name in TEMPORAL_OPERATORS:
                 nargs, dpos = TEMPORAL_OPERATORS[expr.name]
                 dur = expr.args[dpos]
@@ -1184,6 +1221,12 @@ class Translator:
     def _choices(self) -> None:
         for q in self.quantities.values():
             q.reps = self._reps(q)
+        if self.quantities:
+            self.notes.append(
+                "the classes of values assume that each quantity takes values of the type of "
+                "the literals it is compared with (numbers, booleans, or symbols and texts), or "
+                "no value; the answers do not cover traces with values of another type, which "
+                "can make a predicate false or undefined where the model has it true")
         # components of predicates that share quantities
         parent = list(range(len(self.preds)))
 
@@ -1568,8 +1611,9 @@ class NormsModel:
             s = S[n.id]
             out[f"st_{n.stem}"] = s
             if n.judged:
+                # activated at this observation, whatever F.5 then made of it
                 out[f"jn_{n.stem}"] = ir.AND(ir.EQ(ir.V(f"st_{n.stem}"), INACTIVE),
-                                             ir.IN(s, IN_FORCE))
+                                             ir.NOT(ir.IN(s, (INACTIVE, UNUSED))))
             final = ir.IN(s, FINAL)
             if n.id in el:
                 out[f"el_{n.stem}"] = ir.ITE(final, ir.C(0), el[n.id])
@@ -1632,20 +1676,25 @@ class NormsModel:
 
     def legend(self) -> list[str]:
         tr = self.tr
-        lines = [f"// atom {i}: {a.text()}" for i, a in enumerate(tr.atoms)]
+        lines = [f"// atom {i}: {self._comment(a.text())}" for i, a in enumerate(tr.atoms)]
         for pid, p in enumerate(tr.preds):
-            lines.append(f"// predicate {pid}: {_pred_text(p)}")
+            lines.append(f"// predicate {pid}: {self._comment(_pred_text(p))}")
         for q in tr.quantities.values():
-            lines.append(f"// quantity {q.key}: {q.kind or 'bool'}, values "
-                         f"{', '.join(json.dumps(v) for v in q.reps)}")
+            lines.append(self._comment(f"// quantity {q.key}: {q.kind or 'bool'}, values "
+                                       f"{', '.join(json.dumps(v) for v in q.reps)}"))
         return lines
+
+    @staticmethod
+    def _comment(text: str) -> str:
+        """Text for a // comment: no line break or other control character."""
+        return re.sub(r"[\x00-\x1f\x7f\u2028\u2029]", " ", str(text))
 
     def prism_text(self, init: dict | None = None) -> str:
         tr = self.tr
         init = init or {}
         out = [
             f"// Generated by cadl norms-check {NORMS_CHECK_VERSION} (Appendix F, F.12).",
-            f"// Contract {tr.contract.id}, bindings "
+            f"// Contract {self._comment(tr.contract.id)}, bindings "
             f"{', '.join(f'{k}={v}' for k, v in sorted(tr.bindings.items())) or 'none'}, members "
             f"{', '.join(f'{k}[{v[0]}..{v[-1]}]' for k, v in sorted(tr.members.items())) or 'none'}.",
             f"// One command per choice of the environment at one observation (o: the",
@@ -1680,10 +1729,10 @@ class NormsModel:
                 text = f"  {v.name} : [0..H] init {val};"
             else:
                 text = f"  {v.name} : [{v.lo}..{v.hi}] init {val};"
-            out.append(f"{text}  // {v.note}")
+            out.append(f"{text}  // {self._comment(v.note)}")
         out.append("")
         for label, ch, end, guard, upd in self.commands:
-            out.append(f"  // {self.choice_text(ch, end)}")
+            out.append(f"  // {self._comment(self.choice_text(ch, end))}")
             body = " & ".join(f"({k}'={names.get(id(e)) or prism_expr(e)})"
                               for k, e in upd.items()) or "true"
             out.append(f"  [{label}] {guard} -> {body};")
@@ -1693,18 +1742,18 @@ class NormsModel:
         for n in self.norms:
             st = f"st_{n.stem}"
             out.append(f'label "a_{n.stem}" = {st}>={ACTIVE} & {st}<={DISCHARGED};'
-                       f'  // {n.id} has been activated')
+                       f'  // {self._comment(n.id)} has been activated')
             if n.judged:
                 out.append(f'label "v_{n.stem}" = {st}={VIOLATED} | {st}={EXCUSED};'
-                           f'  // {n.id} is violated')
-                out.append(f'label "f_{n.stem}" = {st}={FULFILLED};  // {n.id} is fulfilled')
+                           f'  // {self._comment(n.id)} is violated')
+                out.append(f'label "f_{n.stem}" = {st}={FULFILLED};  // {self._comment(n.id)} is fulfilled')
                 out.append(f'label "j_{n.stem}" = jn_{n.stem};'
-                           f'  // {n.id} was activated at the last observation')
+                           f'  // {self._comment(n.id)} was activated at the last observation')
             if n.kind == "power":
-                out.append(f'label "x_{n.stem}" = ex_{n.stem};  // {n.id} has been exercised')
+                out.append(f'label "x_{n.stem}" = ex_{n.stem};  // {self._comment(n.id)} has been exercised')
             if self.has(f"rp_{n.stem}"):
                 out.append(f'label "r_{n.stem}" = rp_{n.stem};'
-                           f'  // the reparation of {n.id} has been activated')
+                           f'  // the reparation of {self._comment(n.id)} has been activated')
         out.append('label "end" = ended;')
         return "\n".join(out) + "\n"
 
@@ -2136,7 +2185,11 @@ def questions(model: NormsModel) -> list[Question]:
     for n in judged:
         s = n.stem
         out.append(Question("unavoidable", (n.id,), "full", f'Pmin=? [ F "v_{s}" ]'))
-        trap = f'"j_{s}" & !"v_{s}" & P>=1 [ F "v_{s}" ]'
+        # a state from which some choice activates n and every choice that
+        # activates it leads to a state from which every continuation
+        # violates it (an MDP: P<=0 [ X a ] says that no choice leads to a)
+        trap = (f'!"end" & !(P<=0 [ X "j_{s}" ]) & '
+                f'P<=0 [ X ("j_{s}" & !"v_{s}" & !(P>=1 [ F "v_{s}" ])) ]')
         out.append(Question("trap", (n.id,), "full", f"Pmax=? [ F ({trap}) ]", target=trap))
     for a, b in itertools.combinations(judged, 2):
         va, vb = f'"v_{a.stem}"', f'"v_{b.stem}"'
@@ -2198,7 +2251,7 @@ def _parse_prism_output(out: str, count: int) -> list[dict]:
 
 
 def run_prism(prism: str, model_text: str, props: list[str], early_end: bool,
-              timeout: int = 600, workdir: str | None = None) -> list[dict]:
+              timeout: float = 600, workdir: str | None = None) -> list[dict]:
     """Check `props` on the model with PRISM (explicit engine, with the
     strategies of the Pmax properties exported)."""
     with tempfile.TemporaryDirectory(dir=workdir) as tmp:
@@ -2208,11 +2261,24 @@ def run_prism(prism: str, model_text: str, props: list[str], early_end: bool,
         pp.write_text("\n".join(props) + "\n", encoding="utf-8")
         cmd = [prism, str(mp), str(pp), "-const", f"early_end={'true' if early_end else 'false'}",
                "-explicit", "-exportstrat", "stdout"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            raise NormsCheckError(f"PRISM did not finish within {timeout} s") from None
-    out = proc.stdout + proc.stderr
+            import os
+            import signal
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)   # the shell script and its JVM
+            except OSError:
+                proc.kill()
+            proc.communicate()
+            raise NormsCheckTimeout(
+                f"the model checker did not finish within --timeout (PRISM stopped after "
+                f"{timeout:.0f} s); the time grows with the number of commands (choices per "
+                f"observation) and of reachable states: use a coarser --step, a smaller "
+                f"--horizon or fewer --members") from None
+    out = stdout + stderr
     if proc.returncode != 0 and "Error" not in out:
         raise NormsCheckError(f"PRISM failed (exit status {proc.returncode})")
     return _parse_prism_output(out, len(props))
@@ -2305,8 +2371,9 @@ def _witness(model: NormsModel, path: list, claim: tuple, explain: str) -> dict:
 
 # === Check =================================================================
 
-def check(model: NormsModel, prism: str | None = None, timeout: int = 600) -> dict:
-    """Run the questions of F.12 with PRISM and build the report."""
+def check(model: NormsModel, prism: str | None = None, timeout: float = 600) -> dict:
+    """Run the questions of F.12 with PRISM and build the report;
+    `timeout` (seconds) bounds all runs of PRISM together."""
     tr = model.tr
     report = _report_head(model)
     prism = prism or find_checker()
@@ -2318,14 +2385,22 @@ def check(model: NormsModel, prism: str | None = None, timeout: int = 600) -> di
     qs = questions(model)
     text = model.prism_text()
     answers: dict = {}
+    budget = _Budget(timeout)
+    report["runs"] = []
     for mode in ("any", "full"):
         mq = [q for q in qs if q.mode == mode]
+        if not mq:
+            # nothing to ask in this reading (no norm, or no obligation or
+            # prohibition, is translated)
+            continue
         props = []
         for q in mq:
             props.append(q.prop)
             if q.target is not None:
                 props.append(f"filter(print, {q.target}, ({q.target}) | \"init\")")
-        res = run_prism(prism, text, props, mode == "any", timeout)
+        res = run_prism(prism, text, props, mode == "any", budget.left())
+        report["runs"].append({"reading": "any end" if mode == "any" else "full",
+                               "properties": len(props)})
         report["model"]["states"] = res[0]["model_states"] or report["model"]["states"]
         it = iter(res)
         for q in mq:
@@ -2367,13 +2442,7 @@ def check(model: NormsModel, prism: str | None = None, timeout: int = 600) -> di
                                       stop=lambda s: pm.key(s) in targets)
                 last = states[-1] if states else pm.initial()
                 if pm.key(last) in targets:
-                    tail, _ = finish(model, pm, last)
-                    entry["witness"] = _witness(
-                        model, path + tail, ("violated", subject[0]),
-                        f"the norm was activated at observation {len(path) - 1}; from there every "
-                        f"continuation that runs to the horizon violates it; this one continues "
-                        f"without messages and without values")
-                    entry["witness"]["prefix"] = len(path)
+                    entry["witness"] = _trap_witness(model, pm, path, last, subject[0])
                 else:
                     entry["witness"] = {"confirmed": False,
                                         "explanation": "the strategy did not reach the state"}
@@ -2390,10 +2459,64 @@ def check(model: NormsModel, prism: str | None = None, timeout: int = 600) -> di
                 item["explanation"] = "the strategy did not reach the state"
             else:
                 item.update(_conflict_witness(model, prism, text, pm, path, last, subject,
-                                              timeout))
+                                              budget.left()))
             report["conflicts"].append(item)
     _summary(report)
     return report
+
+
+MAX_TRAP_CHOICES = 512
+
+
+def _trap_witness(model: NormsModel, pm: PrismModel, path: list, state: dict,
+                  nid: str) -> dict:
+    """The witness of an activation that cannot be kept, from the state
+    before that observation. norms-eval confirms, for every choice of the
+    environment at that observation (at most MAX_TRAP_CHOICES of them, a
+    seeded sample beyond), that it activates the norm exactly when the
+    model says so, and, for every activating choice followed by
+    observations without messages and values up to the horizon, that the
+    norm is violated. That every other continuation violates it too rests
+    on the model checker."""
+    n = next(x for x in model.norms if x.id == nid)
+    k = len(path)
+    t_k = _t(model.tr.step_ms, k)
+    cmds = pm.enabled(state)
+    sampled = len(cmds) > MAX_TRAP_CHOICES
+    if sampled:
+        cmds = random.Random(0).sample(cmds, MAX_TRAP_CHOICES)
+    activating, agree, violated, first = 0, True, True, None
+    for cmd in cmds:
+        after = pm.apply(cmd, state)
+        step = [parse_label(cmd[0])]
+        tail, _ = finish(model, pm, after)
+        full = path + step + tail
+        result = evaluate_path(model.tr, full)
+        r = _norm_result(result, nid)
+        model_j = bool(after[f"jn_{n.stem}"])
+        eval_j = r["activated_at"] is not None and r["activated_at"] == t_k
+        agree = agree and model_j == eval_j
+        if model_j:
+            activating += 1
+            violated = violated and r["state"] == "violated"
+            if first is None:
+                first = full
+    w = _witness(model, first, ("violated", nid),
+                 f"at observation {k} every choice of the environment that activates the norm "
+                 f"leads to a state from which every continuation that runs to the horizon "
+                 f"violates it; this trace takes one of them and continues without messages "
+                 f"and values")
+    w["prefix"] = k
+    w["choices_checked"] = len(cmds)
+    w["sampled"] = sampled
+    w["activating_choices"] = activating
+    w["confirmed"] = bool(w["confirmed"] and agree and violated and activating)
+    w["confirms"] = (f"norms-eval: of the {len(cmds)} choice(s) at observation {k}"
+                     f"{' (a sample)' if sampled else ''}, exactly the {activating} that the "
+                     f"model says activate the norm do so, and each of them, continued without "
+                     f"messages and values, violates it; that every other continuation violates "
+                     f"it rests on the model checker")
+    return w
 
 
 def _conflict_witness(model: NormsModel, prism: str, text: str, pm: PrismModel, path: list,
@@ -2419,6 +2542,26 @@ def _conflict_witness(model: NormsModel, prism: str, text: str, pm: PrismModel, 
         out["witnesses"].append(w)
     out["confirmed"] = all(w["confirmed"] for w in out["witnesses"])
     return out
+
+
+class _Budget:
+    """The time left of --timeout for all runs of the model checker."""
+
+    def __init__(self, seconds: float) -> None:
+        import time
+        self.seconds = seconds
+        self.end = time.monotonic() + seconds
+
+    def left(self) -> float:
+        import time
+        left = self.end - time.monotonic()
+        if left <= 0:
+            raise NormsCheckTimeout(
+                f"the model checker did not finish within --timeout {self.seconds:g} s; the "
+                f"time grows with the number of commands (choices per observation) and of "
+                f"reachable states: use a coarser --step, a smaller --horizon or fewer "
+                f"--members")
+        return left
 
 
 def _report_head(model: NormsModel) -> dict:
@@ -2580,6 +2723,9 @@ def format_text(report: dict) -> str:
     if not report.get("checked"):
         lines.append("")
         lines.append(f"Not checked: {report.get('skipped')}")
+    elif not report.get("runs"):
+        lines.append("")
+        lines.append("Nothing to ask the model checker: no norm is translated")
     else:
         lines.append("")
         lines.append("Norms (any end: the instance may end at every observation; "
@@ -2620,6 +2766,8 @@ def format_text(report: dict) -> str:
                 lines.append(f"  {n['id']} {_QUESTION_TEXT[key]} [{ok}]")
                 if "choices" in w:
                     lines.append(f"    {w.get('file') or _brief(w)}")
+                if "confirms" in w:
+                    lines.append(f"    {w['confirms']}")
         if not count:
             lines.append("  (none)")
     untranslated = [n for n in report["norms"] if n["status"] != "model"]
@@ -2651,11 +2799,13 @@ def format_text(report: dict) -> str:
 
 
 def check_file(path, contract_id=None, bindings=None, members=None, step=None,
-               horizon=None, export_dir=None, prism=None, timeout: int = 600) -> dict:
+               horizon=None, export_dir=None, prism=None, timeout: float = 600) -> dict:
     """`cadl norms-check`: build the model of a file, check it, export."""
     from .norms_eval import load_version
     sos = load_version(path)
     model = build_model(sos, contract_id, bindings, members, step, horizon)
+    if export_dir is not None:
+        export(model, None, export_dir)       # the model, also when the check fails
     report = check(model, prism, timeout)
     report["file"] = str(path)
     if export_dir is not None:

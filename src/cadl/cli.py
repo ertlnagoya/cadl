@@ -157,6 +157,12 @@ def main(argv: list[str] | None = None) -> int:
     nchk_cmd.add_argument("--export", type=Path, default=None, metavar="DIR",
                           help="Write the PRISM model, the properties and the witness traces "
                                "to DIR")
+    nchk_cmd.add_argument("--timeout", type=float, default=600, metavar="SECONDS",
+                          help="Time for all runs of the model checker together; exit status 2 "
+                               "when it is exceeded (default: 600)")
+    nchk_cmd.add_argument("--require-checker", dest="require_checker", action="store_true",
+                          help="Exit with status 2 when PRISM is not on PATH (default: report "
+                               "that nothing was checked and exit with 0)")
     nchk_cmd.add_argument("--format", choices=["text", "json"], default="text",
                           help="Output format (default: text)")
 
@@ -903,16 +909,24 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
 def _cmd_norms_check(args: argparse.Namespace) -> int:
     """Exit status: 0 when the questions were answered without a finding,
     or when no model checker is on PATH (the model is still exported with
-    --export); 1 on a finding (a conflict, a norm never activated or
-    violated in every instance, an activation that cannot be kept, a power
-    never exercised); 2 on a usage error or a refusal; 3 when a witness is
-    not confirmed by norms-eval (an error of norms-check)."""
-    from .norms_check import check_file, format_text
+    --export) unless --require-checker is given; 1 on a finding (a
+    conflict, a norm never activated or violated in every instance, an
+    activation that cannot be kept, a power never exercised); 2 on a usage
+    error, a refusal, a missing PRISM with --require-checker, or when the
+    model checker exceeds --timeout; 3 when a witness is not confirmed by
+    norms-eval (an error of norms-check)."""
+    from .norms_check import check_file, find_checker, format_text
     from .norms_eval import NormsEvalError
 
+    if args.require_checker and find_checker() is None:
+        print("Error: --require-checker: PRISM (prism) is not on PATH", file=sys.stderr)
+        return 2
+    if args.timeout <= 0:
+        print("Error: --timeout must be positive", file=sys.stderr)
+        return 2
     try:
         report = check_file(args.file, args.contract, args.bindings, args.members,
-                            args.step, args.horizon, args.export)
+                            args.step, args.horizon, args.export, timeout=args.timeout)
     except NormsEvalError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

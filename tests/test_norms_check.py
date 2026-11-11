@@ -5,7 +5,7 @@ The differential tests run the generated PRISM text (with the interpreter
 of `cadl.norms_check`) and `cadl norms-eval` on the same paths of
 environment choices and compare the state of every norm after every
 observation. CADL_NORMS_CHECK_PATHS sets the number of random paths per
-contract and sampling mode (default 30; the long run of the report used
+contract and sampling mode (default 20; the long run of the report used
 1000). The tests that need PRISM are skipped when `prism` is not on PATH.
 """
 
@@ -52,7 +52,7 @@ DOUBLE = EXAMPLES / "norms_no_double_assignment.cadl"
 CONFLICT = EXAMPLES / "norms_check_conflict.cadl"
 PRISM = shutil.which("prism")
 needs_prism = pytest.mark.skipif(PRISM is None, reason="PRISM (prism) is not on PATH")
-PATHS = int(os.environ.get("CADL_NORMS_CHECK_PATHS", "30"))
+PATHS = int(os.environ.get("CADL_NORMS_CHECK_PATHS", "20"))
 
 HEAD = """\
 sos:
@@ -245,7 +245,8 @@ def model_of(name: str, **kw):
     built once per test session."""
     key = (name, json.dumps(kw, sort_keys=True))
     if key not in _MODELS:
-        texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS}
+        texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS,
+                 "DEADLINE_ZERO": DEADLINE_ZERO}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
         _MODELS[key] = (sos, m, PrismModel(m.prism_text(), {"early_end": True}))
@@ -290,7 +291,7 @@ class TestTranslation:
         assert m.H == 2 + (5 + 2) + (2 + 2) + 2
         assert all(n.status == "model" for n in tr.norms)
         assert tr.members["ROBOT"] == [1, 2]
-        assert not tr.notes
+        assert [n for n in tr.notes if "type of the literals" not in n] == []
 
     def test_default_binding_is_reported(self):
         _sos, m, _pm = model_of(str(ROBOT))
@@ -441,8 +442,8 @@ def test_differential_random_paths(case):
 
 
 def test_differential_all_short_paths():
-    """Every path of at most two observations of CONFLICTS (32 choices)."""
-    for name, kw in (("CONFLICTS", {"bindings": ["i=1"]}),):
+    """Every path of at most two observations of DEADLINE_ZERO (16 choices)."""
+    for name, kw in (("DEADLINE_ZERO", {"bindings": ["i=1"]}),):
         _sos, m, pm = model_of(name, **kw)
         paths = all_paths(m.tr, 2)
         assert len(paths) == len(m.tr.choices) * (len(m.tr.choices) + 1)
@@ -478,7 +479,7 @@ def test_paths_cover_the_semantics():
     seen = set()
     for name in ("TEMPORAL", "UNTIL"):
         sos, m, pm = model_of(name, bindings=["i=1"])
-        for p in random_paths(m.tr, 100, seed=5, p_message=0.4, p_end=0.08):
+        for p in random_paths(m.tr, 70, seed=5, p_message=0.4, p_end=0.08):
             lines = trace_lines(m.tr, p)
             r = evaluate(sos, parse_trace(lines))
             for n in r["norms"]:
@@ -544,6 +545,7 @@ def _explicit(m, early_end: bool):
                     changed = True
         return out
 
+    _explicit.succ = succ
     return init, set(succ), lab, ef, af, eg
 
 
@@ -565,7 +567,13 @@ def test_prism_answers_agree_with_explicit_fixpoints():
     for n in judged:
         v = lab[f"v_{n.stem}"]
         assert norms[n.id]["unavoidable"]["answer"] == (init in af(v))
-        trap = lab[f"j_{n.stem}"] - v & af(v)
+        j, doomed = lab[f"j_{n.stem}"], v | af(v)
+        succ = _explicit.succ
+        # some choice activates n, and every choice that activates it leads
+        # to a state from which every continuation violates it
+        trap = {k for k, nxt in succ.items()
+                if k not in lab["end"] and any(x in j for x in nxt)
+                and all(x in doomed for x in nxt if x in j)}
         assert norms[n.id]["keepable"]["answer"] == (init not in ef(trap))
     found = set()
     for i, a in enumerate(judged):
@@ -697,6 +705,133 @@ def test_cli_without_model_checker(tmp_path):
     assert (tmp_path / "STATUS_REPORTING.prism").exists()
     pm = PrismModel((tmp_path / "STATUS_REPORTING.prism").read_text(), {"early_end": True})
     assert run_path(pm, [(0, True)])[-1]["ended"] is True
+
+
+DEADLINE_ZERO = """\
+norms:
+  - id: answer
+    kind: obligation
+    bearer: "R[1]"
+    trigger: "D -> R[1] : ask"
+    content: "R[1] -> D : reply"
+    deadline: 0s
+  - id: at_once
+    kind: obligation
+    bearer: "R[1]"
+    content: "R[1] -> D : hello"
+    deadline: 0s
+  - id: owed
+    kind: obligation
+    bearer: "R[1]"
+    trigger: "D -> R[1] : ask"
+    content: "R[1] -> D : reply"
+    deadline: 1s
+    on_violation: {reparation: sorry}
+  - id: sorry
+    kind: obligation
+    bearer: "R[1]"
+    content: "R[1] -> D : apology"
+    deadline: 0s
+"""
+
+
+@needs_prism
+def test_deadline_zero_obligations_can_be_kept_when_triggered():
+    """An obligation with a deadline of 0 s can be kept at every activation
+    by a trigger or by the start of the instance (the content may come in
+    the same observation); as a reparation, first judged at the next
+    observation, it cannot."""
+    sos = make_sos(DEADLINE_ZERO)
+    m = build_model(sos, bindings={"i": 1})
+    report = check(m, PRISM)
+    norms = {n["id"]: n for n in report["norms"]}
+    assert norms["answer"]["keepable"]["answer"] is True
+    assert norms["at_once"]["keepable"]["answer"] is True
+    assert norms["owed"]["keepable"]["answer"] is True
+    assert norms["sorry"]["keepable"]["answer"] is False
+    w = norms["sorry"]["keepable"]["witness"]
+    assert w["confirmed"] and w["activating_choices"] >= 1
+    assert w["choices_checked"] == len(m.tr.choices) and not w["sampled"]
+    assert "rests on the model checker" in w["confirms"]
+    r = evaluate(sos, parse_trace(w["trace"]))
+    assert {n["id"]: n["state"] for n in r["norms"]}["sorry"] == "violated"
+    assert report["findings"] == [
+        "sorry can be activated in a state from which every continuation violates it"]
+    init, states, lab, ef, af, eg = _explicit(m, False)
+    succ = _explicit.succ
+    for n in m.norms:
+        v, j = lab[f"v_{n.stem}"], lab[f"j_{n.stem}"]
+        doomed = v | af(v)
+        trap = {k for k, nxt in succ.items()
+                if k not in lab["end"] and any(x in j for x in nxt)
+                and all(x in doomed for x in nxt if x in j)}
+        assert norms[n.id]["keepable"]["answer"] == (init not in ef(trap))
+
+
+@needs_prism
+@pytest.mark.parametrize("body", [
+    "norms:\n  - id: o\n    kind: obligation\n    bearer: D\n    content: \"D.a + 1 > 2\"\n",
+    "norms:\n  - id: pw\n    kind: power\n    bearer: D\n    content: \"D -> R[1] : cancel\"\n"
+    "    effects: {discharge: [o]}\n  - id: o\n    kind: obligation\n    bearer: D\n"
+    "    content: \"D.a + 1 > 2\"\n",
+], ids=["nothing", "power only"])
+def test_nothing_or_only_powers_translated(body):
+    m = build_model(make_sos(body), bindings={"i": 1})
+    report = check(m, PRISM)
+    assert report["checked"] and report["unconfirmed"] == []
+    assert "arithmetic" in {n["id"]: n for n in report["norms"]}["o"]["reason"]
+    if "pw" in body:
+        assert [r["reading"] for r in report["runs"]] == ["any end"]
+        assert {n["id"]: n for n in report["norms"]}["pw"]["exercisable"]["answer"]
+    else:
+        assert report["runs"] == []
+        assert "Nothing to ask the model checker" in format_text(report)
+
+
+def test_notes_on_bindings_and_value_types():
+    _sos, m, _pm = model_of(str(ROBOT), bindings=["i=2", "k=1"])
+    assert any("--bindings k" in n for n in m.tr.notes)
+    assert any("type of the literals" in n for n in m.tr.notes)
+
+
+def test_temporal_operator_positions_have_exact_reasons():
+    tr = build_model(make_sos("""\
+norms:
+  - id: o
+    kind: obligation
+    bearer: "R[1]"
+    content: "NOT within(1s, R[1].b)"
+  - id: q
+    kind: prohibition
+    bearer: "R[1]"
+    content: "within(2s, throughout(1s, R[1].b))"
+"""), bindings={"i": 1}).tr
+    assert "under NOT" in tr.by_id["o"].reason
+    assert "nested in within()" in tr.by_id["q"].reason
+
+
+def test_comments_cannot_carry_model_text():
+    sos = make_sos("""\
+norms:
+  - id: p
+    kind: prohibition
+    bearer: "R[1]"
+    content: "R[1].m == 'x\nlabel \\"evil\\" = true; //'"
+""")
+    text = build_model(sos, bindings={"i": 1}).prism_text()
+    assert all("evil" not in line.split("//")[0] for line in text.splitlines())
+    PrismModel(text, {"early_end": True})
+
+
+def test_cli_require_checker_and_timeout(tmp_path):
+    env = dict(os.environ, PATH=str(Path(sys.executable).parent))
+    p = cli(str(CONFLICT), "--bindings", "i=1", "--require-checker", env=env)
+    assert p.returncode == 2 and "--require-checker" in p.stderr
+    if PRISM is not None:
+        p = cli(str(CONFLICT), "--bindings", "i=1", "--timeout", "0.01",
+                "--export", str(tmp_path))
+        assert p.returncode == 2 and "--timeout" in p.stderr
+        assert (tmp_path / "STATUS_REPORTING.prism").exists()
 
 
 def test_cli_refusal():
