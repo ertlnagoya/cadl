@@ -51,9 +51,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   implementation of F.5; `python -m PACKAGE.norms_monitor TRACE.jsonl`
   prints what `cadl norms-eval --format json` prints, without the key
   `file`. Amendments (F.6) work when the model of the new version is
-  given (`versions=`, `--version NAME=MODEL.json`). See "Norms Monitor in
-  Generated Python Code" in the README, also for what an online monitor
-  cannot know.
+  given (`versions=`, `--model-version NAME=MODEL.json`). `next_check()`
+  gives the earliest time stamp at which an observation is certain to
+  decide a deadline or a temporal operator that only waits for time. A
+  refused observation (`TraceError`, or `ObservationError` for an
+  amendment that cannot be applied) leaves the monitor as it was. The
+  model is embedded as one JSON text, and the generator compiles the
+  module and checks that it defines every name it uses before it writes
+  anything. See "Norms Monitor in Generated Python Code" in the README,
+  also for what an online monitor cannot know.
 - The generated package of such a file can be imported where cadl is not
   installed: `NormsMonitor` works, and the other names, which need
   `cadl.codegen.runtime_support`, raise the import error when used.
@@ -122,10 +128,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   other targets that only the Python target generates a monitor for it.
   `contracts.py` has a second comment line under each left-out item.
 - `cadl/norms_eval.py`: the engine reaches the parser through three
-  functions, reads a trace one observation at a time (`_TraceReader`) and
-  processes one observation per call (`_Engine._step`), so that the
-  generated monitor can use the same code. The public functions and the
-  output of `cadl norms-eval` are unchanged.
+  functions, reads a trace one observation at a time (`_TraceReader`,
+  which checks an observation completely before it keeps anything of it)
+  and processes one observation per call (`_Engine._step`), so that the
+  generated monitor can use the same code. `run_trace` is what `evaluate`
+  returns. `select_contract` has a third, optional argument for the
+  wording of its error message.
 - `cadl.norms_eval`: the engine can be driven one observation at a time
   (`_Engine._step`), and a norm can be exempted from the content of one
   observation; `cadl agents-run` uses both. `cadl norms-eval` and its
@@ -147,6 +155,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   specification says: a range only its members, `A[*]` and an unbound
   `A[i]` only members of the declared set, an undeclared actor never. The
   verdicts on the six bundled traces are unchanged.
+- `cadl norms-eval`: an observation after the end of the contract
+  instance has no effect, as F.5 says. Before, the names of the observed
+  quantities were also taken from such observations, so that a name that
+  got its first value after the end was undefined instead of a symbolic
+  value during the instance, and a verdict could differ from that of the
+  same trace without those lines. The result of a trace without
+  observations after the end is unchanged. A `state` after the end no
+  longer produces the warning about a contract without `lifecycle:`.
+- `cadl norms-eval`: a time `t` written as an integer too large for a
+  floating-point number (more than about 300 digits) is rejected like
+  every time above 1e10 s, instead of ending in an internal error.
+- A number in a predicate that overflows to infinity (`1e999`) is no
+  longer read as infinity: the text is not a predicate (`cadl check`
+  warns that it is kept as text; a norm with it is not evaluated).
 - `cadl norms-eval`: a trace is rejected (exit status 2) when `t` is
   `NaN`, infinite or larger than 1e10 in absolute value, when another
   number of a line is `NaN` or infinite, or when `from`, `to` or `name` of

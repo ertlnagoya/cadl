@@ -103,7 +103,11 @@ class ExprTransformer(Transformer):
     """Transform Lark expression parse tree into AST nodes."""
 
     def float_lit(self, items):
-        return FloatLiteral(value=float(items[0]))
+        value = float(items[0])
+        if value in (float("inf"), float("-inf")):
+            # 1e999: no finite value; an expression with it is not one
+            raise ValueError(f"the number {items[0]} is too large")
+        return FloatLiteral(value=value)
 
     def int_lit(self, items):
         return IntLiteral(value=int(items[0]))

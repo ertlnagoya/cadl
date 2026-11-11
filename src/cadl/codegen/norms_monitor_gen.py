@@ -7,12 +7,12 @@ verdicts of F.5 from the observations a running system feeds it.
 
 The generated module does not import cadl. It consists of
 
-1. ``MODEL``: the contracts of the file as plain data (ids, norms,
-   counts-as rules, ``assume:`` / ``guarantee:`` items, lifecycle states)
-   and, for every text the engine parses, what the parser of cadl returned
-   for it. All of it is written with `pprint`, that is, as `repr` of
-   strings, numbers, lists and dicts; no text of the .cadl file is written
-   into the code.
+1. ``MODEL``: the declared actors and the contracts of the file as plain
+   data (ids, norms, counts-as rules, ``assume:`` / ``guarantee:`` items,
+   lifecycle states) and, for every text the engine parses, what the
+   parser of cadl returned for it. It is written as one JSON text in one
+   Python string literal (`repr` of the ASCII JSON) that the module reads
+   with `json.loads`; no text of the .cadl file is written into the code.
 2. the AST classes of `cadl/ast_nodes.py` and the helpers of
    `cadl/norms.py` that the engine uses, copied verbatim;
 3. the engine of `cadl/norms_eval.py` (the text between its
@@ -21,15 +21,23 @@ The generated module does not import cadl. It consists of
 4. `codegen/norms_monitor_template.py`: the table lookups that stand in
    for the parser, and the class `NormsMonitor` that feeds the engine one
    observation at a time.
+
+Before the text is returned it is checked (`check_module`): it compiles,
+and every global name it uses is defined in it or is a builtin. A helper
+that the copied code needs and that was not copied is therefore an error
+of the generator, not a NameError of the monitor.
 """
 
 from __future__ import annotations
 
 import ast
+import builtins
 import dataclasses
 import functools
 import inspect
-import pprint
+import json
+import math
+import symtable
 from typing import Any
 
 from .. import ast_nodes, norms, norms_eval
@@ -46,8 +54,13 @@ _NODE_CLASSES = (
     "Comprehension", "LifecycleSpec", "NormViolationSpec", "PowerEffects",
     "DenialRecovery", "NormDef", "CountsAsDef", "ContractDef",
 )
-# Functions copied from cadl/norms.py.
-_NORMS_FUNCTIONS = ("temporal_calls", "has_temporal_text", "contains_temporal")
+# Copied from cadl/norms.py, with the module-level names they use.
+_NORMS_FUNCTIONS = ("TEMPORAL_OPERATORS", "temporal_calls", "has_temporal_text",
+                    "contains_temporal")
+
+
+class NormsMonitorError(ValueError):
+    """The norms monitor cannot be generated."""
 
 _BEGIN, _END = "# >>> monitor-runtime", "# <<< monitor-runtime"
 
@@ -70,6 +83,7 @@ Use::
     for observation in ...:            # one dict per observation, see below
         for change in m.observe(observation):
             ...                        # a norm or item changed
+        t = m.next_check()             # when to observe if nothing happens
     m.end()                            # the contract instance has ended
     m.verdicts()                       # current verdicts
     m.result()                         # all, as `cadl norms-eval --format json`
@@ -84,12 +98,20 @@ An observation has the keys of one line of a `cadl norms-eval` trace:
   "previous_verdict", "reason"}``: a norm instance changed its state
   (inactive, active, suspended, fulfilled, violated, discharged) or its
   verdict (pending, fulfilled, violated, excused). There is one entry per
-  norm and step, with the state the step left it in. After an amendment a
-  new norm has ``previous_state`` None and a removed one ``state`` None;
+  norm and step, with the state the step left it in. At an observation
+  with ``amend`` (also the first one) a norm that is new in the new
+  version has ``previous_state`` None and a removed one ``state`` None;
 - ``{"t", "kind": "guarantee", "index", "text", "verdict", "previous",
   "reason"}``: a guarantee item was decided;
 - ``{"t", "kind": "assumption", "index", "text", "status", "previous",
   "reason"}``: an assumption item was decided (holds or failed).
+
+``index`` is the position of the item in the current version of the
+contract, from 1; an amendment can change the position of an item, so
+identify an item across an amendment by its ``text``.
+
+An observation that is refused (`TraceError`, `ObservationError`) leaves
+the monitor as it was.
 
 A recorded trace is replayed with::
 
@@ -100,7 +122,7 @@ the same file and trace (without the key ``file``).
 
 Amendments (F.6) need the model of the new version: generate the monitor
 of the new file too and pass its ``MODEL`` as ``versions={"name": MODEL}``
-(command line: ``--version NAME=MODEL.json``, written with
+(command line: ``--model-version NAME=MODEL.json``, written with
 ``--dump-model``). The monitor does not run the lifecycle state machine:
 it reads the lifecycle state from the observations and reports a
 requested transition without applying it.
@@ -137,13 +159,14 @@ def _encode(value: Any) -> Any:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         name = type(value).__name__
         if name not in _NODE_CLASSES:
-            raise ValueError(f"norms monitor: a {name} cannot be part of the model")
+            raise NormsMonitorError(f"norms monitor: a {name} cannot be part of the model")
         out: dict[str, Any] = {"#": name}
         for f in dataclasses.fields(value):
             if f.name != "loc":
                 out[f.name] = _encode(getattr(value, f.name))
         return out
-    raise ValueError(f"norms monitor: a {type(value).__name__} cannot be part of the model")
+    raise NormsMonitorError(
+        f"norms monitor: a {type(value).__name__} cannot be part of the model")
 
 
 def _contract_model(contract: ContractDef) -> dict:
@@ -184,7 +207,7 @@ def _record_parses(contracts: list) -> dict:
             try:
                 norms_eval._Engine(contract, norms_eval.Trace(observations=[]))
             except Exception as e:
-                raise ValueError(
+                raise NormsMonitorError(
                     f"norms monitor: contract '{contract.id}' cannot be read "
                     f"({type(e).__name__}: {e}); see `cadl check`") from e
     finally:
@@ -196,8 +219,8 @@ def _record_parses(contracts: list) -> dict:
 def build_model(sos: SoSDefinition) -> dict:
     """The data of the generated monitor: plain, JSON-serializable."""
     if not norms_declared(sos):
-        raise ValueError("norms monitor: the file does not declare 'norms: 0.1' "
-                         "under extensions:")
+        raise NormsMonitorError("norms monitor: the file does not declare 'norms: 0.1' "
+                                "under extensions:")
     return {
         "norms_version": "0.1",
         "actors": [_encode(dataclasses.replace(a.id, loc=None)) for a in sos.actors],
@@ -206,22 +229,123 @@ def build_model(sos: SoSDefinition) -> dict:
     }
 
 
+# --- the model as text ---------------------------------------------------------
+
+def _not_finite(value: Any, path: str = "MODEL") -> str | None:
+    """Where the model has a number that JSON cannot carry, or None."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return f"{path} = {value!r}"
+    if isinstance(value, dict):
+        for k, v in value.items():
+            found = _not_finite(v, f"{path}[{k!r}]")
+            if found:
+                return found
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            found = _not_finite(v, f"{path}[{i}]")
+            if found:
+                return found
+    return None
+
+
+def model_literal(model: dict) -> str:
+    """The Python expression that gives the model in the generated module:
+    `json.loads` of one string literal. JSON has no nesting limit of the
+    Python parser, no names such as `inf`, and stays one line."""
+    try:
+        where = _not_finite(model)
+        if where:
+            raise NormsMonitorError(
+                f"norms monitor: the model has a number that is not finite ({where}); "
+                f"a predicate or a deadline of the file has a number that is too large")
+        text = json.dumps(model, allow_nan=False, ensure_ascii=True, separators=(",", ":"))
+    except (ValueError, TypeError, RecursionError) as e:
+        if isinstance(e, NormsMonitorError):
+            raise
+        raise NormsMonitorError(
+            f"norms monitor: the model cannot be written as JSON "
+            f"({type(e).__name__}: {e})") from e
+    return f"json.loads({text!r})"
+
+
 # --- the copied code ---------------------------------------------------------
 
-def _definitions(module: Any, names: tuple) -> str:
-    """The source of the named top-level classes or functions of a module,
-    with their decorators, in the order of `names`."""
-    source = inspect.getsource(module)
+def _stripped(tree: ast.AST) -> ast.AST:
+    """The tree without annotations: they are not evaluated in the
+    generated module (`from __future__ import annotations`), so a name
+    that only an annotation uses need not exist."""
+    class Strip(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            self.generic_visit(node)
+            node.returns = None
+            a = node.args
+            for arg in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg]:
+                if arg is not None:
+                    arg.annotation = None
+            return node
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_AnnAssign(self, node):
+            self.generic_visit(node)
+            value = node.value if node.value is not None else ast.Constant(value=None)
+            return ast.copy_location(ast.Assign(targets=[node.target], value=value), node)
+    return ast.fix_missing_locations(Strip().visit(tree))
+
+
+def _global_uses(source: str) -> tuple:
+    """(names bound at the top level of `source`, global names it reads)."""
+    table = symtable.symtable(ast.unparse(_stripped(ast.parse(source))), "<norms_monitor>", "exec")
+    bound = {s.get_name() for s in table.get_symbols()
+             if s.is_assigned() or s.is_imported() or s.is_namespace()}
+    used = set()
+
+    def walk(tab, top):
+        for s in tab.get_symbols():
+            if top:
+                if s.is_referenced():
+                    used.add(s.get_name())
+            elif s.is_global() or (tab.get_type() == "class" and s.is_referenced()
+                                   and not s.is_assigned() and not s.is_free()):
+                used.add(s.get_name())
+        for child in tab.get_children():
+            walk(child, False)
+    walk(table, True)
+    return bound, used
+
+
+def _definitions(source: str, names: tuple, module: str) -> str:
+    """The source of the named top-level definitions of a module (classes
+    and functions with their decorators, and assignments), together with
+    the top-level definitions of the same module they use, in the order of
+    the module."""
     lines = source.splitlines()
-    found = {}
+    nodes: dict[str, ast.AST] = {}
     for node in ast.parse(source).body:
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names:
-            first = min([node.lineno] + [d.lineno for d in node.decorator_list])
-            found[node.name] = "\n".join(lines[first - 1:node.end_lineno])
-    missing = [n for n in names if n not in found]
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)):
+            nodes[node.name] = node
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            nodes[node.targets[0].id] = node
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            nodes[node.target.id] = node
+
+    def text(node: ast.AST) -> str:
+        first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+        return "\n".join(lines[first - 1:node.end_lineno])
+
+    missing = [n for n in names if n not in nodes]
     if missing:
-        raise RuntimeError(f"norms monitor: {module.__name__} has no {', '.join(missing)}")
-    return "\n\n\n".join(found[n] for n in names)
+        raise NormsMonitorError(f"norms monitor: {module} has no {', '.join(missing)}")
+    wanted, todo = set(), list(names)
+    while todo:
+        name = todo.pop()
+        if name in wanted:
+            continue
+        wanted.add(name)
+        _, used = _global_uses(text(nodes[name]))
+        todo.extend(u for u in used if u in nodes and u not in wanted)
+    ordered = sorted(wanted, key=lambda n: nodes[n].lineno)
+    return "\n\n\n".join(text(nodes[n]) for n in ordered)
 
 
 def _regions(source: str, begin: str, end: str) -> list:
@@ -236,28 +360,61 @@ def _regions(source: str, begin: str, end: str) -> list:
         elif current is not None:
             current.append(line)
     if current is not None or not out:
-        raise RuntimeError(f"norms monitor: unbalanced '{begin}' marks")
+        raise NormsMonitorError(f"norms monitor: unbalanced '{begin}' marks")
     return out
 
 
-@functools.lru_cache(maxsize=None)
-def runtime_source() -> str:
-    """The part of the generated module that is the same for every file:
-    everything but the header and ``MODEL``."""
+_EVALUATE_TAIL = "return run_trace(contract, trace, loader, declared_actors(sos))"
+
+
+def _check_evaluate(source: str) -> None:
+    """`evaluate` of norms_eval.py is outside the copied text. What it
+    returns must be exactly what the copied `run_trace` returns, so that
+    nothing the monitor lacks is done to a result of `cadl norms-eval`."""
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "evaluate":
+            nested = {id(n) for sub in node.body
+                      if isinstance(sub, (ast.FunctionDef, ast.ClassDef))
+                      for n in ast.walk(sub)}
+            returns = [n for n in ast.walk(node)
+                       if isinstance(n, ast.Return) and id(n) not in nested]
+            if len(returns) == 1 and returns[0] is node.body[-1] \
+                    and ast.unparse(returns[0]) == _EVALUATE_TAIL:
+                return
+            break
+    raise NormsMonitorError(
+        "norms monitor: `evaluate` of cadl/norms_eval.py must end with "
+        f"`{_EVALUATE_TAIL}` and return nothing else: the generated monitor contains "
+        "run_trace and what it calls, not what evaluate does to its result")
+
+
+def _sources() -> dict:
+    """The texts the generated module is assembled from."""
     from pathlib import Path
-    template = (Path(__file__).parent / "norms_monitor_template.py").read_text(encoding="utf-8")
+    return {
+        "ast_nodes": inspect.getsource(ast_nodes),
+        "norms": inspect.getsource(norms),
+        "norms_eval": inspect.getsource(norms_eval),
+        "template": (Path(__file__).parent / "norms_monitor_template.py").read_text(
+            encoding="utf-8"),
+    }
+
+
+def assemble_runtime(sources: dict) -> str:
+    """The part of the generated module that is the same for every file
+    (everything but the header and ``MODEL``), from the source texts."""
+    template = sources["template"]
     part1, part2 = _regions(template, "# >>> part 1", "# <<< part 1") + \
         _regions(template, "# >>> part 2", "# <<< part 2")
-    engine = _regions(inspect.getsource(norms_eval), _BEGIN, _END)
+    _check_evaluate(sources["norms_eval"])
+    engine = _regions(sources["norms_eval"], _BEGIN, _END)
     sections = [
         "# === AST classes (cadl/ast_nodes.py) ========================================",
-        _definitions(ast_nodes, _NODE_CLASSES),
+        _definitions(sources["ast_nodes"], _NODE_CLASSES, "cadl/ast_nodes.py"),
         "_NODE_TYPES = {c.__name__: c for c in (\n    "
         + ",\n    ".join(_NODE_CLASSES) + ",\n)}",
         "# === Helpers of the norms extension (cadl/norms.py) =========================",
-        f"TEMPORAL_OPERATORS = {norms.TEMPORAL_OPERATORS!r}\n"
-        f"_TEMPORAL_TEXT_RE = re.compile({norms._TEMPORAL_TEXT_RE.pattern!r})",
-        _definitions(norms, _NORMS_FUNCTIONS),
+        _definitions(sources["norms"], _NORMS_FUNCTIONS, "cadl/norms.py"),
         "# === The model as objects; lookups that stand in for the parser =============",
         part1,
         "# === The engine (cadl/norms_eval.py) ========================================",
@@ -267,9 +424,61 @@ def runtime_source() -> str:
     return "\n\n\n".join(sections) + "\n"
 
 
+@functools.lru_cache(maxsize=None)
+def runtime_source() -> str:
+    """`assemble_runtime` of the installed cadl."""
+    return assemble_runtime(_sources())
+
+
+# Names the module may read without defining them.
+_ALLOWED_NAMES = frozenset({"__name__", "__doc__", "__file__"})
+
+
+def check_module(text: str) -> None:
+    """Refuse a module text that would fail when it is imported or used:
+    it must compile, and every global name it reads must be bound at its
+    top level or be a builtin. Raises `NormsMonitorError`."""
+    try:
+        compile(text, "norms_monitor.py", "exec")
+    except (SyntaxError, ValueError, RecursionError, MemoryError) as e:
+        raise NormsMonitorError(f"norms monitor: the generated module does not compile ({e}); "
+                                f"this is an error of cadl, please report it") from e
+    _check_names(text)
+
+
+@functools.lru_cache(maxsize=8)
+def _check_names(text: str) -> None:
+    bound, used = _global_uses(text)
+    unknown = sorted(n for n in used - bound
+                     if not hasattr(builtins, n) and n not in _ALLOWED_NAMES)
+    if unknown:
+        raise NormsMonitorError(
+            "norms monitor: the generated module uses names it does not define: "
+            f"{', '.join(unknown)}. The text copied from cadl/norms_eval.py, cadl/norms.py or "
+            "cadl/ast_nodes.py needs something that is outside the copied parts; this is an "
+            "error of cadl, please report it")
+
+
+def assemble_module(model: dict, runtime: str) -> str:
+    """The text of `norms_monitor.py`, checked."""
+    def module(literal: str) -> str:
+        return (_HEADER + "\n\n"
+                "# === The declared actors and the contracts of the file, as data (JSON) ======\n\n"
+                f"MODEL = {literal}\n\n\n" + runtime)
+    text = module(model_literal(model))
+    try:
+        compile(text, "norms_monitor.py", "exec")
+    except (SyntaxError, ValueError, RecursionError, MemoryError) as e:
+        raise NormsMonitorError(f"norms monitor: the generated module does not compile ({e}); "
+                                f"this is an error of cadl, please report it") from e
+    # The model is one string literal and uses no name: the names are
+    # checked on the same module with an empty model, once per runtime.
+    _check_names(module("json.loads('{}')"))
+    return text
+
+
 def generate_norms_monitor_module(sos: SoSDefinition) -> str:
-    """The text of `norms_monitor.py` for a file that declares norms 0.1."""
-    model = pprint.pformat(build_model(sos), indent=1, width=100, sort_dicts=False)
-    return (_HEADER + "\n\n"
-            "# === The contracts of the file, as data =====================================\n\n"
-            f"MODEL = {model}\n\n\n" + runtime_source())
+    """The text of `norms_monitor.py` for a file that declares norms 0.1.
+    Raises `NormsMonitorError` (a ValueError) when it cannot be generated;
+    nothing is written then."""
+    return assemble_module(build_model(sos), runtime_source())

@@ -1126,9 +1126,7 @@ class _Engine:
         last = len(self.obs) - 1
         for n in range(len(self.obs)):
             if self._step(n, n == last):
-                if n < last:
-                    self.warnings.append(self._ignored_warning(last - n))
-                break
+                break                 # run_trace handles what follows the end
         self._finish_items()
 
     def _step(self, n: int, is_last: bool) -> bool:
@@ -1505,9 +1503,11 @@ class _Engine:
         }
 
 
-def select_contract(sos: SoSDefinition, contract_id: str | None = None) -> ContractDef:
+def select_contract(sos: SoSDefinition, contract_id: str | None = None,
+                    option: str = "--contract") -> ContractDef:
     """The contract to evaluate: the named one, else the only contract with
-    norms: or counts_as:, else the only contract of the file."""
+    norms: or counts_as:, else the only contract of the file. `option` is
+    how the caller's user names a contract, for the error message."""
     if contract_id is not None:
         for c in sos.contracts:
             if c.id == contract_id:
@@ -1520,8 +1520,27 @@ def select_contract(sos: SoSDefinition, contract_id: str | None = None) -> Contr
     if not pool:
         raise NormsEvalError("the file has no contract")
     raise NormsEvalError(
-        "the file has several contracts; choose one with --contract "
+        f"the file has several contracts; choose one with {option} "
         f"({', '.join(c.id for c in pool)})")
+
+
+def run_trace(contract: ContractDef, trace: Trace, loader=None,
+              actors: dict | None = None) -> dict:
+    """The result of one contract on a whole trace. An observation after
+    the end of the contract instance is not part of the instance and has
+    no effect on it (F.5): when the trace has such observations, the
+    instance is evaluated on the trace up to its end, so that they give no
+    name of a quantity, and they are counted in a warning."""
+    engine = _Engine(contract, trace, loader, actors)
+    engine.run()
+    after = len(trace.observations) - 1 - (engine.ended_at or 0)
+    if engine.ended_at is not None and after > 0:
+        instance = Trace(observations=trace.observations[:engine.ended_at + 1],
+                         bindings=trace.bindings, request=trace.request, path=trace.path)
+        engine = _Engine(contract, instance, loader, actors)
+        engine.run()
+        engine.warnings.append(engine._ignored_warning(after))
+    return engine.result()
 
 
 # <<< monitor-runtime
@@ -1567,9 +1586,7 @@ def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
         base = Path(trace.path).parent if trace.path else Path(".")
         return load_version(base / name)
 
-    engine = _Engine(contract, trace, loader, declared_actors(sos))
-    engine.run()
-    return engine.result()
+    return run_trace(contract, trace, loader, declared_actors(sos))
 
 
 # >>> monitor-runtime

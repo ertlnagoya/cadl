@@ -21,8 +21,10 @@ import pytest
 import yaml
 
 from cadl.codegen import generate
+from cadl.codegen import norms_monitor_gen
 from cadl.codegen.norms_monitor_gen import (
-    build_model, generate_norms_monitor_module, has_norms_monitor, runtime_source,
+    NormsMonitorError, assemble_module, assemble_runtime, build_model, check_module,
+    generate_norms_monitor_module, has_norms_monitor, runtime_source,
 )
 from cadl.codegen.safety import UnsafeCodegenInput
 from cadl.norms_eval import NormsEvalError, TraceError, evaluate, parse_trace
@@ -76,11 +78,20 @@ for case in cases:
         r["error"] = [type(e).__name__, str(e)]
     if case.get("steps") and "result" in r:
         recs = [json.loads(l) for l in case["lines"] if l.strip()]
-        names = set()
+        # the names of the quantities and the amendments of the instance
+        # (what follows its end is not part of it)
+        probe = mod.NormsMonitor(case.get("contract"), versions=versions)
+        inside = []
         for rec in recs:
+            probe.observe(rec)
+            inside.append(rec)
+            if probe.ended:
+                break
+        names = set()
+        for rec in inside:
             names.update("".join(k.split()) for k in rec.get("values", {}))
         m = mod.NormsMonitor(case.get("contract"), quantities=names, versions=versions)
-        m._warn_state = not any(rec.get("amend") for rec in recs)
+        m._warn_state = not any(rec.get("amend") for rec in inside)
         changes = [m.observe(rec) for rec in recs]
         if not m.ended and recs[-1].get("end") is not False:
             changes.append(m.end())
@@ -143,6 +154,8 @@ def _norms_eval(sos, lines, contract=None, versions=None) -> dict:
 
 
 def _same_error(expected: list, got: list) -> bool:
+    if expected[0] == "NormsEvalError" and got[0] == "ObservationError":
+        got = ["NormsEvalError", got[1]]     # a NormsEvalError that names the cause
     if expected == got:
         return True
     # A version the test did not give: norms-eval looks for a file of that
@@ -349,7 +362,7 @@ class TestExamples:
         assert dump.returncode == 0, dump.stderr
         (tmp_path / "v2.json").write_text(dump.stdout, encoding="utf-8")
         got = _run_module(packages, "norms_amendment_v1.norms_monitor", trace,
-                          "--version", f"../norms_amendment_v2.cadl={tmp_path / 'v2.json'}")
+                          "--model-version", f"../norms_amendment_v2.cadl={tmp_path / 'v2.json'}")
         want = json.loads(expected.stdout)
         del want["file"]
         assert got.returncode == expected.returncode, got.stderr
@@ -598,7 +611,7 @@ def test_random_traces(name, cadl_file, vocab, new, count, seed, tmp_path, monke
         lines = case["lines"]
         expected = _norms_eval(sos, lines, versions=versions)
         if "error" in expected:
-            assert g.get("error") == expected["error"], lines
+            assert "error" in g and _same_error(expected["error"], g["error"]), lines
             seen["errors"] += 1
             continue
         assert g.get("result") == expected["result"], lines
@@ -826,10 +839,9 @@ class TestApi:
         v1 = _load(tmp_path, "amend_v1", parse_file(V1))
         m = v1.NormsMonitor(bindings={"i": 2})
         m.observe({"t": 0})
-        with pytest.raises(v1.NormsEvalError, match="has no version 'v2'"):
+        with pytest.raises(v1.ObservationError, match="has no version 'v2'"):
             m.observe({"t": 1, "amend": "v2"})
-        with pytest.raises(v1.MonitorError, match="stopped at an error"):
-            m.observe({"t": 2})
+        assert m.observe({"t": 2}) == []            # refused, and the monitor goes on
         m = v1.NormsMonitor(bindings={"i": 2}, versions={"v2": build_model(parse_file(V2))})
         m.observe({"t": 0})
         m.observe({"t": 1, "messages": [ASSIGN]})
@@ -1087,3 +1099,690 @@ print(json.dumps({"model": nm.MODEL, "result": result}))
                          "m = NormsMonitor(); m.observe({'t': 0}); m.end(); print('ok')",
                          tmp_path)
         assert proc.returncode == 0 and proc.stdout.strip() == "ok", proc.stderr
+
+
+# === Found by an independent review ================================================
+# Each test here failed before its fix.
+
+def _small(blocks: str, actors: str = "    - {id: A, role: a}\n", parties: str = "[A]"):
+    return parse(
+        "sos:\n  name: Q\n  extensions:\n    - sos-dsl: 0.1\n    - norms: 0.1\n"
+        "  actors:\n" + actors +
+        "  contracts:\n    - id: C\n      parties: " + parties + "\n" + blocks)
+
+
+Q_BLOCKS = """\
+      guarantee:
+        - "within(2s, throughout(5s, A.ok == true))"
+        - "A.mode == target"
+      norms:
+        - id: n
+          kind: prohibition
+          bearer: A
+          content: "A.mode != target"
+"""
+
+
+def _lines(*records) -> list:
+    return [json.dumps(r) for r in records]
+
+
+class TestModelAsJson:
+    def test_model_is_one_json_string(self):
+        source = generate_norms_monitor_module(parse_file(RICH))
+        (assign,) = [n for n in ast.parse(source).body if isinstance(n, ast.Assign)
+                     and n.targets[0].id == "MODEL"]
+        call = assign.value
+        assert ast.unparse(call.func) == "json.loads" and len(call.args) == 1
+        assert isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+        assert json.loads(call.args[0].value) == build_model(parse_file(RICH))
+        assert call.args[0].value.isascii()
+        assert assign.lineno == assign.end_lineno
+
+    @pytest.mark.parametrize("predicate", [
+        " AND ".join(f"A.x > {i}" for i in range(250)),
+        "(" * 120 + "A.x > 0" + ")" * 120,
+        "A.x < " + "9" * 400,
+    ], ids=["and250", "paren120", "int400"])
+    def test_large_predicates(self, predicate, tmp_path):
+        """A deep or long predicate was written as a nested Python literal
+        that Python could not compile, or only slowly."""
+        sos = _small(f"""\
+      guarantee:
+        - "{predicate}"
+      norms:
+        - id: n
+          kind: obligation
+          bearer: A
+          content: "{predicate}"
+""")
+        lines = _lines({"t": 0, "values": {"A.x": 5}}, {"t": 1, "values": {"A.x": 1000}})
+        expected = _norms_eval(sos, lines)
+        (got,) = _batch(tmp_path, [{"source": generate_norms_monitor_module(sos),
+                                    "lines": lines}])
+        assert got == expected
+
+    def test_number_too_large_is_not_a_predicate(self, tmp_path):
+        """`1e999` was read as infinity and written as `inf`, a NameError
+        when the module was imported."""
+        from cadl.parser import parse_expr
+        with pytest.raises(Exception, match="too large"):
+            parse_expr("A.x < 1e999")
+        with pytest.raises(Exception, match="too large"):
+            parse_expr("A.x > -1e999")
+        assert parse_expr("A.x < 1e308").right.value == 1e308
+        sos = _small("""\
+      norms:
+        - id: n
+          kind: obligation
+          bearer: A
+          content: "A.x < 1e999"
+""")
+        lines = _lines({"t": 0, "values": {"A.x": 5}})
+        expected = _norms_eval(sos, lines)
+        assert expected["result"]["norms"][0]["evaluable"] is False
+        (got,) = _batch(tmp_path, [{"source": generate_norms_monitor_module(sos),
+                                    "lines": lines}])
+        assert got == expected
+
+    @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+    def test_non_finite_number_in_the_model_is_a_generation_error(self, value, tmp_path):
+        from cadl.ast_nodes import BinaryOp, FloatLiteral
+        sos = _small("      guarantee:\n        - \"A.x < 1.5\"\n")
+        (item,) = sos.contracts[0].guarantee
+        assert isinstance(item, BinaryOp)
+        item.right = FloatLiteral(value=value)
+        with pytest.raises(NormsMonitorError, match="not finite .*guarantee"):
+            generate_norms_monitor_module(sos)
+        with pytest.raises(NormsMonitorError):
+            generate(sos, tmp_path / "out", target="python")
+        assert not (tmp_path / "out").exists()
+
+
+def _mutated(name: str, old: str, new: str, count: int = 1) -> dict:
+    sources = dict(norms_monitor_gen._sources())
+    assert sources[name].count(old) == count, (name, old)
+    sources[name] = sources[name].replace(old, new)
+    return sources
+
+
+_HELPERS = '''
+def _rv_open(elapsed, deadline):
+    return deadline is None or elapsed <= deadline + 1e-9
+
+
+def _rv_describe(op, left, right):
+    return f"'{op}' cannot be applied to {left!r} and {right!r}; the predicate does not hold"
+
+
+# >>> monitor-runtime
+_EPS = 1e-9
+'''
+
+
+class TestSelfCheck:
+    """The generator refuses to write a module that would not work. The
+    mutations are applied to copies of the source texts of cadl."""
+
+    def _refused(self, sources: dict, match: str) -> None:
+        with pytest.raises(NormsMonitorError, match=match):
+            assemble_module(build_model(parse_file(EXAMPLE)), assemble_runtime(sources))
+
+    def test_unchanged_sources_pass(self):
+        text = assemble_module(build_model(parse_file(EXAMPLE)),
+                               assemble_runtime(norms_monitor_gen._sources()))
+        assert text == generate_norms_monitor_module(parse_file(EXAMPLE))
+        check_module(text)
+
+    def test_m1_helper_outside_the_copied_region(self):
+        sources = _mutated("norms_eval", "# >>> monitor-runtime\n_EPS = 1e-9\n", _HELPERS.lstrip("\n"))
+        old = "open_ = norm.deadline is None or elapsed <= norm.deadline + _EPS"
+        assert sources["norms_eval"].count(old) == 1
+        sources["norms_eval"] = sources["norms_eval"].replace(
+            old, "open_ = _rv_open(elapsed, norm.deadline)")
+        self._refused(sources, "does not define: _rv_open")
+
+    def test_m2_helper_used_on_a_rare_path(self):
+        """No test of the monitor reaches this warning, so only the check
+        of the names finds it."""
+        sources = _mutated("norms_eval", "# >>> monitor-runtime\n_EPS = 1e-9\n", _HELPERS.lstrip("\n"))
+        old = ("self.warn(f\"'{op}' cannot be applied to {left!r} and {right!r}; "
+               "the predicate does not hold\")")
+        assert sources["norms_eval"].count(old) == 1
+        sources["norms_eval"] = sources["norms_eval"].replace(
+            old, "self.warn(_rv_describe(op, left, right))")
+        self._refused(sources, "does not define: _rv_describe")
+
+    def test_m3_evaluate_changes_the_result(self):
+        """`evaluate` is not copied: it may not do anything to the result."""
+        sources = _mutated(
+            "norms_eval",
+            "    return run_trace(contract, trace, loader, declared_actors(sos))\n",
+            "    result = run_trace(contract, trace, loader, declared_actors(sos))\n"
+            "    for v in result['violations']:\n"
+            "        if v['severity'] == 'Minor':\n"
+            "            v['verdict'] = 'excused'\n"
+            "    return result\n")
+        with pytest.raises(NormsMonitorError, match="`evaluate` .* must end with"):
+            assemble_runtime(sources)
+
+    def test_m4_copied_code_uses_a_module_that_is_not_imported(self):
+        sources = _mutated("norms_eval", "        sos = self.loader(name)\n",
+                           "        name = Path(name).name\n        sos = self.loader(name)\n")
+        self._refused(sources, "does not define: Path")
+
+    def test_b3_helper_of_a_copied_class_is_copied(self, tmp_path):
+        """A default_factory or a decorator defined in ast_nodes.py."""
+        sources = _mutated(
+            "ast_nodes",
+            "@dataclass\nclass PowerEffects:",
+            "def _no_names() -> list:\n    return []\n\n\n"
+            "def _marked(cls):\n    cls.marked = _MARK\n    return cls\n\n\n"
+            "_MARK = \"x\"\n\n\n"
+            "@_marked\n@dataclass\nclass PowerEffects:")
+        old = "    activate: list[str] = field(default_factory=list)"
+        assert sources["ast_nodes"].count(old) == 1
+        sources["ast_nodes"] = sources["ast_nodes"].replace(
+            old, "    activate: list[str] = field(default_factory=_no_names)")
+        runtime = assemble_runtime(sources)
+        for helper in ("def _no_names()", "def _marked(cls)", "_MARK = \"x\"",
+                       "@_marked\n@dataclass"):
+            assert helper in runtime
+        text = assemble_module(build_model(parse_file(EXAMPLE)), runtime)
+        _write_package(tmp_path, "b3", text)
+        proc = _isolated(_NO_CADL + "from b3 import norms_monitor as nm\n"
+                         "assert nm.PowerEffects.marked == 'x'\n"
+                         "assert nm.PowerEffects().activate == []\n"
+                         "assert nm.NormsMonitor(bindings={'i': 2}).observe({'t': 0})\n", tmp_path)
+        assert proc.returncode == 0, proc.stderr
+
+    def test_b3_helper_that_cannot_be_copied_is_refused(self):
+        """A name that ast_nodes.py imports is not in the generated module."""
+        sources = _mutated(
+            "ast_nodes", "@dataclass\nclass PowerEffects:",
+            "import collections\n\n\n@dataclass\nclass PowerEffects:")
+        old = "    activate: list[str] = field(default_factory=list)"
+        sources["ast_nodes"] = sources["ast_nodes"].replace(
+            old, "    activate: list[str] = field(default_factory=collections.deque)")
+        self._refused(sources, "does not define: collections")
+
+    def test_text_that_does_not_compile_is_refused(self):
+        with pytest.raises(NormsMonitorError, match="does not compile"):
+            check_module("def f(:\n    pass\n")
+        with pytest.raises(NormsMonitorError, match="does not define: nowhere"):
+            check_module("import json\n\ndef f(x):\n    return [nowhere(y) for y in x]\n")
+        check_module("from __future__ import annotations\nimport json\n\n"
+                     "def f(x: Missing) -> AlsoMissing:\n    return json.dumps(len(x))\n")
+
+    def test_generate_writes_nothing_when_the_check_fails(self, tmp_path, monkeypatch):
+        sources = _mutated("norms_eval", "        sos = self.loader(name)\n",
+                           "        name = Path(name).name\n        sos = self.loader(name)\n")
+        monkeypatch.setattr(norms_monitor_gen, "runtime_source",
+                            lambda: assemble_runtime(sources))
+        with pytest.raises(NormsMonitorError):
+            generate(parse_file(EXAMPLE), tmp_path / "out", target="python")
+        assert not (tmp_path / "out").exists()
+
+
+@pytest.fixture(scope="module")
+def amend_v1(tmp_path_factory):
+    return _load(tmp_path_factory.mktemp("atomic"), "atomic_v1", parse_file(V1))
+
+
+class TestAtomicObserve:
+    """A refused observation leaves the monitor as it was, and the monitor
+    goes on."""
+
+    GOOD = [
+        {"t": 0.0, "bindings": {"i": 2},
+         "values": {"DISPATCHER.is_operational": True, "ROBOT[2].battery": 80}},
+        {"t": 1.0, "messages": [ASSIGN], "state": "Assigned"},
+        {"t": 6.5, "values": {"ROBOT[2].battery": 79}},
+        {"t": 7.5, "amend": "v2"},
+        {"t": 9.0, "messages": [{"from": "ROBOT[2]", "to": "DISPATCHER", "name": "help_request"}]},
+        {"t": 30.0, "values": {"ROBOT[2].status": "InTransit", "ROBOT[2].battery": 14},
+         "state": "Delivering"},
+        {"t": 110.0, "values": {"ROBOT[2].status": "Delivered"}, "state": "Completed"},
+    ]
+
+    @staticmethod
+    def _bad(t: float) -> list:
+        return [
+            ("TraceError", {"t": "x"}),
+            ("TraceError", {"t": t - 100, "values": {"ROBOT[2].battery": 1}}),
+            ("TraceError", {"t": 10 ** 400, "values": {"ROBOT[2].battery": 1}}),
+            ("TraceError", {"t": float("nan"), "values": {"ROBOT[2].battery": 1}}),
+            ("TraceError", {"t": float("inf"), "messages": [ASSIGN]}),
+            ("TraceError", {"t": True}),
+            ("TraceError", {"t": t, "values": {"ROBOT[2].battery": 1}, "messages": "no"}),
+            ("TraceError", {"t": t, "values": {"ROBOT[2].battery": 1}, "state": "Nowhere"}),
+            ("TraceError", {"t": t, "messages": [{"from": "ROBOT [2]", "to": "DISPATCHER",
+                                                  "name": "ack"}]}),
+            ("ObservationError", {"t": t, "amend": "nope", "values": {"ROBOT[2].battery": 1}}),
+            ("ObservationError", {"t": t, "amend": "other", "messages": [ASSIGN]}),
+            ("TraceError", {"t": t, "amend": "v2", "state": "Nowhere",
+                            "values": {"ROBOT[2].battery": 1}}),
+            ("ObservationError", {"t": t, "amend": "few_states", "messages": [ASSIGN]}),
+        ]
+
+    def _versions(self):
+        v2 = build_model(parse_file(V2))
+        other = json.loads(json.dumps(v2))
+        other["contracts"][0]["id"] = "OTHER"
+        few = json.loads(json.dumps(v2))
+        few["contracts"][0]["lifecycle"]["states"] = ["Nowhere"]
+        return {"v2": v2, "other": other, "few_states": few}
+
+    def test_continuing_gives_the_result_without_the_refused_lines(self, amend_v1):
+        versions = self._versions()
+        clean = amend_v1.NormsMonitor(versions=versions)
+        tried = amend_v1.NormsMonitor(versions=versions)
+        refused = 0
+        for rec in self.GOOD:
+            for kind, bad in self._bad(rec["t"]):
+                if not tried.started and bad.get("t") == rec["t"] - 100:
+                    continue                 # no earlier observation yet
+                state = tried.result() if tried.started else None
+                with pytest.raises(getattr(amend_v1, kind)):
+                    tried.observe(bad)
+                refused += 1
+                assert (tried.result() if tried.started else None) == state, bad
+            assert tried.observe(rec) == clean.observe(rec)
+            assert tried.result() == clean.result()
+            assert tried.next_check() == clean.next_check()
+        assert tried.ended and refused >= 80
+        assert clean.result()["amendments"][0]["file"] == "v2"
+
+    def test_refused_first_observation(self, amend_v1):
+        m = amend_v1.NormsMonitor(bindings={"i": 2}, versions=self._versions())
+        for bad in ({"t": "x", "bindings": {"i": 1}}, {"t": 0, "bindings": {"i": 1}, "state": "Q"},
+                    {"t": 0, "bindings": {"i": 1}, "amend": "nope"},
+                    {"t": 0, "bindings": {"i": 1}, "amend": "v2", "state": "Q"}):
+            with pytest.raises((amend_v1.TraceError, amend_v1.ObservationError)):
+                m.observe(bad)
+            assert not m.started and m._trace.bindings == {"i": 2}
+        m.observe({"t": 0})
+        m.observe({"t": 1, "messages": [ASSIGN]})
+        assert m.verdicts()["norms"]["acknowledge"]["state"] == "active"
+
+    def test_errors_are_documented_classes(self, amend_v1):
+        assert issubclass(amend_v1.ObservationError, amend_v1.MonitorError)
+        assert issubclass(amend_v1.ObservationError, amend_v1.NormsEvalError)
+        assert issubclass(amend_v1.TraceError, ValueError)
+        assert not hasattr(amend_v1.NormsMonitor(), "_broken")
+
+    def test_broken_version_model_is_refused_at_once(self, amend_v1):
+        for broken in ({"norms_version": "0.1"}, {}, None, "v2",
+                       {"norms_version": "0.1", "parsed": {}, "actors": [],
+                        "contracts": [{"id": "X"}]}):
+            with pytest.raises(amend_v1.MonitorError, match=r"versions\['v2'\] is not the MODEL"):
+                amend_v1.NormsMonitor(versions={"v2": broken})
+
+    def test_reader_is_not_corrupted_by_a_huge_time(self, robot):
+        """`math.isfinite(10 ** 400)` raises OverflowError; the time must
+        be refused before anything is kept."""
+        m = robot.NormsMonitor(bindings={"i": 2})
+        m.observe({"t": 0})
+        m.observe({"t": 1, "messages": [ASSIGN]})
+        before = m.result()
+        for t in (10 ** 400, -10 ** 400, 1e11, float("nan"), float("inf"), True, None, "1"):
+            with pytest.raises(robot.TraceError, match="'t' must be"):
+                m.observe({"t": t, "values": {"ROBOT[2].battery": 1}})
+            assert m._reader.prev_t == 1 and "ROBOT[2].battery" not in m._reader.snapshot
+        assert m.result() == before
+        assert m.observe({"t": 2}) == []
+
+    @pytest.mark.parametrize("line", ['{"t": 1' + "0" * 400 + "}", '{"t": 1e400}', '{"t": NaN}',
+                                      '{"t": Infinity}', '{"t": -1e11}', '{"t": true}'])
+    def test_offline_reader_refuses_the_same_times(self, line, robot):
+        with pytest.raises(TraceError):
+            parse_trace(['{"t": 0}', line])
+        with pytest.raises(robot.TraceError):
+            robot.replay(['{"t": 0}', line])
+
+
+class TestAfterTheEnd:
+    AFTEREND = _lines({"t": 0, "values": {"A.mode": "fast", "A.ok": True}},
+                      {"t": 2, "end": True}, {"t": 3, "values": {"target": "fast"}})
+    NOAFTER = AFTEREND[:2]
+
+    def test_observations_after_the_end_have_no_effect(self, tmp_path):
+        """norms-eval took the names of the quantities also from what
+        follows the end, so `target` was undefined instead of a symbolic
+        value and the prohibition was not judged."""
+        sos = _small(Q_BLOCKS)
+        with_ = _norms_eval(sos, self.AFTEREND)["result"]
+        without = _norms_eval(sos, self.NOAFTER)["result"]
+        assert with_["warnings"][-1] == ("1 observation(s) after the end of the contract "
+                                         "instance (t=2) are ignored")
+        assert with_["warnings"][:-1] == without["warnings"]
+        assert _strip(with_) == _strip(without)
+        assert {n["id"]: n["state"] for n in with_["norms"]} == {"n": "violated"}
+        got = _batch(tmp_path, [
+            {"source": generate_norms_monitor_module(sos), "lines": lines, "steps": True}
+            for lines in (self.AFTEREND, self.NOAFTER)])
+        assert got[0]["result"] == got[0]["manual"] == with_
+        assert got[1]["result"] == got[1]["manual"] == without
+
+    def test_state_after_the_end_gives_no_warning(self):
+        sos = _small("      guarantee:\n        - \"A.ok == true\"\n")
+        lines = _lines({"t": 0, "values": {"A.ok": True}}, {"t": 1, "end": True},
+                       {"t": 2, "state": "S"})
+        warnings = _norms_eval(sos, lines)["result"]["warnings"]
+        assert len(warnings) == 1 and "after the end" in warnings[0]
+
+    def test_monitor_keeps_nothing_of_them(self, tmp_path):
+        q = _load(tmp_path, "after_end", _small(Q_BLOCKS), check=False)
+        m = q.NormsMonitor()
+        m.observe({"t": 0, "values": {"A.mode": "fast", "A.ok": True}})
+        m.observe({"t": 2, "end": True})
+        before = m.result()
+        assert m.observe({"t": 3, "values": {"target": "fast"}, "state": "S"}) == []
+        assert len(m._trace.observations) == 2 and "target" not in m._reader.snapshot
+        assert "target" not in m._engine.ev.known
+        with pytest.raises(q.TraceError, match="observation 4: time 1 is before"):
+            m.observe({"t": 1})                # still checked for its form
+        after = m.result()
+        assert after.pop("warnings")[-1].startswith("1 observation(s) after the end")
+        before.pop("warnings")
+        assert after == before
+
+
+class TestWhatAnOnlineMonitorKnows:
+    def test_quantities_are_the_one_permitted_difference(self, tmp_path):
+        """F.5: the verdicts after an observation are those of the prefix
+        when the names of the quantities are fixed for the instance. A
+        monitor that is not given the name `target` reads it as a symbolic
+        value until its first value: the prohibition `A.mode != target` is
+        violated at t=0, where norms-eval on the whole trace, which knows
+        that `target` is a quantity, finds it undefined."""
+        sos = _small(Q_BLOCKS)
+        q = _load(tmp_path, "quantity", sos, check=False)
+        full = [{"t": 0, "values": {"A.mode": "fast", "A.ok": True}},
+                {"t": 1, "values": {"target": "fast"}}, {"t": 2, "end": True}]
+        offline = _norms_eval(sos, _lines(*full))["result"]
+        prefix = _norms_eval(sos, _lines(dict(full[0], end=False)))["result"]
+        assert [n["state"] for n in offline["norms"]] == ["fulfilled"]
+        assert [n["state"] for n in prefix["norms"]] == ["violated"]   # a different instance
+        told, untold = q.NormsMonitor(quantities=["target"]), q.NormsMonitor()
+        told.observe(full[0])
+        untold.observe(full[0])
+        assert untold.verdicts()["norms"]["n"]["state"] == "violated"
+        assert _strip(untold.result()) == _strip(prefix)
+        assert told.verdicts()["norms"]["n"]["state"] == "active"
+        assert told.verdicts()["guarantees"][1]["verdict"] == "pending"
+        for rec in full[1:]:
+            told.observe(rec)
+            untold.observe(rec)
+        assert told.result() == offline == q.replay(_lines(*full))
+        assert untold.verdicts()["norms"]["n"]["state"] == "violated"   # it does not change
+
+    def test_nested_operator_is_decided_later_than_its_own_interval(self, tmp_path):
+        """within(2s, throughout(5s, p)) at t=0: the interval of within is
+        over at t=3, but its operand at t=0 and t=1 is decided only after
+        t=5 and t=6."""
+        sos = _small(Q_BLOCKS)
+        q = _load(tmp_path, "nested", sos, check=False)
+        start = {"t": 0, "values": {"A.mode": "fast", "A.ok": True, "target": "fast"}}
+        nest3 = [start, {"t": 1}, {"t": 3, "end": False}]
+        nest5 = [start, {"t": 1}, {"t": 3}, {"t": 5.5, "end": False}]
+        for records, verdict in ((nest3, "pending"), (nest5, "fulfilled")):
+            offline = _norms_eval(sos, _lines(*records))["result"]
+            assert offline["guarantees"][0]["verdict"] == verdict
+            assert q.replay(_lines(*records)) == offline
+        m = q.NormsMonitor()
+        for rec in nest3:
+            m.observe(rec)
+        assert m.verdicts()["guarantees"][0]["verdict"] == "pending"
+        (c,) = [c for c in m.observe({"t": 5.5}) if c["kind"] == "guarantee"]
+        assert (c["index"], c["verdict"], c["t"]) == (1, "fulfilled", 5.5)
+
+    def test_operator_can_be_undefined(self, tmp_path):
+        """A.ok never has a value: the operator is neither true nor false
+        after its interval, and the guarantee stays pending."""
+        sos = _small("      guarantee:\n        - \"within(2s, A.ok == true)\"\n")
+        q = _load(tmp_path, "undefined_op", sos, check=False)
+        lines = _lines({"t": 0}, {"t": 1}, {"t": 3}, {"t": 4, "end": True})
+        offline = _norms_eval(sos, lines)["result"]
+        (g,) = offline["guarantees"]
+        assert g["verdict"] == "pending" and "no value" in g["reason"]
+        assert q.replay(lines) == offline
+
+    def test_state_warning_does_not_depend_on_versions(self, tmp_path):
+        sos = _small("      guarantee:\n        - \"A.ok == true\"\n")
+        q = _load(tmp_path, "state_warning", sos, check=False)
+        for versions in (None, {"v2": build_model(sos)}):
+            m = q.NormsMonitor(versions=versions)
+            m.observe({"t": 0})
+            m.observe({"t": 1, "state": "S"})
+            assert m.result()["warnings"][0].startswith("the trace gives 'state'")
+
+
+class TestNextCheck:
+    def test_observing_at_next_check_detects_the_deadline(self, robot):
+        """Observing at next_deadline() does not: content at the deadline
+        itself is in time."""
+        m = robot.NormsMonitor(bindings={"i": 2})
+        m.observe({"t": 0, "values": {"DISPATCHER.is_operational": True}})
+        m.observe({"t": 1, "messages": [ASSIGN]})
+        assert m.next_deadline() == 6.0
+        assert m.observe({"t": m.next_deadline()}) == []
+        check = m.next_check()
+        assert 6.0 < check < 6.0 + 1e-8
+        changes = m.observe({"t": check})
+        assert ("acknowledge", "violated") in [(c["id"], c["state"]) for c in changes]
+
+    @pytest.mark.parametrize("t0", [0.0, 12345.678, 1e9, 9.9e9])
+    def test_loop_decides_everything_that_waits_for_time(self, t0, robot):
+        """Also where the step of the floating-point numbers is larger
+        than the tolerance of 1e-9 s."""
+        m = robot.NormsMonitor(bindings={"i": 2})
+        m.observe({"t": t0, "values": {"DISPATCHER.is_operational": True,
+                                       "ROBOT[2].status": "Idle"}})
+        m.observe({"t": t0 + 1, "messages": [ASSIGN]})
+        seen = []
+        for _ in range(10):
+            check = m.next_check()
+            if check is None:
+                break
+            assert check > m._trace.observations[-1].t
+            seen.extend(m.observe({"t": check}))
+        assert m.next_check() is None and m.next_deadline() is None
+        done = {c.get("id") or c["kind"]: c.get("verdict") or c.get("status") for c in seen}
+        assert done == {"acknowledge": "violated", "report_failure": "violated",
+                        "assumption": "holds", "guarantee": "violated"}
+        assert len(m._trace.observations) == 5      # one observation per thing decided
+        m.end()
+        assert m.next_check() is None
+
+    def test_nested_and_temporal_contents(self, tmp_path):
+        sos = _small("""\
+      assume:
+        - "throughout(1s, within(2s, A.ok == true))"
+      guarantee:
+        - "within(2s, throughout(5s, A.ok == true))"
+        - "until(A.ok == true, within(3s, A.done == true), 4s) OR A.x > 9"
+      norms:
+        - id: n
+          kind: obligation
+          bearer: A
+          content: "within(3s, A.done == true)"
+          deadline: 2s
+""")
+        q = _load(tmp_path, "next_check", sos, check=False)
+        m = q.NormsMonitor()
+        m.observe({"t": 10, "values": {"A.ok": True, "A.done": False, "A.x": 1}})
+        checks = []
+        for _ in range(20):
+            check = m.next_check()
+            if check is None:
+                break
+            checks.append(check)
+            m.observe({"t": check})
+        v = m.verdicts()
+        assert [a["status"] for a in v["assumptions"]] == ["holds"]
+        assert [g["verdict"] for g in v["guarantees"]] == ["fulfilled", "violated"]
+        assert v["norms"]["n"]["state"] == "violated"
+        assert checks == sorted(checks) and len(checks) <= 6
+        assert round(checks[-1], 6) == 17.0     # the guarantees: 10 + 2 + 5 and 10 + 4 + 3
+
+    def test_before_the_first_observation(self, robot):
+        m = robot.NormsMonitor(bindings={"i": 2})
+        with pytest.raises(robot.MonitorError, match="no observation"):
+            m.next_check()
+
+
+class TestSmallThings:
+    def test_bindings_and_request_are_copied(self, robot):
+        bindings, request = {"i": 2}, {"deadline": [300]}
+        m = robot.NormsMonitor(bindings=bindings, request=request)
+        bindings["i"] = 3
+        request["deadline"].append(1)
+        assert (m._trace.bindings, m._trace.request) == ({"i": 2}, {"deadline": [300]})
+        first = {"t": 0, "bindings": {"i": 2}, "request": {"a": {"b": 1}},
+                 "values": {"ROBOT[2].battery": 50}}
+        m.observe(first)
+        first["bindings"]["i"] = 3
+        first["request"]["a"]["b"] = 2
+        first["values"]["ROBOT[2].battery"] = 1
+        assert m.result()["instance"]["bindings"] == {"i": 2}
+        assert m._trace.request == {"a": {"b": 1}}
+        assert m._reader.snapshot == {"ROBOT[2].battery": 50}
+
+    def test_several_contracts_name_the_argument(self, tmp_path):
+        sos = parse("""
+sos:
+  name: Two
+  extensions:
+    - norms: 0.1
+  actors:
+    - {id: A, role: a}
+  contracts:
+    - id: C1
+      parties: [A]
+      norms:
+        - {id: n, kind: permission, bearer: A, content: "A.ok == true"}
+    - id: C2
+      parties: [A]
+      norms:
+        - {id: n, kind: permission, bearer: A, content: "A.ok == true"}
+""")
+        two = _load(tmp_path, "two_contracts", sos)
+        with pytest.raises(two.NormsEvalError, match=r"choose one with contract= \(C1, C2\)"):
+            two.NormsMonitor()
+        with pytest.raises(two.NormsEvalError, match=r"choose one with contract= \(C1, C2\)"):
+            two.replay(['{"t": 0}'])
+        assert two.NormsMonitor("C2").contract == "C2"
+        _write_package(tmp_path, "two", generate_norms_monitor_module(sos))
+        trace = tmp_path / "t.jsonl"
+        trace.write_text('{"t": 0}\n', encoding="utf-8")
+        proc = _run_module(tmp_path, "two.norms_monitor", trace)
+        assert proc.returncode == 2 and "choose one with --contract (C1, C2)" in proc.stderr
+        with pytest.raises(NormsEvalError, match="choose one with --contract"):
+            evaluate(sos, parse_trace(['{"t": 0}']))
+
+    def test_cli_flag_is_model_version(self, packages):
+        proc = _run_module(packages, "norms_amendment_v1.norms_monitor", "--help")
+        assert "--model-version NAME=MODEL.json" in proc.stdout
+        assert "--version" not in proc.stdout.replace("--model-version", "")
+        proc = _run_module(packages, "norms_amendment_v1.norms_monitor",
+                           TRACES / "norms_amendment_v1_to_v2.jsonl", "--version", "a=b")
+        assert proc.returncode == 2
+
+    def test_first_observation_with_amend(self, tmp_path):
+        v1 = _load(tmp_path, "first_amend", parse_file(V1))
+        m = v1.NormsMonitor(bindings={"i": 2}, versions={"v2": build_model(parse_file(V2))})
+        changes = {c["id"]: c for c in m.observe({"t": 0, "amend": "v2"}) if c["kind"] == "norm"}
+        # new in v2: no previous state; gone in v2: no state
+        assert changes["request_help"]["previous_state"] is None
+        assert changes["may_swap_battery"]["previous_state"] is None
+        assert changes["may_swap_battery"]["state"] == "active"
+        assert changes["report_failure"]["state"] is None
+        assert changes["report_failure"]["previous_state"] == "inactive"
+        assert changes["report_failure"]["reason"] == "removed by the amendment"
+        # active from the start of the instance, then discharged by its policy
+        assert changes["may_return_to_charge"]["state"] == "discharged"
+        offline = _norms_eval(parse_file(V1), _lines({"t": 0, "bindings": {"i": 2},
+                                                      "amend": "v2", "end": False}),
+                              versions={"v2": parse_file(V2)})["result"]
+        assert _strip(m.result()) == _strip(offline)
+
+
+class TestActorRanges:
+    """Actor references are matched against the declared actors (F.3):
+    the generated model carries them, also for a new version."""
+
+    BLOCKS = """\
+      counts_as:
+        - {when: "R[2..3] -> D : ping", creates: pinged}
+        - {when: "R[*] -> D : stop", creates: stopping}
+      norms:
+        - id: pong
+          kind: obligation
+          bearer: D
+          trigger: pinged
+          content: "D -> R[*] : pong"
+          deadline: 3s
+        - id: quiet
+          kind: prohibition
+          bearer: "R[i]"
+          content: "R[i] -> D : noise"
+          until: stopping
+"""
+    ACTORS = "    - {id: D, role: d}\n    - {id: \"R[1..3]\", role: r}\n"
+    WIDER = "    - {id: D, role: d}\n    - {id: \"R[1..9]\", role: r}\n"
+
+    @staticmethod
+    def _msg(a, b, name):
+        return {"from": a, "to": b, "name": name}
+
+    def test_model_carries_the_declared_actors(self):
+        model = build_model(_small(self.BLOCKS, self.ACTORS, "[D, \"R[*]\"]"))
+        assert [a["name"] for a in model["actors"]] == ["D", "R"]
+        assert model["actors"][1]["index"] == {"#": "RangeExpr", "start": 1, "end": 3}
+
+    @pytest.mark.parametrize("bindings", [{"i": 1}, {}])
+    def test_ranges_members_and_undeclared_actors(self, bindings, tmp_path):
+        sos = _small(self.BLOCKS, self.ACTORS, "[D, \"R[*]\"]")
+        m = self._msg
+        records = [
+            {"t": 0, "bindings": bindings},
+            {"t": 1, "messages": [m("R[1]", "D", "ping"), m("R[7]", "D", "ping"),
+                                  m("Z", "D", "ping"), m("R", "D", "ping")]},
+            {"t": 2, "messages": [m("R[7]", "D", "noise"), m("R[7]", "D", "stop"),
+                                  m("Z", "D", "stop"), m("R", "D", "stop")]},
+            {"t": 3, "messages": [m("R[3]", "D", "ping")]},
+            {"t": 4, "messages": [m("D", "R[7]", "pong"), m("D", "R", "pong")]},
+            {"t": 5, "messages": [m("D", "R[2]", "pong")]},
+            {"t": 6, "messages": [m("R[2]", "D", "stop")]},
+            {"t": 7, "end": True},
+        ]
+        offline = _norms_eval(sos, _lines(*records))["result"]
+        history = {n["id"]: [(h["t"], h["state"]) for h in n["history"]] for n in offline["norms"]}
+        # R[1] is outside R[2..3]; R[7], Z and the set R are no members
+        assert history["pong"] == [(3.0, "active"), (5.0, "fulfilled")]
+        assert history["quiet"] == [(0.0, "active"), (6.0, "discharged")]
+        assert [e["t"] for e in offline["institutional_events"]] == [3.0, 6.0]
+        (got,) = _batch(tmp_path, [{"source": generate_norms_monitor_module(sos),
+                                    "lines": _lines(*records), "steps": True}])
+        assert got["result"] == got["manual"] == offline
+        for k, at_k in enumerate(got["prefixes"]):
+            want = _norms_eval(sos, _prefix(_lines(*records), k))["result"]
+            assert _strip(at_k) == _strip(want)
+
+    def test_amendment_brings_the_actors_of_the_new_version(self, tmp_path):
+        """R[7] is no member in the old version and one in the new."""
+        old = _small(self.BLOCKS, self.ACTORS, "[D, \"R[*]\"]")
+        new = _small(self.BLOCKS, self.WIDER, "[D, \"R[*]\"]")
+        m = self._msg
+        records = [{"t": 0, "bindings": {"i": 1}},
+                   {"t": 1, "messages": [m("R[7]", "D", "stop")]},
+                   {"t": 2, "amend": "wider"},
+                   {"t": 3, "messages": [m("R[7]", "D", "stop")]},
+                   {"t": 4, "end": True}]
+        offline = _norms_eval(old, _lines(*records), versions={"wider": new})["result"]
+        assert [e["t"] for e in offline["institutional_events"]] == [3.0]
+        (got,) = _batch(tmp_path, [{"source": generate_norms_monitor_module(old),
+                                    "versions": {"wider": build_model(new)},
+                                    "lines": _lines(*records), "steps": True}])
+        assert got["result"] == got["manual"] == offline
