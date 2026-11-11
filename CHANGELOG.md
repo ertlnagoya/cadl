@@ -6,6 +6,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.22] — 2026-11-11
+
+Three parts of the extension appendices that were specified but not
+implemented: certified regime maps (Appendix H), a stateful runtime for
+agent governance (Appendix G), and an online monitor of norms in the
+generated Python code (Appendix F). Each was reviewed independently
+before the release; the agent runtime went through seven review rounds,
+and the defects they found are fixed here. `cadl check` gains the rules
+G-17 to G-19 for enforced contracts, and `cadl norms-eval` reads traces
+more strictly (see Changed).
+
+Known limits of the agent runtime are listed in G.13 of the
+specification: it is an offline replay of a recorded trace without a
+protocol adapter; the audit log has no integrity protection; a predicate
+with a quantifier or `[*]` is not evaluated, so a prohibition that
+depends on it always applies and a permission never does; amendments were
+tested by hand only; the Cedar policies cover static norms and were not
+part of these reviews.
+
 ### Added
 - `cadl model-check FILE --regime-map ID --certify`: the **certified
   regime map** of a regime map query (Appendix H, H.9). The result is a
