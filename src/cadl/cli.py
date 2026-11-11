@@ -190,6 +190,9 @@ def main(argv: list[str] | None = None) -> int:
     approve_cmd.add_argument("decision", choices=["approve", "reject"])
     approve_cmd.add_argument("--as", dest="actor", required=True, metavar="ACTOR",
                              help="The actor who approves or rejects")
+    approve_cmd.add_argument("--show", action="store_true",
+                             help="Show the held call and its arguments, and write "
+                                  "nothing")
     approve_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
                              help="The key of the actor (HMAC-SHA256); the gateway "
                                   "requires it unless it runs with --insecure-approvals")
@@ -1048,7 +1051,7 @@ def _cmd_agents_run(args: argparse.Namespace) -> int:
         if args.audit is not None:
             log = "".join(line + "\n" for line in chain_lines(
                 result["audit"], file_sha256(args.file), epoch_text(trace.epoch), key,
-                trace.run_id))
+                trace.run_id, trace.approvals))
         report = (json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False)
                   if args.format == "json" else format_text(result))
     except TraceError as e:

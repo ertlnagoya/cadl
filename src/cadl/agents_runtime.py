@@ -122,6 +122,8 @@ class RunTrace:
     host_instances: list[str] | None = None
     # The run id of the first line, or None.
     run_id: str | None = None
+    # How the host read approvals (`approvals` of the first line), or None.
+    approvals: str | None = None
 
 
 def _parse_epoch(text: Any, where: str) -> datetime:
@@ -169,7 +171,8 @@ def _check_instances(value: Any, where: str) -> list[dict]:
 
 
 HOST_EVENTS = ("method_refused", "unsolicited_response", "unauthorised_approval",
-               "unauthorised_rejection", "unauthorised_message", "approval_evidence")
+               "unauthorised_rejection", "unauthorised_message", "approval_evidence",
+               "approval_unauthenticated", "forward_failed")
 _HOST_EVENT_KEYS = {"event", "reason", "hold_id", "message"}
 
 
@@ -203,7 +206,15 @@ def _first_line_keys(rec: dict, where: str, first: bool) -> tuple:
     None when the line does not give them, and `more` has `run_id`,
     `withdraw` and `host_events`."""
     epoch = quantities = hosted = None
-    more: dict[str, Any] = {"run_id": None, "withdraw": [], "host_events": []}
+    more: dict[str, Any] = {"run_id": None, "approvals": None, "withdraw": [],
+                            "host_events": []}
+    if "approvals" in rec:
+        if not first:
+            raise TraceError(f"{where}: 'approvals' is allowed only on the first line")
+        mode = rec.pop("approvals")
+        if mode not in ("authenticated", "insecure", "none"):
+            raise TraceError(f"{where}: 'approvals' is authenticated, insecure or none")
+        more["approvals"] = mode
     if "run_id" in rec:
         if not first:
             raise TraceError(f"{where}: 'run_id' is allowed only on the first line")
@@ -268,6 +279,7 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
     quantities = None
     hosted = None
     run_id = None
+    approvals = None
     for lineno, line in enumerate(lines, start=1):
         if not line.strip():
             plain.append("")
@@ -285,6 +297,7 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
         quantities = q if q is not None else quantities
         hosted = h if h is not None else hosted
         run_id = more["run_id"] if more["run_id"] is not None else run_id
+        approvals = more["approvals"] if more["approvals"] is not None else approvals
         extras.append((state, entries, lineno, more))
         plain.append(json.dumps(rec))
     base = parse_trace(plain, path=path)
@@ -295,7 +308,8 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
                     host_events=x["host_events"])
                for o, (s, e, n, x) in zip(base.observations, extras)],
         bindings=base.bindings, request=base.request, epoch=epoch, path=path,
-        quantities=quantities, host_instances=hosted, run_id=run_id)
+        quantities=quantities, host_instances=hosted, run_id=run_id,
+        approvals=approvals)
 
 
 class RunTraceReader:
@@ -331,6 +345,7 @@ class RunTraceReader:
             trace.epoch, trace.quantities, trace.host_instances = epoch, quantities, hosted
             trace.bindings, trace.request = self._base.bindings, self._base.request
             trace.run_id = more["run_id"]
+            trace.approvals = more["approvals"]
         _check_epoch_range(trace.epoch, obs.t, lineno)
         line = Line(obs=obs, state=state, instances=entries, lineno=lineno,
                     withdraw=more["withdraw"], host_events=more["host_events"])

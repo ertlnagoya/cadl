@@ -56,6 +56,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   inbox is refused unless `--insecure-approvals`. A cancelled held call is
   withdrawn (hold state `withdrawn`). Lone surrogates in a trace are a
   trace error (`agents-run`, `norms-eval`) instead of a crash.
+- Second review of `cadl mcp-gateway`. A number that overflows to
+  infinity (`1e999`) passed the parser and made forwarding fail after the
+  decision, so the log showed an allowed call that was never sent; such
+  numbers, and nesting deeper than 100, are now refused, the line to send
+  and the digest of the arguments are made before deciding, a failure to
+  send is recorded (`forward_failed`), and the held calls that a failure
+  denies are withdrawn in the runtime too. The approver sees the
+  arguments of a held call (`DIR/holds/h-N.json`, `mcp-approve --show`),
+  and an approval is bound to their SHA-256. The approvals mode
+  (`authenticated`, `insecure`, `none`) is in the first trace line and the
+  audit header; accepted approvals record the key id and the nonce, and an
+  insecure one is `approval_unauthenticated`.
 - Audit log: a random `run_id` in the header (and on the first line of
   the gateway's trace); numbers in the canonical form are integers or
   decimals without exponent; integers beyond 2**53 are refused;

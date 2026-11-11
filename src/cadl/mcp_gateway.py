@@ -85,6 +85,7 @@ from .audit_log import (
     epoch_text,
     file_sha256,
     is_run_id,
+    key_id,
     loads_unique,
     new_run_id,
     read_key,
@@ -263,6 +264,8 @@ class _Held:
     id: Any
     request: dict
     message: dict
+    wire: str = ""                  # the line that is sent when it is released
+    params_sha256: str = ""         # SHA-256 of the canonical JSON of `params`
 
 
 class Gateway:
@@ -348,8 +351,10 @@ class Gateway:
         self.t0 = clock()
         self.last_t = 0.0
         self.runtime = AgentsRuntime.open(self.sos, path=str(trace_out))
+        self.approvals_mode = ("none" if self.inbox is None else
+                               "authenticated" if approver_keys is not None else "insecure")
         self.chain = AuditChain(file_sha256(self.file), epoch_text(self.epoch), key,
-                                self.run_id)
+                                self.run_id, self.approvals_mode)
         self.audit_f = open(audit, "x", encoding="utf-8")
         self.trace_f = open(trace_out, "x", encoding="utf-8")
         self._write(self.audit_f, self.chain.header())
@@ -357,7 +362,8 @@ class Gateway:
         # length with `datetime.fromisoformat`.
         stamp = (self.epoch.strftime("%Y-%m-%dT%H:%M:%S")
                  + f".{self.epoch.microsecond // 1000:03d}Z")
-        first = {"t": 0, "run_id": self.run_id, "epoch": stamp, "quantities": []}
+        first = {"t": 0, "run_id": self.run_id, "approvals": self.approvals_mode,
+                 "epoch": stamp, "quantities": []}
         first.update(init or {})
         if self.inbox is not None:          # before anything can be held
             self._publish("run.json", {"run_id": self.run_id,
@@ -552,6 +558,16 @@ class Gateway:
                                                          "must be an object"))
             return
         m = {"from": self.agent["text"], "to": self.server["text"], "name": name}
+        # Everything that can fail is done before the decision: the line to
+        # send and the digest of the arguments that an approver signs.
+        try:
+            text = wire(obj)
+            params_sha256 = hashlib.sha256(canonical(params)).hexdigest()
+        except (ValueError, TypeError) as e:
+            self.send_client(_error(id_, INVALID_PARAMS,
+                                    f"Invalid params: not representable in canonical "
+                                    f"JSON ({e})"))
+            return
         with self.lock:
             if self._held_id(id_) or _id_key(id_) in self.inflight:
                 self.send_client(_error(id_, INVALID_REQUEST,
@@ -568,11 +584,10 @@ class Gateway:
                 return
             self._settle(out)
             if decision == "allow":
-                self.inflight.add(_id_key(id_))
-                self.send_server(wire(obj))
+                self._forward(id_, text, m)
             elif decision == "escalate":
                 hold_id = step["hold_id"]
-                self.held[hold_id] = _Held(id_, obj, m)
+                self.held[hold_id] = _Held(id_, obj, m, text, params_sha256)
                 self._publish_hold(hold_id)
                 _log(f"tools/call {id_!r} ({m['name']}) is held as {hold_id} "
                      f"for {step['result']['escalate_to']}")
@@ -589,10 +604,25 @@ class Gateway:
             if h is None:
                 continue
             if rec["decision"] == "allow":
-                self.inflight.add(_id_key(h.id))
-                self.send_server(wire(h.request))
+                self._forward(h.id, h.wire, h.message)
             else:
                 self.send_client(denial_result(h.id, h.message, rec))
+
+    def _forward(self, id_: Any, text: str, m: dict) -> None:
+        """Send an allowed or released call. The line was made before the
+        decision; if sending still fails, the failure is recorded
+        (`forward_failed`), so that the log does not show an effect alone."""
+        self.inflight.add(_id_key(id_))
+        try:
+            self.to_server(text)
+        except Exception as e:      # noqa: BLE001
+            self.inflight.discard(_id_key(id_))
+            _log(f"the call {id_!r} was decided but could not be sent: {e}")
+            self.send_client(_error(id_, INTERNAL_ERROR,
+                                    "Internal error: the call could not be sent to the "
+                                    "server"))
+            self._host_event("forward_failed", reason=f"{type(e).__name__}: {e}"[:200],
+                             message=m)
 
     # --- server -> client ---------------------------------------------------------
 
@@ -669,13 +699,15 @@ class Gateway:
         if self.inbox is None:
             return
         entry = next((h for h in self.runtime.held() if h["hold_id"] == hold_id), None)
-        if entry is None:
+        held = self.held.get(hold_id)
+        if entry is None or held is None:
             return
         try:
             self._publish(f"holds/{hold_id}.json", {
                 "run_id": self.run_id, "hold_id": hold_id, "message": entry["message"],
                 "hold_time": entry["time"], "approver": entry["approver"],
-                "deadline": entry["deadline"]})
+                "deadline": entry["deadline"], "params": held.request.get("params"),
+                "params_sha256": held.params_sha256})
         except OSError as e:
             _log(f"cannot publish hold {hold_id}: {e}")
 
@@ -774,8 +806,16 @@ class Gateway:
         kind = obj.get("kind")
         if kind == "approval":
             m, hold_id = self._approval(obj)
+            head = {k: m[k] for k in ("from", "to", "name")}
+            params = obj.get("params_sha256")
+            if self.approver_keys is None:
+                reason = f"file={digest};params=" + (f"sha256:{params}" if params else "-")
+                return m, [{"event": "approval_unauthenticated", "hold_id": hold_id,
+                            "reason": reason, "message": head}]
+            reason = (f"file={digest};params=sha256:{params};"
+                      f"key_id={key_id(self.approver_keys[m['from']])};nonce={obj['nonce']}")
             return m, [{"event": "approval_evidence", "hold_id": hold_id,
-                        "reason": digest, "message": {k: m[k] for k in ("from", "to", "name")}}]
+                        "reason": reason, "message": head}]
         if kind == "message":
             return self._other_message(obj), []
         raise _Refused("'kind' is neither approval nor message")
@@ -807,7 +847,7 @@ class Gateway:
 
     def _approval(self, obj: dict) -> tuple[dict, str]:
         allowed = {"kind", "hold_id", "decision", "as", "run_id", "message", "hold_time",
-                   "nonce", "mac"}
+                   "params_sha256", "nonce", "mac"}
         if set(obj) - allowed:
             raise _Refused("unknown keys: " + ", ".join(sorted(set(obj) - allowed)))
         hold_id, decision, actor = obj.get("hold_id"), obj.get("decision"), obj.get("as")
@@ -831,8 +871,10 @@ class Gateway:
         self._check_mac(obj, who["text"], record, hold_id, m)
         if self.approver_keys is not None and self.runtime.hold_state(hold_id) == "held":
             entry = next(h for h in self.runtime.held() if h["hold_id"] == hold_id)
-            if obj.get("message") != entry["message"] or obj.get("hold_time") != entry["time"]:
-                raise _Refused("the file names another held message or time",
+            held = self.held.get(hold_id)
+            if obj.get("message") != entry["message"] or obj.get("hold_time") != entry["time"] \
+                    or held is None or obj.get("params_sha256") != held.params_sha256:
+                raise _Refused("the file names another held message, time or arguments",
                                event=record, hold_id=hold_id, message=m,
                                reason="wrong_message")
         return m, hold_id
@@ -862,9 +904,19 @@ class Gateway:
         return out
 
     def _fail_held(self) -> None:
-        """After a failure, the held calls are denied (fail-closed)."""
-        for hold_id, h in list(self.held.items()):
-            del self.held[hold_id]
+        """After a failure, the held calls are denied (fail-closed). While
+        the enforcement point can still record, the holds are withdrawn
+        first, so that the log and the runtime agree with what the client
+        is told; after a failure of the enforcement point itself, the log
+        has no end record."""
+        held = list(self.held.items())
+        self.held.clear()
+        if held and self.failed is None:
+            try:
+                self._step({"t": self.now(), "withdraw": [h for h, _ in held]})
+            except Exception:       # noqa: BLE001
+                pass
+        for hold_id, h in held:
             self._unpublish_hold(hold_id)
             self.send_client(denial_result(h.id, h.message, {
                 "reason": "the enforcement point failed (fail-closed)", "hold_id": hold_id}))
@@ -1126,7 +1178,7 @@ def approval_file(inbox: Path, hold_id: str, decision: str, actor: str,
     if published.exists():
         hold = _read_published(published)
         obj.update(run_id=hold.get("run_id"), message=hold.get("message"),
-                   hold_time=hold.get("hold_time"))
+                   hold_time=hold.get("hold_time"), params_sha256=hold.get("params_sha256"))
     elif key is not None:
         raise GatewayError(f"the gateway has published no held call {hold_id} "
                            f"({published} does not exist)")
@@ -1141,16 +1193,26 @@ def cli_approve(args) -> int:
         print(f"Error: --as {args.actor!r} is not a concrete actor", file=sys.stderr)
         return 2
     try:
+        published = Path(args.inbox) / "holds" / f"{args.hold_id}.json"
+        hold = _read_published(published) if published.exists() else None
+        if hold is not None:
+            m = hold.get("message") or {}
+            print(f"hold {args.hold_id} of run {hold.get('run_id')}: "
+                  f"{m.get('from')} -> {m.get('to')} : {m.get('name')} at "
+                  f"{hold.get('hold_time')}, deadline {hold.get('deadline')}")
+            print("arguments (params, SHA-256 " + str(hold.get("params_sha256")) + "):")
+            print(json.dumps(hold.get("params"), ensure_ascii=False, indent=2))
+        elif args.show:
+            raise GatewayError(f"the gateway has published no held call {args.hold_id}")
+        if args.show:
+            return 0
         key = read_key(args.key) if args.key is not None else None
         obj = approval_file(args.inbox, args.hold_id, args.decision, args.actor, key)
         path = _drop(args.inbox, obj)
     except (GatewayError, AuditKeyError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
-    m = obj.get("message") or {}
-    print(f"{path}: {args.decision} {args.hold_id} "
-          f"({m.get('from')} -> {m.get('to')} : {m.get('name')} at {obj.get('hold_time')})"
-          + ("" if key else " WITHOUT a MAC"))
+    print(f"{path}: {args.decision} {args.hold_id}" + ("" if key else " WITHOUT a MAC"))
     return 0
 
 

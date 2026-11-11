@@ -785,7 +785,9 @@ class TestReviewFindings:
                   if a.get("event") == "unauthorised_approval"]
         assert unauth == [c[0] for c in cases] + ["replayed"]
         evidence = [a for a in result["audit"] if a.get("event") == "approval_evidence"]
-        assert len(evidence) == 1 and evidence[0]["reason"].startswith("sha256:")
+        assert len(evidence) == 1 and evidence[0]["reason"].startswith("file=sha256:")
+        assert f"nonce={good['nonce']}" in evidence[0]["reason"]
+        assert f"params=sha256:{good['params_sha256']}" in evidence[0]["reason"]
         # the evidence comes before the decision of the approval and its release
         k = next(i for i, a in enumerate(result["audit"]) if a.get("outcome") == "approved")
         assert result["audit"].index(evidence[0]) == k - 2
@@ -844,3 +846,148 @@ class TestReviewFindings:
         gw2.stop()
         r = verify(tmp_path / "a.jsonl", run_id=gw2.run_id)
         assert not r["valid"] and "run id" in r["error"]["what"]
+
+
+class TestSecondReview:
+    """Regression tests of the second review (M1, W2, W3, L1); each failed
+    on bfc4302."""
+
+    def test_m1_non_finite_numbers_are_refused_before_a_decision(self, tmp_path):
+        gw, client, server, clock = gateway(tmp_path)
+        gw.client_line('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
+                       '{"name":"delete_file","arguments":{"n":-1e999}}}')
+        gw.client_line('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":'
+                       '{"n":1e999}}')
+        assert [json.loads(c)["error"]["code"] for c in client] == [-32600, -32600]
+        assert server == [] and gw.held == {} and gw.failed is None
+        gw.stop()
+        assert replay_equal(tmp_path)["steps"] == []        # nothing was decided
+
+    def test_m1_arguments_outside_the_canonical_form(self, tmp_path):
+        gw, client, server, clock = gateway(tmp_path)
+        gw.client_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "delete_file",
+                                              "arguments": {"n": 2 ** 60}}}))
+        assert json.loads(client[0])["error"]["code"] == -32602
+        assert gw.held == {} and server == []
+
+    def test_m1_a_failure_after_the_decision_is_recorded(self, tmp_path):
+        gw, client, server, clock = gateway(tmp_path)
+        gw.client_line(call(1, "delete_file"))               # h-1
+        gw.client_line(call(2, "delete_file"))               # h-2
+        good = TestReviewFindings._approval(None, gw, "h-1")
+        sent = []
+
+        def broken(text):
+            raise OSError("pipe closed")
+        gw.to_server = broken
+        (tmp_path / "in" / "a.json").write_text(json.dumps(good))
+        clock.t += 1
+        gw.tick()
+        gw.to_server = sent.append
+        replies = {json.loads(c)["id"]: json.loads(c) for c in client}
+        assert replies[1]["error"]["code"] == -32603          # released, not sent
+        assert "h-2" in gw.held and 2 not in replies          # the other hold is intact
+        assert gw.failed is None
+        gw.stop()
+        result = replay_equal(tmp_path)
+        failed = [a for a in result["audit"] if a.get("event") == "forward_failed"]
+        assert len(failed) == 1 and failed[0]["message"]["name"] == "delete_file"
+
+    def test_m1_fail_held_withdraws_in_the_runtime(self, tmp_path):
+        gw, client, server, clock = gateway(tmp_path)
+        gw.client_line(call(1, "delete_file"))
+        gw.client_line(call(2, "delete_file"))
+        gw._fail_held()
+        assert sorted(json.loads(c)["id"] for c in client) == [1, 2]
+        gw.stop()
+        result = replay_equal(tmp_path)
+        assert [h["state"] for h in result["holds"]] == ["withdrawn", "withdrawn"]
+
+    def test_w2_an_approval_is_bound_to_the_arguments(self, tmp_path):
+        gw, client, server, clock = gateway(tmp_path)
+        for k, path in ((1, "/tmp/x"), (2, "/")):          # same time, same message
+            gw.client_line(json.dumps({"jsonrpc": "2.0", "id": k, "method": "tools/call",
+                                       "params": {"name": "delete_file",
+                                                  "arguments": {"path": path}}}))
+        holds = {h: json.loads((tmp_path / "in" / "holds" / f"{h}.json").read_text())
+                 for h in ("h-1", "h-2")}
+        assert holds["h-1"]["params"]["arguments"] == {"path": "/tmp/x"}
+        assert holds["h-1"]["hold_time"] == holds["h-2"]["hold_time"]
+        assert holds["h-1"]["params_sha256"] != holds["h-2"]["params_sha256"]
+        # an approval made for h-1, re-addressed to h-2 and signed again
+        moved = TestReviewFindings._approval(None, gw, "h-1")
+        moved["hold_id"] = "h-2"
+        moved["mac"] = message_mac(APPROVER_KEYS["OPERATOR"], moved)
+        (tmp_path / "in" / "a.json").write_text(json.dumps(moved))
+        gw.tick()
+        assert server == [] and "h-2" in gw.held
+        good = TestReviewFindings._approval(None, gw, "h-1")
+        (tmp_path / "in" / "b.json").write_text(json.dumps(good))
+        gw.tick()
+        assert [json.loads(x)["id"] for x in server] == [1]
+        assert json.loads(server[0])["params"]["arguments"] == {"path": "/tmp/x"}
+        gw.stop()
+        result = replay_equal(tmp_path)
+        assert [a["reason"] for a in result["audit"]
+                if a.get("event") == "unauthorised_approval"] == ["wrong_message"]
+
+    def test_w2_mcp_approve_shows_the_arguments(self, tmp_path, capsys):
+        gw, client, server, clock = gateway(tmp_path)
+        gw.client_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "delete_file",
+                                              "arguments": {"path": "/etc/passwd"}}}))
+        capsys.readouterr()
+        assert main(["mcp-approve", str(tmp_path / "in"), "h-1", "approve", "--as",
+                     "OPERATOR", "--show"]) == 0
+        out = capsys.readouterr().out
+        assert "/etc/passwd" in out and "PLANNER -> FILES : delete_file" in out
+        assert list((tmp_path / "in").glob("*.json")) == [tmp_path / "in" / "run.json"]
+
+    def test_w3_approvals_mode_and_evidence(self, tmp_path):
+        modes = {}
+        for name, kw in (("auth", {}), ("insecure", {"approver_keys": None,
+                                                     "insecure_approvals": True})):
+            d = tmp_path / name
+            d.mkdir()
+            gw, client, server, clock = gateway(d, **kw)
+            gw.client_line(call(1, "delete_file"))
+            from cadl.mcp_gateway import approval_file
+            obj = approval_file(d / "in", "h-1", "approve", "OPERATOR",
+                                APPROVER_KEYS["OPERATOR"] if name == "auth" else None)
+            (d / "in" / "a.json").write_text(json.dumps(obj))
+            gw.tick()
+            gw.stop()
+            result = replay_equal(d)
+            head = json.loads((d / "a.jsonl").read_text().splitlines()[0])
+            first = json.loads((d / "a.trace.jsonl").read_text().splitlines()[0])
+            modes[name] = (head["approvals"], first["approvals"],
+                           [a["event"] for a in result["audit"]
+                            if a.get("event", "").startswith("approval_")])
+        assert modes["auth"] == ("authenticated", "authenticated", ["approval_evidence"])
+        assert modes["insecure"] == ("insecure", "insecure", ["approval_unauthenticated"])
+        d = tmp_path / "none"
+        d.mkdir()
+        g = Gateway(EXAMPLE, "PLANNER", "FILES", d / "a.jsonl", d / "a.t", list().append,
+                    list().append)
+        g.stop()
+        assert json.loads((d / "a.jsonl").read_text().splitlines()[0])["approvals"] == "none"
+
+    def test_l1_deep_nesting_is_refused(self, tmp_path):
+        gw, client, server, clock = gateway(tmp_path)
+        gw.client_line("[" * 100000 + "]" * 100000)
+        gw.client_line('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"x":'
+                       + '{"a":' * 50000 + "1" + "}" * 50000 + "}}")
+        gw.client_line('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"x":'
+                       + "[" * 98 + "]" * 98 + "}}")              # depth 100: accepted
+        codes = [json.loads(c)["error"]["code"] for c in client]
+        assert codes == [-32600, -32600] and len(server) == 1 and gw.failed is None
+
+    def test_l1_a_cancelled_forwarded_call_stays_in_flight(self, tmp_path):
+        gw, client, server, clock = gateway(tmp_path)
+        gw.client_line(json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/list"}))
+        gw.client_line(json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                   "params": {"requestId": 9}}))
+        assert len(server) == 2                             # the cancellation is passed on
+        gw.server_line(json.dumps({"jsonrpc": "2.0", "id": 9, "result": {"tools": []}}))
+        assert [json.loads(c)["id"] for c in client] == [9]  # a late answer still passes

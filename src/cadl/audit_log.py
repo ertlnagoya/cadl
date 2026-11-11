@@ -68,6 +68,8 @@ class AuditKeyError(ValueError):
 
 
 MAX_INT = 2 ** 53
+# How the host of an enforcement point read approvals (G.8 header).
+APPROVAL_MODES = ("authenticated", "insecure", "none")
 _SURROGATE_RE = re.compile("[\ud800-\udfff]")
 _RUN_ID_RE = re.compile(r"[0-9a-f]{32}")
 
@@ -142,9 +144,40 @@ def is_run_id(text: Any) -> bool:
     return isinstance(text, str) and _RUN_ID_RE.fullmatch(text) is not None
 
 
-def loads_unique(text: str) -> Any:
-    """`json.loads` that rejects duplicate keys at any depth, NaN and
-    infinities, and lone surrogates; raises ValueError."""
+MAX_DEPTH = 100
+
+
+def json_depth(text: str) -> int:
+    """The largest nesting of arrays and objects in a JSON text, counted
+    outside strings, without parsing it."""
+    depth = deepest = 0
+    in_string = escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > deepest:
+                deepest = depth
+        elif ch in "]}":
+            depth -= 1
+    return deepest
+
+
+def loads_unique(text: str, max_depth: int = MAX_DEPTH) -> Any:
+    """`json.loads` that rejects duplicate keys at any depth, NaN,
+    infinities and numbers that overflow to infinity (`1e999`), lone
+    surrogates, and nesting deeper than `max_depth`; raises ValueError."""
+    if json_depth(text) > max_depth:
+        raise ValueError(f"nested deeper than {max_depth} arrays or objects")
+
     def pairs(items):
         out = {}
         for k, v in items:
@@ -155,7 +188,14 @@ def loads_unique(text: str) -> Any:
 
     def bad_constant(name: str):
         raise ValueError(f"{name} is not JSON")
-    obj = json.loads(text, object_pairs_hook=pairs, parse_constant=bad_constant)
+
+    def finite(text: str) -> float:
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError(f"{text} is not a finite number")
+        return value
+    obj = json.loads(text, object_pairs_hook=pairs, parse_constant=bad_constant,
+                     parse_float=finite)
     check_surrogates(obj)
     return obj
 
@@ -214,12 +254,15 @@ class AuditChain:
     one line without the newline."""
 
     def __init__(self, source_sha256: str, epoch: str | None, key: bytes | None = None,
-                 run_id: str | None = None):
+                 run_id: str | None = None, approvals: str | None = None):
         if run_id is None:
             run_id = new_run_id()
         if not is_run_id(run_id):
             raise ValueError("a run id is 32 lowercase hexadecimal digits")
         self.run_id = run_id
+        if approvals not in (None,) + APPROVAL_MODES:
+            raise ValueError("approvals is authenticated, insecure or none")
+        self.approvals = approvals
         self.key = key
         self.source_sha256 = source_sha256
         self.epoch = epoch
@@ -250,6 +293,7 @@ class AuditChain:
             "hash": "sha256" if self.key is None else "hmac-sha256",
             "key_id": None if self.key is None else key_id(self.key),
             "run_id": self.run_id,
+            "approvals": self.approvals,
             "source_sha256": self.source_sha256,
             "epoch": self.epoch,
         })
@@ -283,9 +327,10 @@ def epoch_text(epoch) -> str | None:
 
 
 def chain_lines(records: list[dict], source_sha256: str, epoch: str | None,
-                key: bytes | None = None, run_id: str | None = None) -> list[str]:
+                key: bytes | None = None, run_id: str | None = None,
+                approvals: str | None = None) -> list[str]:
     """A complete log: header, records, end record."""
-    chain = AuditChain(source_sha256, epoch, key, run_id)
+    chain = AuditChain(source_sha256, epoch, key, run_id, approvals)
     return [chain.header()] + [chain.record(r) for r in records] + [chain.end()]
 
 
@@ -330,7 +375,8 @@ def verify(path, key: bytes | None = None, source_sha256: str | None = None,
     data = Path(path).read_bytes()
     out: dict[str, Any] = {
         "file": str(path), "valid": False, "error": None, "lines": 0, "records": 0,
-        "hash": None, "key_id": None, "run_id": None, "source_sha256": None,
+        "hash": None, "key_id": None, "run_id": None, "approvals": None,
+        "source_sha256": None,
         "epoch": None, "complete": False, "last_digest": None,
     }
     try:
@@ -404,6 +450,7 @@ def _verify(data: bytes, key, source_sha256, allow_open, out) -> None:
                 raise _Invalid(1, "unknown hash algorithm", " or ".join(ALGORITHMS),
                                algorithm)
             out.update(hash=algorithm, key_id=obj.get("key_id"), run_id=obj.get("run_id"),
+                       approvals=obj.get("approvals"),
                        source_sha256=obj.get("source_sha256"), epoch=obj.get("epoch"))
             if algorithm == "hmac-sha256" and key is None:
                 raise AuditKeyError("the log is keyed (hmac-sha256, key id "
@@ -452,6 +499,7 @@ def format_verify_text(result: dict) -> str:
             f"  hash: {result['hash']}" + (f" (key id {result['key_id']})"
                                            if result["key_id"] else ""),
             f"  run id: {result['run_id']}",
+            f"  approvals: {result['approvals'] or '-'}",
             f"  source sha256: {result['source_sha256']}",
             f"  epoch: {result['epoch']}",
             f"  state: {state}",
