@@ -42,6 +42,132 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   with arguments compared by value), and about a quantifier or
   comprehension variable named like a symbolic bound of a declared set
   (N-14).
+- **Strategic model extension (`games` 0.1, Appendix I).** A file that
+  declares `stochastic: 0.1` and `games: 0.1` may give its `model:` block
+  `kind: smg`: a turn-based stochastic game on the model of Appendix H,
+  with `players:`, `owner:` on a command, named profiles of memoryless
+  deterministic strategies (`profiles:`, `compliance:`), payoffs as signed
+  weighted sums of expected rewards accumulated until a target
+  (`payoffs:`), and equilibrium queries (`equilibria:`).
+  - `cadl check` applies the rules I-1 to I-11 of I.10, among them I-5
+    (at most one player chooses in a state; it replaces S-9), I-6 (every
+    profile selects a command wherever there is a choice), I-8 (every
+    profile is admissible at the fixed values: no single player can keep
+    the game away from the target of its payoff) and I-9 (for a map: the
+    design is well-defined at the corners of the region and the profile
+    admissible at the centre of each of its 3ⁿ faces).
+  - `cadl game-check FILE [--equilibrium ID] [--regime R] [--set p=v]`:
+    the **equilibrium checks** of I.8 at the fixed values, with exact
+    rational arithmetic: per player the payoff, the best-response value
+    (policy iteration with exact linear solves), the deviation gain and
+    the canonical best response; `status`, `deviators`, and
+    `from_every_state`.
+  - `cadl game-check FILE --certify [--max-depth N] [--max-cells N]
+    [--partition N] [--no-merge]`: the **equilibrium maps** of I.9. A cell
+    is `equilibrium` or `not_equilibrium` (with `deviators`, a deviation
+    for each, and bounds of the gains) only when that holds at every
+    valuation of the cell, established by parameter lifting of the game
+    of each player against the profile and the conditions N, E1 and E2;
+    otherwise `undecided`, with a `reason`. Text and JSON output in the
+    shape of I.13; exit status 0 (computed), 1 (a map did not reach its
+    resolution, or a query was not evaluated), 2 (nothing can be claimed).
+  - `cadl model-check` evaluates the properties and regime maps of a
+    strategic model in the Markov chain of their `profile:` (default: the
+    compliance profile). `cadl model-export` writes the game in the model
+    language of PRISM-games (`smg`, `player … endplayer`; no properties
+    file; not run through PRISM-games). `cadl sim-ir` carries the game in
+    `stochastic_model` (`kind: "smg"`, `owner`, `profile`,
+    `open_in_equilibria`, `players`, `profiles`, `compliance`, `payoffs`,
+    `equilibria`).
+  - A payoff term with `sanction_of:` or `reward_of:` (Appendix J) is
+    parsed and never read with a default weight: the equilibrium queries
+    of such a model report `not_evaluated`.
+  - Examples `examples/games_robot_delivery.cadl` and
+    `examples/games_two_players.cadl` (the two examples of I.12).
+  - Tests: every number of I.12; a soundness fuzzer of the maps
+    (`tests/games_fuzz.py`: random parametric games against a brute-force
+    oracle that shares no code with `cadl`), with five deliberate
+    soundness bugs that it must detect; best-response values compared with
+    Storm (exact) when `stormpy` is installed.
+- **Grounding extension (Appendix J, grounding 0.1), the norms side.** A
+  file that declares `grounding: 0.1` together with `norms: 0.1` may use
+  `grounding: {items, tolerance}` in a contract, `shares:` and
+  `on_fulfilment: {reward, magnitude}` in a norm, and `magnitude:` in
+  `on_violation:`. The keys are annotations: `cadl norms-eval`,
+  `cadl agents-run` and the generated `norms_monitor.py` give the same
+  results with and without them, and no code generator writes them.
+- `cadl norms-indices FILE [--contract ID] [--format text|json]`: for
+  every contract, the derived index of information sharing (alpha^), the
+  derived index of the concentration of powers (beta^) and the incentive
+  coverage (chi) of J.4, as exact ratios or as undefined with the reason,
+  with the counts J-5 asks for: the pairs given by a sharing entry, an
+  obligation and a permission, the pairs not given, the member-specific
+  entries and norms, the powers per bearer, the norms in the effects of
+  each power, the share of the decision holder, and the norms with a
+  reparation only and with a transition.
+- `cadl check`: the rules J-1 to J-9 of J.8 (README, Type Checks, item
+  15). J-1 to J-4 are errors and concern the new keys only; every
+  comparison of a declared `alpha`, `beta` or `lambda` with the norms
+  (J-6 to J-8) is a warning, and J-9 is informational. The comparisons
+  are exact; J-7 does not apply to a declared end point (0 or 1), which
+  J-6 tests, and J-9 does not repeat a declared value that J-6 or J-7
+  reports. A sharing entry with more than one item or with arguments
+  gives no pair (warning). A text of white space only counts as empty.
+  Declaring `grounding: 0.1` in a file that declares
+  `norms: 0.1` and uses none of the new keys adds no error. The new keys
+  in a file that does not declare the extension get one warning as
+  undeclared extension keys and are not interpreted (J.12).
+- `cadl norms-diff`: for a file that declares the extension, changes of
+  `on_violation.magnitude`, `on_fulfilment:`, `shares:`,
+  `grounding.items`, `grounding.tolerance` and of each index, and a
+  warning when a declared `alpha` or `beta` and its index move in opposite
+  directions between the two versions (J-13). A norm added in the new
+  version is listed with its magnitude, `on_fulfilment:` and `shares:`;
+  when only one version declares the extension, the report says that the
+  indices are not compared.
+- IR (`cadl sim-ir`, J.10), only for a file that declares the extension:
+  `grounding` in every contract (`items`, `tolerance`, `indices`) and
+  `shares`, `on_violation_magnitude`, `on_fulfilment_reward`,
+  `on_fulfilment_magnitude` in every norm. The IR of every other file is
+  unchanged.
+- `cadl.grounding.norm_payoff_link`, `covers` and `lambda_parameters`:
+  what a payoff term `sanction_of:` / `reward_of:` of a strategic model
+  (Appendix I; J.7, J-10) needs from the norm it names.
+- **The link between the strategic model and the norms (J.7).** In a
+  file that declares `stochastic`, `games`, `norms` and `grounding`, a
+  payoff term `sanction_of: "C.n"` has the weight −m · ℓ and a term
+  `reward_of: "C.n"` the weight m′ · ℓ (m, m′ the magnitudes of the
+  norm, ℓ the parameter bound to `C.lambda`). `cadl check` applies J-10
+  (errors), J-11 (warnings) and J-12 (the expected count of each
+  `sanction_of:` and `reward_of:` term under the compliance profile, per
+  design; a `reward_of:` term always breaks condition (ii) of J.7). Every result of
+  `cadl game-check` computed with such a term carries the assumption of
+  J.7 (`assumptions` in JSON). The IR writes the defined weight and the
+  fields `sanction_of` / `reward_of`.
+- **J-14** in `cadl game-check --certify`: in a file that declares
+  `grounding: 0.1`, a one-parameter equilibrium map whose parameter
+  (bound to `C.lambda` or not) occurs only in weights, with a power of at
+  most one counted on the text (no cancellation), decides a cell
+  that the bounds of I.9 leave undecided from exact evaluations at its
+  end points (`method: "endpoints (J-14)"`; deviators only under
+  condition (ii) of J.7). Every map reports whether J-14 applies, or why
+  not, also in a file without the grounding extension. The fuzzer (`tests/games_fuzz.py --j14`) checks
+  these cells and detects three deliberate violations of the conditions.
+- `examples/games_grounding_robot_delivery.cadl`: the example of J.7.
+- `examples/grounding_robot_delivery.cadl`: the example of J.9
+  (alpha^ = 5/8, beta^ = 1/2, chi = 1/3).
+
+### Changed
+- `cadl model-export` of a strategic model renames also the keywords that
+  PRISM-games adds (`player`, `endplayer`, `smg`, `csg`, `tptg`) by the
+  rule of H.11, and reports two players that are written the same (I.11).
+- `cadl game-check` reports a query that is not evaluated in the shape of
+  I.13: per design `{design, status: "not_evaluated", reason}`.
+- In a file that declares `stochastic: 0.1` and not `games: 0.1`, a
+  `model:` block that uses `kind: smg` or keys of the strategic model
+  extension gets one more informational diagnostic (the keys belong to an
+  undeclared extension, I.15). It is read by Appendix H as before. Models
+  of Appendix H are evaluated, exported and lowered exactly as in 0.3.22.
 
 ## [0.3.22] — 2026-11-11
 

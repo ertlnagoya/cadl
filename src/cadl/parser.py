@@ -1126,7 +1126,7 @@ def _build_model_command(data: dict) -> ModelCommandDef:
         ]
     return ModelCommandDef(
         action=data.get('action'), when=data.get('when'), guard=data.get('guard'),
-        updates=updates, keys=_model_keys(data),
+        updates=updates, keys=_model_keys(data), owner=data.get('owner'),
     )
 
 
@@ -1160,11 +1160,14 @@ def _build_model(data) -> ModelBlock:
     block.regimes = data.get('regimes')
     block.rewards = _model_entries(block, data, 'rewards', "S-12", _build_model_reward)
     block.properties = _model_entries(block, data, 'properties', "S-13", lambda d: ModelPropertyDef(
-        id=d.get('id'), regimes=d.get('regimes'), expr=d.get('expr'), keys=_model_keys(d)))
+        id=d.get('id'), regimes=d.get('regimes'), expr=d.get('expr'), keys=_model_keys(d),
+        profile=d.get('profile')))
     block.regime_maps = _model_entries(block, data, 'regime_maps', "S-14", lambda d: ModelRegimeMapDef(
         id=d.get('id'), over=d.get('over'), regimes=d.get('regimes'),
         objective=d.get('objective'), constraint=d.get('constraint'),
-        resolution=d.get('resolution'), keys=_model_keys(d)))
+        resolution=d.get('resolution'), keys=_model_keys(d), profile=d.get('profile')))
+    block.games = {k: data[k] for k in ('players', 'profiles', 'compliance', 'payoffs',
+                                        'equilibria') if k in data}
     return block
 
 
@@ -1291,6 +1294,10 @@ def _build_sos(data: dict) -> SoSDefinition:
     contracts_data = _get(sos_data, 'contracts', [])
     if isinstance(contracts_data, list):
         sos.contracts = [_build_contract(c) for c in contracts_data if isinstance(c, dict)]
+        # Grounding extension (Appendix J): its keys are kept as written,
+        # apart from the norms; interpreted only when it is declared (J.12).
+        from .grounding import read_raw
+        sos.grounding = read_raw(contracts_data)
 
     # Protocols
     protocols_data = _get(sos_data, 'protocols', [])

@@ -1,0 +1,113 @@
+# Strategic model extension (Appendix I, games 0.1): the first example of I.12.
+#
+# The model of examples/stochastic_robot_delivery.cadl with one choice:
+# before each attempt the robot (player R) decides whether to follow the
+# handling procedure. A careful attempt costs an effort of 1 and succeeds
+# with probability s; a careless one costs nothing, succeeds with
+# probability s/2, and is sanctioned by 2 * lambda. The dispatcher (player
+# D) pays a fee of 10 for a delivered parcel and has no choice here.
+# `comply` (always careful) is a Nash equilibrium exactly when lambda is at
+# least 0.150108 in the centralised regime and 0.060373 in the distributed
+# one.
+#
+#   cadl check       examples/games_robot_delivery.cadl
+#   cadl game-check  examples/games_robot_delivery.cadl
+#   cadl game-check  examples/games_robot_delivery.cadl --certify --equilibrium comply_by_lambda
+#   cadl model-check examples/games_robot_delivery.cadl
+sos:
+  name: "RobotDeliveryGame"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+    - games: 0.1
+
+  actors:
+    - { id: DISPATCHER,    role: "Assigns and replans routes" }
+    - { id: "ROBOT[1..N]", role: "Delivers parcels" }
+
+  contracts:
+    - id: DELIVERY
+      parties: [DISPATCHER, "ROBOT[*]"]
+      information: { alpha: 0.9 }
+      authority:   { decision_holder: DISPATCHER, beta: 0.9 }
+      incentives:  { lambda: 0.1 }
+
+  transitions:
+    - { from: CENTRALIZED, to: DISTRIBUTED, condition: "loss_rate > 0.3" }
+    - { from: DISTRIBUTED, to: CENTRALIZED, condition: "loss_rate <= 0.2" }
+
+  model:
+    kind: smg
+    parameters:
+      - { id: p_fail,  range: [0, 0.5], value: 0.05 }
+      - { id: p_loss,  range: [0, 0.5], value: 0.1 }
+      - { id: alpha,   from: "DELIVERY.alpha" }
+      - { id: beta,    from: "DELIVERY.beta" }
+      - { id: lambda,  from: "DELIVERY.lambda" }
+      - { id: q_local, range: [0, 1],   value: 0.6 }
+    variables:
+      - { id: task,     type: "{Pending, Delivered}", init: Pending }
+      - { id: attempts, type: "[0..3]",               init: 0 }
+      - { id: settled,  type: bool,                   init: false }
+    labels:
+      delivered: "task == Delivered"
+    players:
+      - { id: R, actors: ["ROBOT[*]"] }
+      - { id: D, actors: [DISPATCHER] }
+    commands:
+      - action: careful
+        owner: R
+        guard: "task == Pending AND attempts < 3"
+        updates:
+          - prob: "beta * alpha * (1 - p_fail) * (1 - p_loss) + (1 - beta) * q_local"
+            set: { task: Delivered, attempts: "attempts + 1" }
+          - prob: rest
+            set: { attempts: "attempts + 1" }
+      - action: careless
+        owner: R
+        guard: "task == Pending AND attempts < 3"
+        updates:
+          - prob: "0.5 * (beta * alpha * (1 - p_fail) * (1 - p_loss) + (1 - beta) * q_local)"
+            set: { task: Delivered, attempts: "attempts + 1" }
+          - prob: rest
+            set: { attempts: "attempts + 1" }
+      - action: settle
+        guard: "(task == Delivered OR attempts == 3) AND NOT settled"
+        updates:
+          - set: { settled: true }
+    regimes:
+      CENTRALIZED: { parameters: { beta: 0.9 } }
+      DISTRIBUTED: { parameters: { beta: 0.1 } }
+    rewards:
+      - { id: fee,       items: [ { action: settle, guard: "task == Delivered", value: 1 } ] }
+      - { id: effort,    items: [ { action: careful,  value: 1 } ] }
+      - { id: shortcuts, items: [ { action: careless, value: 1 } ] }
+    profiles:
+      comply:
+        - { choose: careful }
+      shortcut_first:
+        - { guard: "attempts == 0", choose: careless }
+        - { choose: careful }
+    compliance: comply
+    payoffs:
+      - player: R
+        until: "settled"
+        terms:
+          - { reward: fee,       weight: 10 }
+          - { reward: effort,    weight: -1 }
+          - { reward: shortcuts, weight: "-2 * lambda" }
+      - player: D
+        until: "settled"
+        terms:
+          - { reward: fee, weight: 5 }
+    properties:
+      - { id: P_DELIVERY, expr: "P>=0.95 [ F<=3 delivered ]" }
+      - { id: P_DELIVERY_SHORTCUT, profile: shortcut_first, expr: "P=? [ F<=3 delivered ]" }
+    equilibria:
+      - { id: comply_nash }
+      - { id: shortcut_nash, profile: shortcut_first }
+      - { id: comply_by_lambda, over: { lambda: [0, 1] }, resolution: 0.05 }
+      - id: comply_by_lambda_and_failure
+        regimes: [CENTRALIZED, DISTRIBUTED]
+        over: { lambda: [0, 0.4], p_fail: [0, 0.5] }
+        resolution: 0.05

@@ -180,6 +180,10 @@ cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
 
 # ある版から次の版への改正が規範に及ぼす効果
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
+
+# 根拠付け拡張：契約ごとの情報共有の導出指標、権限集中の導出指標、インセンティブ被覆率
+cadl norms-indices examples/grounding_robot_delivery.cadl
+cadl norms-indices examples/grounding_robot_delivery.cadl --format json
 # 確率モデル拡張：model: ブロックをPRISMへ出力（設計ごとにモデルファイルと性質ファイル）
 cadl model-export examples/stochastic_robot_delivery.cadl -o prism_out/
 
@@ -189,6 +193,10 @@ cadl model-check examples/stochastic_robot_delivery.cadl --regime-map best_for_d
 
 # 保証付きの運用モードマップ：パラメータ空間のどのセルでどの運用モードが最良か
 cadl model-check examples/stochastic_robot_delivery.cadl --regime-map best_for_delivery --certify
+
+# 戦略モデル拡張（games 0.1）：遵守プロファイルはナッシュ均衡か。パラメータ領域のどのセルで均衡か
+cadl game-check examples/games_robot_delivery.cadl
+cadl game-check examples/games_robot_delivery.cadl --certify --equilibrium comply_by_lambda
 
 # 自然言語からCADLを生成（ANTHROPIC_API_KEYが必要）
 cadl ai "5台の自律ドローンが農地を測量するシステム。地上局が統括する。"
@@ -609,6 +617,70 @@ python -m robot_delivery_norms.norms_monitor TRACE.jsonl [--contract ID] [--form
 
 SolidityとOPAのターゲットは規範を監視しません。時相演算子を含む項目を外し、そのことを警告で示します。
 
+### 制度パラメータの根拠付け（grounding 0.1）
+
+根拠付け拡張（仕様書の付録J）は、契約に宣言した `alpha`・`beta`・`lambda` を、その契約の規範と関係づけます。ファイルは `grounding: 0.1` を、それが必要とする `norms: 0.1` とともに宣言し、次の四つのキーを使えます。
+
+```yaml
+contracts:
+  - id: DELIVERY_SLA
+    parties: [DISPATCHER, "ROBOT[*]", "CUSTOMER[*]"]
+    authority:   { decision_holder: DISPATCHER, beta: 0.9 }
+    information:
+      alpha: 0.6
+      sharing: ["DISPATCHER -> ROBOT[*] : route"]
+    incentives:  { lambda: 0.5 }
+    grounding:
+      items: { route: DISPATCHER, battery: "ROBOT[*]" }   # 情報項目: その出所
+      tolerance: 0.25                                      # 既定値 0.25
+    norms:
+      - id: may_return_to_charge
+        kind: permission
+        bearer: "ROBOT[i]"
+        content: "ROBOT[i] -> DISPATCHER : charging_request"
+        shares: [battery]                                  # このメッセージが伝える項目
+      - id: no_low_battery_driving
+        kind: prohibition
+        bearer: "ROBOT[i]"
+        content: "ROBOT[i].battery < 10 AND ROBOT[i].status == InTransit"
+        on_violation: { sanction: "removed from the pool", magnitude: 4 }
+        on_fulfilment: { reward: "bonus", magnitude: 1 }
+```
+
+`cadl norms-indices FILE [--contract ID] [--format text|json]` は、契約ごとに三つの量を計算します。どれも二つの個数の正確な比で、分母が0のときは未定義です（J.4）。
+
+| 量 | 比 | あわせて報告するもの |
+|---|---|---|
+| **alpha^**（情報共有） | 共有エントリ・義務・許可のいずれかが当事者全体に与える対（項目、出所以外の当事者）の数 / そのような対の総数 | 三つの与え方ごとの対の数、与えられていない対、宛先が特定のメンバー（`ROBOT[3]`）であるために対を与えないエントリと規範 |
+| **beta^**（権限の集中） | 一つの単一アクターが担う権限の最大数 / 権限の数 | 担い手ごとの権限の数、各権限が `effects:` に挙げる規範の数、`decision_holder` の占める割合 |
+| **chi**（インセンティブ被覆率） | 制裁の文言、報酬の文言、0より大きい大きさのいずれかを持つ義務と禁止の数 / 義務と禁止の数 | 修復だけを持つ規範、`transition:` を持つ規範 |
+
+```console
+$ cadl norms-indices examples/grounding_robot_delivery.cadl
+Contract DELIVERY_SLA (tolerance 0.25)
+  alpha^ (information sharing) = 5/8 = 0.625  given pairs / pairs
+    declared alpha: 0.6, declared - index = -0.025
+    pairs given by a sharing entry: 3, by an obligation: 1, by a permission: 1
+    ...
+  beta^ (concentration of powers) = 1/2 = 0.5  largest number of powers of one single actor / powers
+    declared beta: 0.9, declared - index = 0.4
+    ...
+  chi (incentive coverage) = 1/3 = 0.333333  norms that carry an incentive / obligations and prohibitions
+    declared lambda: 0.5 (a scale; not compared with chi)
+    ...
+  warning  contract 'DELIVERY_SLA' declares beta: 0.9, but the index of concentration of powers is 1/2 = 0.5 ...; they differ by 0.4, more than the tolerance 0.25 (J-7)
+```
+
+JSONには `file`、`grounding`、`contracts[]`（`id`、`items`、`tolerance` と、`alpha`・`beta`・`coverage`。それぞれ `defined`、`numerator`、`denominator`、`exact`、`value`、または理由つきの `undefined` と、上の個数を持ちます。ほかに `diagnostics[]`）、`designs[]`（J-9の診断）があります。終了ステータスは、指標を報告できれば警告の有無にかかわらず0、使い方の誤り（ファイルがない、型検査のエラーがある、`grounding: 0.1` と `norms: 0.1` を宣言していない）では2です。
+
+導出指標は規範についての証拠であり、パラメータの意味そのものではありません。`cadl check` は宣言された `alpha` と `beta` を指標と比較し、食い違いを警告するだけです（「型検査の内容」の15）。`lambda` は尺度であり、数値とは比較しません。`norms: 0.1` を宣言していて新しいキーを使っていないファイルは、`grounding: 0.1` を宣言しても不正になりません。
+
+**注釈にすぎない。** `shares:`、`on_fulfilment:`、大きさは判定を変えません。`cadl norms-eval`、`cadl agents-run`、生成した `norms_monitor.py` は、これらがあってもなくても同じ結果を返し、生成したモニタはこれらを持ちません。コード生成器もこれらを書き出さないので、報酬の文言に引用符があっても構いません。IR（`cadl sim-ir`）は、拡張を宣言したファイルについてこれらを持ちます。各契約に `grounding`（`items`、`tolerance`、`alpha`・`beta`・`coverage` の個数を持つ `indices`。未定義の量は `null`）が、各規範に `shares`、`on_violation_magnitude`、`on_fulfilment_reward`、`on_fulfilment_magnitude` が加わります（J.10）。拡張を宣言していないファイルのIRは変わりません。
+
+**二つの版。** `cadl norms-diff OLD NEW` は、`on_violation.magnitude`、`on_fulfilment:`、`shares:`、`grounding.items`、`grounding.tolerance` の変更と、変化した指標、新しい版で追加された規範の大きさ・`on_fulfilment:`・`shares:` も報告します。片方の版だけが拡張を宣言している場合は、指標を比較せず、その旨を報告します。宣言された `alpha` または `beta` と、その指標が二つの版の間で逆向きに動くときは警告します（J-13）。たとえば、改正でロボットに権限を与えながら `beta` を上げる場合です。
+
+**戦略モデル向け。** 戦略モデル（付録I。後述の「戦略モデル」を参照）では、利得の項に重みを書く代わりに規範を名指せます：`{ reward: shortcuts, sanction_of: "DELIVERY.no_shortcut" }`。その項の重みは −m · ℓ（`reward_of:` では +m′ · ℓ）です。m は規範の `on_violation.magnitude`（m′ は `on_fulfilment.magnitude`）、ℓ は `from: "C.lambda"` で束縛したパラメータです（J.7）。`cadl.grounding.norm_payoff_link(sos, "C.n", "sanction_of" | "reward_of")` は参照を解決し、大きさ（正確な値）、担い手、出所の名前 `C.lambda`、または参照を使えない理由の説明を返します。例は `examples/games_grounding_robot_delivery.cadl` です。
+
 ### 確率モデル（PRISMへの出力）
 
 `extensions:` で `stochastic: 0.1` を宣言したファイルには、`model:` ブロック（仕様書の付録H）を書けます。これは、有限の状態変数の上のガード付き確率コマンドで書くパラメトリック離散時間マルコフ連鎖で、パラメータを契約の `alpha`・`beta`・`lambda` に束縛できます。`transitions:` の各運用モードが、固有のパラメータ値とコマンドを持つ一つの「設計」になります。例は `examples/stochastic_robot_delivery.cadl` にあります。
@@ -638,6 +710,36 @@ cadl model-check examples/stochastic_robot_delivery.cadl --regime-map best_for_d
 - 保証付きのマップの限界：設計どうしの値の差ではなく、設計ごとの上下界を比べるので、境界に近いセルは、境界が通っていなくても `undecided` のまま残ります。セル全体で同点の運用モードを並べて挙げるのは、上下界がそれを示す場合（等しい定数の上下界、またはモデルが同じ設計）だけです。開いたパラメータについて多重アフィンでない確率（`p * p`）は区間演算で囲みます。これは粗く、セルで設計が良定義であることは、区間が `[0, 1]` に収まる場合にだけ判定できます。グラフを保存しないセルも、判定を見送らずに解析します。そこでは、期待報酬の有限の上界は、頂点のどの選び方でも確率1で目標に達する場合にだけ得られます。計算量は、開いたパラメータ・セル・状態の数とともに増えます（連立一次方程式を厳密に解き、未知数は2 000までです）。
 - この実装の上限：規則S-7とS-9は状態空間全体の列挙で判定し、状態数が200 000を超えるモデルは受け付けません。評価器は、未知数が2 000を超える連立一次方程式と、点の数が10 000を超える格子を受け付けません。
 - `cadl model-export` は、その設計のどのコマンドにもないアクションラベルをもつ遷移報酬を出力しません（PRISMもStormも、そのような項目を受け付けません）。項目がなくなる報酬構造には `true : (0);` を出力します。
+
+### 戦略モデル（均衡検査と均衡マップ）
+
+`stochastic: 0.1` と `games: 0.1` を宣言したファイルでは、`model:` ブロックに `kind: smg` を書けます（仕様書の付録I）。これは、付録Hのモデルの上のターン制確率ゲームです。`players:` でプレイヤーを宣言し、コマンドの `owner:` でそれを誰が選ぶかを述べ、`profiles:` で記憶なしで決定的な戦略のプロファイルに、順序のある規則 `{guard, choose}` の形で名前を付け、`compliance:` で契約が求めるプロファイルを指し、`payoffs:` で各プレイヤーに、目標に達するまでに累積する期待報酬の符号付きの重み付き和を与え、`equilibria:` で、プロファイルが単独の逸脱に対してナッシュ均衡（またはε均衡）であるかを問います。例は `examples/games_robot_delivery.cadl`（取扱手順を省くことのできるロボット。省くとλに比例する制裁を受ける）と `examples/games_two_players.cadl`（ディスパッチャも監視するかどうかを選ぶ）です。
+
+```bash
+# 固定されたパラメータ値での均衡検査（model.equilibria のうち over: のない項目）
+cadl game-check examples/games_robot_delivery.cadl
+cadl game-check examples/games_robot_delivery.cadl --equilibrium comply_nash --regime CENTRALIZED --set lambda=0.2 --format json
+
+# 均衡マップ（over: のある項目）：equilibrium / not_equilibrium と保証したセル、または undecided のセル
+cadl game-check examples/games_robot_delivery.cadl --certify
+cadl game-check examples/games_robot_delivery.cadl --certify --equilibrium comply_by_lambda --max-cells 500 --format json
+
+# 一様な分割から始め、解析したままのセルを報告（I.12の16個のセル）
+cadl game-check examples/games_two_players.cadl --certify --equilibrium watched_map --partition 4 --no-merge
+
+# 戦略モデルの性質と運用モードマップは、プロファイルのもとで評価（既定は遵守プロファイル）
+cadl model-check examples/games_robot_delivery.cadl
+# ゲームをPRISM-gamesのモデル言語で出力（モデルファイルのみ）
+cadl model-export examples/games_robot_delivery.cadl --output prism_out/
+```
+
+- **均衡検査**は、設計とプレイヤーごとに、プロファイルのもとでの利得、最適応答値、逸脱利得、標準の最適応答（プロファイルのコマンドが最適な状態ではそれを選び、そうでない状態では宣言順で最初の最適なコマンドを選ぶ戦略）を、厳密な有理数で報告します。続いて、`status`（`equilibrium`、または `deviators` を伴う `not_equilibrium`）と、`from_every_state`（どのプレイヤーも、到達できるどの状態からも得をしないか。`equilibrium` かつ ε = 0 のときだけ）を報告します。最適応答は、ほかのプレイヤーの戦略を固定して得られる1人のプレイヤーのマルコフ決定過程の上で、連立一次方程式を厳密に解く方策反復によって計算します。プロファイルは**許容**でなければならない（どの1人のプレイヤーも、ゲームを自分の利得の目標から遠ざけ続けられない）ので、記憶なしで決定的な最適応答は、記憶や確率的な選択を使う戦略を含むすべての戦略の中で最適です（I.7）。
+- **均衡マップ**は、`over:` の領域をセルで覆います。`equilibrium` と `not_equilibrium` は、セルの**すべての**付値についての主張であり、保証付きです。セルの上では、各プレイヤーのプロファイルに対するゲームを緩和します（各状態が、許されたコマンドごとに、セルの頂点での分布を一つ選ぶ。多重アフィンでない確率は、厳密な区間で囲む）。そして、緩和した過程の厳密な最適値から、I.9の十分条件N・E1・E2によってセルを判定します。セルを判定するのは、どのプレイヤーの緩和した過程でも、すべての方策が確率1で目標に達し、かつ設計がそのセルで適切に定義されることを示せたときだけです。それ以外のセルは `undecided` とし、`reason`（`bounds`・`not_admissible`・`not_well_defined`）を付けます。未決定の割合が `resolution:` 以下になるか、上限（`--max-depth`、既定は24。`--max-cells`、既定は20 000）に達するまで、最大の未決定のセルを二分します。その後、同じ主張をもつセルを一つにまとめます（`--no-merge` を付けると、解析したままのセルを報告します）。浮動小数点数は使いません。
+- `cadl game-check` の終了ステータス（I.13）：求められた結果をすべて計算できたときは、答えが何であっても **0**。マップが分解能に達しなかったとき、または問い合わせを評価しなかったときは **1**。何も主張できないとき（静的な誤り、使い方の誤り、使った値で設計が適切に定義されない、またはプロファイルが許容でない）は **2**。`--set` を使うと、これらの条件をその値で検査し直します。評価するマップが開くパラメータは `--set` で指定できません。`--certify` を付けないとマップは計算せず、そのことを出力に書きます。
+- 戦略モデルに対する `cadl model-check` は、各性質と各運用モードマップを、その `profile:`（既定は遵守プロファイル）のマルコフ連鎖で評価します。`cadl model-export` は、設計ごとにモデルファイルを一つ出力します。先頭は `smg` で、その設計のコマンドを所有するプレイヤーごとに `player … endplayer` を一つ書きます。性質ファイルは出力しません（I.11）。**出力したファイルをPRISM-gamesで実行したことはありません。** `cadl sim-ir` は、ゲームを `stochastic_model` に入れて出力します（I.13）。
+- **規範との結び付け（付録J、J.7）。** `norms: 0.1` と `grounding: 0.1` も宣言したファイルでは、利得の項 `sanction_of: "C.n"` の重みは −m · ℓ、`reward_of: "C.n"` の重みは m′ · ℓ です。m（m′）は規範の `on_violation.magnitude`（`on_fulfilment.magnitude`）、ℓ は `from: "C.lambda"` で束縛したパラメータです。`cadl sim-ir` は、定義された重み（`"-2 * lambda"`）を `sanction_of`・`reward_of` の欄とともに出力します。このような項を使って計算した結果には、テキストでもJSON（`assumptions`）でも、J.7の仮定（「報酬構造 r は C.n の違反の回数を数えるものとする」）を付けます。`cadl check` は、各 `sanction_of:`・`reward_of:` の項について、固定値での遵守プロファイルのもとでの期待回数を設計ごとに報告します（J-12）。`sanction_of:` の項では、0は遵守しても制裁を受けないこと、すなわちJ.7の条件 (ii) を意味します。`reward_of:` の項は、回数にかかわらず、重みの符号によって条件 (ii) を満たしません。`grounding: 0.1` の宣言がなければ、このような項は誤りです（I-7）。重みが定義されない項を既定の重みで読むことはなく、その問い合わせは `not_evaluated` と報告します（終了ステータス1）。
+- **端点による保証（J-14）。** `grounding: 0.1` を宣言したファイルで、均衡マップの開いたパラメータが一つ（ℓ。`C.lambda` に束縛されているかどうかは問わない）であり、ℓ がどの確率にもどの報酬の値にも現れず、どの重みにも文面上で数えて（積では因子の次数を足し、打ち消しは考えない）1次以下でしか現れないとき、I.9の条件で決まらなかったセル [a, b] は、a と b の両方でプロファイルがε均衡であれば `equilibrium` とします（厳密な評価。逸脱利得は ℓ について凸）。また、b での逸脱利得がεを超え、プレイヤー p についてJ.7の条件 (ii)（ほかのパラメータに使う値において、ℓ を含む p の重みがすべて m ≥ 0 の −m·ℓ であり、その報酬構造のプロファイルのもとでの期待値が0であること）が成り立つとき（逸脱利得は非増加）、p をそのセルの逸脱者とします。このようなセルには `method: "endpoints (J-14)"` を付け、マップには J-14 が適用できるか、できないならその理由（`j14`。`grounding: 0.1` を宣言していないファイルでは、J-14がその拡張の規則であること）を書きます。端点からはこれ以外の主張は導きません。
+- 限界。ファイルで名前を付ける戦略は、記憶なしで決定的です。混合戦略による均衡、同時手番、部分観測はありません（I.1）。マップの条件は十分条件であり、必要条件ではありません。均衡となる領域の境界に接するセルは、分割をどれだけ細かくしても `undecided` のまま残ります。あるプレイヤーの緩和した過程に、目標に決して達しない方策があるセル（たとえば、ある確率が0になって閉路ができる付値を含むセル）は、プロファイルがそこで許容であっても `undecided` のまま残ります。`not_equilibrium` のために試す逸脱は、セルの中心での標準の最適応答です。セルに挙げる逸脱者は、セル全体で確かめられたものなので、粗いセルでは、それを分けたセルより少ないことがあります。I-3は、付録Hのキーワードをプレイヤーのidにすることを禁じていますが、I.12の例はプレイヤーを `R` と名付けています。この処理系は、`F`・`U`・`P`・`R` をプレイヤーのidとして受け付けます（出力では、H.11のとおり名前を変えます）。
 
 ### AI統合
 
@@ -669,6 +771,10 @@ cadl model-check examples/stochastic_robot_delivery.cadl --regime-map best_for_d
 12. **確率モデル拡張の静的意味論**（付録H、H.10。`stochastic: 0.1` を宣言したファイルのみ） — `model:` に `variables:` と `commands:` があり、`kind:` が `dtmc` であること（S-1）。id・ラベル名・列挙リテラル・アクションラベルが識別子であり、キーワードでなく、それぞれの名前空間で一度だけ宣言されること、ラベル名が `init`・`deadlock` でないこと、列挙リテラルの出力名 `x_L` が宣言済みのどの名前とも、また互いにも異なること（S-2）。`from:` が定義済みの契約の `alpha`・`beta`・`lambda`、または `context.environment` の数値の項目を指すこと（S-3）。`range:` が `[lo, hi]` であり、契約に束縛したパラメータ以外では必須で、すべての値がその範囲に入ること（S-4）。変数の型が `bool`・`"[lo..hi]"`・`"{A, B}"` のいずれかで、`init:` が定義域の値であること（S-5）。状態述語が文法に従い、型が正しいこと（S-6）。更新が宣言済みの変数にその型の値を代入し、ガードが真になるすべての状態で値が定義域に収まること（S-7）。確率が数値・パラメータの式・`rest` のいずれかで、`rest` はコマンドごとに一つ以下、合計がちょうど1であること（S-8）。どの設計のどの状態でも、有効なコマンドが一つ以下であること（S-9）。`model.regimes:` と `when:` がファイルの運用モードを指し、`transitions:` があること（S-10）。すべてのパラメータがすべての設計で固定値を持ち、そこで確率が `[0, 1]` に入り報酬が負でないこと（S-11）。報酬構造に項目があり、その `action:` がコマンドのアクションラベルであり、`value:` が運用モードマップの開いたパラメータを含まないこと（S-12）。性質が性質の文法に従い、`R` は歩数の上限のない `F` にだけ使い、しきい値が範囲内であること（S-13）。運用モードマップが、1〜4個の開いたパラメータ、2個以上の運用モード、問い合わせである目的関数一つ、しきい値性質である制約、`(0, 1)` の分解能を持ち、領域の頂点で各設計が適切に定義されること（S-14）。S-7とS-9は状態空間を列挙して判定します（200 000状態まで）。警告：出所が同じ二つのパラメータ（S-3）、`model.regimes:` に項目のない運用モード（S-10）。情報：将来の版のために予約されたキーと値（S-15）。宣言がない場合、`model:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換も出力もしません
 
 13. **エージェントガバナンス拡張の静的意味論**（付録G、G.9。`agents: 0.1` を宣言したファイルのみ） — ファイルが `norms: 0.1` も宣言していること（G-1）。`agent:` の `kind:` が `llm_agent` / `tool_server` / `human` / `service` のいずれかで、`protocol:` が名前であること（G-2）。`tools:` はツールサーバにだけ書け、ツールサーバには一つ以上必要で、ツール名が重複しない識別子であること（G-3）。受信者がツールサーバであるメッセージイベントがそのツールを名指すこと（G-4。プロトコルのステップでは警告）。`enforcement.default` が `deny` か `allow`、`enforcement.point` が `caller` / `receiver` / `gateway` のいずれかであること（G-5）。執行対象の契約では、許可・禁止の内容であるメッセージの送信者が担い手であること（G-6）。`on_denied:` は執行対象の契約の、メッセージを内容とする禁止にだけ書け、キーが一つ以上あり、`timeout:` が0より大きい期間で `escalate_to:` を伴うこと（G-7）。`escalate_to:` と `notify:` が定義済みの単一のアクターを名指し、`escalate_to:` が担い手以外の当事者であること（G-8）。`escalate_to: A` を持つ契約に、`A` のメッセージから `approval` を作る `counts_as:` ルールがあり、執行対象の契約では `approval` と `rejection` が予約されていること（G-9）。`fallback:` が、担い手から定義済みのアクターへの、禁止されたメッセージとは異なるメッセージイベントであること（G-10）。`delegations:` は執行対象の契約にだけ書け、各項目が、担い手に束縛される添字のない、メッセージを内容とする許可を一つ名指すこと（G-11）。`to:` にツールサーバ以外の定義済みのアクターを並べ、`max_depth:` が1以上であること（G-12）。`grant:` と `revoke:` が識別子で、互いに異なり、`approval`・`rejection` や当事者のツールとも異なること（G-13）、執行対象の契約では、すべてのメッセージイベント（規範の `trigger:`・`until:`・`content:`、`counts_as:` ルールの `when:`、委任の `until:`）の送信者と受信者が当事者の一つの参照に含まれ（契約は自分が統治するメッセージだけを観測するため）、宣言された要素だけを名指すこと（G-17）、契約のすべての添字変数（担い手、相手方、`escalate_to:`、`notify:`、`fallback:`、メッセージイベントの送信者・受信者・引数、述語。`ROBOT[j+1]` のような添字の式の中も含む）が、当事者（当事者 `ROBOT[i]` の `i`）、限量子、または内包表記によって束縛されていること（G-18）。警告：`if:` のもとで作られる制度的事象が、禁止のトリガまたは許可の `until:` であること（G-19）、`timeout:` のない `escalate_to:`（G-7）、`human` でない承認者（G-8）、`rejection` のルールがないこと（G-9）、`to:` に含まれる担い手（G-12）、内容がメッセージイベントでない、または引数を持つ許可・禁止（G-14）、`default: allow` で開いたままのツールと、執行対象の契約の当事者でないツールサーバ（G-15）、契約が必要としながら自ら拒否するメッセージ（G-16）。宣言がない場合、`agent:`・`enforcement:`・`delegations:`・`on_denied:` は未宣言の拡張キーとして警告を一つ出し、検査もIRへの変換もしません
+
+14. **戦略モデル拡張の静的意味論**（付録I、I.10。`games: 0.1` を宣言したファイルのみ） — `stochastic: 0.1` も宣言していること（I-1）。`kind:` が `dtmc` か `smg` であり、`kind: smg` のモデルに `players:`・`profiles:`・`compliance:`・`payoffs:` があり、それ以外のモデルに本拡張のキーがないこと（I-2）。プレイヤーのidが一意な識別子であり、各プレイヤーが宣言済みのアクターを挙げ、一つのアクターを2人のプレイヤーが代表しないこと（I-3）。`owner:` がプレイヤーを指し、所有されたコマンドがアクションラベルを持ち、同じラベルのコマンドの所有者が一つであるか、どれも所有者を持たないこと（I-4）。どの設計のどの状態でも、有効なコマンドが一つ以下であるか、すべて1人のプレイヤーのものでラベルが互いに異なること（I-5。S-9に代わる）。プロファイルの名前が一意な識別子であり、規則がラベルを使わないガードのもとで所有されたコマンドのラベルを選び、二つ以上のコマンドが有効などの状態でもどのプロファイルもコマンドを選び、`compliance:` がプロファイルを指すこと（I-6）。どのプレイヤーにも利得がちょうど一つあり、その目標が真偽値の述語で、項が一つ以上あり、宣言済みの報酬構造を一度ずつ使い、重みが宣言済みのパラメータの式であること。`sanction_of:` または `reward_of:` をもつ項には `grounding: 0.1` の宣言が要ること（I-7）。どのプロファイルも、どの設計でも、固定値で許容であること（I-8）。`equilibria:` の項目が、性質と運用モードマップの中で一意なid、プロファイル、設計、負でない `epsilon:` を持つこと。マップでは、範囲内にあって、どの運用モードも値を割り当てず、どの報酬の値にも現れない1〜4個の開いたパラメータと、`(0, 1)` の `resolution:` を持ち、領域の頂点で設計が適切に定義され、領域のすべての面の中心でプロファイルが許容であること（I-9）。性質と運用モードマップの `profile:` がプロファイルを指すこと（I-10）。I-5とI-6は状態空間を列挙して判定し、I-8とI-9は到達可能なゲームの上で判定します。警告：どの状態でも最初に適用される規則にならないプロファイルの規則（I-6）、目標が初期状態で成り立つ利得（I-7）。情報：予約されたキーと値（I-11）、`games: 0.1` を宣言していないファイルにある本拡張のキー（そのファイルは付録Hに従って読みます。I.15）。`stochastic: 0.1` なしで `games: 0.1` を宣言したファイルは、I-1の誤りになります
+
+15. **根拠付け拡張の静的意味論**（付録J、J.8。`grounding: 0.1` を宣言したファイルのみ） — ファイルが `norms: 0.1` も宣言していること（J-1）。`grounding.items` のキーが識別子であって予約語でなく、値が契約の当事者を指すアクター参照であること、`tolerance:` が `[0, 1]` の数であること（J-2）。`shares:` が、内容がメッセージ事象である義務または許可にあり、宣言された項目を一つ以上、重複なく挙げていること（J-3）。大きさが有限で負でない数であること、`on_fulfilment:` が義務または禁止にあり、`reward:`（文言）か `magnitude:` を持つこと（J-4）。次は警告であり、エラーにはなりません。項目をその出所に与える共有規範、当事者でない宛先やアクター集合の添字なしの名前である宛先、宣言されていない項目を持つ共有エントリ、項目が二つ以上あるか引数を持つために対を与えない共有エントリ（J-3）。制裁や報酬の文言と並ぶ大きさ0（J-4）。与えられた対がある（指標が未定義のときは共有エントリがある）のに `alpha: 0`、与えられていない対があるのに `alpha: 1`、最も多くの権限を担う単一アクターが担っていない権限があるのに `beta: 1`、均等な割合を超えて権限を担う単一アクターがいるのに `beta: 0`（J-6）。0でも1でもない宣言された `alpha` または `beta` が指標から許容差を超えて離れていること、決定権者の権限がほかのアクターより少ないこと（J-7）。規範を持つ契約で、制裁も報酬も持つ義務・禁止がないのに `lambda` が0より大きいこと、持つものがあるのに `lambda: 0` であること（J-8）。`stochastic: 0.1` も宣言したファイルでは、`C.alpha` または `C.beta` に束縛されたパラメータが指標から許容差を超えて離れている設計を、J-6かJ-7が同じ宣言値をすでに報告している場合を除き、情報として報告します（J-9）。比較は正確です（小数は書かれたとおり、比は分数で扱います）。宣言がない場合、`grounding:`、`shares:`、`on_fulfilment:`、`on_violation.magnitude` は未宣言の拡張キーとして警告を一つ出し、解釈せず、指標も計算しません（J.12）。戦略モデル（付録I）では、項が `weight:`・`sanction_of:`・`reward_of:` のうち一つ以下を持つこと、参照が定義済みの契約の義務または禁止を指し、その鍵に対応する大きさが0より大きいこと、`C.lambda` に束縛したパラメータがちょうど一つあること、規範の担い手を代表する（担い手を覆うアクター参照を持つ）プレイヤーの利得であること、一つの規範を鍵ごとに一度しか名指さないこと（J-10、誤り）。警告：結び付けた契約の、大きさを持ち、担い手をプレイヤーが代表するのに、どの項も名指さない規範、`C.lambda` に束縛したパラメータを含む書かれた重み（J-11）。情報：各 `sanction_of:`・`reward_of:` の項の、遵守プロファイルのもとでの期待回数（設計ごと、J-12）。J-14は `cadl game-check --certify` が使います
 
 このほか、検査を失敗させずに次を報告します。`cadl codegen` が出力できない `codegen:` のターゲット（警告）、未知の拡張名、`motivation:` ブロック（情報）。`motivation:` ブロックは解釈しませんが、保持して `cadl sim-ir` の出力に引き渡します。
 
@@ -716,6 +822,7 @@ IR JSON と Unity C# ツリーが生成され、後者が [cadl-raspimouse-simul
 | `raspimouse_mcp_sos.cadl` | Raspimouse群ロボット（MCP-SoS） | 認知型 | MCPツールによるLLM制御、Static/Dynamicパスモード、3つの運用モード |
 | `sos_dsl_robot_delivery.cadl` | SoS-DSL拡張を使ったロボット配送 | 認知型 | 契約ライフサイクル（7状態）、3つのモニタ。ハンズオン講座で使うサンプル |
 | `agents_tool_governance.cadl` | LLMプランナ、サブエージェント、2つのツールサーバ（agents 0.1） | — | 執行対象の契約、人へのエスカレーション、来歴つきの委任。サンプル入力は `agents_inputs/`、`cadl agents-run` 用のトレースは `traces/` |
+| `grounding_robot_delivery.cadl` | 規範と根拠付け拡張を使ったロボット配送（grounding 0.1） | 認知型 | 付録J、J.9の例。情報項目、`shares:`、制裁の大きさ。`cadl norms-indices` で指標5/8、1/2、被覆率1/3 |
 | `agents_change_control.cadl` | 所有者、リードエージェント、2つのワーカー、リポジトリ（agents 0.1） | — | トリガから `until:` までの間だけ発効する禁止、`max_depth: 1` と `until:` を持つ委任。`cadl agents-run` 用のトレースは `traces/` |
 
 ### デモスクリプト
@@ -753,6 +860,7 @@ src/cadl/
   norms_eval.py        記録済みトレースに対する規範拡張の判定
   agents_runtime.py    エージェントガバナンス拡張のランタイム：トレース上の判定、保留、委任、監査記録
   norms_diff.py        改正が規範に及ぼす効果（二つの版の比較）
+  grounding.py         根拠付け拡張：導出指標、規則J-1からJ-9とJ-13
   cli.py               コマンドラインインタフェース
   codegen/
     __init__.py        公開generate() API（マルチターゲット対応）
@@ -815,6 +923,7 @@ tests/
   test_expr_parser.py    式文法のテスト
   test_unparse.py        式の往復変換テスト
   test_norms_eval.py     トレースに対する規範の判定（`cadl norms-eval`）
+  test_grounding_extension.py  根拠付け拡張：指標、規則、IR、`cadl norms-indices`
   test_norms_monitor.py  生成した規範モニタと `cadl norms-eval` の比較（サンプル、記録したケース、ランダムなトレース）
   norms_monitor_cases.py そのために test_norms_eval.py のケースを記録するpytestプラグイン
   test_name_resolution.py 生成コードでのアクター／状態変数の解決
@@ -866,6 +975,8 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | SoS-DSL拡張（`lifecycle:` / `monitors:`）とUnity C#生成 | 利用可能 |
 | 規範拡張：静的検査と、記録済みトレースに対する判定と改正（`cadl norms-eval`、`cadl norms-diff`） | 利用可能 |
 | 規範拡張：生成したPythonパッケージのオンラインモニタ（`norms_monitor.py`） | 利用可能（Solidity・OPA・Unity C#は規範を監視しない。モデル検査器への変換は未実装） |
+| 根拠付け拡張（grounding 0.1）の規範側：導出指標とインセンティブ被覆率（`cadl norms-indices`）、規則J-1からJ-9、IR、二つの版の比較（`cadl norms-diff` のJ-13） | 利用可能 |
+| 戦略モデル拡張（games 0.1）：均衡検査と保証付きの均衡マップ（`cadl game-check`）、付録Jの規範との結び付け（`sanction_of:` / `reward_of:`、J-10からJ-12、J-14） | 利用可能（PRISM-games向けの出力はPRISM-gamesで実行していない） |
 | エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、監査記録。`cadl agents-run`）、Rego / Cedarの境界ポリシー | 利用可能（ランタイムはオフラインの参照実装で、トレースを再生するだけであり、プロトコルには接続しない） |
 | 検証メソッド `model_check` / `simulation` / `proof` | 未対応（未対応である旨を明示的に報告） |
 

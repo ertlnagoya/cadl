@@ -1,0 +1,51 @@
+sos:
+  name: "T"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+    - games: 0.1
+    - norms: 0.1
+    - grounding: 0.1
+  actors:
+    - { id: X, role: "x" }
+    - { id: Y, role: "y" }
+  contracts:
+    - id: C
+      parties: [X, Y]
+      incentives: { lambda: 0.5 }
+      norms:
+        - id: n
+          kind: prohibition
+          bearer: X
+          counterparty: Y
+          content: "X.state == Bad"
+          on_violation: { severity: Major, sanction: "fine", magnitude: 2 }
+  model:
+    kind: smg
+    parameters:
+      - { id: lam, from: "C.lambda" }
+      - { id: q, range: [0, 1], value: 0.5 }
+    variables:
+      - { id: loc, type: "[0..3]", init: 0 }
+    players:
+      - { id: A, actors: [X] }
+    commands:
+      - { action: good, owner: A, guard: "loc == 0", updates: [ { set: { loc: 1 } } ] }
+      - { action: bad,  owner: A, guard: "loc == 0", updates: [ { prob: "lam", set: { loc: 2 } }, { prob: rest, set: { loc: 1 } } ] }
+      - { action: mid, guard: "loc == 2", updates: [ { prob: "1 - lam", set: { loc: 3 } }, { prob: rest, set: { loc: 1 } } ] }
+      - { action: win, guard: "loc == 3", updates: [ { set: { loc: 1 } } ] }
+    rewards:
+      - { id: rg, items: [ { action: good, value: 1 } ] }
+      - { id: rb, items: [ { action: bad, value: 1 } ] }
+      - { id: rw, items: [ { action: win, value: 1 } ] }
+    profiles:
+      s: [ { choose: good } ]
+    compliance: s
+    payoffs:
+      - player: A
+        until: "loc == 1"
+        terms:
+          - { reward: rb, weight: -0.5 }
+          - { reward: rw, weight: 4 }
+    equilibria:
+      - { id: mp, over: { lam: [0, 1] }, resolution: 0.01 }

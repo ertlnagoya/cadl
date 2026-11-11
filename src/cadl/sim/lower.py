@@ -52,7 +52,7 @@ from .ir import (
 
 def lower_to_ir(sos: SoSDefinition) -> SimIR:
     """Convert a parsed SoSDefinition AST into the 3-layer SimIR."""
-    return SimIR(
+    ir = SimIR(
         name=sos.name,
         sos_type=sos.type.value if sos.type else "",
         description=sos.description or "",
@@ -81,11 +81,28 @@ def lower_to_ir(sos: SoSDefinition) -> SimIR:
         agents_extension=_agents_active(sos),
         stochastic_model=_lower_stochastic_model(sos),
     )
+    ir.grounding_extension = _lower_grounding(sos, ir.institution)
+    return ir
 
 
 def _agents_active(sos: SoSDefinition) -> bool:
     from ..agents import agents_active
     return agents_active(sos)
+
+
+def _lower_grounding(sos: SoSDefinition, institution) -> bool:
+    """The fields of the grounding extension (Appendix J, J.10): the field
+    `grounding` of every contract and four fields of every norm. Returns
+    whether the extension is active; nothing is written when it is not."""
+    from ..grounding import annotations, grounding_active, ir_contract, ir_norm_fields
+    if not grounding_active(sos):
+        return False
+    for contract, spec in zip(sos.contracts, institution.contracts):
+        spec.grounding = ir_contract(sos, contract)
+        for norm_spec, ann in zip(spec.norms, annotations(sos, contract).norms):
+            for key, value in ir_norm_fields(ann).items():
+                setattr(norm_spec, key, value)
+    return True
 
 
 def _lower_stochastic_model(sos: SoSDefinition) -> Any:
