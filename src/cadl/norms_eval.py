@@ -252,6 +252,399 @@ def _bound_refs(contract: ContractDef) -> set:
     return out
 
 
+# === Wildcard and range references in predicates (F.5) ======================
+#
+# `A[*]` or `A[lo..hi]` outside the domain of a quantifier or comprehension
+# is shorthand (F.5, "Wildcard and range references"):
+#
+# 1. The argument e of an aggregate f(e) that is not a comprehension binds
+#    every such reference in e outside a nested aggregate call: f(e) is
+#    f(e' for x in D), with all references of one set and index form
+#    replaced by the member A[x]. Two sets or forms there: not evaluable.
+# 2. Every other reference is bound by its smallest enclosing comparison,
+#    or, outside every comparison, by the operand of AND, OR, NOT, the body
+#    of a quantifier or the predicate argument of a temporal operator that
+#    contains it (the whole predicate at the top): the site s becomes
+#    `for all x1 in D1: ... for all xn in Dn: s'`, one variable per set and
+#    index form, in the order of their first occurrence.
+#
+# The variables are named `*1`, `*2`, ...: no written name can hide them.
+
+_COMPARISON_OPS = ("==", "!=", "<", "<=", ">", ">=")
+# Aggregates whose value moves one way when the domain grows (F.5): a
+# comparison of one of them with an operand that binds no variable is
+# decided from the known members when every completion agrees.
+_MONOTONE_AGGREGATES = ("count", "min", "max")
+_FLIPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "==", "!=": "!="}
+
+
+def _has_binder(node: Any) -> bool:
+    """Whether `node` contains a quantifier or a comprehension."""
+    if isinstance(node, (QuantifiedExpr, Comprehension)):
+        return True
+    if isinstance(node, ActorRef):
+        return node.index is not None and not isinstance(node.index, (str, int)) \
+            and _has_binder(node.index)
+    if isinstance(node, MemberAccess):
+        return _has_binder(node.obj)
+    if isinstance(node, UnaryOp):
+        return _has_binder(node.operand)
+    if isinstance(node, BinaryOp):
+        return _has_binder(node.left) or _has_binder(node.right)
+    if isinstance(node, FunctionCall):
+        return any(_has_binder(a) for a in node.args)
+    return False
+
+
+def _monotone_operands(expr: Any) -> Any:
+    """(aggregate call, other operand, operator with the call on the left)
+    of a comparison `count|min|max(e for x in D) op b`, or `b op ...`,
+    whose other operand binds no variable; None for any other node."""
+    if not (isinstance(expr, BinaryOp) and expr.op in _COMPARISON_OPS):
+        return None
+    for call, other, op in ((expr.left, expr.right, expr.op),
+                            (expr.right, expr.left, _FLIPPED[expr.op])):
+        if (isinstance(call, FunctionCall) and call.name in _MONOTONE_AGGREGATES
+                and len(call.args) == 1 and isinstance(call.args[0], Comprehension)
+                and not (isinstance(other, FunctionCall) and other.name == "__in__")
+                and not _has_binder(other)):
+            return call, other, op
+    return None
+
+
+def _interval_decides(op: str, lo: Any, hi: Any, b: Any, integral: bool) -> Any:
+    """`v op b` for every v in [lo, hi] (bounds may be infinite; with
+    `integral`, v ranges over the integers): True when it holds for all,
+    False when for none, None otherwise."""
+    if op in ("==", "!="):
+        inside = lo <= b <= hi and (not integral or float(b).is_integer())
+        if lo == hi == b:
+            equal = True
+        elif not inside:
+            equal = False
+        else:
+            return None
+        return equal if op == "==" else not equal
+    cmp = {"<": lambda v: v < b, "<=": lambda v: v <= b,
+           ">": lambda v: v > b, ">=": lambda v: v >= b}[op]
+    at_lo, at_hi = cmp(lo), cmp(hi)
+    if at_lo and at_hi:
+        return True
+    if not at_lo and not at_hi:
+        return False
+    return None
+
+
+def _wildcard_key(node: Any) -> Any:
+    """(set, "*") for `A[*]`, (set, lo, hi) for `A[lo..hi]`, else None."""
+    if isinstance(node, ActorRef):
+        if node.index == "*":
+            return (node.name, "*")
+        if isinstance(node.index, RangeExpr):
+            return (node.name, node.index.start, node.index.end)
+    return None
+
+
+def wildcard_text(key: tuple) -> str:
+    """`A[*]` or `A[lo..hi]` for a key of `_wildcard_key`."""
+    if len(key) == 2:
+        return f"{key[0]}[*]"
+    return f"{key[0]}[{key[1]}..{key[2]}]"
+
+
+def _wildcard_domain(key: tuple) -> ActorRef:
+    if len(key) == 2:
+        return ActorRef(name=key[0], index="*")
+    return ActorRef(name=key[0], index=RangeExpr(start=key[1], end=key[2]))
+
+
+def _is_aggregate_shorthand(node: Any) -> bool:
+    """An aggregate call whose one argument is not a comprehension."""
+    return (isinstance(node, FunctionCall) and node.name in AGGREGATES
+            and len(node.args) == 1 and not isinstance(node.args[0], Comprehension))
+
+
+def _wildcards(node: Any, out: list, nested_aggregates: bool) -> None:
+    """The free wildcard and range references of `node`, in the order in
+    which they are written: not in the domain of a quantifier or
+    comprehension, and not in the argument of an aggregate shorthand that
+    could not be rewritten. With `nested_aggregates` False, nothing inside
+    a nested aggregate call either (rule 1)."""
+    key = _wildcard_key(node)
+    if key is not None:
+        out.append(key)
+    elif isinstance(node, ActorRef):
+        if node.index is not None and not isinstance(node.index, (str, int)):
+            _wildcards(node.index, out, nested_aggregates)
+    elif isinstance(node, MemberAccess):
+        _wildcards(node.obj, out, nested_aggregates)
+    elif isinstance(node, UnaryOp):
+        _wildcards(node.operand, out, nested_aggregates)
+    elif isinstance(node, BinaryOp):
+        _wildcards(node.left, out, nested_aggregates)
+        _wildcards(node.right, out, nested_aggregates)
+    elif isinstance(node, QuantifiedExpr):
+        _wildcards(node.predicate, out, nested_aggregates)
+    elif isinstance(node, Comprehension):
+        _wildcards(node.element, out, nested_aggregates)
+    elif isinstance(node, FunctionCall):
+        if node.name in AGGREGATES and (not nested_aggregates or _is_aggregate_shorthand(node)):
+            return
+        for a in node.args:
+            _wildcards(a, out, nested_aggregates)
+
+
+def _substitute(node: Any, names: dict, nested_aggregates: bool) -> Any:
+    """`node` with every free reference of `_wildcards` whose key is in
+    `names` replaced by the member `A[x]` of the variable x = names[key]."""
+    def sub(n: Any) -> Any:
+        return _substitute(n, names, nested_aggregates)
+    key = _wildcard_key(node)
+    if key is not None:
+        if key in names:
+            return ActorRef(name=node.name, index=ActorRef(name=names[key]))
+        return node
+    if isinstance(node, ActorRef):
+        if node.index is not None and not isinstance(node.index, (str, int)):
+            return replace(node, index=sub(node.index))
+        return node
+    if isinstance(node, MemberAccess):
+        return replace(node, obj=sub(node.obj))
+    if isinstance(node, UnaryOp):
+        return replace(node, operand=sub(node.operand))
+    if isinstance(node, BinaryOp):
+        return replace(node, left=sub(node.left), right=sub(node.right))
+    if isinstance(node, QuantifiedExpr):
+        return replace(node, predicate=sub(node.predicate))
+    if isinstance(node, Comprehension):
+        return replace(node, element=sub(node.element))
+    if isinstance(node, FunctionCall):
+        if node.name in AGGREGATES and (not nested_aggregates or _is_aggregate_shorthand(node)):
+            return node
+        return replace(node, args=[sub(a) for a in node.args])
+    return node
+
+
+def _compared_with_itself(node: Any, key: tuple) -> bool:
+    """Whether a comparison in `node` (outside nested aggregate calls) has
+    a reference of the group `key` on both sides."""
+    if isinstance(node, BinaryOp):
+        if node.op in _COMPARISON_OPS:
+            left: list = []
+            right: list = []
+            _wildcards(node.left, left, False)
+            _wildcards(node.right, right, False)
+            if key in left and key in right:
+                return True
+        return _compared_with_itself(node.left, key) or _compared_with_itself(node.right, key)
+    if isinstance(node, UnaryOp):
+        return _compared_with_itself(node.operand, key)
+    if isinstance(node, QuantifiedExpr):
+        return _compared_with_itself(node.predicate, key)
+    if isinstance(node, FunctionCall) and node.name not in AGGREGATES:
+        return any(_compared_with_itself(a, key) for a in node.args)
+    return False
+
+
+class _Desugar:
+    """The rewriting of `desugar_wildcards`; `notes` collects the readings
+    that may surprise, as (kind, text) with kind `not`, `pairs`, `or`,
+    `same`, `temporal` or `aggregate`."""
+
+    def __init__(self, notes: list | None) -> None:
+        self.count = 0
+        self.notes = notes
+        self.temporal: str | None = None      # the temporal operator being walked
+
+    def note(self, kind: str, text: str) -> None:
+        if self.notes is not None and (kind, text) not in self.notes:
+            self.notes.append((kind, text))
+
+    def fresh(self) -> str:
+        self.count += 1
+        return f"*{self.count}"
+
+    # rule 1, innermost aggregate first
+    def aggregates(self, node: Any) -> Any:
+        if isinstance(node, ActorRef):
+            if node.index is not None and not isinstance(node.index, (str, int)) \
+                    and _wildcard_key(node) is None:
+                return replace(node, index=self.aggregates(node.index))
+            return node
+        if isinstance(node, MemberAccess):
+            return replace(node, obj=self.aggregates(node.obj))
+        if isinstance(node, UnaryOp):
+            return replace(node, operand=self.aggregates(node.operand))
+        if isinstance(node, BinaryOp):
+            return replace(node, left=self.aggregates(node.left),
+                           right=self.aggregates(node.right))
+        if isinstance(node, QuantifiedExpr):
+            return replace(node, predicate=self.aggregates(node.predicate))
+        if isinstance(node, Comprehension):
+            return replace(node, element=self.aggregates(node.element))
+        if not isinstance(node, FunctionCall):
+            return node
+        node = replace(node, args=[self.aggregates(a) for a in node.args])
+        if not _is_aggregate_shorthand(node):
+            return node
+        keys: list = []
+        _wildcards(node.args[0], keys, False)
+        keys = list(dict.fromkeys(keys))
+        if len(keys) != 1:
+            if keys:
+                self.note("aggregate", f"the argument of {node.name}() refers to "
+                          f"{' and '.join(wildcard_text(k) for k in keys)}, so it is not "
+                          f"evaluated; write a comprehension")
+            return node
+        if _compared_with_itself(node.args[0], keys[0]):
+            t = wildcard_text(keys[0])
+            self.note("same", f"{t} on both sides of a comparison in the argument of "
+                      f"{node.name}(): each member is compared with itself; to compare two "
+                      f"members, write a comprehension with a quantifier over a second "
+                      f"member, as in {node.name}((exists k in {t}: k != j AND ...) "
+                      f"for j in {t})")
+        var = self.fresh()
+        element = _substitute(node.args[0], {keys[0]: var}, False)
+        return replace(node, args=[Comprehension(element=element, variable=var,
+                                                 domain=_wildcard_domain(keys[0]))])
+
+    # rule 2
+    def bind(self, node: Any, negated: bool) -> tuple:
+        keys: list = []
+        _wildcards(node, keys, True)
+        keys = list(dict.fromkeys(keys))
+        if not keys:
+            return node, set()
+        names = {k: self.fresh() for k in keys}
+        body = _substitute(node, names, True)
+        for k in reversed(keys):
+            body = QuantifiedExpr(quantifier="for_all", variable=names[k],
+                                  domain=_wildcard_domain(k), predicate=body)
+        texts = " and ".join(wildcard_text(k) for k in keys)
+        if negated:
+            self.note("not", f"{texts} under NOT: NOT applies to 'for all' over the members, "
+                      f"so the predicate holds when some member does not satisfy the "
+                      f"comparison")
+        if len(keys) > 1:
+            self.note("pairs", f"{texts} in one comparison: it must hold for every "
+                      f"combination of their members")
+        if isinstance(node, BinaryOp) and node.op in _COMPARISON_OPS:
+            left: list = []
+            right: list = []
+            _wildcards(node.left, left, True)
+            _wildcards(node.right, right, True)
+            for k in [k for k in keys if k in left and k in right]:
+                t = wildcard_text(k)
+                self.note("same", f"{t} on both sides of a comparison: each member is "
+                          f"compared with itself; to compare two members, write "
+                          f"for all j in {t}: for all k in {t}: j == k OR ... "
+                          f"with {k[0]}[j] and {k[0]}[k]")
+        if self.temporal is not None:
+            first = wildcard_text(keys[0])
+            self.note("temporal", f"{texts} inside {self.temporal}(): the comparison must "
+                      f"hold for all members at the same observation; for each member on "
+                      f"its own, write the quantifier outside, as in for all j in {first}: "
+                      f"{self.temporal}(...) with {keys[0][0]}[j]")
+        return body, set(keys)
+
+    def walk(self, node: Any, pred: bool, negated: bool) -> tuple:
+        """(node rewritten, keys bound in it); `pred`: the node stands where
+        a predicate is expected."""
+        if isinstance(node, BinaryOp) and node.op in ("AND", "OR"):
+            left, kl = self.walk(node.left, True, negated)
+            right, kr = self.walk(node.right, True, negated)
+            if node.op == "OR":
+                for k in sorted(kl & kr, key=str):
+                    self.note("or", f"{wildcard_text(k)} in both operands of OR: each "
+                              f"comparison quantifies over the members on its own")
+            return replace(node, left=left, right=right), kl | kr
+        if isinstance(node, UnaryOp) and node.op == "NOT":
+            operand, keys = self.walk(node.operand, True, not negated)
+            return replace(node, operand=operand), keys
+        if isinstance(node, QuantifiedExpr):
+            body, keys = self.walk(node.predicate, True, negated)
+            return replace(node, predicate=body), keys
+        if isinstance(node, FunctionCall) and node.name in TEMPORAL_OPERATORS:
+            args, keys = [], set()
+            outer, self.temporal = self.temporal, node.name
+            try:
+                for a in node.args:
+                    if isinstance(a, DurationLiteral):
+                        args.append(a)
+                    else:
+                        a, k = self.walk(a, True, negated)
+                        args.append(a)
+                        keys |= k
+            finally:
+                self.temporal = outer
+            return replace(node, args=args), keys
+        keys: set = set()
+        if isinstance(node, ActorRef):
+            if node.index is not None and not isinstance(node.index, (str, int)) \
+                    and _wildcard_key(node) is None:
+                index, keys = self.walk(node.index, False, negated)
+                node = replace(node, index=index)
+        elif isinstance(node, MemberAccess):
+            obj, keys = self.walk(node.obj, False, negated)
+            node = replace(node, obj=obj)
+        elif isinstance(node, UnaryOp):
+            operand, keys = self.walk(node.operand, False, negated)
+            node = replace(node, operand=operand)
+        elif isinstance(node, BinaryOp):
+            left, kl = self.walk(node.left, False, negated)
+            right, kr = self.walk(node.right, False, negated)
+            node, keys = replace(node, left=left, right=right), kl | kr
+        elif isinstance(node, Comprehension):
+            element, keys = self.walk(node.element, False, negated)
+            node = replace(node, element=element)
+        elif isinstance(node, FunctionCall) and not _is_aggregate_shorthand(node):
+            # (an aggregate shorthand that rule 1 left is not evaluated)
+            args = []
+            for a in node.args:
+                a, k = self.walk(a, False, negated)
+                args.append(a)
+                keys |= k
+            node = replace(node, args=args)
+        if pred or (isinstance(node, BinaryOp) and node.op in _COMPARISON_OPS):
+            node, k = self.bind(node, negated)
+            keys |= k
+        return node, keys
+
+
+def _has_wildcard(node: Any) -> bool:
+    """Whether a wildcard or range reference stands in `node` outside the
+    domains of its quantifiers and comprehensions."""
+    if _wildcard_key(node) is not None:
+        return True
+    if isinstance(node, ActorRef):
+        return node.index is not None and not isinstance(node.index, (str, int)) \
+            and _has_wildcard(node.index)
+    if isinstance(node, MemberAccess):
+        return _has_wildcard(node.obj)
+    if isinstance(node, UnaryOp):
+        return _has_wildcard(node.operand)
+    if isinstance(node, BinaryOp):
+        return _has_wildcard(node.left) or _has_wildcard(node.right)
+    if isinstance(node, QuantifiedExpr):
+        return _has_wildcard(node.predicate)
+    if isinstance(node, Comprehension):
+        return _has_wildcard(node.element)
+    if isinstance(node, FunctionCall):
+        return any(_has_wildcard(a) for a in node.args)
+    return False
+
+
+def desugar_wildcards(expr: Any, notes: list | None = None) -> Any:
+    """A predicate with its wildcard and range references outside the
+    domains of quantifiers and comprehensions rewritten as quantifiers and
+    comprehensions (F.5); `expr` itself when it has none. `notes`, when
+    given, receives the readings that may surprise (N-15)."""
+    if not _has_wildcard(expr):
+        return expr
+    d = _Desugar(notes)
+    return d.walk(d.aggregates(expr), True, False)[0]
+
+
 class _TraceReader:
     """Reads the observations of one contract instance into a `Trace`, one
     at a time."""
@@ -493,6 +886,15 @@ class _Evaluator:
                         or self.unsupported(comp.element, False, {
                             **bound,
                             comp.variable: None if isinstance(dom, RangeExpr) else dom.name}))
+            if _is_aggregate_shorthand(expr):
+                keys: list = []
+                _wildcards(expr.args[0], keys, False)
+                keys = list(dict.fromkeys(keys))
+                if len(keys) > 1:
+                    # what desugar_wildcards leaves (F.5, rule 1)
+                    return (f"the argument of {expr.name}() refers to "
+                            f"{' and '.join(wildcard_text(k) for k in keys)}; "
+                            f"an aggregate ranges over one set or range")
             return f"the function call {expr.name}() is not evaluable"
         return f"{type(expr).__name__} is not evaluable"
 
@@ -646,6 +1048,9 @@ class _Evaluator:
                 if left is marker or right is marker:
                     return marker
             return not stop
+        refined = self._monotone(expr, k, n)
+        if refined is not None:
+            return refined
         left = self.value(expr.left, k, n)
         if (op == "==" and isinstance(expr.right, FunctionCall)
                 and expr.right.name == "__in__"):
@@ -891,6 +1296,37 @@ class _Evaluator:
             return UNKNOWN
         return not decisive
 
+    def _elements(self, name: str, comp: Comprehension, group: Any, members: list,
+                  k: int, n: int) -> tuple:
+        """The values of the element of an aggregate for the members of its
+        domain: (values, markers, invalid). For `count` a value is a truth
+        value; for the others a number. An undefined element is a marker.
+        `invalid` is True when an element has a value of the wrong kind (a
+        text or symbolic value; for min, max, sum and avg also a boolean),
+        which makes the aggregate undefined (F.5), with a warning."""
+        vals, markers, invalid = [], [], False
+        for index in members:
+            v = self._with(comp.variable, (group, index),
+                           lambda: self.value(comp.element, k, n))
+            if name == "count":
+                if not isinstance(v, (_Marker, bool, int, float)) or isinstance(v, _Sym):
+                    invalid = True
+                v = self.truth(v, comp.element)
+            elif isinstance(v, _Sym):
+                invalid = True
+                v = self._no_value(v)
+            elif not isinstance(v, _Marker) and (isinstance(v, bool)
+                                                  or not isinstance(v, (int, float))):
+                self.warn(f"{name}() of the value {v!r}, which is not a number; "
+                          f"the predicate does not hold")
+                invalid = True
+                v = UNKNOWN
+            if isinstance(v, _Marker):
+                markers.append(v)
+            else:
+                vals.append(v)
+        return vals, markers, invalid
+
     def _aggregate(self, name: str, comp: Comprehension, k: int, n: int) -> Any:
         """sum, count, min, max or avg of a comprehension at observation k;
         undefined on an open domain or when an element is undefined.
@@ -906,23 +1342,7 @@ class _Evaluator:
                 self.warn(f"the range of '{comp.variable}' in {name}() has a bound without "
                           f"a value; the aggregate is undefined")
             return UNKNOWN
-        vals, markers = [], []
-        for index in members:
-            v = self._with(comp.variable, (group, index),
-                           lambda: self.value(comp.element, k, n))
-            if name == "count":
-                v = self.truth(v, comp.element)
-            elif isinstance(v, _Sym):
-                v = self._no_value(v)
-            elif not isinstance(v, _Marker) and (isinstance(v, bool)
-                                                  or not isinstance(v, (int, float))):
-                self.warn(f"{name}() of the value {v!r}, which is not a number; "
-                          f"the predicate does not hold")
-                v = UNKNOWN
-            if isinstance(v, _Marker):
-                markers.append(v)
-            else:
-                vals.append(v)
+        vals, markers, _ = self._elements(name, comp, group, members, k, n)
         worst = self._worst(*markers)
         if worst is not None:
             return worst
@@ -938,6 +1358,44 @@ class _Evaluator:
         if name == "max":
             return max(vals)
         return sum(vals) / len(vals)
+
+    def _monotone(self, expr: BinaryOp, k: int, n: int) -> Any:
+        """A comparison of `count`, `min` or `max` of a comprehension with
+        an operand that binds no variable, decided from the interval of
+        values that the aggregate can take (F.5): undefined elements, and
+        on an open domain the members not yet named, may take any value.
+        count lies in [true, true + undefined] (no upper bound when open),
+        max in [largest defined value, +inf), min in (-inf, smallest
+        defined value]. True or False when every value of the interval
+        gives it; None (evaluate as usual) otherwise, and when the domain
+        is closed and every element is defined (the exact value)."""
+        found = _monotone_operands(expr)
+        if found is None:
+            return None
+        call, other, op = found
+        comp = call.args[0]
+        dom = self.domain(comp.domain, k)
+        if dom is UNKNOWN:
+            return None
+        group, members, closed = dom
+        if group is None and not closed:
+            return None                     # a range whose bound has no value
+        b = self.value(other, k, n)
+        if isinstance(b, bool) or not isinstance(b, (int, float)):
+            return None
+        vals, markers, invalid = self._elements(call.name, comp, group, members, k, n)
+        if invalid or any(m is UNDECIDED for m in markers) or (closed and not markers):
+            return None         # a value of the wrong kind: undefined, as F.5 says
+        inf = float("inf")
+        if call.name == "count":
+            lo = sum(1 for v in vals if v is True)
+            hi = lo + len(markers) if closed else inf
+            return _interval_decides(op, lo, hi, b, True)
+        if not vals:
+            return None
+        if call.name == "max":
+            return _interval_decides(op, max(vals), inf, b, False)
+        return _interval_decides(op, -inf, min(vals), b, False)
 
     # --- temporal operators (F.4) -------------------------------------------
 
@@ -1038,7 +1496,7 @@ class _Term:
         else:
             self.kind = "predicate"
             try:
-                self.expr = _parse_rule(self.text)
+                self.expr = desugar_wildcards(_parse_rule(self.text))
             except Exception:
                 self.error = "it is not a predicate (Appendix A.10)"
             else:
@@ -1242,6 +1700,8 @@ class _Engine:
                 expr = _parse_rule(expr.value)
             except Exception:
                 expr = None
+        if expr is not None:
+            expr = desugar_wildcards(expr)
         temporal = expr is not None and contains_temporal(expr)
         error = ("it is not a predicate (Appendix A.10)" if expr is None
                  else self.ev.unsupported(expr, True))

@@ -150,7 +150,10 @@ class TestMapOverLambda:
         ]
         for d in result["designs"]:
             assert d["undecided_fraction"] == F(1, 32) and d["resolution_reached"]
-            assert d["method"] == METHOD and "lambda" not in d["parameters"]
+            # The bounds of I.9, and the end points of I.9 for the cells they
+            # leave undecided (one open parameter, only in weights).
+            assert d["method"].startswith(METHOD) and "end points (I.9)" in d["method"]
+            assert "lambda" not in d["parameters"]
             assert d["parameters"]["p_fail"] == F(1, 20)
             star = LAMBDA_STAR[d["design"]]
             undecided = next(c for c in d["cells"] if c.status == "undecided")
@@ -191,7 +194,7 @@ class TestMapOverLambda:
             "id": "comply_by_lambda", "profile": "comply", "epsilon": "0",
             "over": {"lambda": ["0", "1"]}, "resolution": "1/20"}
         central = result["designs"][0]
-        assert central["design"] == "CENTRALIZED" and central["method"] == METHOD
+        assert central["design"] == "CENTRALIZED" and central["method"].startswith(METHOD)
         assert central["undecided_fraction"] == "1/32" and central["resolution_reached"] is True
         assert central["parameters"] == {"p_fail": "1/20", "p_loss": "1/10", "alpha": "9/10",
                                          "beta": "9/10", "q_local": "3/5"}

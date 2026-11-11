@@ -1,0 +1,39 @@
+# One player, two deviations whose payoffs move in opposite directions
+# with lam: the gain is |1 - 2 lam|, convex but not monotone. Condition A
+# of the end-point certification (I.9) holds, condition B holds for no
+# player (the coefficients of lam have both signs). With epsilon 1/4 the
+# profile is an epsilon-equilibrium exactly for lam in [3/8, 5/8].
+sos:
+  name: "NonMonotone"
+  type: Acknowledged
+  extensions:
+    - stochastic: 0.1
+    - games: 0.1
+  actors:
+    - { id: X, role: "x" }
+  model:
+    kind: smg
+    parameters:
+      - { id: lam, range: [0, 1], value: 0.5 }
+    variables:
+      - { id: loc, type: "[0..1]", init: 0 }
+    players:
+      - { id: A, actors: [X] }
+    commands:
+      - { action: good, owner: A, guard: "loc == 0", updates: [ { set: { loc: 1 } } ] }
+      - { action: up,   owner: A, guard: "loc == 0", updates: [ { set: { loc: 1 } } ] }
+      - { action: down, owner: A, guard: "loc == 0", updates: [ { set: { loc: 1 } } ] }
+    rewards:
+      - { id: ru, items: [ { action: up, value: 1 } ] }
+      - { id: rd, items: [ { action: down, value: 1 } ] }
+    profiles:
+      s: [ { choose: good } ]
+    compliance: s
+    payoffs:
+      - player: A
+        until: "loc == 1"
+        terms:
+          - { reward: ru, weight: "1 - 2 * lam" }
+          - { reward: rd, weight: "2 * lam - 1" }
+    equilibria:
+      - { id: mp, epsilon: 0.25, over: { lam: [0, 1] }, resolution: 0.01 }

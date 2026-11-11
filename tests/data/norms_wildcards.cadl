@@ -1,0 +1,63 @@
+# Wildcard and range references in predicates (F.5): every predicate of
+# this contract uses A[*] or A[lo..hi] outside a quantifier domain.
+# tests/data/norms_wildcards_quantified.cadl is the same contract with
+# each predicate written as its quantified form by hand;
+# tests/test_norms_wildcards.py checks that both give the same verdicts
+# on random traces, offline and in the generated monitor.
+
+sos:
+  name: Wild
+  extensions:
+    - sos-dsl: 0.1
+    - norms: 0.1
+  actors:
+    - {id: D, role: d}
+    - {id: "R[1..3]", role: r}
+    - {id: "S[1..N]", role: s}
+  contracts:
+    - id: C
+      parties: [D, "R[*]", "S[*]"]
+      assume:
+        - "D.up == true"
+        - "R[*].load >= 0"
+      guarantee:
+        - "S[*].load < 9"
+        - "within(5s, S[*].job == 0)"
+        - "sum(R[*].load) < 20"
+        - "NOT R[1..2].load > 8"
+      lifecycle:
+        states: [Open, Closed]
+        initial: Open
+        terminal: [Closed]
+        transitions:
+          - {id: close, from: Open, to: Closed, on: "D -> S[i] : release"}
+      counts_as:
+        - {when: "max(S[*].load) > 8", creates: overload}
+        - {when: "D -> S[i] : assign", creates: assigned, if: "count(S[1..3].job == 7) < 2"}
+      norms:
+        - id: same_job
+          kind: prohibition
+          bearer: D
+          content: "R[*].load > S[1..2].job AND R[*].job == R[*].job"
+        - id: busy_ack
+          kind: obligation
+          bearer: "S[i]"
+          trigger: overload
+          content: "S[i] -> D : ack"
+          deadline: 4s
+        - id: may_assign
+          kind: permission
+          bearer: D
+          content: "D -> S[i] : assign"
+          until: "S[*].job == 0 OR R[*].job == 0"
+        - id: light
+          kind: prohibition
+          bearer: D
+          trigger: "S[2..N].job == 7 OR R[2..3].job == 7"
+          content: "NOT S[2..3].load < 6"
+        - id: settle
+          kind: obligation
+          bearer: D
+          trigger: assigned
+          content: "throughout(2s, R[*].load <= 5 OR S[*].job == 0)"
+          deadline: 6s

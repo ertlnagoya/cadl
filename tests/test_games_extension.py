@@ -710,9 +710,22 @@ class TestQueries:
             model["observations"] = {}
             model["commands"][0]["sync"] = "x"
             model["variables"][0]["owner"] = "A"
-            model["equilibria"][0]["concept"] = "spe"
         infos = with_rule(check(mutate).infos, "I-11")
-        assert len(infos) == 5 and check(mutate).ok
+        assert len(infos) == 4 and check(mutate).ok
+
+    def test_concept(self):
+        """`concept:` (I.8): `nash` (the default) and `every_reachable_state`;
+        a reserved value gets the information of I-11 and the error of
+        I-9, any other value the error."""
+        model = checked_model(parse_file(ROBOT))
+        assert [q.concept for q in model.equilibria] == ["nash"] * 4
+        mutate = lambda m, s: m["equilibria"][0].update(concept="every_reachable_state")
+        assert check(mutate).ok
+        assert model_of(mutate).equilibria[0].concept == "every_reachable_state"
+        result = check(lambda m, s: m["equilibria"][0].update(concept="subgame_perfect"))
+        assert with_rule(result.infos, "I-11") and with_rule(result.errors, "I-9")
+        result = check(lambda m, s: m["equilibria"][0].update(concept="spe"))
+        assert not with_rule(result.infos, "I-11") and with_rule(result.errors, "I-9")
 
     def test_i11_replaces_s15(self):
         assert not with_rule(check().infos, "S-15")
@@ -844,11 +857,11 @@ class TestIR:
                       {"reward": "shortcuts", "weight": "-2 * lambda"}]}
         assert ir["equilibria"][0] == {
             "id": "comply_nash", "profile": "comply", "regimes": ["CENTRALIZED", "DISTRIBUTED"],
-            "epsilon": 0, "over": None, "resolution": None}
+            "epsilon": 0, "over": None, "resolution": None, "concept": "nash"}
         assert ir["equilibria"][2] == {
             "id": "comply_by_lambda", "profile": "comply",
             "regimes": ["CENTRALIZED", "DISTRIBUTED"],
-            "epsilon": 0, "over": {"lambda": [0, 1]}, "resolution": 0.05}
+            "epsilon": 0, "over": {"lambda": [0, 1]}, "resolution": 0.05, "concept": "nash"}
 
     def test_regime_map_has_a_profile(self):
         ir = game_to_ir(model_of(TestModelUnderProfile().regime_map, base=robot))
