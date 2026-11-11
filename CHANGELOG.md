@@ -59,10 +59,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   and five traces under `examples/traces/` for it and for
   `examples/agents_tool_governance.cadl`.
 
-- `cadl agents-run`: an occurrence of a message event that depends on an
-  index which the contract instance does not bind is unknown and resolved
-  fail-closed (it does not activate a permission, end a prohibition or
-  create `approval`; it does activate a prohibition and end a permission).
+- `cadl agents-run`: every contract instance must bind the index
+  variables of the parties of its contract (`bindings`); an instance
+  without such a binding is a trace error. `cadl.agents_runtime.run`
+  refuses a file with errors of `cadl check`; `check=False` is an unsafe
+  switch for tests. As defence in depth, an occurrence that depends on an
+  unbound index is unknown and never has an effect that lets a message
+  through (activate or resume a permission, end, suspend or discharge a
+  prohibition, create an institutional event, exercise a power, fulfil an
+  obligation), and always has the effects that block.
 
 ### Fixed
 - `cadl norms-eval`: an actor reference in a `trigger:`, an `until:`, the
@@ -94,9 +99,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the sender and the receiver of every message event of the contract
   (`trigger:`, `until:` and `content:` of its norms, `when:` of its
   `counts_as:` rules, `until:` of a delegation) must be covered by its
-  parties; G-18, an index variable in the sender or receiver of a
-  `trigger:`, an `until:` or a `when:` must be one that a party binds
-  (`i` with a party `ROBOT[i]`). Both are errors. A file that 0.3.21
+  parties, by one reference of `parties:`, and must name only declared
+  members (`SUP[7]` for a set `SUP[1..3]` is an error); G-18, every index
+  variable of the contract (in bearers, counterparties, `escalate_to:`,
+  `notify:`, `fallback:` and the senders and receivers of its message
+  events) must be one that a party binds (`i` with a party `ROBOT[i]`).
+  Both are errors. A contract with parties `ROBOT[*]` and norms of
+  `ROBOT[i]` has to write the party as `ROBOT[i]`. A file that 0.3.21
   accepted with such an event has to name the actor as a party. For
   the rules that create `approval` and `rejection`, G-17 makes sure that
   the contract governs the approver's message.

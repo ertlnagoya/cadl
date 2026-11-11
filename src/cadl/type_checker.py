@@ -1431,50 +1431,108 @@ class TypeChecker:
         """G-17 and G-18: an instance of an enforced contract observes a
         message only when the contract governs it (G.5), so a message event
         of the contract that a non-party could send or receive would never
-        occur; and an index that no party binds would match any member."""
-        from .agents import _actor_entry, _party_ref, parse_message_event, ref_covered
+        occur; and an index that no party binds has no value the file
+        accounts for."""
+        from .agents import (
+            _actor_entry,
+            _party_ref,
+            parse_message_event,
+            parse_ref,
+            ref_covered,
+        )
         try:
             parties = [_party_ref(p) for p in contract.parties]
         except Exception:
             return
         bound = {p["var"] for p in parties if p["kind"] == "var"}
         actors = {a.id.name: _actor_entry(a) for a in self.sos_actors}
-        items = []      # where, text, location, whether G-18 applies
+
+        def unbound(ref: dict, what: str, loc) -> None:
+            """G-18: every index variable is the index of a party."""
+            if ref["kind"] == "var" and ref["var"] not in bound:
+                self.result.add_error(
+                    f"The index '{ref['var']}' of {what} in {ctx} is not bound by a "
+                    f"party of the contract (no party is written with [{ref['var']}]); "
+                    f"a contract instance binds only the indices of its parties (G-18)",
+                    loc,
+                )
+
+        def outside(ref: dict):
+            """A literal index or a range that leaves the declared set."""
+            decl = actors[ref["name"]]
+            if not decl["indexed"] or ref["kind"] not in ("index", "range"):
+                return False
+            lo = ref["index"] if ref["kind"] == "index" else ref["lo"]
+            hi = ref["index"] if ref["kind"] == "index" else ref["hi"]
+            return (decl["lo"] is not None and lo < decl["lo"]) or (
+                decl["bounded"] and hi > decl["hi"])
+
+        items = []      # where, text, location
         for n in contract.norms:
             for key in ("trigger", "until", "content"):
                 text = getattr(n, key)
                 if text and text.strip() not in events:
-                    items.append((f"{key}: of norm '{n.id}'", text, n.loc, key != "content"))
+                    items.append((f"{key}: of norm '{n.id}'", text, n.loc))
+            od = n.on_denied
+            texts = [("bearer:", n.bearer), ("counterparty:", n.counterparty),
+                     ("on_denied.escalate_to:", od.escalate_to if od else None),
+                     ("on_denied.notify:", od.notify if od else None)]
+            for key, text in texts:
+                if not text:
+                    continue
+                try:
+                    ref = parse_ref(text)
+                except Exception:
+                    continue
+                unbound(ref, f"'{ref['text']}', the {key} of norm '{n.id}'", n.loc)
+            fb = None
+            if od is not None and od.fallback:
+                try:
+                    fb = parse_message_event(od.fallback)
+                except Exception:
+                    fb = None
+            if fb is not None:
+                for ref in (fb.sender, fb.receiver):
+                    unbound(ref, f"'{ref['text']}' in on_denied.fallback: of norm "
+                                 f"'{n.id}'", n.loc)
         for r in contract.counts_as:
             items.append((f"when: of the counts_as rule that creates '{r.creates}'",
-                          r.when, r.loc, True))
+                          r.when, r.loc))
         for d in contract.delegations:
             if d.until and d.until.strip() not in events:
-                items.append((f"until: of the delegation of '{d.norm}'", d.until, d.loc, True))
-        for where, text, loc, is_event in items:
+                items.append((f"until: of the delegation of '{d.norm}'", d.until, d.loc))
+        for where, text, loc in items:
             try:
                 m = parse_message_event(text)
             except Exception:
                 m = None
             if m is None:
                 continue
+            to_party_tool = (ref_covered(m.receiver, parties, actors)
+                             and self.agent_kinds.get(m.receiver["name"]) == "tool_server")
             for role, ref in (("sender", m.sender), ("receiver", m.receiver)):
                 if ref["name"] not in actors:
                     continue                    # reported by N-9
-                if not ref_covered(ref, parties, actors):
+                if outside(ref):
+                    self.result.add_error(
+                        f"The {role} '{ref['text']}' of the {where} in {ctx} names "
+                        f"actors outside the declared set '{ref['name']}'; for them "
+                        f"this message event could never occur (G-17)", loc,
+                    )
+                elif not ref_covered(ref, parties, actors):
+                    why = ("a tool call of an actor that is not a party is governed and "
+                           "is decided by the default and by the norms written for "
+                           "parties; a contract cannot make it the event of a norm"
+                           if role == "sender" and to_party_tool else
+                           "an enforced contract observes only the messages it governs, "
+                           "so this message event could never occur")
                     self.result.add_error(
                         f"The {role} '{ref['text']}' of the {where} in {ctx} is not "
-                        f"covered by the parties of the contract; an enforced contract "
-                        f"observes only the messages it governs, so this message "
-                        f"event could never occur (G-17)", loc,
+                        f"covered by one reference in the parties of the contract; "
+                        f"{why} (G-17)", loc,
                     )
-                elif is_event and ref["kind"] == "var" and ref["var"] not in bound:
-                    self.result.add_error(
-                        f"The index '{ref['var']}' of the {role} '{ref['text']}' of the "
-                        f"{where} in {ctx} is not bound by a party of the contract "
-                        f"(no party is written with [{ref['var']}]); the event would "
-                        f"depend on an unbound index (G-18)", loc,
-                    )
+                else:
+                    unbound(ref, f"the {role} '{ref['text']}' of the {where}", loc)
 
     def _check_delegations(
         self, contract: ContractDef, ctx: str, events: set[str], norm_ids: set[str],

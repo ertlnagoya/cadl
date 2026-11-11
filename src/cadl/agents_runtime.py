@@ -308,17 +308,34 @@ class _BoundaryEngine(_Engine):
         self._harden()
 
     def _harden(self) -> None:
-        """Resolve unknown occurrences fail-closed (see `_BoundaryTerm`).
-        The events of obligations and powers keep the reading of F.3."""
+        """Resolve unknown occurrences fail-closed (see `_BoundaryTerm`):
+        an unknown occurrence never has an effect that lets a message
+        through and always has the effects that block. A permission is not
+        activated and is ended; a prohibition is activated and not ended;
+        no institutional event is created; a power is not activated, is
+        ended, and is not exercised; an obligation is activated, not ended
+        and not fulfilled."""
         for _, when, _ in self.rules:
             _resolve_unknown(when, False)
         for norm in self.norms:
-            if norm.d.kind == "permission":
+            kind = norm.d.kind
+            if kind in ("permission", "power"):
                 _resolve_unknown(norm.trigger, False)
                 _resolve_unknown(norm.until, True)
-            elif norm.d.kind == "prohibition":
+            else:                       # prohibition, obligation
                 _resolve_unknown(norm.trigger, True)
                 _resolve_unknown(norm.until, False)
+            if kind in ("power", "obligation"):
+                _resolve_unknown(norm.content, False)
+
+    def _is_bearer(self, norm, performer, n: int) -> bool:
+        """The performer of a power: when the bearer has an index that the
+        instance does not bind, who the bearer is is unknown, and nobody
+        exercises the power (F.3 would take any member)."""
+        if norm.bearer_ref is not None and performer is not None \
+                and not self.ev.actor(norm.bearer_ref, n)[1]:
+            return False
+        return super()._is_bearer(norm, performer, n)
 
     def push(self, o: Observation) -> bool:
         """Append one observation and process it; True when the contract
@@ -435,11 +452,17 @@ class AgentsRuntime:
     """One logical enforcement point over the enforced contracts of a file."""
 
     def __init__(self, sos: SoSDefinition, trace: RunTrace,
-                 versions: dict | None = None) -> None:
+                 versions: dict | None = None, check: bool = True) -> None:
         if not G.agents_active(sos):
             raise NormsEvalError(
                 "the file does not declare the agent governance extension: add "
                 "'norms: 0.1' and 'agents: 0.1' under extensions: (Appendix G)")
+        # `check=False` is unsafe and meant for tests of the fail-closed
+        # resolution: it runs a file that `cadl check` rejects and creates
+        # instances that do not bind the indices of their parties.
+        self.check = check
+        if check:
+            _require_valid(sos, "the file")
         self.sos = sos
         self.policy = G.build_policy(sos)
         self.trace = trace
@@ -457,6 +480,7 @@ class AgentsRuntime:
         self._current: dict | None = None
         self._snapshot: dict[str, Any] = {}
         self._lineno = 0
+        self._checked: set[str] = set()
         self._known: set[str] = set()
         for line in trace.lines:
             self._known.update(line.obs.values)
@@ -558,8 +582,21 @@ class AgentsRuntime:
 
     # --- instances --------------------------------------------------------------
 
+    def _require_bindings(self, cid: str, name: str, bindings: dict) -> None:
+        """A contract instance binds every index variable of its parties."""
+        if not self.check:
+            return
+        for ref in self._contract(cid)["parties"]:
+            if ref["kind"] == "var" and ref["var"] not in bindings:
+                raise TraceError(
+                    f"line {self._lineno}: instance {name} of {cid} has no binding for "
+                    f"the index '{ref['var']}' of its party {ref['text']}; an instance "
+                    f"of an enforced contract binds every index of its parties "
+                    f"('bindings')")
+
     def _create(self, cid: str, name: str, bindings: dict, request: dict, t: float,
                 state: str | None = None) -> _Instance:
+        self._require_bindings(cid, name, bindings)
         inst = _Instance(cid, name, dict(bindings), dict(request), t)
         inst.state = state
         trace = Trace(observations=[], bindings=inst.bindings, request=inst.request,
@@ -592,6 +629,9 @@ class AgentsRuntime:
         if name not in self.versions:
             base = Path(self.trace.path).parent if self.trace.path else Path(".")
             self.versions[name] = load_version(base / name)
+        elif self.check and name not in self._checked:
+            _require_valid(self.versions[name], name)
+        self._checked.add(name)
         return self.versions[name]
 
     def _ended(self, inst: _Instance, t: float) -> None:
@@ -1017,6 +1057,8 @@ class AgentsRuntime:
 
     def _finish_amendment(self, name: str, new, policy, changed: list[str], t: float) -> None:
         self.sos, self.policy = new, policy
+        for inst in self._running():
+            self._require_bindings(inst.contract, inst.name, inst.bindings)
         self.amendments.append({"time": self._time(t), "file": name, "contracts": changed})
         self._event(t, "amendment", None, self._governing_instances(None, changed),
                     reason=name)
@@ -1189,12 +1231,31 @@ def _unique(items) -> list:
     return out
 
 
-def run(sos: SoSDefinition, trace: RunTrace, versions: dict | None = None) -> dict:
+def _require_valid(sos: SoSDefinition, what: str) -> None:
+    """Refuse a file with errors of `cadl check` (among them the rules G-1
+    to G-18, on which the runtime relies)."""
+    from .type_checker import type_check
+    result = type_check(sos)
+    if not result.ok:
+        errors = "\n".join(f"  {e}" for e in result.errors)
+        raise NormsEvalError(f"{what} has {len(result.errors)} type-check error(s); the "
+                             f"runtime does not run it:\n{errors}")
+
+
+def run(sos: SoSDefinition, trace: RunTrace, versions: dict | None = None,
+        check: bool = True) -> dict:
     """Replay a trace through the enforcement point of a file (G.5 to
     G.8). `versions` maps the value of an ``amend`` key to a parsed file;
     a value that is not in it is read as a path relative to the trace
-    file. Returns a JSON-serializable dict; see the README for its keys."""
-    return AgentsRuntime(sos, trace, versions).run()
+    file. Returns a JSON-serializable dict; see the README for its keys.
+
+    The file and every version it is amended to must pass `cadl check`,
+    and every contract instance must bind the indices of its parties;
+    otherwise NormsEvalError or TraceError is raised. ``check=False``
+    switches both tests off. It is **unsafe**: the runtime then relies on
+    its fail-closed resolution of unknown occurrences alone. It exists for
+    the tests of that resolution."""
+    return AgentsRuntime(sos, trace, versions, check).run()
 
 
 def run_files(cadl_path, trace_path) -> dict:

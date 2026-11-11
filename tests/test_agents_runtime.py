@@ -90,6 +90,13 @@ def audit(result: dict) -> list[dict]:
     return [r for r in result["audit"] if not housekeeping(r)]
 
 
+def run_unchecked(sos, run_trace, versions=None) -> dict:
+    """The runtime on a file that `cadl check` rejects, or with instances
+    that do not bind the indices of their parties: only its fail-closed
+    resolution of unknown occurrences protects such a run."""
+    return run(sos, run_trace, versions, check=False)
+
+
 def decisions(result: dict) -> list[tuple]:
     return [short(r) for r in result["audit"] if "decision" in r]
 
@@ -448,7 +455,7 @@ class TestTwoContracts:
             (2, m("AG", "OP", "approve", "h-1")),       # not the rule's message
             (3, m("OP", "AG", "approve", "h-2")),       # no such hold
             (4, m("OP", "AG", "approve", "h-1")),
-            (5, None, {"end": False})))
+            (5, None, {"end": False}), bindings={"i": 2}))
         assert [short(x) for x in audit(r)] == [
             (0, "AG>U:wipe", "escalate", "prohibition", ["no_wipe"], "h-1", None),
             (1, "SUP>AG:approve", "deny", "default", []),
@@ -1193,7 +1200,7 @@ def aim(sos, lines: list[str], seed: int, versions=None) -> list[str]:
     created before each message, and rewrite the hold id."""
     import random
     rng = random.Random(seed + 13)
-    first = run(sos, parse_run_trace(lines), dict(versions or {}))
+    first = run(sos, parse_run_trace(lines), dict(versions or {}), check=False)
     created, out, k = 0, [], 0
     for line in map(json.loads, lines):
         for msg_ in line.get("messages", []):
@@ -1260,7 +1267,9 @@ def random_runs() -> list[tuple[str, object, dict]]:
         for seed in (1, 2):
             make = random_host_trace if host else random_trace
             lines = make(sos, 1000 + 100 * k + seed)
-            out.append((f"{name}-{seed}", sos, run(sos, parse_run_trace(lines))))
+            # C5_SOURCE is rejected by G-17; it is run as an unchecked file.
+            out.append((f"{name}-{seed}", sos,
+                        run(sos, parse_run_trace(lines), check=name != "c5")))
     return out
 
 
@@ -1412,13 +1421,27 @@ class TestRandomTraces:
         import random
         from .agents_oracle import Model
         specs = json.loads((REVIEW / "stress_specs.json").read_text())
-        total, kinds = 0, set()
+        # With full bindings the runtime runs as `cadl agents-run` does.
+        # Instances without bindings (`{}`) and the rejected files y2 and y3
+        # need the unsafe mode: there the comparison is about the
+        # fail-closed resolution of unknown occurrences.
+        variants = []
         for name, spec in specs.items():
+            partial = any(b == {} for bs in spec.get("host", {}).values() for b in bs)
+            variants.append((name, spec, not partial and name not in ("Y2", "Y3")))
+            if partial and name not in ("Y2", "Y3"):
+                bound = dict(spec, host={c: [b for b in bs if b] or bs
+                                         for c, bs in spec["host"].items()})
+                if all(b for bs in bound["host"].values() for b in bs):
+                    variants.append((name + "-bound", bound, True))
+        assert [v[0] for v in variants if v[2]] == ["TG", "CC", "X2", "X3", "X1-bound"]
+        total, kinds = 0, set()
+        for name, spec, checked in variants:
             path = {"TG": EXAMPLE, "CC": CHANGE}.get(name, REVIEW / spec["path"])
             sos = parse_file(path)
             for seed in range(12):
                 lines = oracle_trace(random.Random(seed), spec, 45)
-                r = run(sos, parse_run_trace([json.dumps(x) for x in lines]))
+                r = run(sos, parse_run_trace([json.dumps(x) for x in lines]), check=checked)
                 model = Model(path.read_text(), host=tuple(spec.get("host", {})))
                 for line in lines:
                     t = line["t"]
@@ -1607,7 +1630,8 @@ class TestReleaseIsDecidedAgain:
                           + '          trigger: "SUP -> AG : arm"\n')
         r = replay(src, trace(
             (0, m("AG", "T", "wipe")), (1, m("SUP", "AG", "arm")),
-            (2, m("OP", "AG", "approve", "h-1")), (3, None, {"end": False})))
+            (2, m("OP", "AG", "approve", "h-1")), (3, None, {"end": False}),
+            bindings={"i": 2}))
         last = r["audit"][-1]
         assert (last["decision"], last["reason"], last["contracts"], last["norms"]) == \
             ("deny", "prohibition", ["C2"], ["C2.no_wipe2"])
@@ -1663,7 +1687,8 @@ class TestActorReferencesInEvents:
         # may_report names OP, and the ungoverned message changes nothing.
         r = replay(RICH, trace(
             (0, m("X", "AG", "freeze")), (1, m("AG", "M", "ping")),
-            (2, m("X", "AG", "approve", "h-1")), (3, None, {"end": False})))
+            (2, m("X", "AG", "approve", "h-1")), (3, None, {"end": False}),
+            bindings={"i": 2}))
         assert [x[2:4] for x in decisions(r)] == [
             ("allow", "ungoverned"), ("allow", "default"), ("allow", "ungoverned")]
         assert events(r) == []                      # no approval event was created
@@ -1685,7 +1710,7 @@ class TestApproverMessageIsGoverned:
             norms(proh("no_wipe", "AG", "AG -> T : wipe", "on_denied: { escalate_to: OP }")))
         errors = with_rule(res.errors, "G-17")
         assert len(errors) == 1 and "receiver 'X'" in errors[0]
-        assert "not covered by the parties" in errors[0]
+        assert "not covered by one reference in the parties" in errors[0]
 
     def test_c4_member_outside_an_indexed_party(self):
         from .test_agents_extension import check, with_rule
@@ -1833,7 +1858,7 @@ class TestGovernedObservations:
         # without the check, as a host that skips the check would.
         errors = [str(e) for e in type_check(parse(C5_SOURCE)).errors]
         assert len(errors) == 2 and all("(G-17)" in e for e in errors)
-        r = run(parse(C5_SOURCE), parse_run_trace(trace(
+        r = run_unchecked(parse(C5_SOURCE), parse_run_trace(trace(
             (0, m("R[3]", "AG", "lock")), (1, m("AG", "T", "read")),
             (2, m("R[2]", "AG", "lock")), (3, m("AG", "T", "read")),
             (4, m("X", "AG", "unlock")), (5, m("AG", "T", "read")),
@@ -1881,7 +1906,7 @@ class TestEventsAreCoveredByTheParties:
     def test_what_the_rule_prevents_at_run_time(self):
         # The last scenario of u2.py on the unchecked file: the non-party
         # ADMIN cannot freeze, and `stop` does not end may_x.
-        r = run(unchecked("y2.cadl"), parse_run_trace(trace(
+        r = run_unchecked(unchecked("y2.cadl"), parse_run_trace(trace(
             (0, None), (1, m("ADMIN", "AG", "freeze")), (2, m("AG", "TOOL", "xx")),
             (3, m("ADMIN", "AG", "stop")), (4, m("AG", "TOOL", "xx")),
             (5, None, {"end": False}))))
@@ -1941,7 +1966,7 @@ class TestUnboundIndexInEvents:
         assert not rule_errors(review("x1.cadl"), "G-18")
 
     def test_u1_unbound_index_does_not_activate_a_permission(self):
-        r = run(unchecked("y2.cadl"), parse_run_trace(trace(
+        r = run_unchecked(unchecked("y2.cadl"), parse_run_trace(trace(
             (0, None), (1, m("SUP[2]", "AG", "enable")), (2, m("AG", "TOOL", "read")),
             (3, None, {"end": False}))))
         assert decisions(r)[-1][2:4] == ("deny", "default")
@@ -1949,14 +1974,14 @@ class TestUnboundIndexInEvents:
         assert any("'k'" in w and "fail-closed" in w for w in r["warnings"])
 
     def test_u4_unbound_index_does_not_lift_a_prohibition(self):
-        r = run(unchecked("y2_u.cadl"), parse_run_trace(trace(
+        r = run_unchecked(unchecked("y2_u.cadl"), parse_run_trace(trace(
             (0, None, {"instances": [dict(contract="C", instance="a", bindings={"i": 1})]}),
             (1, m("AG", "TOOL", "act")), (2, m("SUP[2]", "AG", "lift")),
             (3, m("AG", "TOOL", "act")), (4, None, {"end": False}))))
         assert [x[2] for x in decisions(r)] == ["escalate", "allow", "escalate"]
 
     def test_bound_index_works_as_before(self):
-        r = run(unchecked("y2_u.cadl"), parse_run_trace(trace(
+        r = run_unchecked(unchecked("y2_u.cadl"), parse_run_trace(trace(
             (0, None, {"instances": [dict(contract="C", instance="a",
                                           bindings={"i": 1, "k": 2})]}),
             (1, m("SUP[1]", "AG", "lift")), (2, m("AG", "TOOL", "act")),
@@ -1980,7 +2005,7 @@ class TestUnboundIndexInEvents:
         # G.5: unknown is fail-closed in both directions.
         sos = parse(self.FAIL_CLOSED)
         assert len(rule_errors(sos, "G-18")) == 3
-        r = run(sos, parse_run_trace(trace(
+        r = run_unchecked(sos, parse_run_trace(trace(
             (0, [m("AG", "T", "read"), m("AG", "T", "write"), m("OP", "SUB", "g"),
                  m("SUB", "T", "read")]),
             (1, [m("R[3]", "AG", "stop"), m("R[3]", "AG", "lock"), m("R[3]", "OP", "end")]),
@@ -2057,7 +2082,7 @@ class TestSymbolicUpperBound:
         assert values == [s["result"] for s in r["steps"]]
 
     def test_u3_grant_to_a_non_member(self):
-        r = run(unchecked("y3.cadl"), parse_run_trace(trace(
+        r = run_unchecked(unchecked("y3.cadl"), parse_run_trace(trace(
             (0, [m("R[1]", "R[0]", "g"), m("R[0]", "TOOL", "act"), m("R[1]", "R[2]", "g"),
                  m("R[2]", "TOOL", "act")]), (1, None, {"end": False}))))
         assert [x[2:4] for x in decisions(r)] == [
@@ -2108,3 +2133,339 @@ class TestTimeBase:
                        "--trace", str(REVIEW / "ws_ne.jsonl")])
         err = capsys.readouterr().err
         assert status == 2 and "ROBOT[ 2 ]" in err and "concrete actor" in err
+
+
+# === Findings of the third review ================================================================
+# Root cause: an instance of an enforced contract that runs with an index
+# variable unbound. G-18 and the runtime now exclude it; the fail-closed
+# resolution stays as a second line for the unsafe mode of the API.
+
+E_ = (50, None, {"end": False})
+
+
+class TestEveryIndexIsBoundByAParty:
+    """P1 (1): G-18 for every index variable of an enforced contract."""
+
+    def test_g_g_power_with_an_index_that_no_party_binds(self):
+        errors = rule_errors(unchecked("g_g.cadl"), "G-18")
+        assert len(errors) == 2
+        assert any("the bearer: of norm 'pw'" in e for e in errors)
+        assert any("the content: of norm 'pw'" in e for e in errors)
+
+    def test_files_with_the_index_as_a_party_pass(self):
+        for name in ("w1.cadl", "g_ob.cadl", "w2.cadl", "x1.cadl", "lb.cadl"):
+            assert type_check(unchecked(name)).ok, name
+
+    @pytest.mark.parametrize("extra, part", [
+        ('counterparty: "R[j]"', "counterparty:"),
+        ('on_denied: { notify: "R[j]" }', "on_denied.notify:"),
+        ('on_denied: { escalate_to: "R[j]" }', "on_denied.escalate_to:"),
+        ('on_denied: { escalate_to: OP, fallback: "AG -> R[j] : ask" }', "on_denied.fallback:"),
+    ])
+    def test_references_outside_events(self, extra, part):
+        from .test_agents_extension import check, with_rule
+        blocks = (APPROVAL_RULES, norms(proh("no_wipe", "AG", "AG -> T : wipe", extra)))
+        errors = with_rule(check(*blocks).errors, "G-18")
+        assert len(errors) == 1 and part in errors[0] and "'j'" in errors[0]
+        fixed = [b.replace("R[j]", "R[i]") for b in blocks]
+        bound = '[OP, SUP, AG, SUB, T, "R[i]"]'
+        assert not with_rule(check(*fixed, parties=bound).errors, "G-18")
+
+    def test_bearer_and_content_of_every_kind(self):
+        from .test_agents_extension import check, with_rule
+        for kind in ("permission", "prohibition", "obligation", "power"):
+            entry = (f'- id: n\n  kind: {kind}\n  bearer: "R[i]"\n'
+                     f'  content: "R[i] -> T : read"\n')
+            errors = with_rule(check(norms(entry)).errors, "G-18")
+            assert len(errors) == 2, kind                 # bearer and content
+            ok = check(norms(entry), parties='[OP, SUP, AG, SUB, T, "R[i]"]')
+            assert not with_rule(ok.errors, "G-18"), kind
+
+    def test_the_former_form_of_the_rich_file_is_rejected(self):
+        # Parties `R[*]` with norms of `R[i]`: nothing in the file binds i.
+        old = RICH.replace('M, "R[i]"]', 'M, "R[*]"]')
+        assert old != RICH and len(rule_errors(parse(old), "G-18")) == 4
+        assert type_check(parse(RICH)).ok
+
+
+class TestInstancesBindTheIndicesOfTheirParties:
+    """P1 (2): the root fix in the runtime."""
+
+    ACT = m("AG", "TOOL", "act")
+
+    def test_default_instance_without_bindings_is_a_trace_error(self):
+        for name, var in (("w1.cadl", "k"), ("g_ob.cadl", "k"), ("w2.cadl", "i")):
+            with pytest.raises(TraceError) as err:
+                replay(review(name), trace((0, None), (1, self.ACT), E_))
+            text = str(err.value)
+            assert "line 1" in text and "instance default of C" in text
+            assert f"index '{var}'" in text, text
+
+    def test_host_created_instance_without_bindings(self):
+        with pytest.raises(TraceError, match="line 2: instance b of C has no binding"):
+            replay(review("w1.cadl"), trace(
+                (0, None, {"instances": [dict(contract="C", instance="a", bindings={"k": 1})]}),
+                (1, self.ACT, {"instances": [dict(contract="C", instance="b")]}), E_))
+
+    def test_cli_exit_status(self, capsys, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(trace((0, None), (1, self.ACT))) + "\n")
+        log = tmp_path / "audit.jsonl"
+        status = main(["agents-run", str(REVIEW / "w1.cadl"), "--trace", str(f),
+                       "--audit", str(log)])
+        err = capsys.readouterr().err
+        assert status == 2 and "has no binding for the index 'k'" in err and not log.exists()
+
+    def test_w1_with_the_binding_only_that_member_has_the_power(self):
+        # v2.py, P4: k = 1.
+        r = replay(review("w1.cadl"), trace(
+            (0, None), (1, m("SUP[2]", "AG", "pause")), (2, self.ACT),
+            (3, m("SUP[1]", "AG", "pause")), (4, self.ACT),
+            (5, m("SUP[2]", "AG", "bless")), (6, m("AG", "TOOL", "wipe")),
+            (7, m("SUP[1]", "AG", "bless")), (8, m("AG", "TOOL", "wipe")), E_,
+            bindings={"k": 1}))
+        tool = [x[2:4] for x in decisions(r) if x[1].startswith("AG>TOOL")]
+        assert tool == [("escalate", "prohibition"), ("allow", "permission"),
+                        ("deny", "default"), ("allow", "permission")]
+        # `SUP[2] -> AG : pause` is not the content `SUP[1] -> AG : pause` of
+        # the power: it is no act at all.
+        assert events(r) == []
+
+    def test_amendment_that_adds_an_index_to_the_parties(self):
+        v1 = source(norms(perm("p", "AG", "AG -> T : read")))
+        v2 = parse(source(norms(perm("p", "AG", "AG -> T : read")),
+                          parties='[OP, SUP, AG, SUB, T, "R[i]"]'))
+        with pytest.raises(TraceError, match="no binding for the index 'i'"):
+            replay(v1, trace((0, None), (1, None, {"amend": "v2"}), E_), versions={"v2": v2})
+
+
+class TestUnknownNeverLetsThrough:
+    """P1 (3) and P2: the fail-closed resolution for powers and obligations,
+    reachable only in the unsafe mode."""
+
+    ACT = m("AG", "TOOL", "act")
+
+    def w1(self, *rows) -> dict:
+        return run_unchecked(unchecked("w1.cadl"), parse_run_trace(trace((0, None), *rows, E_)))
+
+    def test_p1_unknown_performer_does_not_suspend_a_prohibition(self):
+        r = self.w1((1, self.ACT), (2, m("SUP[2]", "AG", "pause")), (3, self.ACT))
+        assert [x[2] for x in decisions(r)] == ["escalate", "allow", "escalate"]
+        assert norm_states(r)["no_act"][0] == "active"
+
+    def test_p1_unknown_performer_does_not_activate_a_permission(self):
+        r = self.w1((1, m("AG", "TOOL", "read")), (2, m("SUP[3]", "AG", "arm")),
+                    (3, m("AG", "TOOL", "read")))
+        assert [x[2:4] for x in decisions(r)] == [
+            ("deny", "default"), ("allow", "default"), ("deny", "default")]
+
+    def test_p1_no_institutional_event_and_no_power_through_it(self):
+        r = self.w1((1, m("SUP[2]", "AG", "halt")), (2, self.ACT),
+                    (3, m("SUP[2]", "AG", "bless")), (4, m("AG", "TOOL", "wipe")))
+        assert [x[2:4] for x in decisions(r) if x[1].startswith("AG>TOOL")] == [
+            ("escalate", "prohibition"), ("deny", "default")]
+        assert r["instances"][0]["institutional_events"] == []
+
+    def test_g_g_unchecked_file(self):
+        # The host binds k although no party does: then only SUP[1] has the
+        # power. Without the binding nobody has it.
+        for bindings, pausers in (({"k": 1}, {"SUP[1]"}), ({}, set())):
+            for who in ("SUP[1]", "SUP[3]"):
+                r = run_unchecked(unchecked("g_g.cadl"), parse_run_trace(trace(
+                    (0, None), (1, m(who, "AG", "pause")), (2, self.ACT), E_,
+                    bindings=bindings)))
+                paused = decisions(r)[-1][2:4] == ("allow", "permission")
+                assert paused == (who in pausers), (bindings, who)
+
+    def test_p2_unknown_occurrence_does_not_fulfil_an_obligation(self):
+        # g_ob.cadl: the content `AG -> SUP[k] : answer` with k unbound. The
+        # obligation is violated and its reparation, a prohibition, starts.
+        r = run_unchecked(unchecked("g_ob.cadl"), parse_run_trace(trace(
+            (0, None), (1, m("OP", "AG", "ask")), (2, m("AG", "SUP[3]", "answer")),
+            (20, m("AG", "TOOL", "read")), E_)))
+        assert decisions(r)[-1][2:5] == ("deny", "prohibition", ["lock"])
+        assert norm_states(r)["ob"] == ("violated", "violated")
+
+    def test_p2_with_the_binding_the_obligation_is_fulfilled(self):
+        r = replay(review("g_ob.cadl"), trace(
+            (0, None), (1, m("OP", "AG", "ask")), (2, m("AG", "SUP[3]", "answer")),
+            (3, m("AG", "SUP[2]", "answer")), (20, m("AG", "TOOL", "read")), E_,
+            bindings={"k": 2}))
+        assert norm_states(r)["ob"][0] == "fulfilled"
+        assert decisions(r)[-1][2:4] == ("allow", "permission")
+
+    def test_v4_w2_unchecked(self):
+        # Approvals that can never be created, a permission any member ends.
+        r = run_unchecked(unchecked("w2.cadl"), parse_run_trace(trace(
+            (0, None), (1, self.ACT), (2, m("OP", "W[1]", "approve", "h-1")),
+            (4, m("AG", "TOOL", "read")), (5, m("W[3]", "AG", "stop")),
+            (6, m("AG", "TOOL", "read")), (700, None, {"end": False}))))
+        assert [x[2:4] for x in decisions(r)] == [
+            ("escalate", "prohibition"), ("allow", "default"), ("allow", "permission"),
+            ("allow", "default"), ("deny", "default"), ("deny", "expired")]
+
+
+class TestEventsNameDeclaredMembers:
+    """P3 and the wording of G-17."""
+
+    def test_g_a_literal_index_outside_the_declared_set(self):
+        errors = rule_errors(unchecked("g_a.cadl"), "G-17")
+        assert len(errors) == 1 and "'SUP[7]'" in errors[0]
+        assert "outside the declared set" in errors[0]
+
+    @pytest.mark.parametrize("ref, count", [
+        ("R[3]", 0), ("R[4]", 1), ("R[0]", 1), ("R[2..3]", 0), ("R[2..4]", 1), ("R[0..2]", 1),
+    ])
+    def test_literal_indices_and_ranges(self, ref, count):
+        from .test_agents_extension import check, with_rule
+        res = check(norms(perm("p", "AG", "AG -> T : read", f'trigger: "{ref} -> AG : go"')))
+        errors = with_rule(res.errors, "G-17")
+        assert len(errors) == count
+        assert all("outside the declared set" in e for e in errors)
+
+    def test_g_c_coverage_is_by_one_party_reference(self):
+        # parties SUP[1..2] and SUP[3] together do not cover SUP[1..3].
+        errors = rule_errors(unchecked("g_c.cadl"), "G-17")
+        assert len(errors) == 2
+        assert all("one reference in the parties" in e for e in errors)
+
+    def test_tool_call_of_an_outsider_as_content(self):
+        from .test_agents_extension import check, with_rule
+        res = check(norms(proh("no_x", "X", "X -> T : wipe")))
+        errors = with_rule(res.errors, "G-17")
+        assert len(errors) == 1 and "sender 'X'" in errors[0]
+        assert "tool call of an actor that is not a party is governed" in errors[0]
+        assert "could never occur" not in errors[0]
+
+
+class TestApiRefusesInvalidFiles:
+    """N1 through the API: `run` and `run_files` check the file."""
+
+    def test_run_refuses_a_file_with_errors(self):
+        with pytest.raises(NormsEvalError, match=r"(?s)type-check error.*\(G-17\)"):
+            run(unchecked("y2.cadl"), parse_run_trace(['{"t": 0}']))
+        with pytest.raises(NormsEvalError, match=r"\(G-18\)"):
+            run(unchecked("g_g.cadl"), parse_run_trace(['{"t": 0}']))
+
+    def test_run_files(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text('{"t": 0}\n')
+        with pytest.raises(NormsEvalError, match="type-check error"):
+            run_files(REVIEW / "y2.cadl", f)
+
+    def test_amendment_to_an_invalid_version(self):
+        with pytest.raises(NormsEvalError, match="bad has 2 type-check"):
+            replay(review("x2.cadl"), trace((0, None), (1, None, {"amend": "bad"}), E_),
+                   versions={"bad": unchecked("g_c.cadl")})
+
+    def test_unsafe_mode_is_explicit(self):
+        r = run(unchecked("y2.cadl"), parse_run_trace(['{"t": 0}']), check=False)
+        assert r["contracts"] == ["C"]
+
+
+POWERS = REVIEW / "w1.cadl"
+
+
+class TestRandomPowersAndObligations:
+    """Generated traces with powers and obligations, which the reviewer's
+    model does not have."""
+
+    VOCAB = [("AG", "TOOL", "act"), ("AG", "TOOL", "read"), ("AG", "TOOL", "wipe"),
+             ("OP", "AG", "approve"), ("OP", "AG", "reject"), ("OP", "AG", "ask"),
+             ("SUP[k]", "AG", "pause"), ("SUP[k]", "AG", "arm"), ("SUP[k]", "AG", "halt"),
+             ("SUP[k]", "AG", "bless"), ("AG", "SUP[k]", "answer")]
+
+    def lines(self, seed: int, bindings) -> list[str]:
+        import random
+        rng = random.Random(seed)
+        rows, t, holds = [], 0, 0
+        for _ in range(200):
+            t += rng.choice([0, 1, 1, 2, 5, 30])
+            sender, receiver, name = rng.choice(self.VOCAB)
+            k = rng.choice(["1", "2", "3", "3", "9"])
+            args = [f"h-{rng.randint(max(1, holds - 1), holds + 1)}"] \
+                if name in ("approve", "reject") else []
+            holds += name == "act"
+            rows.append((t, m(sender.replace("k", k), receiver.replace("k", k), name, *args)))
+        return trace(*rows, (t + 1, None, {"end": False}), bindings=bindings)
+
+    def power_uses(self, r: dict) -> list[str]:
+        return [h["reason"] for n in r["instances"][0]["norms"] for h in n["history"]
+                if h["reason"].startswith("power ")]
+
+    @pytest.mark.parametrize("name", ["w1.cadl", "g_ob.cadl"])
+    def test_no_effect_through_a_performer_the_instance_does_not_determine(self, name):
+        effects = 0
+        for seed in range(10):
+            # Unbound: nobody exercises a power, no event, nothing fulfilled.
+            r = run_unchecked(unchecked(name), parse_run_trace(self.lines(seed, {})))
+            assert self.power_uses(r) == [], seed
+            inst = r["instances"][0]
+            assert all(e["name"] in ("approval", "rejection")
+                       for e in inst["institutional_events"])
+            assert all(n["state"] != "fulfilled" for n in inst["norms"]
+                       if n["kind"] == "obligation"), seed
+            assert all(x["message"]["name"] != "wipe" for x in r["audit"]
+                       if x.get("decision") == "allow")
+            # Bound: only SUP[k] acts, and an obligation is fulfilled only by
+            # a message to SUP[k] that was allowed.
+            for k in (1, 3):
+                r = replay(review(name), self.lines(seed, {"k": k}))
+                uses = self.power_uses(r)
+                assert all(u.endswith(f"exercised by SUP[{k}]") for u in uses), (seed, k)
+                effects += len(uses)
+                inst = r["instances"][0]
+                assert all(e["performer"] == f"SUP[{k}]" for e in inst["institutional_events"]
+                           if e["name"] in ("halted", "blessed"))
+                answered = any(x.get("decision") == "allow"
+                               and x["message"] == {"from": "AG", "to": f"SUP[{k}]",
+                                                    "name": "answer"}
+                               for x in r["audit"])
+                for n in inst["norms"]:
+                    if n["kind"] == "obligation" and n["state"] == "fulfilled":
+                        assert answered, (seed, k)
+                        effects += 1
+        assert effects >= (10 if name == "w1.cadl" else 1)
+
+
+class TestLowerBoundsUnderOpa:
+    """lb.cadl of the review: sets `R[2..N]`, `B[2..4]`, `Z[0..N]`, tool
+    servers `T[1..N]`; `decide` and the generated Rego agree."""
+
+    @pytest.mark.skipif(OPA is None, reason="the opa binary is not on PATH")
+    def test_decide_and_rego(self, tmp_path):
+        import itertools
+        import random
+        sos = review("lb.cadl")
+        policy = build_policy(sos)
+        actors = ["OP", "R", "T", "X[1]"] + [
+            f"{n}[{k}]" for n in "RBZT" for k in (0, 1, 2, 3, 4, 5, 10 ** 30)]
+        rng = random.Random(1)
+        inputs = []
+        for sender, receiver in itertools.product(actors, actors):
+            for name in ("act", "read", "g", "zz"):
+                if rng.random() > .12:
+                    continue
+                inp = {"message": {"from": sender, "to": receiver, "name": name}}
+                if rng.random() < .7:
+                    inp["instances"] = [
+                        {"contract": c, "instance": f"n{j}", "bindings": b, "in_force": {},
+                         "derived": [{"norm": "may_act", "holder": sender,
+                                      "chain": ["OP", sender]}] if c == "C" else []}
+                        for j, (c, b) in enumerate(
+                            (c, b) for c in ("C", "D")
+                            for b in rng.sample([{}, {"i": 0}, {"i": 2}, {"i": 5}],
+                                                rng.choice([0, 1, 2])))]
+                inputs.append(inp)
+        expected = [decide(policy, i) for i in inputs]
+        assert len(inputs) >= 400 and len({e["reason"] for e in expected}) >= 5
+        generate(sos, tmp_path, target="agent-rego")
+        f = tmp_path / "inputs.json"
+        f.write_text(json.dumps(inputs))
+        proc = subprocess.run(
+            [OPA, "eval", "--format", "json", "--data", str(tmp_path / "agent_policy.rego"),
+             "--input", str(f),
+             "[r | x := input[_]; r := data.cadl.agent_policy.result with input as x]"],
+            capture_output=True, text=True, timeout=300)
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout)["result"][0]["expressions"][0]["value"] == expected
