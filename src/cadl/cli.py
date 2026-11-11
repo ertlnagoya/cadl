@@ -64,6 +64,29 @@ def main(argv: list[str] | None = None) -> int:
     decide_cmd.add_argument("--format", choices=["text", "json"], default="text",
                             help="Output format (default: text)")
 
+    # agents-run command
+    run_cmd = subparsers.add_parser(
+        "agents-run",
+        help="Replay a recorded sequence of messages through the enforcement "
+             "point: decisions, holds, delegations and audit records "
+             "(agent governance extension, agents 0.1)",
+        description="Reference runtime of the agent governance extension "
+                    "(Appendix G, G.5 to G.8). It decides every message of the "
+                    "trace with the decision function of `agents-decide`, on the "
+                    "state left by the earlier messages: in-force flags from the "
+                    "norms engine, derived instances from grants and revocations, "
+                    "holds with approval, rejection and timeout. Deterministic "
+                    "and offline: the only clock is 't' of the trace. Exit "
+                    "status: 0 when the trace was replayed, 2 usage error.")
+    run_cmd.add_argument("file", type=Path, help="CADL file with enforced contracts")
+    run_cmd.add_argument("--trace", type=Path, required=True,
+                         help="Recorded messages (JSON Lines, the trace format of "
+                              "norms-eval with 'epoch' and 'instances')")
+    run_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                         help="Output format (default: text)")
+    run_cmd.add_argument("--audit", type=Path, default=None, metavar="OUT.jsonl",
+                         help="Write the audit records (G.8) as JSON Lines")
+
     # regime-map command
     regime_cmd = subparsers.add_parser("regime-map", help="Analyze regime transitions and build a regime map")
     regime_cmd.add_argument("file", type=Path, help="CADL file to analyze")
@@ -200,6 +223,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_sim_ir(args)
     elif args.command == "sim-gen":
         return _cmd_sim_gen(args)
+    elif args.command == "agents-run":
+        return _cmd_agents_run(args)
     elif args.command == "norms-eval":
         return _cmd_norms_eval(args)
     elif args.command == "norms-diff":
@@ -789,6 +814,42 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
     else:
         print(format_text(result))
     return 0 if result["ok"] else 1
+
+
+def _cmd_agents_run(args: argparse.Namespace) -> int:
+    """Exit status: 0 when the trace was replayed, whatever the decisions
+    are; 2 on a usage error. The audit file is written only after the
+    whole trace was replayed, so a failed run leaves no partial log."""
+    import json
+    from .agents_runtime import audit_lines, format_text, run_files
+    from .norms_eval import NormsEvalError, TraceError
+
+    def no_audit() -> None:
+        if args.audit is not None:
+            print(f"No audit file was written: the run did not complete "
+                  f"({args.audit} was not created or changed).", file=sys.stderr)
+
+    try:
+        result = run_files(args.file, args.trace)
+        log = "".join(line + "\n" for line in audit_lines(result))
+        report = (json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False)
+                  if args.format == "json" else format_text(result))
+    except TraceError as e:
+        print(f"Trace error: {args.trace}: {e}", file=sys.stderr)
+        no_audit()
+        return 2
+    except (NormsEvalError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        no_audit()
+        return 2
+    if args.audit is not None:
+        try:
+            args.audit.write_text(log, encoding="utf-8")
+        except OSError as e:
+            print(f"Error: cannot write the audit log: {e}", file=sys.stderr)
+            return 2
+    print(report)
+    return 0
 
 
 def _cmd_norms_diff(args: argparse.Namespace) -> int:

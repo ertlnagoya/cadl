@@ -1,0 +1,28 @@
+sos:
+  name: "X1"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - id: "OP[1..3]"
+      role: "approvers"
+      agent: { kind: human }
+    - id: AG
+      role: "agent"
+      agent: { kind: llm_agent }
+    - id: TOOL
+      role: "tool"
+      agent: { kind: tool_server, tools: [act, read] }
+  contracts:
+    - id: C1
+      parties: ["OP[i]", AG, TOOL]
+      enforcement: {}
+      counts_as:
+        - { when: "OP[i] -> AG : approve", creates: approval }
+        - { when: "OP[i] -> AG : reject", creates: rejection }
+      norms:
+        - id: no_act
+          kind: prohibition
+          bearer: AG
+          content: "AG -> TOOL : act"
+          on_denied: { escalate_to: "OP[i]", timeout: 10min }

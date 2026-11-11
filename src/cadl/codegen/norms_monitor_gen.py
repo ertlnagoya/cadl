@@ -113,6 +113,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass, field, replace
@@ -199,6 +200,7 @@ def build_model(sos: SoSDefinition) -> dict:
                          "under extensions:")
     return {
         "norms_version": "0.1",
+        "actors": [_encode(dataclasses.replace(a.id, loc=None)) for a in sos.actors],
         "contracts": [_contract_model(c) for c in sos.contracts],
         "parsed": _record_parses(sos.contracts),
     }

@@ -62,14 +62,22 @@ def item_text(expr: Any) -> str:
     return expr._item_text
 
 
+class _Actor:
+    """A declared actor: its `id` is the actor reference of the declaration."""
+
+    def __init__(self, ref: Any) -> None:
+        self.id = ref
+
+
 class _Model:
-    """The contracts of one version of the file."""
+    """The declared actors and the contracts of one version of the file."""
 
     def __init__(self, model: dict) -> None:
         if not isinstance(model, dict) or model.get("norms_version") != "0.1":
             raise MonitorError("not a model of a norms 0.1 monitor")
         for kind, table in model["parsed"].items():
             _PARSED[kind].update(table)
+        self.actors = [_Actor(_decode(a)) for a in model["actors"]]
         self.contracts = [self._contract(c) for c in model["contracts"]]
 
     @staticmethod
@@ -136,7 +144,9 @@ class NormsMonitor:
     def __init__(self, contract: str | None = None, bindings: dict | None = None,
                  request: dict | None = None, quantities: Any = None,
                  versions: dict | None = None) -> None:
-        self._contract = select_contract(_Model(MODEL), contract)
+        model = _Model(MODEL)
+        self._contract = select_contract(model, contract)
+        self._actors = declared_actors(model)
         self._trace = Trace(observations=[], bindings=dict(bindings or {}),
                             request=dict(request or {}))
         self._reader = _TraceReader(self._trace)
@@ -166,7 +176,7 @@ class NormsMonitor:
         eng = self._engine
         try:
             if eng is None:
-                eng = _Engine(self._contract, self._trace, self._load_version)
+                eng = _Engine(self._contract, self._trace, self._load_version, self._actors)
                 self._check_parsed()
             elif eng.lifecycle is not None:
                 eng._fill_states(n)
@@ -363,7 +373,7 @@ def replay(lines: Any, contract: str | None = None, versions: dict | None = None
     rec: Any = None
     for lineno, line in enumerate(lines, start=1):
         if line.strip():
-            rec = json.loads(line)
+            rec = loads_strict(line)
             m.observe(rec, where=f"line {lineno}")
     if not m.ended and rec.get("end") is not False:
         m.end()

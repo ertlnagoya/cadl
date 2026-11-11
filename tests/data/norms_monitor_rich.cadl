@@ -38,6 +38,7 @@ sos:
         - {when: "R[i].temp > 80", creates: overheat}
         - {when: "R[*] -> D : stop", creates: stopping}
         - {when: "demand > 3", creates: surge}
+        - {when: "R[2..3] -> D : ping", creates: pinged}
       norms:
         - id: deliver
           kind: obligation
@@ -96,6 +97,12 @@ sos:
           trigger: surge
           content: "demand <= 3 AND demand >= 0"
           deadline: 4s
+        - id: pong
+          kind: obligation
+          bearer: D
+          trigger: pinged
+          content: "D -> R[*] : pong"
+          deadline: 3s
         - id: pause
           kind: power
           bearer: D

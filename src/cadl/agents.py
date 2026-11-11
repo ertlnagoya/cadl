@@ -13,8 +13,10 @@ reference decision function:
 
 The decision function is stateless. Holds, release and expiry (G.6), the
 bookkeeping of grants, chains and revocations (G.7) and audit records
-(G.8) belong to a host runtime; the in-force flags of the norms that are
-not static and the valid derived instances come in through the input.
+(G.8) belong to a runtime; the in-force flags of the norms that are not
+static and the valid derived instances come in through the input.
+:mod:`cadl.agents_runtime` is the reference runtime: it replays a recorded
+trace and calls :func:`decide` for every message.
 """
 
 from __future__ import annotations
@@ -179,6 +181,29 @@ def is_static(contract: ContractDef, norm: NormDef) -> bool:
         if fb is not None:
             refs += [fb.sender, fb.receiver]
     return all(r["kind"] != "var" for r in refs)
+
+
+def ref_covered(ref: dict, parties: list) -> bool:
+    """Whether every actor that an actor reference can name matches one of
+    the party references (as `parse_ref` data), as G.5 reads `parties:`:
+    a party `A[i]` or `A[*]` stands for every member of `A`."""
+    for p in parties:
+        if p["name"] != ref["name"]:
+            continue
+        if p["kind"] == "plain" or ref["kind"] == "plain":
+            if p["kind"] == ref["kind"]:
+                return True
+        elif p["kind"] in ("all", "var"):
+            return True
+        elif p["kind"] == "index":
+            if ref["kind"] == "index" and ref["index"] == p["index"]:
+                return True
+        elif ref["kind"] == "index":
+            if p["lo"] <= ref["index"] <= p["hi"]:
+                return True
+        elif ref["kind"] == "range" and p["lo"] <= ref["lo"] and ref["hi"] <= p["hi"]:
+            return True
+    return False
 
 
 # --- Boundary policy ----------------------------------------------------------
@@ -385,8 +410,8 @@ def _check_input(inp) -> tuple[dict, dict, str, list | None]:
                     and all(isinstance(a, str) for a in d["chain"])):
                 raise AgentsInputError(
                     f"each entry of {where}.derived needs norm, holder and chain")
-        out.append({"contract": entry["contract"], "bindings": bindings,
-                    "in_force": in_force, "derived": derived})
+        out.append({"contract": entry["contract"], "instance": entry.get("instance"),
+                    "bindings": bindings, "in_force": in_force, "derived": derived})
     return actors[0], actors[1], name, out
 
 
@@ -483,6 +508,75 @@ def _unique(items) -> list:
     return out
 
 
+def message_kind(policy: dict, receiver: dict, name: str) -> str:
+    """G.4: ``tool_call``, ``undeclared_tool`` or ``ordinary``."""
+    decl = policy["actors"].get(receiver["name"])
+    if (decl is None or decl["kind"] != "tool_server"
+            or not is_member(policy, receiver["name"], receiver)):
+        return "ordinary"
+    return "tool_call" if name in decl["tools"] else "undeclared_tool"
+
+
+def governs(policy: dict, contract: dict, sender: dict, receiver: dict, name: str) -> bool:
+    """G.5: whether an enforced contract governs a message. A party
+    reference with an index bound by the contract instance is an unknown
+    match, which counts. A message to a tool server that is a party is
+    governed whatever its sender, also when the sender is not a party or
+    not a declared actor."""
+    def party(actor):
+        return any(ref_match(policy, ref, actor, {}) is not False
+                   for ref in contract["parties"])
+
+    to_tool_server = message_kind(policy, receiver, name) != "ordinary"
+    return party(receiver) and (to_tool_server or party(sender))
+
+
+def _running(contract: dict, instances: list | None) -> list:
+    """The running instances of a contract in a checked input. Without
+    `instances` in the input: one running instance, no index bound, no
+    derived instance (G.10)."""
+    if instances is None:
+        return [{"contract": contract["id"], "instance": None,
+                 "bindings": {}, "in_force": {}, "derived": []}]
+    return [i for i in instances if i["contract"] == contract["id"]]
+
+
+def _grounds(policy, contract, running, sender, receiver, name) -> list:
+    """Step 3.2: the prohibitions of a contract that apply to the message,
+    each with the running instances in which it applies. Unknown is
+    fail-closed: the prohibition applies."""
+    out = []
+    for n in contract["norms"]:
+        if n["kind"] != "prohibition":
+            continue
+        where = [i for i in running
+                 if _applies(policy, n, sender, receiver, name, i) is not False]
+        if where:
+            out.append((n, where))
+    return out
+
+
+def applying_prohibitions(policy: dict, inp: Any) -> list[dict]:
+    """The prohibitions that apply to the message of a policy input, over
+    all governing contracts and whatever the decision is: per prohibition
+    its contract, its norm entry of the policy, and the names of the
+    running instances in which it applies. In the order of declaration.
+
+    :func:`decide` lists the grounds of the determining contracts only; a
+    runtime needs all of them when it creates a hold and when it re-checks
+    a released message (G.6)."""
+    sender, receiver, name, instances = _check_input(inp)
+    out = []
+    for c in policy["contracts"]:
+        if not governs(policy, c, sender, receiver, name):
+            continue
+        for n, where in _grounds(policy, c, _running(c, instances),
+                                 sender, receiver, name):
+            out.append({"contract": c["id"], "norm": n,
+                        "instances": [i["instance"] for i in where]})
+    return out
+
+
 def decide(policy: dict, inp: Any) -> dict:
     """The decision function of G.5 for one message.
 
@@ -492,20 +586,13 @@ def decide(policy: dict, inp: Any) -> dict:
     """
     sender, receiver, name, instances = _check_input(inp)
 
-    decl = policy["actors"].get(receiver["name"])
-    tool_server = (decl is not None and decl["kind"] == "tool_server"
-                   and is_member(policy, receiver["name"], receiver))
-    tool_call = tool_server and name in decl["tools"]
+    kind = message_kind(policy, receiver, name)
+    tool_server = kind != "ordinary"
+    tool_call = kind == "tool_call"
 
-    # Step 1: ungoverned. A party reference with an index bound by the
-    # contract instance is an unknown match, which counts. A message to a
-    # tool server that is a party is governed whatever its sender, also
-    # when the sender is not a party or not a declared actor.
-    def party(c, actor):
-        return any(ref_match(policy, ref, actor, {}) is not False for ref in c["parties"])
-
+    # Step 1: ungoverned.
     governing = [c for c in policy["contracts"]
-                 if party(c, receiver) and (tool_server or party(c, sender))]
+                 if governs(policy, c, sender, receiver, name)]
     if not governing:
         return _result("allow", "ungoverned")
 
@@ -516,12 +603,7 @@ def decide(policy: dict, inp: Any) -> dict:
     # Step 3: each governing contract decides over its running instances.
     outcomes = []
     for c in governing:
-        if instances is None:
-            # No `instances` in the input: one running instance, no index
-            # bound, no derived instance (G.10).
-            running = [{"bindings": {}, "in_force": {}, "derived": []}]
-        else:
-            running = [i for i in instances if i["contract"] == c["id"]]
+        running = _running(c, instances)
         out = {"id": c["id"], "norms": [], "grounds": [], "provenance": [],
                "approvers": set()}
         outcomes.append(out)
@@ -533,13 +615,7 @@ def decide(policy: dict, inp: Any) -> dict:
             continue
         # 3.2 Prohibitions: unknown is fail-closed, the prohibition applies.
         escalable = True
-        for n in c["norms"]:
-            if n["kind"] != "prohibition":
-                continue
-            where = [i for i in running
-                     if _applies(policy, n, sender, receiver, name, i) is not False]
-            if not where:
-                continue
+        for n, where in _grounds(policy, c, running, sender, receiver, name):
             out["grounds"].append(n)
             for inst in where:
                 approver = _approver(n, inst)

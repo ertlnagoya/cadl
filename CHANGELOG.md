@@ -57,6 +57,63 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - The generated package of such a file can be imported where cadl is not
   installed: `NormsMonitor` works, and the other names, which need
   `cadl.codegen.runtime_support`, raise the import error when used.
+- `cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl]`
+  and `cadl.agents_runtime.run`: the reference runtime of the agent
+  governance extension (Appendix G, G.5 to G.8). It replays a recorded
+  sequence of messages through one logical enforcement point over the
+  enforced contracts of a file. For every message it derives the state
+  that the decision function needs (the in-force flags of the norms that
+  are not static from the verdict engine of `cadl norms-eval`, the valid
+  derived instances from the grants and revocations seen so far, the
+  running contract instances and their bindings), calls the decision
+  function of `cadl agents-decide`, and applies the result: an allowed
+  message becomes an observation of the norms engine, a denied or held
+  message does not. An `escalate` creates a hold (`h-1`, `h-2`, ...); an
+  `approval` or `rejection` of the approver with the hold id as first
+  argument, the timeout, the end of a contract instance or an amendment
+  closes it; an approved message is decided again at the time of the
+  approval and, if nothing denies it, released as the next observation; it
+  does not violate its grounds (G.6). The grounds of a hold are kept per
+  contract instance. In the second decision the approval stands in for
+  the permission and for the grounds only there: a prohibition that
+  applies in another contract instance, an ended contract instance of a
+  ground, or another governing contract that does not allow the message
+  any more (a revoked delegation, an ended instance, an amendment) denies
+  the release. An instance of an enforced contract observes a message
+  only when its contract governs it. Grants and
+  revocations keep the derived instances with their provenance chains,
+  `max_depth`, `to:` and `until:` (G.7). An obligation whose content the
+  contract itself denied or held is `excused`, and a violated prohibition
+  stays in force as G.5 says. The runtime is deterministic and offline:
+  its only clock is `t` of the trace.
+- Trace format of `cadl agents-run`: the JSON Lines of `cadl norms-eval`
+  for the whole enforcement point, with `epoch` (first line: the time of
+  `t = 0`, so that audit times are ISO 8601 time stamps) and `instances`
+  (host-created contract instances with `bindings`, `request`, `state`
+  and `end`).
+- Audit log (G.8), in the JSON output and as JSON Lines with `--audit`:
+  decision records with exactly the fields of G.8 (`time`, `message`,
+  `instances`, the result of G.10, `hold_id`, `outcome`), two per hold,
+  and event records (`event`, `norm`, `chain`, `holders`, `hold_id`,
+  `reason`) for grants, revocations, unauthorised acts, the end of a
+  derived instance for any other cause, the start and the end of a
+  contract instance, and an amendment. A closing record lists the contract
+  instances of the grounds of its hold. The log is reproducible; it is
+  written only when the whole trace was replayed; it has no hash chain or
+  signature, which G.8 does not ask for.
+- `cadl.agents.applying_prohibitions`, `governs` and `message_kind`: parts
+  of the decision function that the runtime needs on their own. `decide`
+  uses them and returns what it returned before.
+- `examples/agents_change_control.cadl` (a prohibition in force between a
+  trigger and an `until:`, a delegation with `max_depth: 1` and `until:`)
+  and five traces under `examples/traces/` for it and for
+  `examples/agents_tool_governance.cadl`.
+
+- `cadl check`, rule G-9: the sender and the receiver of the `when:`
+  message of a `counts_as:` rule that creates `approval` or `rejection`
+  must be parties of the contract, so that the contract governs the
+  approver's message. A file that `cadl` 0.3.21 accepted with such a rule
+  between other actors now has an error.
 
 ### Changed
 - `cadl codegen`: the warning for an `assume:` / `guarantee:` item with a
@@ -69,6 +126,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   processes one observation per call (`_Engine._step`), so that the
   generated monitor can use the same code. The public functions and the
   output of `cadl norms-eval` are unchanged.
+- `cadl.norms_eval`: the engine can be driven one observation at a time
+  (`_Engine._step`), and a norm can be exempted from the content of one
+  observation; `cadl agents-run` uses both. `cadl norms-eval` and its
+  output are unchanged.
 
 ### Fixed
 - `cadl model-export`: a transition reward whose action label no command
@@ -77,6 +138,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   action the model does not have, so such a file did not load. A reward
   structure left without items gets the item `true : (0);`, because Storm
   rejects an empty structure.
+- `cadl norms-eval`: an actor reference in a `trigger:`, an `until:`, the
+  `when:` of a `counts_as:` rule or a message content matched too many
+  actors. A range (`ROBOT[1..2]`) was read as `ROBOT[*]` and matched
+  `ROBOT[3]`; `ROBOT[*]` and an index that the instance does not bind
+  matched any actor of that name, also outside the declared set
+  (`ROBOT[9]` for `ROBOT[1..3]`). A reference now matches as F.3 of the
+  specification says: a range only its members, `A[*]` and an unbound
+  `A[i]` only members of the declared set, an undeclared actor never. The
+  verdicts on the six bundled traces are unchanged.
+- `cadl norms-eval`: a trace is rejected (exit status 2) when `t` is
+  `NaN`, infinite or larger than 1e10 in absolute value, when another
+  number of a line is `NaN` or infinite, or when `from`, `to` or `name` of
+  a message is not well-formed. Whitespace inside these names is no
+  longer removed: `"ROB OT"` was read as `ROBOT`.
 
 ## [0.3.21] — 2026-11-11
 

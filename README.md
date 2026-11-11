@@ -156,8 +156,10 @@ cadl codegen examples/robot_delivery.cadl --target opa -o /tmp/rego_out
 cadl codegen examples/sos_dsl_robot_delivery.cadl --target unity-csharp -o /tmp/unity_out
 
 # Agent governance extension (agents 0.1): decide one message at the boundary,
+# replay a recorded sequence of messages (holds, delegations, audit records),
 # and generate the boundary policy as Rego or Cedar
 cadl agents-decide examples/agents_tool_governance.cadl --input examples/agents_inputs/delete_file.json
+cadl agents-run examples/agents_tool_governance.cadl --trace examples/traces/agents_tool_governance_a_approved.jsonl
 cadl codegen examples/agents_tool_governance.cadl --target agent-rego -o /tmp/agent_rego
 cadl codegen examples/agents_tool_governance.cadl --target agent-cedar -o /tmp/agent_cedar
 
@@ -295,7 +297,88 @@ notify:      OPERATOR
 
 The input is a JSON object with `message` (`from`, `to`, `name`) and optionally `now` and `instances` (per running contract instance: `bindings`, `in_force` flags of the norms that are not static, and the valid `derived` instances with their chains); `examples/agents_inputs/` has the sample calls of the appendix. The exit status is 0 for `allow`, 1 for `deny`, 3 for `escalate`, and 2 for a usage error. A message to a tool server that is a party of an enforced contract is governed whatever its sender, so an actor that is not a party, or not declared at all, is denied by the tool default. Matching is three-valued, and an unknown is resolved fail-closed: an unknown prohibition applies, an unknown permission does not.
 
-The command is stateless. Holds and their release or expiry (G.6), grants, chains and revocations (G.7), and audit records (G.8) are not implemented: a host runtime keeps that state and supplies the in-force flags and the valid derived instances through the input.
+The command is stateless: the in-force flags and the valid derived instances come in through the input. `cadl agents-run` (below) keeps that state and calls the same decision function for every message of a recorded trace.
+
+#### Runtime on a Recorded Trace
+
+`cadl agents-run` is the reference runtime of the appendix (G.5 to G.8). It replays a recorded sequence of messages through one logical enforcement point over all enforced contracts of the file and computes the decision for every message, the holds and how they end, the delegation state, and the audit records. It is deterministic and offline: it does not run agents or tools, and its only clock is `t` of the trace.
+
+```bash
+cadl agents-run examples/agents_tool_governance.cadl \
+    --trace examples/traces/agents_tool_governance_a_approved.jsonl
+cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl]
+```
+
+For each message, in the order of the trace, the runtime (a) derives the state: the in-force flags of the norms that are not static from the verdict engine of `cadl norms-eval`, the valid derived instances from the grants and revocations seen so far, and the running contract instances with their bindings; (b) calls the decision function of `cadl agents-decide` on the policy input built from that state; (c) applies the decision: an allowed message becomes an observation of the norms engine for the instances of the contracts that govern it, a denied message does not, and an `escalate` creates a hold (`h-1`, `h-2`, ... in the order of creation); (d) appends the audit records. A hold ends when the approver's message creates `approval` or `rejection` through a `counts_as:` rule with the hold id as first argument (`approve("h-1")`), when its timeout passes, or when a contract instance of one of its grounds ends or its contract is amended. An approved message is decided again at the time of the approval and, if nothing denies it, released as the next observation; it does not violate the prohibitions it was held on. In that second decision the approval stands in for the permission and for the grounds only in the contract instances of the grounds: a prohibition that applies anywhere else, a contract instance of a ground that has ended, or another governing contract that no longer allows the message (a revoked delegation, an ended instance, an amendment) denies the release. The file must declare `norms: 0.1` and `agents: 0.1` and pass `cadl check`. The exit status is 0 when the trace was replayed, whatever the decisions are, and 2 on a usage error.
+
+**Trace.** The JSON Lines format of `cadl norms-eval` (`t`, `bindings`, `request`, `values`, `messages`, `state`, `amend`, `end`; see [Norm Verdicts on a Trace](#norm-verdicts-on-a-trace)), read for the whole enforcement point instead of one contract instance, with two more keys:
+
+```json
+{"t": 0, "epoch": "2026-11-10T09:00:00Z", "messages": [{"from": "OPERATOR", "to": "PLANNER", "name": "grant_read"}]}
+{"t": 180, "messages": [{"from": "PLANNER", "to": "FILES", "name": "delete_file"}]}
+{"t": 220, "messages": [{"from": "OPERATOR", "to": "PLANNER", "name": "approve", "args": ["h-1"]}]}
+```
+
+| Key | Meaning |
+|---|---|
+| `epoch` | First line only: the time of `t = 0` as an ISO 8601 time stamp. With it, the times of the audit records and `now` of the policy input are time stamps; without it they are the numbers of `t` |
+| `instances` | Host-created contract instances: a list of entries with `contract`, `instance`, and optionally `bindings`, `request`, `state`, `"end": true`. An entry that names a new instance creates it at this line; a later entry sets its lifecycle `state` or ends it. A contract that no entry names with an instance other than `default` has the single instance `default`, from the first line to the end, with the `bindings` and `request` of the first line |
+| `t` | A finite number of at most 1e10 in absolute value (seconds); `NaN`, `Infinity` and larger values are trace errors, also in `cadl norms-eval` |
+| `messages` | Decided one at a time, in the order written; `from` and `to` are concrete actors (`PLANNER`, `ROBOT[2]`) and `name` is an identifier, written without extra whitespace (`"PLAN NER"` is a trace error) |
+| `state` | Applies to every running instance of a contract with a `lifecycle:`; an entry of `instances` sets it for one instance. A terminal state ends the instance |
+| `amend` | A new version of the file. Each enforced contract whose definition changed is amended as in `cadl norms-eval`; its held holds are cancelled and its derived instances are tested against the new version (G.7). The set of enforced contracts must stay the same |
+| `end` | `true` ends every running instance; so does the last line, unless it says `"end": false` (holds that are still held then stay `held`). Messages on later lines are still decided and recorded: an ended instance does not come back, so a tool call of its contract is denied with `no_instance` |
+
+One line is processed in this order: holds whose deadline lies before `t` expire; instances are created; the time and the `values` of the line (and an `amend`) are one observation without message, so that a deadline or a window that has passed is settled before a message is decided; each message is decided, and an allowed one is one observation; a `state` change and an `end` are a last observation without message.
+
+**Output.** The text report shows the audit log, the holds, the derived instances and the final state of the norms of every contract instance. `--format json` gives one object:
+
+| Key | Content |
+|---|---|
+| `file`, `trace`, `agents_version`, `contracts` | What was replayed; the enforced contracts |
+| `summary` | `messages`, `allow`, `deny`, `escalate` (decisions of the messages), `holds` (count per final state and `held`), `released`, `audit_records` |
+| `audit[]` | The audit log (below) |
+| `steps[]` | Per message of the trace: `time`, `message` (with `args`), `input` (the policy input the runtime built, as for `agents-decide`), `result`, `hold_id` |
+| `releases[]` | Per approved hold: `time`, `hold_id`, `message`, `input` (the policy input at the approval), `grounds` (`contract`, `norm`, `instance`), `released` |
+| `holds[]` | `hold_id`, `state` (`held`, `approved`, `rejected`, `expired`, `cancelled`), `message`, `time`, `approver`, `deadline`, `contracts`, `norms`, `closed`, `released` (whether the message took effect) |
+| `delegations[]` | Every derived instance: `contract`, `instance`, `norm`, `holder`, `chain`, `state` (`active`, `discharged`), `valid`, `granted`, `ended`, `end_reason` |
+| `instances[]` | Per contract instance: `contract`, `instance`, `bindings`, `running`, `start`, `end`, `state`, and from the norms engine `norms[]` (as in `norms-eval`, plus `in_force`), `violations[]`, `institutional_events[]`, `unauthorised[]`, `ok` |
+| `amendments[]`, `warnings[]` | Amendments applied (`time`, `file`, `contracts`); warnings |
+
+**Audit log.** `--audit OUT.jsonl` writes the records as JSON Lines, in the order in which the enforcement point writes them; the same file and trace always give the same bytes. A *decision record* is the audit record of G.8: the result of the decision (`decision`, `reason`, `contracts`, `norms`, `provenance`, `escalate_to`, `timeout`, `fallback`, `notify`) with `time`, `message` (`from`, `to`, `name`), `instances` (the running instances of the governing contracts; in a closing record the contract instances of the grounds of the hold, running or not), `hold_id`, and `outcome`. An `escalate` gives two records with the same `hold_id`: the decision, and a closing record whose `outcome` is the final state of the hold and whose reason is `approved`, `rejected`, `expired` (with the deadline as `time`), or `cancelled`, or the reason of the denial when the second decision denies. An *event record* has `event` instead of `decision`, and the fields `time`, `event`, `message`, `instances`, `norm`, `chain`, `holders`, `hold_id`, `reason`:
+
+| `event` | Written when | `reason` |
+|---|---|---|
+| `grant` | A grant message was observed and conditions 1 to 4 of G.7 hold; `chain` and `holders` give the new derived instance | `null`, or `holder_exists` for the no-op of condition 5 |
+| `revoke` | A revoke message was observed; `holders` lists the discharged holders | `null`, or `no_effect` |
+| `unauthorised_grant` | A grant message failed one of the conditions 1 to 4 | The first that failed: `no_authority`, `not_in_to`, `in_chain`, `max_depth` |
+| `delegation_end` | A derived instance ended for another cause than a revoke message; one record per instance, with its `chain` and holder | `until`, `original_discharged`, `instance_end`, `amendment` |
+| `instance_start`, `instance_end` | A contract instance started or ended (`message` is `null`) | `null`; for the end `end` or `terminal_state` |
+| `amendment` | A new version took effect; `instances` lists the running instances of the amended contracts | The name of the new version as the trace gives it |
+| `unauthorised_approval`, `unauthorised_rejection` | An `approval` or `rejection` changed no hold | `unknown_hold`, `not_held`, `not_approver`, `other_instance` (not created in a contract instance of a ground) |
+| `unauthorised_act` | The norms engine recorded an unauthorised act (F.5, item 7) | `no_power` |
+
+```json
+{"time": "2026-11-10T09:03:00Z", "message": {"from": "PLANNER", "to": "FILES", "name": "delete_file"}, "instances": [{"contract": "ASSISTED_REPORTING", "instance": "default"}], "decision": "escalate", "reason": "prohibition", "contracts": ["ASSISTED_REPORTING"], "norms": ["ASSISTED_REPORTING.no_delete"], "provenance": [], "escalate_to": "OPERATOR", "timeout": 600000, "fallback": ["PLANNER -> TICKETS : create_ticket"], "notify": ["OPERATOR"], "hold_id": "h-1", "outcome": null}
+{"time": "2026-11-10T09:03:40Z", "message": {"from": "PLANNER", "to": "FILES", "name": "delete_file"}, "instances": [{"contract": "ASSISTED_REPORTING", "instance": "default"}], "decision": "allow", "reason": "approved", "contracts": ["ASSISTED_REPORTING"], "norms": ["ASSISTED_REPORTING.no_delete"], "provenance": [], "escalate_to": "OPERATOR", "timeout": null, "fallback": [], "notify": [], "hold_id": "h-1", "outcome": "approved"}
+```
+
+The audit file is written only after the whole trace was replayed: when a run fails, no file is written and the error message says so. Changes of the in-force flag of a norm have no record of their own; they follow from the recorded messages, the times, and the `values` of the trace. The log has no integrity protection (no hash chain or signature); G.8 does not ask for one.
+
+**Readings.** Where G.5 to G.8 leave a choice, the runtime reads them as follows.
+
+- A message is an observation only for the instances of the enforced contracts that govern it (G.5); a message that no enforced contract governs is allowed as `ungoverned` and observed by none of them.
+- A denied or held message is not an observation: the norms engine never sees it, so it triggers no norm, creates no institutional event, fulfils no obligation, violates no prohibition, and is no grant, revocation, approval or rejection. Time still passes: every line is first observed without its messages.
+- The time of a line is observed before its messages are decided, so a prohibition whose window has closed no longer applies, and an obligation whose deadline has passed is already `violated`, when a message of that time is decided.
+- The grounds of a hold are kept per contract instance. An `approval` or `rejection` closes a hold only when it was created in a contract instance of a ground; one is enough. The same message creating the event in several instances counts once.
+- A closing record with the reason `rejected`, `expired` or `cancelled` keeps the `contracts`, `norms`, `escalate_to`, `fallback` and `notify` of the hold; `timeout` is `null` in every closing record. When the second decision denies an approved message, the record has the result of that denial and the outcome `approved`.
+- The second decision of an approved message never creates a second hold: a contract that would escalate denies. Its record lists every contract that denies, with the first of the reasons `no_instance`, `prohibition`, `default`.
+- The `until:` of a delegation ends the derived instances that are active when it occurs; a later grant creates a new one.
+- A violated obligation is `excused` when a matching message of its bearer was denied by its own contract, or held on a ground of it and not released, between its activation and its deadline (or, without a deadline, the violation). Matching is that of the boundary: sender, receiver and name.
+- After a violation, the window clock of a prohibition stops while it is suspended, as before the violation.
+- An amendment applies to the enforced contracts whose definition differs between the two versions.
+
+`examples/traces/` has three traces for `examples/agents_tool_governance.cadl`: the three calls of G.12, with a call through a delegation chain, an escalation that is approved, and a denial after a revocation (a); a rejection, the fallback, and a hold cancelled at the end (b); an undeclared tool, a timeout, and a late approval (c). `examples/agents_change_control.cadl` has a prohibition that is in force only between a trigger and an `until:`, and a delegation with `max_depth: 1` and an `until:`; its traces show approval, rejection and expiry during a freeze (a), and the depth limit and the end of a delegation (b).
 
 ### Regime Transitions
 
@@ -421,11 +504,11 @@ The file must declare `norms: 0.1` and pass `cadl check`. `--contract` is needed
 
 | Key | Meaning |
 |---|---|
-| `t` | Time in seconds (required); `now` in predicates |
+| `t` | Time in seconds (required); `now` in predicates. A finite number of at most 1e10 in absolute value |
 | `bindings` | First line only: the indices the instance binds (`ROBOT[i]` is read as `ROBOT[2]`) |
 | `request` | First line only: the fields of `request` |
 | `values` | Updates of the snapshot, keyed by the name as written in predicates (`ROBOT[2].battery`, `delivery_time`); a value stays until it changes |
-| `messages` | Messages sent at this observation: `from`, `to`, `name`, optional `args`. A message event matches on sender, receiver and name; when the CADL text gives arguments (`ack(accepted)`), they must equal `args` |
+| `messages` | Messages sent at this observation: `from`, `to`, `name`, optional `args`; `from` and `to` are concrete actors (`DISPATCHER`, `ROBOT[2]`) and `name` an identifier, written without extra whitespace. A message event matches on sender, receiver and name; when the CADL text gives arguments (`ack(accepted)`), they must equal `args`. An actor reference matches as F.3 says: `ROBOT[1..2]` only `ROBOT[1]` and `ROBOT[2]`, `ROBOT[*]` and an unbound `ROBOT[i]` only members of the declared set, an undeclared actor never |
 | `state` | Lifecycle state of the instance after this observation; it stays until it changes and starts as `lifecycle.initial`. Predicates of an observation read the state before it (step 6 of F.5 comes last) |
 | `amend` | Path of a new version of the CADL file, relative to the trace file: the contract is amended at this observation (see below) |
 | `end` | `true` ends the instance here. It also ends at the first terminal `state`, and otherwise at the last line, unless that line says `"end": false`: the trace is then a prefix and nothing is settled |
@@ -572,7 +655,7 @@ The type checker (`cadl check`) validates:
 11. **Norms static semantics** (Appendix F, F.7; only when the file declares `norms: 0.1`) — norm ids are identifiers, unique in the contract, and differ from the institutional events named by `creates:` (N-1); `kind:` is `obligation`, `permission`, `prohibition`, or `power` (N-2); `bearer:` and `counterparty:` are declared actors without a wildcard or range (N-3); `deadline:` is a duration, and `deadline:` and `on_violation:` belong to obligations and prohibitions (N-4); `effects:` belong to powers, which need at least one, and name other norms of the contract (N-5); a `reparation:` is an obligation or prohibition without `trigger:`, and reparations form no cycle (N-6); `on_violation.transition` is a state of the contract's `lifecycle:` (N-7); the actors of a message event are declared, and a power is exercised by an institutional event created from a message or by a message its bearer sends (N-9); `within(d, p)`, `throughout(d, p)`, and `until(p, q, d)` have a duration literal `d > 0` and appear only in `assume:`, `guarantee:`, and a norm's `content:` (N-10); `on_amendment: {transform: X}` names an identifier (N-11). Warnings: a norm id used as a whole `trigger:` / `until:` / `content:` (N-8), a permission and a prohibition with the same bearer and content (N-12), a bearer or counterparty that is not a party (N-3), and an obligation or prohibition whose message is not sent by its bearer (N-9). Without the declaration, `norms:` and `counts_as:` get one warning as undeclared extension keys and are neither checked nor lowered to the IR
 12. **Stochastic model static semantics** (Appendix H, H.10; only when the file declares `stochastic: 0.1`) — `model:` has `variables:` and `commands:`, and `kind:` is `dtmc` (S-1); ids, label names, enumeration literals, and action labels are identifiers, are no keywords, and are declared once in their namespace, a label is not named `init` or `deadlock`, and the exported names `x_L` of enumeration literals are distinct from every declared name and from each other (S-2); `from:` names `alpha`, `beta`, or `lambda` of a declared contract or a numeric entry of `context.environment` (S-3); `range:` is `[lo, hi]`, required except for a parameter bound to a contract, and every value lies in it (S-4); a variable is `bool`, `"[lo..hi]"`, or `"{A, B}"` with an `init:` of its domain (S-5); every state predicate conforms to the grammar and is well typed (S-6); an update assigns declared variables values of their type that stay in the domain wherever the guard is true (S-7); probabilities are numbers, expressions over parameters, or `rest`, at most one `rest` per command, and they sum to exactly 1 (S-8); at most one command is enabled in any state of any design (S-9); `model.regimes:` and `when:` name regimes of the file, and need `transitions:` (S-10); every parameter has a fixed value under every design, where probabilities lie in `[0, 1]` and rewards are not negative (S-11); a reward structure has items whose `action:` labels a command and whose `value:` mentions no parameter opened by a regime map (S-12); a property conforms to the property grammar, with `R` only over `F` without a step bound and thresholds in range (S-13); a regime map has one to four open parameters, at least two regimes, one objective that is a query, a threshold constraint, a resolution in `(0, 1)`, and designs that are well-defined at the corner points of its region (S-14). S-7 and S-9 enumerate the state space (at most 200 000 states). Warnings: two parameters with the same source (S-3) and a regime without an entry in `model.regimes:` (S-10). Informational: the keys and values reserved for a later version (S-15). Without the declaration, `model:` gets one warning as an undeclared extension key and is not checked, lowered to the IR, or exported
 
-12. **Agent governance static semantics** (Appendix G, G.9; only when the file declares `agents: 0.1`) — the file also declares `norms: 0.1` (G-1); `agent:` has a `kind:` of `llm_agent`, `tool_server`, `human`, or `service` and a `protocol:` that is a name (G-2); `tools:` belongs to a tool server, which lists at least one, and tool names are unique identifiers (G-3); a message event whose receiver is a tool server names one of its tools (G-4; a warning for a protocol step); `enforcement.default` is `deny` or `allow` and `enforcement.point` is `caller`, `receiver`, or `gateway` (G-5); in an enforced contract the sender of the message content of a permission or prohibition is its bearer (G-6); `on_denied:` belongs to a prohibition with a message content in an enforced contract, has at least one key, and its `timeout:` is a duration greater than zero that requires `escalate_to:` (G-7); `escalate_to:` and `notify:` name single declared actors, and `escalate_to:` names a party other than the bearer (G-8); a contract with `escalate_to: A` has a `counts_as:` rule that creates `approval` from a message of `A`, and `approval` and `rejection` are reserved in an enforced contract (G-9); a `fallback:` is a message event of the bearer to a declared actor that differs from the prohibited message (G-10); `delegations:` belongs to an enforced contract, and each entry names one permission with a message content whose bearer has no bound index (G-11), lists declared actors other than tool servers under `to:`, and has a `max_depth:` of at least 1 (G-12); `grant:` and `revoke:` are identifiers that differ from each other, from `approval` and `rejection`, and from the tools of the parties (G-13). Warnings: `escalate_to:` without `timeout:` (G-7), an approver that is not `human` (G-8), no rule for `rejection` (G-9), the bearer listed under `to:` (G-12), a permission or prohibition whose content is not a message event or has arguments (G-14), tools left open by `default: allow` and a tool server that is a party of no enforced contract (G-15), and a message the contract needs but would itself deny (G-16). Without the declaration, `agent:`, `enforcement:`, `delegations:`, and `on_denied:` get one warning as undeclared extension keys and are neither checked nor lowered to the IR
+12. **Agent governance static semantics** (Appendix G, G.9; only when the file declares `agents: 0.1`) — the file also declares `norms: 0.1` (G-1); `agent:` has a `kind:` of `llm_agent`, `tool_server`, `human`, or `service` and a `protocol:` that is a name (G-2); `tools:` belongs to a tool server, which lists at least one, and tool names are unique identifiers (G-3); a message event whose receiver is a tool server names one of its tools (G-4; a warning for a protocol step); `enforcement.default` is `deny` or `allow` and `enforcement.point` is `caller`, `receiver`, or `gateway` (G-5); in an enforced contract the sender of the message content of a permission or prohibition is its bearer (G-6); `on_denied:` belongs to a prohibition with a message content in an enforced contract, has at least one key, and its `timeout:` is a duration greater than zero that requires `escalate_to:` (G-7); `escalate_to:` and `notify:` name single declared actors, and `escalate_to:` names a party other than the bearer (G-8); a contract with `escalate_to: A` has a `counts_as:` rule that creates `approval` from a message of `A`, `approval` and `rejection` are reserved in an enforced contract, and the message of a rule that creates them goes from a party to a party (G-9); a `fallback:` is a message event of the bearer to a declared actor that differs from the prohibited message (G-10); `delegations:` belongs to an enforced contract, and each entry names one permission with a message content whose bearer has no bound index (G-11), lists declared actors other than tool servers under `to:`, and has a `max_depth:` of at least 1 (G-12); `grant:` and `revoke:` are identifiers that differ from each other, from `approval` and `rejection`, and from the tools of the parties (G-13). Warnings: `escalate_to:` without `timeout:` (G-7), an approver that is not `human` (G-8), no rule for `rejection` (G-9), the bearer listed under `to:` (G-12), a permission or prohibition whose content is not a message event or has arguments (G-14), tools left open by `default: allow` and a tool server that is a party of no enforced contract (G-15), and a message the contract needs but would itself deny (G-16). Without the declaration, `agent:`, `enforcement:`, `delegations:`, and `on_denied:` get one warning as undeclared extension keys and are neither checked nor lowered to the IR
 
 It also reports, without failing the check, a `codegen:` target that `cadl codegen` cannot emit (warning), an extension name it does not know, and a `motivation:` block, which it keeps and passes on in `cadl sim-ir` but does not interpret (informational).
 
@@ -619,7 +702,8 @@ This generates the IR JSON, the Unity C# tree, and drops the latter into the Uni
 | `raspimouse_c_sos.cadl` | Raspimouse swarm (C-SoS) | Collaborative | Local DirectionDijkstra + central verification, discrete-time sync |
 | `raspimouse_mcp_sos.cadl` | Raspimouse swarm (MCP-SoS) | Acknowledged | LLM-controlled via MCP tools, Static/Dynamic path modes, 3 regimes |
 | `sos_dsl_robot_delivery.cadl` | Robot delivery with the SoS-DSL extension | Acknowledged | Contract lifecycle (7 states), 3 monitors; the example used by the hands-on course |
-| `agents_tool_governance.cadl` | LLM planner, sub-agent and two tool servers (agents 0.1) | — | Enforced contract, escalation to a human, delegation with provenance; sample inputs in `agents_inputs/` |
+| `agents_tool_governance.cadl` | LLM planner, sub-agent and two tool servers (agents 0.1) | — | Enforced contract, escalation to a human, delegation with provenance; sample inputs in `agents_inputs/`, traces for `cadl agents-run` in `traces/` |
+| `agents_change_control.cadl` | Owner, lead agent, two workers and a repository (agents 0.1) | — | A prohibition in force between a trigger and an `until:`, delegation with `max_depth: 1` and `until:`; traces for `cadl agents-run` in `traces/` |
 
 ### Demo Scripts
 
@@ -654,6 +738,7 @@ src/cadl/
   iec62853.py          IEC 62853-oriented dependability summary
   unparse.py           Expression AST back to CADL source text
   norms_eval.py        Verdicts of the norms extension on a recorded trace
+  agents_runtime.py    Runtime of the agent governance extension: decisions, holds, delegations and audit records on a trace
   norms_diff.py        Effect of an amendment on the norms (two versions compared)
   cli.py               Command-line interface
   codegen/
@@ -728,6 +813,7 @@ tests/
   test_codegen_deterministic.py   Generated code is identical across runs
   test_keyword_boundaries.py      Keywords are not split out of longer names
   test_agents_extension.py        Agent governance extension: G-1 to G-16, decisions, agent-rego / agent-cedar
+  test_agents_runtime.py          Runtime of the agent governance extension (`cadl agents-run`): holds, delegations, audit records
 
 examples/
   robot_delivery.cadl        Robot delivery SoS (Acknowledged type)
@@ -767,7 +853,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | SoS-DSL extension (`lifecycle:` / `monitors:`) and Unity C# generation | Available |
 | Norms extension: static checks, and verdicts and amendments on a recorded trace (`cadl norms-eval`, `cadl norms-diff`) | Available |
 | Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available (Solidity, OPA and Unity C# do not monitor norms; no translation to a model checker) |
-| Agent governance extension (agents 0.1): checks, decision function, Rego / Cedar boundary policies | Available (the stateful runtime of holds, delegations and audit is not implemented) |
+| Agent governance extension (agents 0.1): checks, decision function, runtime on a recorded trace (holds, delegations, audit records; `cadl agents-run`), Rego / Cedar boundary policies | Available (the runtime is an offline reference: it replays a trace and is not connected to a protocol) |
 | `model_check` / `simulation` / `proof` verification methods | Not supported yet (reported explicitly) |
 
 ## Related Projects

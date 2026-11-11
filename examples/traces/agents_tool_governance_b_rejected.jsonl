@@ -1,0 +1,4 @@
+{"t": 0, "epoch": "2026-11-10T09:00:00Z", "messages": [{"from": "PLANNER", "to": "FILES", "name": "delete_file"}]}
+{"t": 10, "messages": [{"from": "OPERATOR", "to": "PLANNER", "name": "reject", "args": ["h-1"]}]}
+{"t": 20, "messages": [{"from": "PLANNER", "to": "TICKETS", "name": "create_ticket"}]}
+{"t": 30, "messages": [{"from": "PLANNER", "to": "FILES", "name": "delete_file"}]}

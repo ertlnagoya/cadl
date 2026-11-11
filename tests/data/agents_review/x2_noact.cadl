@@ -1,0 +1,50 @@
+sos:
+  name: "X2"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+  actors:
+    - id: OP
+      role: "approver"
+      agent: { kind: human }
+    - id: OWNER
+      role: "owner of B"
+      agent: { kind: human }
+    - id: AG
+      role: "agent"
+      agent: { kind: llm_agent }
+    - id: TOOL
+      role: "tool"
+      agent: { kind: tool_server, tools: [read, other] }
+  contracts:
+    - id: CA
+      parties: [OP, AG, TOOL]
+      enforcement: {}
+      counts_as:
+        - { when: "OP -> AG : approve", creates: approval }
+        - { when: "OP -> AG : reject", creates: rejection }
+      norms:
+        - id: no_act
+          kind: prohibition
+          bearer: AG
+          content: "AG -> TOOL : other"
+          on_denied: { escalate_to: OP, timeout: 10min }
+    - id: CB
+      parties: [OWNER, AG, TOOL]
+      enforcement: {}
+      norms:
+        - id: owner_act
+          kind: permission
+          bearer: OWNER
+          content: "OWNER -> TOOL : other"
+        - id: owner_read
+          kind: permission
+          bearer: OWNER
+          content: "OWNER -> TOOL : read"
+        - id: ag_read
+          kind: permission
+          bearer: AG
+          until: "OWNER -> AG : stop"
+          content: "AG -> TOOL : read"
+      delegations:
+        - { norm: owner_act, to: [AG], grant: grant_act, revoke: revoke_act }

@@ -1351,6 +1351,19 @@ class TypeChecker:
                         f"escalate_to: of a prohibition of the contract; the name "
                         f"is reserved in an enforced contract (G-9)", rule.loc,
                     )
+                    continue
+                # The approver's message has to be governed by the contract,
+                # or no instance of it observes the message.
+                from .agents import _party_ref, ref_covered
+                parties = [_party_ref(p) for p in contract.parties]
+                for role, ref in (("sender", m.sender), ("receiver", m.receiver)):
+                    if not ref_covered(ref, parties):
+                        self.result.add_error(
+                            f"The counts_as rule that creates '{rule.creates}' in {ctx} "
+                            f"has the {role} '{ref['text']}', which is not a party of "
+                            f"the contract: the contract does not govern the message, "
+                            f"so it cannot create the event (G-9)", rule.loc,
+                        )
 
         self._check_delegations(contract, ctx, events, norm_ids)
 

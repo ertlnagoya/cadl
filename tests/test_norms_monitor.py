@@ -174,7 +174,7 @@ class TestGeneratedModule:
                 assert node.level == 0, "relative import"
                 modules.add(node.module.split(".")[0])
         assert modules <= {"__future__", "argparse", "copy", "dataclasses", "json", "re",
-                           "sys", "typing"}, modules
+                           "math", "sys", "typing"}, modules
 
     def test_is_python_3_9_syntax(self):
         source = generate_norms_monitor_module(parse_file(EXAMPLE))
@@ -448,7 +448,9 @@ _ROBOT = {
         ("ROBOT[2]", "DISPATCHER", "charging_request", None),
         ("ROBOT[2]", "DISPATCHER", "swap_request", None),
         ("ROBOT[2]", "ROBOT[2]", "replan_command", None),
-        ("ROBOT [2]", "DISPATCHER", "failure_report", None),
+        ("INTRUDER", "ROBOT[2]", "route_assignment", None),      # not declared
+        ("DISPATCHER", "ROBOT", "replan_command", None),         # the set, not a member
+        ("ROBOT[0]", "DISPATCHER", "failure_report", None),
     ],
     "values": {
         "DISPATCHER.is_operational": [True, True, True, False, None],
@@ -469,6 +471,11 @@ _RICH = {
         ("R[1]", "D", "sorry", None), ("R[1]", "D", "noise", None), ("R[1]", "D", "rest", None),
         ("R[1]", "D", "stop", None), ("R[2]", "D", "stop", None), ("R[2]", "D", "done", None),
         ("R[1]", "R[1]", "abort", None), ("R[1]", "D", "pause", None), ("D", "R[2]", "pause", None),
+        # actor ranges: R is R[1..3]; `pinged` is created by R[2..3] only
+        ("R[1]", "D", "ping", None), ("R[2]", "D", "ping", None), ("R[3]", "D", "ping", None),
+        ("R[7]", "D", "ping", None), ("R[7]", "D", "stop", None), ("Z", "D", "stop", None),
+        ("R", "D", "stop", None), ("D", "R[2]", "pong", None), ("D", "R[7]", "pong", None),
+        ("D", "R", "pong", None), ("R[7]", "D", "done", None),
     ],
     "values": {
         "D.up": [True, True, True, False, None],
