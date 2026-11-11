@@ -6,6 +6,45 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `cadl norms-check FILE [--contract ID] [--bindings i=n] [--members SET=n]
+  [--step DURATION] [--horizon N] [--export DIR] [--format text|json]`:
+  design-time checking of the norms of one contract instance by a model
+  checker (Appendix F, F.12; new module `cadl.norms_check`). The norms
+  are translated into an MDP in the PRISM language whose environment
+  chooses, at each observation (one every step, the greatest common
+  divisor of the durations by default), the message events, one class of
+  values per quantity (the classes that the literals of the predicates
+  cut the domain into, and no value) and the end of the instance; one
+  transition is the six steps of F.5. PRISM (`prism` on PATH, explicit
+  engine) answers per norm whether it can be activated, violated and
+  fulfilled, whether it is violated in every instance that runs to the
+  horizon, whether every activation can be kept, which pairs of
+  obligations and prohibitions are in conflict, whether each power can
+  be exercised and each reparation activated. Every "possible" answer
+  comes with a witness trace that the command evaluates with the engine
+  of `cadl norms-eval` (two for a conflict). `--export` writes the model,
+  the two property files and the witnesses. Predicates with
+  quantifiers, aggregates, arithmetic or two quantities, `request`,
+  `now`, `state` and amendments are not translated (the norm, and the
+  norms that depend on it, are reported with the reason). Without PRISM
+  the command reports that nothing was checked (exit status 0). Exit
+  status 1 on a finding, 2 on a usage error, refusal or timeout, 3 when a
+  witness is not confirmed. `--timeout SECONDS` (default 600) bounds all
+  runs of PRISM together; `--require-checker` makes a missing PRISM an
+  error (exit status 2). An activation that cannot be kept is asked in
+  the state before the activating observation, so an obligation with a
+  deadline of 0 s whose content may come at its activation is not
+  reported; its witness is confirmed for every choice at that
+  observation. The classes of values assume values of the type of the
+  literals, which the report notes. `examples/norms_check_conflict.cadl` shows a
+  conflict, a reparation that cannot be kept and a power that is never
+  exercised. The translation is tested differentially against
+  `cadl norms-eval` on random paths and on every path of at most two observations of one contract, with an interpreter
+  of the generated PRISM text that is itself compared with the PRISM
+  simulator.
+
 ## [0.3.24] — 2026-11-11
 
 Extensions of the norms, strategic model and agents tooling. Wildcard

@@ -1,0 +1,88 @@
+# Norms Extension Demo for Design-Time Checking (Appendix F, F.12)
+#
+# A contract with three design errors that `cadl norms-check` finds over
+# all behaviours of one contract instance, before any trace exists:
+#
+# - report_status and radio_silence are in conflict: while the dispatcher
+#   has imposed radio silence, a status request can only be answered by
+#   violating the prohibition, and keeping the prohibition violates the
+#   obligation at its deadline;
+# - apologise, the reparation of report_status, has a deadline of 0s and is
+#   judged from the observation after its activation: once activated, it
+#   is always violated;
+# - the power audit belongs to AUDITOR, but the counts-as rule makes a
+#   self test of the robot count as an inspection, so the act is always
+#   performed by the robot and the power is never exercised.
+#
+#   cadl norms-check examples/norms_check_conflict.cadl --bindings i=1
+#
+# needs PRISM (prism) on PATH; with --export DIR it writes the PRISM model
+# and one trace per answer that `cadl norms-eval` evaluates.
+
+sos:
+  name: "RobotStatusReporting"
+  type: Acknowledged
+  version: "0.1.0"
+  description: "Status reporting of delivery robots, with norms in conflict."
+  extensions:
+    - norms: 0.1
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities: [monitor_fleet]
+      interface:
+        input:  [status_report, self_test]
+        output: [status_request, silence, resume_radio]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities: [follow_path, deliver]
+      interface:
+        input:  [status_request, silence, resume_radio]
+        output: [status_report, self_test, apology]
+
+    - id: AUDITOR
+      role: "inspector"
+      autonomy: medium
+      capabilities: [inspect]
+
+  contracts:
+    - id: STATUS_REPORTING
+      parties: [DISPATCHER, "ROBOT[*]", AUDITOR]
+
+      counts_as:
+        - when: "ROBOT[i] -> DISPATCHER : self_test"
+          creates: inspection
+
+      norms:
+        - id: report_status
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: DISPATCHER
+          trigger: "DISPATCHER -> ROBOT[i] : status_request"
+          content: "ROBOT[i] -> DISPATCHER : status_report"
+          deadline: 2s
+          on_violation:
+            severity: Major
+            reparation: apologise
+        - id: apologise
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: DISPATCHER
+          content: "ROBOT[i] -> DISPATCHER : apology"
+          deadline: 0s
+        - id: radio_silence
+          kind: prohibition
+          bearer: "ROBOT[i]"
+          trigger: "DISPATCHER -> ROBOT[i] : silence"
+          until: "DISPATCHER -> ROBOT[i] : resume_radio"
+          content: "ROBOT[i] -> DISPATCHER : status_report"
+        - id: audit
+          kind: power
+          bearer: AUDITOR
+          content: inspection
+          effects:
+            discharge: [radio_silence]

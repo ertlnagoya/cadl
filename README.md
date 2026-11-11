@@ -183,6 +183,10 @@ cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
 # What an amendment from one version to the next does to the norms
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
 
+# Design-time check of the norms of one contract instance over all behaviours
+# (needs PRISM on PATH): violable norms, conflicts, powers never exercised, with witness traces
+cadl norms-check examples/norms_check_conflict.cadl --bindings i=1 --export /tmp/norms-check
+
 # Grounding extension: the derived indices of information sharing and of the
 # concentration of powers, and the incentive coverage, of each contract
 cadl norms-indices examples/grounding_robot_delivery.cadl
@@ -619,6 +623,24 @@ The file must declare `norms: 0.1` and pass `cadl check`. `--contract` is needed
 `examples/traces/` has five traces for `examples/norms_robot_delivery.cadl`: all norms fulfilled (a), a missed acknowledgement repaired by a failure report (b), both missed (c), a late delivery excused because the dispatcher stopped operating (d), and a reassignment that discharges the obligations (e). `norms_amendment_v1_to_v2.jsonl` is a trace of `examples/norms_amendment_v1.cadl` that is amended to `examples/norms_amendment_v2.cadl` while a failure report is due.
 
 `examples/norms_no_double_assignment.cadl` adds to that contract a prohibition quantified over the robots: the same delivery must not be assigned to two robots at once (`exists j in ROBOT: exists k in ROBOT: j != k AND ROBOT[j].delivery == request.id AND ROBOT[k].delivery == request.id`). Its traces: no double assignment (a, fulfilled), `ROBOT[3]` also gets the delivery at t=3 (b, violated at t=3), and a reassignment to the same robot (c, fulfilled). `N` has no value in them, so the domain is open: the content is true once two named robots carry the delivery, and undefined, which does not violate, while no two do.
+
+### Design-Time Checking of Norms (Model Checking)
+
+`cadl norms-check FILE [--contract ID] [--bindings i=2] [--members ROBOT=2] [--step 1s] [--horizon N] [--export DIR] [--timeout SECONDS] [--require-checker] [--format text|json]` translates the norms of one contract instance into a Markov decision process in the PRISM language (Appendix F, F.12) and asks PRISM questions over all behaviours of the instance, before any trace exists. At each observation the environment chooses which message events occur, a class of values for each quantity (one value per class that the literals of the predicates cut the domain into, plus "no value"), and whether the instance ends. One observation every `--step` (default: the greatest common divisor of the deadlines and intervals), at most `--horizon` + 1 observations (default from the deadlines and intervals); the model is exact for traces with an observation at every step. The classes assume that each quantity takes values of the type of the literals it is compared with (numbers, booleans, or symbols and texts) or no value; the answers do not cover traces with values of another type (a text where numbers are compared can make a predicate false or undefined where the model has it true), and the report says so in a note.
+
+```bash
+cadl norms-check examples/norms_check_conflict.cadl --bindings i=1
+#  report_status / radio_silence: after 1 observation(s) keeping one violates the other
+#  apologise can be activated in a state from which every continuation violates it
+#  the power audit is never exercised
+```
+
+For every translated norm it reports whether it can be activated, violated and fulfilled (the instance may end at any observation), whether it is violated in every instance that runs to the horizon, and whether every activation can be kept; for every pair of obligations and prohibitions whether they are in conflict (a reachable state where each can still be kept alone but every continuation violates one of them); for every power whether it can be exercised; and whether a reparation can be activated. Every "possible" answer comes with a witness: a trace in the `cadl norms-eval` format that the command itself evaluates with the engine of `cadl norms-eval` and marks as confirmed (a conflict has two, one keeping each norm). `--export DIR` writes the model (`<contract>.prism`), the properties (`<contract>_any.props` with `-const early_end=true`, `<contract>_full.props` with `early_end=false`) and the witnesses (`witness_<norm>_<question>.jsonl`). JSON has `instance`, `model`, `norms[]` (per question `answer` and `witness` with `trace`, `choices`, `confirmed`), `conflicts[]`, `findings[]`, `unconfirmed[]`, `assumptions[]`, `rules[]` and `notes[]`.
+
+Translated: message events, counts-as rules, predicates that compare one quantity with literals (`==`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, a boolean quantity alone) with `AND`, `OR`, `NOT`, a content that is one `within` / `throughout` / `until`, deadlines, `until:`, powers and their effects, reparations, and `assume:` items of these forms. Not translated, with the reason in the report: quantifiers, aggregates, wildcard references in predicates, arithmetic, comparisons of two quantities, `request`, `now`, `state`, amendments, and every norm that depends on a norm that is not translated. Refused: more than 1,000 observations, 16 message events, 8,192 choices per observation, or 20,000 combinations of classes of values in one group of predicates. An activation cannot be kept when, before an observation, some choice activates the norm and every activating choice leads to a state from which every continuation violates it (a reparation with a deadline of 0 s; an obligation with a deadline of 0 s triggered by a message can be kept, since the content may come in the same observation); the witness confirms with `cadl norms-eval` every choice at that observation and an idle continuation of each activating one, and the report says that the rest rests on the model checker. The time grows with the number of commands of the model (four per choice) and of reachable states: 12 message events (4,096 choices) took more than ten minutes. `--timeout SECONDS` bounds all runs of PRISM together (default 600) and exits with status 2 when it is exceeded; `--export` writes the model before PRISM runs. The exit status is 0 without findings (also when PRISM is not on PATH; the report says nothing was checked, and `--export` still writes the model; with `--require-checker` a missing PRISM exits with status 2), 1 on a finding (a conflict, a norm never activated or violated in every instance, an activation that cannot be kept, a power never exercised), 2 on a usage error, a refusal or a timeout, and 3 when a witness is not confirmed by `cadl norms-eval` (an error of norms-check).
+
+The translation is tested against `cadl norms-eval`: the tests run the generated PRISM text with an interpreter of the subset it uses on random paths of environment choices and on every path of at most two observations of one contract and compare the state of every norm after every observation, the verdicts, the exercises of powers and the activations of reparations (`CADL_NORMS_CHECK_PATHS` raises the number of random paths); the interpreter is compared with paths that the PRISM simulator generates, and the answers of PRISM with explicit fixpoints over the reachable states.
+
 ### Norms Monitor in Generated Python Code
 
 For a file that declares `norms: 0.1`, `cadl codegen -t python` also writes `norms_monitor.py`: an online monitor of one contract instance (Appendix F, F.5). A running system feeds it observations as they happen and gets back the changes of the norm states and of the four-valued verdicts, including those of `assume:` / `guarantee:` items with temporal operators, which `contracts.py` leaves out.
@@ -919,6 +941,7 @@ src/cadl/
   iec62853.py          IEC 62853-oriented dependability summary
   unparse.py           Expression AST back to CADL source text
   norms_eval.py        Verdicts of the norms extension on a recorded trace
+  norms_check.py       Design-time checking of norms: translation to PRISM, questions, witnesses
   agents_runtime.py    Runtime of the agent governance extension: decisions, holds, delegations and audit records on a trace, offline or one line at a time
   audit_log.py         Hash chain of the audit log (SHA-256 or HMAC-SHA256) and its verification (`cadl audit-verify`)
   mcp_gateway.py       MCP stdio gateway that decides tool calls with the runtime (`cadl mcp-gateway`, `mcp-approve`, `mcp-message`)
@@ -986,6 +1009,7 @@ tests/
   test_expr_parser.py    Expression grammar tests
   test_unparse.py        Expression round-trip tests
   test_norms_eval.py     Norm verdicts on a trace (`cadl norms-eval`)
+  test_norms_check.py    Design-time checking of norms, differential tests (`cadl norms-check`)
   test_grounding_extension.py  Grounding extension: indices, rules, IR, `cadl norms-indices`
   test_grounding_sos.py  Grounding extension: the quantities of the SoS over all contracts
   test_norms_wildcards.py Wildcard and range references in predicates (F.5): rewriting, equivalence with the quantified forms, N-15
@@ -1042,7 +1066,8 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | Simulator IR and config generation (Python, Unity, Go) | Available |
 | SoS-DSL extension (`lifecycle:` / `monitors:`) and Unity C# generation | Available |
 | Norms extension: static checks, and verdicts and amendments on a recorded trace (`cadl norms-eval`, `cadl norms-diff`) | Available |
-| Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available (Solidity, OPA and Unity C# do not monitor norms; no translation to a model checker) |
+| Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available (Solidity, OPA and Unity C# do not monitor norms) |
+| Norms extension: design-time checking of one contract instance with PRISM (`cadl norms-check`) | Available (quantified predicates, several instances and amendments are not translated) |
 | Grounding extension (grounding 0.1), norms side: derived indices and incentive coverage (`cadl norms-indices`), rules J-1 to J-9, IR, comparison of two versions (J-13 in `cadl norms-diff`) | Available |
 | Strategic model extension (games 0.1): equilibrium checks and certified equilibrium maps (`cadl game-check`), with the link to norms of Appendix J (`sanction_of:` / `reward_of:`, J-10 to J-12, J-14) | Available (the export for PRISM-games has not been run through PRISM-games) |
 | Agent governance extension (agents 0.1): checks, decision function, runtime on a recorded trace (holds, delegations, hash-chained audit records; `cadl agents-run`, `cadl audit-verify`), MCP stdio gateway (`cadl mcp-gateway`), Rego / Cedar boundary policies | Available (the gateway is a reference, tested with a fake MCP server and client only; no A2A connection) |
