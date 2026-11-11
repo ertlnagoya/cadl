@@ -2010,11 +2010,21 @@ def prism_model_text(model: Model, design: Design) -> str:
         out.append("")
         for name, (tree, _) in model.labels.items():
             out.append(f'label "{_prism_name(name)}" = ({tr(tree)});')
+    actions = {c.action for c in model.commands if c.exists_in(design.name)}
     for r in model.rewards:
         out += ["", f'rewards "{_prism_name(r.id)}"']
+        written = 0
         for item in r.items:
+            if item.action and item.action not in actions:
+                # No command of this design has the action, so the item is
+                # never earned here; PRISM and Storm reject an item that
+                # names an action the model does not have.
+                continue
             action = f"[{_prism_name(item.action)}] " if item.action else ""
             out.append(f"  {action}{tr(item.guard)} : ({_tr_param(item.value)});")
+            written += 1
+        if not written:
+            out.append("  true : (0);")    # Storm rejects an empty structure
         out.append("endrewards")
     return "\n".join(out) + "\n"
 
