@@ -349,6 +349,7 @@ class EnforcementPoint:
         (the gateway's own actor, then its client) that it can match, else
         the first declared member of the set."""
         out = []
+        self._rule_refs = []            # (contract, receiver reference), same order
         for c in self.sos.contracts:
             if c.enforcement is None:
                 continue
@@ -361,7 +362,27 @@ class EnforcementPoint:
                 to = self._rule_receiver(ev.receiver, candidates)
                 if to is not None:
                     out.append((r.creates, ev.sender, to, ev.name))
+                    self._rule_refs.append((c.id, ev.receiver))
         return out
+
+    def _bound_receiver(self, index: int, hold_id: str, default: str) -> str:
+        """The receiver of the approval rule `index` for the hold: an index
+        variable takes its value from the bindings of the contract instance
+        of a ground of the hold in the rule's contract, when there is one."""
+        refs = getattr(self, "_rule_refs", [])
+        if index >= len(refs):
+            return default
+        contract, ref = refs[index]
+        if ref["kind"] != "var":
+            return default
+        for c, bindings in self.runtime.hold_bindings(hold_id):
+            value = bindings.get(ref["var"])
+            if c == contract and isinstance(value, int) and not isinstance(value, bool):
+                actor = {"name": ref["name"], "index": value,
+                         "text": f"{ref['name']}[{value}]"}
+                if G.is_member(self.policy, ref["name"], actor):
+                    return actor["text"]
+        return default
 
     def _rule_receiver(self, recv: dict, candidates=()) -> str | None:
         if recv["kind"] == "plain":
@@ -692,9 +713,10 @@ class EnforcementPoint:
             raise _Refused(f"'as' is not a concrete actor: {actor!r}")
         event = "approval" if decision == "approve" else "rejection"
         m = None
-        for ev, sender, to, name in self.approval_rules:
+        for i, (ev, sender, to, name) in enumerate(self.approval_rules):
             if ev == event and G.ref_match(self.policy, sender, who, {}) is True:
-                m = {"from": who["text"], "to": to, "name": name, "args": [hold_id]}
+                m = {"from": who["text"], "to": self._bound_receiver(i, hold_id, to),
+                     "name": name, "args": [hold_id]}
                 break
         if m is None:
             raise _Refused(f"no counts_as rule of an enforced contract creates {event} "

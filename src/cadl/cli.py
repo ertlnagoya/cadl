@@ -257,6 +257,9 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--max-readers-per-address", type=int, default=4, metavar="N",
                          help="Of those, connections of one remote address, IPv4 address or IPv6 /64 (default 4); "
                               "beyond that the connection is closed at once")
+    a2a_cmd.add_argument("--max-readers-per-prefix", type=int, default=16, metavar="N",
+                         help="Of those, connections of one IPv4 /24 or IPv6 /48 "
+                              "(default 16); beyond that 503")
     a2a_cmd.add_argument("--max-handlers-per-actor", type=int, default=16, metavar="N",
                          help="Authenticated requests of one actor handled at the same "
                               "time, held blocking requests included (default 16); "

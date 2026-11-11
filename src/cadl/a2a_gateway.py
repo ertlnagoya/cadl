@@ -152,6 +152,7 @@ MAX_NONCES = 1_000_000         # authenticated requests of one actor in one run
 MAX_HANDLERS = 64              # authenticated requests handled at the same time
 MAX_READERS = 64               # connections whose request is being read
 MAX_READERS_PER_ADDRESS = 4    # of those, from one remote address
+MAX_READERS_PER_PREFIX = 16    # of those, from one IPv4 /24 or IPv6 /48
 READER_WAIT = 1.0              # seconds a connection waits for a free reader slot
 MAX_HANDLERS_PER_ACTOR = 16    # authenticated requests of one actor at the same time
 MAX_HOLDS_PER_ACTOR = 64       # holds of one actor, blocking or not
@@ -1525,9 +1526,8 @@ class _Handler(BaseHTTPRequestHandler):
         self._reading = True
         self._reader_slot = False
         self._address_key = None
-        self._timer = threading.Timer(self.server.read_timeout, self._read_expired)
-        self._timer.daemon = True
-        self._timer.start()
+        self._prefix_key = None
+        self._timer = self.server.deadlines.add(self.server.read_timeout, self._read_expired)
 
     def _read_expired(self) -> None:
         """The request was not read within the deadline: closed, and
@@ -1552,46 +1552,76 @@ class _Handler(BaseHTTPRequestHandler):
             if self._reader_slot:
                 self._reader_slot = False
                 self.server.readers.release()
-            if self._address_key is not None:
-                srv = self.server
-                with srv.address_lock:
-                    n = srv.address_count.get(self._address_key, 1) - 1
-                    if n > 0:
-                        srv.address_count[self._address_key] = n
-                    else:
-                        srv.address_count.pop(self._address_key, None)
-                self._address_key = None
+            srv = self.server
+            with srv.address_lock:
+                for attr, table in (("_address_key", srv.address_count),
+                                    ("_prefix_key", srv.prefix_count)):
+                    k = getattr(self, attr)
+                    if k is not None:
+                        n = table.get(k, 1) - 1
+                        if n > 0:
+                            table[k] = n
+                        else:
+                            table.pop(k, None)
+                        setattr(self, attr, None)
             return in_time
+
+    def _refuse(self, why: str) -> None:
+        """503 before the request is read, recorded at the capped rate."""
+        self._done_reading()
+        self.server.gw.refused("overloaded", why)
+        try:
+            self.connection.settimeout(2)
+            self.connection.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                    b"Retry-After: 1\r\nContent-Length: 0\r\n"
+                                    b"Connection: close\r\n\r\n")
+        except OSError:
+            pass
+
+    def parse_request(self) -> bool:
+        """The request line and the headers, refused with 400 when a header
+        line is malformed: whitespace before the colon (which the parser of
+        the standard library takes as the end of the headers, so that a
+        following `Transfer-Encoding` would be lost), a folded line, or a
+        bare carriage return."""
+        if not super().parse_request():
+            return False
+        h = self.headers
+        bad = bool(h.defects) or bool(h.get_payload()) or any(
+            any(c in k for c in " \t\r\n") or "\r" in v or "\n" in v
+            for k, v in h.raw_items())
+        if bad:
+            self.close_connection = True
+            self.send_error(400, "malformed header line (whitespace before a colon, "
+                                 "a folded line or a bare carriage return)")
+            return False
+        return True
 
     def handle(self):
         """At most `max_readers_per_address` connections of one remote
-        address are being read at the same time (beyond that the
-        connection is closed at once, `overloaded`, `address`), and at most
-        `max_readers` in all; a connection waits up to `READER_WAIT`
-        seconds for a free slot, then gets 503 (`overloaded`, `readers`)."""
+        address, `max_readers_per_prefix` of one IPv4 /24 or IPv6 /48, and
+        `max_readers` in all are being read at the same time. Beyond the
+        first two the connection gets 503 at once (`overloaded`, `address`
+        or `prefix`); when all readers are busy it waits up to
+        `READER_WAIT` seconds for one, then gets 503 (`readers`)."""
         srv = self.server
         key = srv.peer_key(self.client_address)
+        prefix = srv.prefix_key(self.client_address)
         with srv.address_lock:
             if srv.address_count.get(key, 0) >= srv.max_readers_per_address:
-                full = True
+                full = "address"
+            elif srv.prefix_count.get(prefix, 0) >= srv.max_readers_per_prefix:
+                full = "prefix"
             else:
-                full = False
+                full = None
                 srv.address_count[key] = srv.address_count.get(key, 0) + 1
-                self._address_key = key
-        if full:
-            self._done_reading()
-            srv.gw.refused("overloaded", "address")
+                srv.prefix_count[prefix] = srv.prefix_count.get(prefix, 0) + 1
+                self._address_key, self._prefix_key = key, prefix
+        if full is not None:
+            self._refuse(full)
             return
         if not srv.readers.acquire(timeout=READER_WAIT):
-            self._done_reading()
-            srv.gw.refused("overloaded", "readers")
-            try:
-                self.connection.settimeout(2)
-                self.connection.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
-                                        b"Retry-After: 1\r\nContent-Length: 0\r\n"
-                                        b"Connection: close\r\n\r\n")
-            except OSError:
-                pass
+            self._refuse("readers")
             return
         self._reader_slot = True
         try:
@@ -1646,6 +1676,59 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(reply)
 
 
+class _Deadlines:
+    """The read deadlines of all connections in one thread and one heap,
+    in place of a timer thread per connection. `add` returns an entry
+    whose `cancel` makes it never fire."""
+
+    class Entry:
+        __slots__ = ("cancelled",)
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    def __init__(self) -> None:
+        import heapq
+        self._heapq = heapq
+        self._heap: list = []
+        self._seq = itertools.count()
+        self._cond = threading.Condition()
+        self._stopped = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def add(self, seconds: float, fn: Callable[[], None]) -> "_Deadlines.Entry":
+        entry = self.Entry()
+        with self._cond:
+            self._heapq.heappush(self._heap, (time.monotonic() + seconds, next(self._seq),
+                                              entry, fn))
+            self._cond.notify()
+        return entry
+
+    def stop(self) -> None:
+        with self._cond:
+            self._stopped = True
+            self._cond.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._stopped and (not self._heap or
+                                             self._heap[0][0] > time.monotonic()):
+                    wait = None if not self._heap else self._heap[0][0] - time.monotonic()
+                    self._cond.wait(wait)
+                if self._stopped:
+                    return
+                _, _, entry, fn = self._heapq.heappop(self._heap)
+            if not entry.cancelled:
+                try:
+                    fn()
+                except Exception as e:      # noqa: BLE001
+                    _log(f"internal error at a read deadline: {type(e).__name__}: {e}")
+
+
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1653,14 +1736,18 @@ class _Server(ThreadingHTTPServer):
 
     def __init__(self, address, gw, family, max_readers: int = MAX_READERS,
                  read_timeout: float = READ_TIMEOUT,
-                 max_readers_per_address: int = MAX_READERS_PER_ADDRESS):
+                 max_readers_per_address: int = MAX_READERS_PER_ADDRESS,
+                 max_readers_per_prefix: int = MAX_READERS_PER_PREFIX):
         self.address_family = family
         self.gw = gw
         self.readers = threading.BoundedSemaphore(max_readers)
         self.read_timeout = read_timeout
         self.max_readers_per_address = max_readers_per_address
+        self.max_readers_per_prefix = max_readers_per_prefix
         self.address_count: dict = {}
+        self.prefix_count: dict = {}
         self.address_lock = threading.Lock()
+        self.deadlines = _Deadlines()
         super().__init__(address, _Handler)
 
     @staticmethod
@@ -1679,6 +1766,24 @@ class _Server(ThreadingHTTPServer):
                 return str(ip.ipv4_mapped)
             return str(ipaddress.ip_network(f"{ip}/64", strict=False))
         return str(ip)
+
+    @staticmethod
+    def prefix_key(client_address) -> Any:
+        """The network that the cap per prefix counts: the /24 of an IPv4
+        address (also IPv4-mapped), the /48 of an IPv6 address."""
+        host = client_address[0]
+        try:
+            ip = ipaddress.ip_address(str(host).split("%", 1)[0])
+        except ValueError:
+            return host
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        bits = 24 if ip.version == 4 else 48
+        return str(ipaddress.ip_network(f"{ip}/{bits}", strict=False))
+
+    def server_close(self):
+        self.deadlines.stop()
+        super().server_close()
 
     def handle_error(self, request, client_address):
         _log(f"a connection failed: {sys.exc_info()[0].__name__}: {sys.exc_info()[1]}")
@@ -1708,7 +1813,8 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
           tls_cert: Path | None = None, tls_key: Path | None = None,
           poll: float = 0.05, max_readers: int = MAX_READERS,
           read_timeout: float = READ_TIMEOUT,
-          max_readers_per_address: int = MAX_READERS_PER_ADDRESS) -> int:
+          max_readers_per_address: int = MAX_READERS_PER_ADDRESS,
+          max_readers_per_prefix: int = MAX_READERS_PER_PREFIX) -> int:
     """Run the gateway until SIGTERM or SIGINT. Returns the exit status."""
     host, port = parse_listen(listen)
     if not _is_loopback(host) and tls_cert is None:
@@ -1732,7 +1838,7 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
     gw = A2AGateway(**gw_args)
     try:
         server = _Server((host, port), gw, family, max_readers, read_timeout,
-                         max_readers_per_address)
+                         max_readers_per_address, max_readers_per_prefix)
     except OSError as e:
         gw.stop()
         raise GatewayError(f"cannot listen on {listen}: {e}") from None
@@ -1810,6 +1916,7 @@ def cli_gateway(args) -> int:
             raise GatewayError("the trace and the audit log are the same file")
         if args.poll <= 0 or args.upstream_timeout <= 0 or args.read_timeout <= 0 \
                 or min(args.max_handlers, args.max_readers, args.max_readers_per_address,
+                       args.max_readers_per_prefix,
                        args.max_handlers_per_actor, args.max_holds_per_actor) < 1:
             raise GatewayError("--poll, --upstream-timeout, --read-timeout and the --max-* "
                                "options must be positive")
@@ -1825,7 +1932,8 @@ def cli_gateway(args) -> int:
         code = serve(gw_args, listen=args.listen, port_file=args.port_file,
                      tls_cert=args.tls_cert, tls_key=args.tls_key, poll=args.poll,
                      max_readers=args.max_readers, read_timeout=args.read_timeout,
-                     max_readers_per_address=args.max_readers_per_address)
+                     max_readers_per_address=args.max_readers_per_address,
+                     max_readers_per_prefix=args.max_readers_per_prefix)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

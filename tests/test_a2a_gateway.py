@@ -1578,3 +1578,117 @@ class TestSignedHolds:
         gw.tick()
         assert gw.runtime.hold_state("h-1") == "approved"
         gw.stop()
+
+
+class TestLowFindings:
+    """The Low findings of the fifth review."""
+
+    def test_index_variable_receiver_uses_the_hold_bindings(self, tmp_path):
+        """`OPERATOR -> SUMMARIZER[i] : approve` with the instance binding i
+        to 2, at an MCP gateway in front of FILES: the approval through the
+        inbox is the message to SUMMARIZER[2], the receiver that the hold's
+        contract instance binds, not the first member of the set."""
+        from cadl.gateway_core import _drop
+        from cadl.mcp_gateway import Gateway
+        text = (ROOT / "examples" / "agents_tool_governance.cadl").read_text()
+        text = (text.replace("- id: SUMMARIZER\n", "- id: SUMMARIZER[1..2]\n")
+                .replace("PLANNER, SUMMARIZER, FILES", 'PLANNER, "SUMMARIZER[i]", FILES')
+                .replace("to: [PLANNER, SUMMARIZER]", 'to: [PLANNER, "SUMMARIZER[*]"]')
+                .replace("OPERATOR -> PLANNER : approve", "OPERATOR -> SUMMARIZER[i] : approve")
+                .replace("OPERATOR -> PLANNER : reject", "OPERATOR -> SUMMARIZER[i] : reject"))
+        g = tmp_path / "bound.cadl"
+        g.write_text(text)
+        inbox = tmp_path / "inbox"
+        out: list = []
+        gw = Gateway(g, "PLANNER", "FILES", tmp_path / "m.jsonl", tmp_path / "m.trace.jsonl",
+                     to_client=out.append, to_server=out.append, inbox=inbox,
+                     approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]},
+                     init={"bindings": {"i": 2}})
+        assert {to for _, _, to, _ in gw.approval_rules} == {"SUMMARIZER[1]"}   # static
+        gw.client_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "delete_file",
+                                              "arguments": {"path": "/x"}}}))
+        _drop(inbox, approval_file(inbox, "h-1", "approve", "OPERATOR",
+                                   APPROVER_KEYS["OPERATOR"]))
+        gw.tick()
+        assert gw.runtime.hold_state("h-1") == "approved"
+        gw.stop()
+        names = [(r["message"]["to"], r["message"]["name"]) for r in
+                 read_records(tmp_path / "m.jsonl") if "decision" in r]
+        assert ("SUMMARIZER[2]", "approve") in names
+        replayed = tmp_path / "r.jsonl"
+        assert main(["agents-run", str(g), "--trace", str(tmp_path / "m.trace.jsonl"),
+                     "--audit", str(replayed)]) == 0
+        assert replayed.read_bytes() == (tmp_path / "m.jsonl").read_bytes()
+
+    @pytest.mark.parametrize("head", [
+        b"Content-Length: 5\r\nTransfer-Encoding : chunked\r\n",
+        b"Content-Length: 5\r\nTransfer-Encoding\t: chunked\r\n",
+        b"Content-Length: 5\r\nX-Folded: one\r\n two\r\n",
+        b"Content-Length: 5\r\nX-Cr: a\rb\r\n",
+    ])
+    def test_malformed_header_lines(self, tmp_path, head):
+        """A header with whitespace before its colon (which the parser of the
+        standard library takes as the end of the headers), a folded header
+        or a bare carriage return: 400, nothing read as a request."""
+        import threading
+        from cadl.a2a_gateway import _Server
+        loc = Local(tmp_path)
+        srv = _Server(("127.0.0.1", 0), loc.gw, socket.AF_INET)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        sock = socket.create_connection(("127.0.0.1", srv.server_address[1]))
+        sock.sendall(b"POST / HTTP/1.1\r\nHost: x\r\n" + head + b"\r\n{}\r\n")
+        sock.settimeout(10)
+        answer = sock.recv(64)
+        assert answer.split(b" ")[1] == b"400", answer
+        sock.close()
+        srv.shutdown()
+        srv.server_close()
+        assert loc.sent == [] and loc.gw.runtime.steps == []
+        assert host_events(loc.audit) == []              # not even authenticated
+        loc.stop_and_replay()
+
+    def test_caps_per_address_and_prefix(self, tmp_path):
+        """A connection beyond the cap of its address, or of its /24, gets 503
+        at once. All connections come from 127.0.0.1, so the test names their
+        addresses by their source ports."""
+        import threading
+        from cadl.a2a_gateway import _Server
+        loc = Local(tmp_path)
+        srv = _Server(("127.0.0.1", 0), loc.gw, socket.AF_INET, max_readers_per_address=1,
+                      max_readers_per_prefix=2, read_timeout=5)
+        addresses: dict = {}
+        srv.peer_key = lambda addr: addresses.get(addr[1], addr)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+
+        def connect(address):
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            addresses[s.getsockname()[1]] = address
+            s.connect(("127.0.0.1", port))
+            s.sendall(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n")
+            s.settimeout(3)
+            return s
+
+        def status(s):
+            try:
+                return s.recv(32)[:12]
+            except socket.timeout:
+                return b"(waiting)"
+        first = connect("10.0.0.1")
+        time.sleep(0.2)
+        same = connect("10.0.0.1")                      # the same address
+        assert status(same) == b"HTTP/1.1 503"
+        second = connect("10.0.0.2")                    # same /24 (127.0.0.0/24)
+        time.sleep(0.2)
+        third = connect("10.0.0.3")                     # beyond the /24 cap
+        assert status(third) == b"HTTP/1.1 503"
+        threads = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+        assert threads == []                            # one thread for all deadlines
+        for s in (first, same, second, third):
+            s.close()
+        srv.shutdown()
+        srv.server_close()
+        assert sorted(set(_events(loc.audit, "overloaded"))) == ["address", "prefix"]
+        loc.stop_and_replay()
