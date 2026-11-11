@@ -36,6 +36,32 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   on a failure of the decision step. The gateway writes a trace that
   `cadl agents-run` replays to the same decisions and the same audit log,
   byte for byte.
+- `cadl a2a-gateway FILE --agent-actor ACTOR --upstream URL --client-keys
+  KEYS.json --audit OUT.jsonl [...]` (ships in 0.3.25): the A2A mapping of
+  Appendix G, G.11, as an HTTP server for the JSON-RPC binding of A2A
+  1.0.0 in front of one A2A agent. Every request is authenticated with
+  the key of its actor (`Authorization: CADL-HMAC`, an HMAC-SHA256 bound
+  to the run, a nonce used once, the path and the SHA-256 of the body);
+  an unauthenticated request gets HTTP 401 and is recorded
+  (`unauthenticated_request`). A `SendMessage` names its CADL message and
+  arguments with the extension
+  `https://www.ertl.jp/cadl-spec/a2a/agents-message/v0.1` and is decided
+  by the online runtime: allowed requests are passed on re-serialised,
+  denied ones get a task in `TASK_STATE_REJECTED`, escalated ones are held
+  (blocking, or a `TASK_STATE_SUBMITTED` task of the gateway with
+  `returnImmediately`) until an approval through the inbox
+  (`cadl mcp-approve`), a rejection or the timeout. `GetTask` and
+  `CancelTask` pass for the client's own tasks only (`task_refused`);
+  streaming, push notifications, `ListTasks`, `GetExtendedAgentCard`,
+  `tenant` and every other method are refused. A held request is
+  withdrawn when its client cancels the task or closes the connection.
+  Optional HTTPS (`--tls-cert`, `--tls-key`); an address other than
+  loopback needs it. The trace replays through `cadl agents-run` to the
+  same audit log, byte for byte. New host events `unauthenticated_request`,
+  `task_refused` and `invalid_response`, which `agents-run` reads.
+- `cadl.gateway_core`: the enforcement point, trace, audit log, holds,
+  inbox and inbox tools shared by the two gateways, factored out of
+  `cadl.mcp_gateway`, which re-exports its former names.
 
 ### Security
 - `cadl mcp-gateway` after an independent review. A client could hide a
@@ -72,6 +98,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the gateway's trace); numbers in the canonical form are integers or
   decimals without exponent; integers beyond 2**53 are refused;
   `audit-verify --run-id` and `--anchor`.
+- Review of `cadl a2a-gateway` before its release: a context id that the
+  gateway had not seen given to the client was claimed by whoever named it
+  first, also across runs, so a client could continue another client's
+  context; it is now refused. `tenant` could select another tenant's task
+  with the same id; it is refused. An approval rule whose receiver is a
+  set (`OPERATOR -> WORKER[*] : approve`) was not recognised, so an
+  approval could come as an A2A message without the binding to the held
+  arguments; approval names are now taken from every such rule, also for
+  the inbox of `cadl mcp-message`. Over TLS, a client that closed the
+  connection of a held request with close_notify was not seen as gone.
+  Unauthenticated requests are recorded at most 20 times a second.
 
 ### Changed
 - The audit file of `cadl agents-run --audit` has a header line, an end

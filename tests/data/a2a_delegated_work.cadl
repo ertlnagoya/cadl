@@ -1,0 +1,73 @@
+# Agent governance extension (agents 0.1) between A2A agents, for the
+# tests of `cadl a2a-gateway` (Appendix G, G.11 and G.13).
+#
+# The planner sends A2A messages to the summariser. The gateway in front
+# of the summariser decides each of them. The contract is closed
+# (default: deny), so every message to the summariser needs a permission.
+
+sos:
+  name: "DelegatedWork"
+  extensions:
+    - norms: 0.1
+    - agents: 0.1
+
+  actors:
+    - id: OPERATOR
+      role: "Human operator who approves exceptions"
+      agent: { kind: human }
+    - id: PLANNER
+      role: "LLM agent that delegates work to the summariser"
+      agent: { kind: llm_agent, protocol: a2a }
+    - id: SUMMARIZER
+      role: "LLM agent behind the gateway"
+      agent: { kind: llm_agent, protocol: a2a }
+
+  contracts:
+    - id: DELEGATED_WORK
+      parties: [OPERATOR, PLANNER, SUMMARIZER]
+      enforcement:
+        point: gateway
+        default: deny
+      counts_as:
+        - { when: "OPERATOR -> SUMMARIZER : approve", creates: approval }
+        - { when: "OPERATOR -> SUMMARIZER : reject",  creates: rejection }
+      norms:
+        - id: may_summarize
+          kind: permission
+          bearer: PLANNER
+          content: "PLANNER -> SUMMARIZER : summarize"
+        - id: may_approve
+          kind: permission
+          bearer: OPERATOR
+          content: "OPERATOR -> SUMMARIZER : approve"
+        - id: may_reject
+          kind: permission
+          bearer: OPERATOR
+          content: "OPERATOR -> SUMMARIZER : reject"
+        - id: may_translate
+          kind: permission
+          bearer: OPERATOR
+          content: "OPERATOR -> SUMMARIZER : translate"
+        - id: may_grant
+          kind: permission
+          bearer: OPERATOR
+          content: "OPERATOR -> PLANNER : grant_translate"
+        - id: may_revoke
+          kind: permission
+          bearer: OPERATOR
+          content: "OPERATOR -> PLANNER : revoke_translate"
+        - id: no_publish
+          kind: prohibition
+          bearer: PLANNER
+          content: "PLANNER -> SUMMARIZER : publish"
+          on_denied:
+            escalate_to: OPERATOR
+            timeout: 10min
+            fallback: "PLANNER -> SUMMARIZER : summarize"
+            notify: OPERATOR
+      delegations:
+        - norm: may_translate
+          to: [PLANNER]
+          grant: grant_translate
+          revoke: revoke_translate
+          max_depth: 1

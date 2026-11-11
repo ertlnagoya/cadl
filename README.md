@@ -345,7 +345,7 @@ For each message, in the order of the trace, the runtime (a) derives the state: 
 | `run_id` | First line only: the run id of the audit log (32 lowercase hex digits). Without it `--audit` draws a random one |
 | `approvals` | First line only: how the host read approvals, `authenticated`, `insecure` or `none`; copied into the audit header |
 | `withdraw` | Hold ids whose held message the host withdraws at this line (the client cancelled the call): a hold that is still `held` closes as `withdrawn` (closing record `deny`, reason `withdrawn`), and a later approval of it is `not_held` |
-| `host_events` | Event records of the host at this line, written before the line is processed: entries with `event` (`method_refused`, `unsolicited_response`, `unauthorised_approval`, `unauthorised_rejection`, `unauthorised_message`, `approval_evidence`, `approval_unauthenticated`, `forward_failed`) and optional `reason`, `hold_id`, `message`. They change no decision; the MCP gateway writes them |
+| `host_events` | Event records of the host at this line, written before the line is processed: entries with `event` (`method_refused`, `unsolicited_response`, `unauthorised_approval`, `unauthorised_rejection`, `unauthorised_message`, `approval_evidence`, `approval_unauthenticated`, `forward_failed`, and from 0.3.25 `unauthenticated_request`, `task_refused`, `invalid_response`) and optional `reason`, `hold_id`, `message`. They change no decision; the MCP and A2A gateways write them |
 
 One line is processed in this order: holds whose deadline lies before `t` expire; the holds of `withdraw` close; the `host_events` are recorded; instances are created; the time and the `values` of the line (and an `amend`) are one observation without message, so that a deadline or a window that has passed is settled before a message is decided; each message is decided, and an allowed one is one observation; a `state` change and an `end` are a last observation without message.
 
@@ -451,6 +451,40 @@ Decisions are taken in the order of arrival, one at a time; several calls may be
 **Time, trace and replay.** The time `t` is the time since the start of the gateway on a monotonic clock, in seconds rounded to milliseconds; the first line of the trace gives a random `run_id`, the wall-clock time of `t = 0` as `epoch` and `"quantities": []`, plus the keys of `--init FIRST.json` (`bindings`, `request`, `values`, `quantities`, `instances`, `host_instances`, `state`). Every step is written to the trace (`--trace-out`, by default the audit path with `.trace.jsonl`) before it is decided: each decided message, a line `{"t": t}` when the deadline of a hold has passed, `withdraw` and `host_events` lines, and a last line `{"t": t}` when the gateway stops. `cadl agents-run FILE --trace TRACE --audit A.jsonl` on that trace makes the same decisions and writes the same audit log, byte for byte (with the same `--audit-key`). The gateway refuses to start when the audit log or the trace exists. A hold whose timeout is longer than the client's request timeout ends at the client first; choose `timeout:` accordingly.
 
 Not covered: the gateway does not observe `values` (a norm that reads a quantity sees it as missing data, G.5), and it does not create or end host-created contract instances after the first line. Under MCP 2026-07-28 a `tools/call` that a server answers with `input_required` is retried by the client as a new request, which is decided again. The approver's tool trusts the held message that the gateway publishes.
+
+#### A2A Gateway
+
+`cadl a2a-gateway` (from 0.3.25) puts the enforcement point in front of one A2A agent, the actor `ACTOR` of the file. It is an HTTP server for the JSON-RPC binding of [A2A 1.0.0](https://a2a-protocol.org/v1.0.0/specification/): JSON-RPC 2.0 over HTTP POST to the path `/`, `Content-Type: application/json`, and the header `A2A-Version: 1.0`. Allowed requests go to the agent at `--upstream URL`.
+
+```bash
+cadl a2a-gateway FILE --agent-actor ACTOR --upstream URL --client-keys CLIENTS.json \
+    --audit OUT.jsonl [--audit-key FILE] [--approvals DIR --approver-keys KEYS.json] \
+    [--trace-out TRACE.jsonl] [--init FIRST.json] [--listen HOST:PORT] [--port-file FILE] \
+    [--tls-cert CERT.pem --tls-key KEY.pem] [--agent-card CARD.json] \
+    [--upstream-token FILE] [--upstream-timeout SECONDS] [--poll SECONDS]
+```
+
+`ACTOR` is an actor of the file with `agent: { kind: llm_agent, protocol: a2a }`; it is the receiver of every message. The gateway listens on `127.0.0.1:8470` by default; an address other than loopback needs `--tls-cert` and `--tls-key`.
+
+**Sender.** Every request is authenticated before its body is read as JSON. `--client-keys CLIENTS.json` maps each actor that may send to its key (the same format as `--approver-keys`; every actor has to be an actor of the file). A request carries `Authorization: CADL-HMAC actor="PLANNER", nonce="<32 hex>", mac="<64 hex>"`, where `mac` is the HMAC-SHA256, under the actor's key, of the canonical JSON (G.8) of `{"scheme": "cadl-a2a-request/1", "actor", "run_id", "nonce", "method": "POST", "path": "/", "body_sha256"}`. `cadl.a2a_gateway.authorization(key, actor, run_id, body)` computes the header. Every response carries the run id of the gateway in the header `CADL-Run-Id`, and a 401 response names it in `WWW-Authenticate: CADL-HMAC run="..."`. A nonce is accepted once per run, and the run id binds the request to one run. A request without a valid header gets HTTP 401 and is recorded as `unauthenticated_request` with the reason `missing`, `malformed`, `unknown_actor`, `bad_mac` or `replayed` (at most 20 records a second; the next record counts the requests that were not recorded). Without an authenticated sender there is no message and nothing is decided. The client's `Authorization` header is not passed on; `--upstream-token FILE` gives the gateway's own bearer token for the agent.
+
+**Message.** A2A messages have no name of an operation. The name and the arguments of the CADL message come from an extension: the message lists `https://www.ertl.jp/cadl-spec/a2a/agents-message/v0.1` in `extensions` and carries `{"name": "summarize", "args": ["..."]}` under that URI in `metadata` (at most 16 string arguments of at most 256 characters). A `SendMessage` of the actor `X` is then the message `X -> ACTOR : summarize` at the time of its arrival.
+
+| Request | What the gateway does |
+|---|---|
+| `SendMessage` | `allow`: passed on, re-serialised, with a JSON-RPC id of the gateway; the agent's answer goes back with the client's id. `deny`: answered with a task of the gateway in `TASK_STATE_REJECTED` whose status message names the reason, the norms, the hold, the fallback and `notify` (also as `metadata` under the extension URI). `escalate`: held. A blocking request waits until the hold closes; with `configuration.returnImmediately` the client gets a task of the gateway in `TASK_STATE_SUBMITTED` at once, and `GetTask` shows it settled later. A released request is passed on; a rejected, expired or cancelled one, or one whose release is denied, gets a rejected task. A message without the extension, or one named like an approval or a rejection of a `counts_as:` rule, is rejected without a decision and recorded as `unauthorised_message` (`no_name`, `approval_as_message`) |
+| `GetTask`, `CancelTask` | Passed on for the client's own tasks only, without a decision and without a record; a task of another client, or of an earlier run, is `TaskNotFoundError` (-32001) and recorded as `task_refused`. `CancelTask` of a held request withdraws it (G.6) and answers `TASK_STATE_CANCELED`. The task of a released `returnImmediately` request keeps the gateway's id: the gateway asks the agent for its task and shows it under that id |
+| `SendStreamingMessage`, `SubscribeToTask`, `ListTasks`, `GetExtendedAgentCard` | Refused with `UnsupportedOperationError` (-32004) and recorded as `method_refused` |
+| Push notification methods, or `configuration.taskPushNotificationConfig` | Refused with `PushNotificationNotSupportedError` (-32003) and recorded as `method_refused` |
+| Any other method | Refused with -32601 and recorded as `method_refused` |
+
+A `SendMessage` may name only tasks (`taskId`, `referenceTaskIds`) and contexts (`contextId`) that the agent or the gateway gave to the same actor in this run; anything else is `TaskNotFoundError` and `task_refused`. `tenant` is refused (-32602), because the tasks of a client are kept by their id alone. A task or context that the agent gives to a second actor is not shown to it (`InvalidAgentResponseError`, -32006, recorded as `invalid_response`).
+
+**What passes.** HTTP: one `Content-Length` of at most 1 MiB, no `Transfer-Encoding`, one request per connection. The body is parsed as strictly as a line of the MCP gateway (duplicate keys, NaN, `1e999`, deep nesting, lone surrogates and invalid UTF-8 are refused) and passed on as the compact JSON of the parsed object with every non-ASCII character escaped. A missing or other `A2A-Version` is `VersionNotSupportedError` (-32009); an absent header means 0.3 in A2A 1.0.0. Everything that can fail is done before the decision; if the request still cannot be sent after an allow or a release, the client gets -32603 and the log `forward_failed`; if it was sent and no valid answer came back, the client gets -32006 and the log `invalid_response`. When the client closes the connection of a blocking held request, the request is withdrawn. On SIGTERM or SIGINT the gateway answers held blocking requests with -32603 and writes the end of the trace and the log; it exits with 1 when the enforcement point failed.
+
+**Approvals.** Approvals and other messages come through the inbox, as for the MCP gateway (`--approvals DIR --approver-keys KEYS.json`, `cadl mcp-approve`, `cadl mcp-message`). The held message's `params` (the whole `SendMessage` request) are published in `DIR/holds/h-N.json`, and an approval is bound to their SHA-256. An approval does not come as an A2A message. The time, the trace and the replay are those of the MCP gateway: `cadl agents-run` on the trace writes the same audit log, byte for byte.
+
+Not covered: streaming, push notifications, `ListTasks`, tenants, the gRPC and HTTP+JSON bindings, authentication schemes of A2A other than `CADL-HMAC` (an A2A client has to compute the header), and a client that asks for an unknown context id. The gateway does not keep the owners of tasks across runs. It has been tested with a fake A2A agent and a fake client only.
 
 ### Regime Transitions
 
@@ -921,7 +955,9 @@ src/cadl/
   norms_eval.py        Verdicts of the norms extension on a recorded trace
   agents_runtime.py    Runtime of the agent governance extension: decisions, holds, delegations and audit records on a trace, offline or one line at a time
   audit_log.py         Hash chain of the audit log (SHA-256 or HMAC-SHA256) and its verification (`cadl audit-verify`)
+  gateway_core.py      What the gateways share: enforcement point, trace, audit log, holds, inbox, `mcp-approve`, `mcp-message`
   mcp_gateway.py       MCP stdio gateway that decides tool calls with the runtime (`cadl mcp-gateway`, `mcp-approve`, `mcp-message`)
+  a2a_gateway.py       A2A gateway (JSON-RPC over HTTP) that decides SendMessage with the runtime (`cadl a2a-gateway`)
   norms_diff.py        Effect of an amendment on the norms (two versions compared)
   grounding.py         Grounding extension: derived indices, rules J-1 to J-9 and J-13
   cli.py               Command-line interface
@@ -1004,6 +1040,8 @@ tests/
   test_audit_log.py               Hash chain of the audit log: every single-byte change, deletion, insertion, reordering, keyed and unkeyed (`cadl audit-verify`)
   test_mcp_gateway.py             MCP gateway with a fake server and client: scenarios replayed through `cadl agents-run`, malformed input, crashes, concurrency
   mcp_fake_server.py              Fake MCP server (stdio) for test_mcp_gateway.py
+  test_a2a_gateway.py             A2A gateway with a fake agent and client: scenarios replayed through `cadl agents-run`, authentication, malformed input, task isolation
+  a2a_fake_agent.py               Fake A2A agent (HTTP, JSON-RPC) for test_a2a_gateway.py
 
 examples/
   robot_delivery.cadl        Robot delivery SoS (Acknowledged type)
@@ -1045,7 +1083,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | Norms extension: online monitor in the generated Python package (`norms_monitor.py`) | Available (Solidity, OPA and Unity C# do not monitor norms; no translation to a model checker) |
 | Grounding extension (grounding 0.1), norms side: derived indices and incentive coverage (`cadl norms-indices`), rules J-1 to J-9, IR, comparison of two versions (J-13 in `cadl norms-diff`) | Available |
 | Strategic model extension (games 0.1): equilibrium checks and certified equilibrium maps (`cadl game-check`), with the link to norms of Appendix J (`sanction_of:` / `reward_of:`, J-10 to J-12, J-14) | Available (the export for PRISM-games has not been run through PRISM-games) |
-| Agent governance extension (agents 0.1): checks, decision function, runtime on a recorded trace (holds, delegations, hash-chained audit records; `cadl agents-run`, `cadl audit-verify`), MCP stdio gateway (`cadl mcp-gateway`), Rego / Cedar boundary policies | Available (the gateway is a reference, tested with a fake MCP server and client only; no A2A connection) |
+| Agent governance extension (agents 0.1): checks, decision function, runtime on a recorded trace (holds, delegations, hash-chained audit records; `cadl agents-run`, `cadl audit-verify`), MCP stdio gateway (`cadl mcp-gateway`), A2A gateway over JSON-RPC (`cadl a2a-gateway`), Rego / Cedar boundary policies | Available (the gateways are references, tested with fake servers, agents and clients only) |
 | `model_check` / `simulation` / `proof` verification methods | Not supported yet (reported explicitly) |
 
 ## Related Projects

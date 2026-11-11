@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     averify_cmd = subparsers.add_parser(
         "audit-verify",
         help="Verify the hash chain of an audit log written by agents-run or "
-             "mcp-gateway (agents 0.1, G.8)",
+             "mcp-gateway or a2a-gateway (agents 0.1, G.8)",
         description="Verify the integrity fields of an audit log (G.8, integrity "
                     "of the log): the header, the sequence numbers, the digest of "
                     "every line and the link to the previous line, and the end "
@@ -174,6 +174,75 @@ def main(argv: list[str] | None = None) -> int:
                         help="Do not remove undeclared tools from tools/list results")
     gw_cmd.add_argument("--poll", type=float, default=0.05, metavar="SECONDS",
                         help="Interval for the inbox and for deadlines (default 0.05)")
+
+    # a2a-gateway command
+    a2a_cmd = subparsers.add_parser(
+        "a2a-gateway",
+        usage="cadl a2a-gateway FILE --agent-actor ACTOR --upstream URL "
+              "--client-keys KEYS.json --audit OUT.jsonl [options]",
+        help="Run an A2A gateway (JSON-RPC over HTTP) in front of an A2A agent that "
+             "decides every SendMessage with the enforcement point (agents 0.1)",
+        description="An HTTP server in front of the A2A agent ACTOR of the file, "
+                    "reached at URL (A2A 1.0.0, JSON-RPC binding). Every request is "
+                    "authenticated with the key of its actor (header Authorization: "
+                    "CADL-HMAC). A SendMessage names its CADL message with the "
+                    "extension of G.11 and is decided by the online runtime of "
+                    "agents-run: allowed messages are passed on, denied messages "
+                    "are answered with a task in TASK_STATE_REJECTED, escalated "
+                    "messages are held until an approval, a rejection or the "
+                    "timeout (see mcp-approve). GetTask and CancelTask are passed "
+                    "on for the client's own tasks; other methods are refused. "
+                    "Writes the audit log and the trace that agents-run replays "
+                    "to the same decisions. Exit status: 0 after SIGTERM or "
+                    "SIGINT, 1 when the enforcement point failed, 2 usage error.")
+    a2a_cmd.add_argument("file", type=Path, help="CADL file with enforced contracts")
+    a2a_cmd.add_argument("--agent-actor", required=True, metavar="ACTOR",
+                         help="The actor that the A2A agent behind the gateway is "
+                              "(agent: { kind: llm_agent, protocol: a2a }); the receiver "
+                              "of every message")
+    a2a_cmd.add_argument("--upstream", required=True, metavar="URL",
+                         help="The JSON-RPC endpoint of the A2A agent (http or https)")
+    a2a_cmd.add_argument("--client-keys", type=Path, required=True, metavar="FILE",
+                         help="JSON object from actor to the key file (or {\"hex\": ...}) "
+                              "with which its requests are authenticated (HMAC-SHA256)")
+    a2a_cmd.add_argument("--audit", type=Path, required=True, metavar="OUT.jsonl",
+                         help="Audit log to create (must not exist)")
+    a2a_cmd.add_argument("--audit-key", type=Path, default=None, metavar="FILE",
+                         help="Key the hash chain of the audit log (HMAC-SHA256)")
+    a2a_cmd.add_argument("--trace-out", type=Path, default=None, metavar="TRACE.jsonl",
+                         help="Trace to create (must not exist; default: the audit "
+                              "path with the suffix .trace.jsonl)")
+    a2a_cmd.add_argument("--approvals", type=Path, default=None, metavar="DIR",
+                         help="Inbox directory for approvals, rejections and other "
+                              "messages (mcp-approve, mcp-message)")
+    a2a_cmd.add_argument("--approver-keys", type=Path, default=None, metavar="FILE",
+                         help="The keys of the approvers and other senders of the "
+                              "inbox; required with --approvals")
+    a2a_cmd.add_argument("--insecure-approvals", action="store_true",
+                         help="Read the inbox without authentication (for tests only)")
+    a2a_cmd.add_argument("--init", type=Path, default=None, metavar="FILE.json",
+                         help="Keys for the first line of the trace: bindings, "
+                              "request, values, quantities, instances, "
+                              "host_instances, state")
+    a2a_cmd.add_argument("--listen", default="127.0.0.1:8470", metavar="HOST:PORT",
+                         help="Address to listen on (default 127.0.0.1:8470; port 0 "
+                              "picks a free port). An address other than loopback "
+                              "needs --tls-cert and --tls-key")
+    a2a_cmd.add_argument("--port-file", type=Path, default=None, metavar="FILE",
+                         help="Write the port that the gateway listens on to FILE")
+    a2a_cmd.add_argument("--tls-cert", type=Path, default=None, metavar="FILE",
+                         help="Certificate chain (PEM) for HTTPS")
+    a2a_cmd.add_argument("--tls-key", type=Path, default=None, metavar="FILE",
+                         help="Private key (PEM) for HTTPS")
+    a2a_cmd.add_argument("--agent-card", type=Path, default=None, metavar="FILE.json",
+                         help="Agent card served at /.well-known/agent-card.json")
+    a2a_cmd.add_argument("--upstream-token", type=Path, default=None, metavar="FILE",
+                         help="Bearer token for the agent, read from FILE")
+    a2a_cmd.add_argument("--upstream-timeout", type=float, default=300.0,
+                         metavar="SECONDS", help="Timeout of a request to the agent "
+                                                 "(default 300)")
+    a2a_cmd.add_argument("--poll", type=float, default=0.05, metavar="SECONDS",
+                         help="Interval for the inbox and for deadlines (default 0.05)")
 
     # mcp-approve command
     approve_cmd = subparsers.add_parser(
@@ -407,6 +476,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "mcp-gateway":
         from .mcp_gateway import cli_gateway
         return cli_gateway(args)
+    elif args.command == "a2a-gateway":
+        from .a2a_gateway import cli_gateway as a2a_cli_gateway
+        return a2a_cli_gateway(args)
     elif args.command == "mcp-approve":
         from .mcp_gateway import cli_approve
         return cli_approve(args)
