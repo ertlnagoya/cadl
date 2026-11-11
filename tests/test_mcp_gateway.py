@@ -249,6 +249,7 @@ class TestScenarios:
         r = Run(tmp_path, cadl=short_timeout(tmp_path))
         r.call(1, "delete_file")
         r.wait_lines(2)
+        r.wait_hold("h-1")   # the approval is bound to the published hold
         late = approval_file(r.inbox, "h-1", "approve", "OPERATOR",
                              APPROVER_KEYS["OPERATOR"])
         r.no_response(1, wait=0.2)
