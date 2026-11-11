@@ -8,7 +8,7 @@ Checks performed (per spec §6.2.2):
    them with the actual message exchanges is planned, not implemented)
 5. Institutional parameter range constraints (0 <= alpha, beta, lambda <= 1)
 6. SoS-DSL static semantics, rules L-1 to M-3 (Appendix E §E.4)
-7. Norms static semantics, rules N-1 to N-12 (Appendix F §F.7), when the
+7. Norms static semantics, rules N-1 to N-13 (Appendix F §F.7), when the
    file declares `norms: 0.1`
 8. Agent governance static semantics, rules G-1 to G-19 (Appendix G §G.9),
    when the file declares `agents: 0.1` (which requires `norms: 0.1`)
@@ -101,6 +101,37 @@ class TypeCheckResult:
 
     def add_info(self, message: str, loc: SourceLocation | None = None) -> None:
         self.infos.append(TypeError(message=message, loc=loc, severity="info"))
+
+
+def _trigger_is_content(contract: ContractDef, norm) -> bool:
+    """N-13: whether every occurrence of the message-event trigger of a
+    norm is also an occurrence of its message-event content (same
+    message name and arguments, and content actor references that match
+    every actor the trigger's can match)."""
+    from .agents import parse_message_event, ref_covered
+    events = {r.creates for r in contract.counts_as if r.creates}
+    if not norm.trigger or norm.trigger.strip() in events or norm.content.strip() in events:
+        return False
+    try:
+        trig = parse_message_event(norm.trigger)
+        cont = parse_message_event(norm.content)
+    except Exception:
+        return False
+    if trig is None or cont is None or trig.name is None or trig.name != cont.name:
+        return False
+    if cont.has_args and _message_args(cont.text) != _message_args(trig.text):
+        return False
+    for t, c in ((trig.sender, cont.sender), (trig.receiver, cont.receiver)):
+        if c["kind"] == "var" or t["kind"] == "var":
+            if c["text"] != t["text"] and c["kind"] != "all":
+                return False
+        elif not ref_covered(t, [c]):
+            return False
+    return True
+
+
+def _message_args(text: str) -> str:
+    return re.sub(r"\s+", "", text.split(":", 1)[1]) if ":" in text else ""
 
 
 class TypeChecker:
@@ -963,6 +994,16 @@ class TypeChecker:
                         f"the two conflict (N-12)",
                         perm.loc,
                     )
+
+        # N-13: a prohibition that its own trigger violates.
+        for proh in contract.norms:
+            if proh.kind == "prohibition" and _trigger_is_content(contract, proh):
+                self.result.add_warning(
+                    f"The trigger: of the prohibition '{proh.id}' of {ctx} is also an "
+                    f"occurrence of its content:, so the prohibition is violated at the "
+                    f"observation that activates it (N-13)",
+                    proh.loc,
+                )
 
     # --- Agent governance extension (Appendix G, G.9) ---
 

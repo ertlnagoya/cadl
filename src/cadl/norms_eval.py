@@ -59,6 +59,7 @@ from .ast_nodes import (
     ActorRef,
     BinaryOp,
     BoolLiteral,
+    Comprehension,
     ContractDef,
     DurationLiteral,
     FloatLiteral,
@@ -66,6 +67,7 @@ from .ast_nodes import (
     IntLiteral,
     MemberAccess,
     NormDef,
+    QuantifiedExpr,
     RangeExpr,
     SoSDefinition,
     StringLiteral,
@@ -188,16 +190,43 @@ def loads_strict(line: str) -> Any:
 
 
 def declared_actors(sos: SoSDefinition) -> dict[str, tuple]:
-    """The declared actors: name -> (indexed, lo, hi); a bound that is
-    not an integer is None (`A[1..N]` gives lo 1 and hi None)."""
+    """The declared actors: name -> (indexed, lo, hi, symbolic); a bound
+    that is not an integer is None, and `symbolic` is the name of a
+    symbolic upper bound (`A[1..N]` gives lo 1, hi None and "N")."""
     out: dict[str, tuple] = {}
     for a in sos.actors:
         index = a.id.index
-        lo = hi = None
+        lo = hi = symbolic = None
         if isinstance(index, RangeExpr):
             lo = index.start if isinstance(index.start, int) else None
             hi = index.end if isinstance(index.end, int) else None
-        out[a.id.name] = (index is not None, lo, hi)
+            if isinstance(index.end, str):
+                symbolic = index.end
+        out[a.id.name] = (index is not None, lo, hi, symbolic)
+    return out
+
+
+# `A[i]` written in a norm or a counts-as rule: with a binding of `i` to v,
+# the contract instance names the member A[v] (F.5, domains of quantifiers).
+_INDEXED_REF_RE = re.compile(r"([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*)\s*\]")
+# A value key or a message actor that names a member: `A[3].x` or `A[3]`.
+_MEMBER_KEY_RE = re.compile(r"^([A-Za-z_]\w*)\[(0|[1-9][0-9]*)\](?:\.|$)")
+# The aggregate functions of a comprehension (A.10) that the engine evaluates.
+AGGREGATES = ("sum", "count", "min", "max", "avg")
+
+
+def _bound_refs(contract: ContractDef) -> set:
+    """The pairs (set, index variable) of the references `A[i]` in the
+    norms and the counts-as rules of a contract."""
+    out: set = set()
+    for d in contract.norms:
+        for text in (d.bearer, d.counterparty, d.trigger, d.until, d.content):
+            if text:
+                out.update(_INDEXED_REF_RE.findall(text))
+    for r in contract.counts_as:
+        for text in (r.when, r.if_):
+            if text:
+                out.update(_INDEXED_REF_RE.findall(text))
     return out
 
 
@@ -353,9 +382,17 @@ class _Evaluator:
         self.known = set()
         for o in self.obs:
             self.known.update(o.values)
-        self._cache: dict[tuple[int, int], tuple[Any, Any]] = {}
+        self._cache: dict[tuple, tuple[Any, Any]] = {}
         # Declared actors (`declared_actors`); None when they are not known.
         self.actors: dict[str, tuple] | None = None
+        # The variables of the quantifiers and comprehensions being
+        # evaluated: name -> (set or None, index).
+        self._scope: dict[str, tuple] = {}
+        # Observation index -> (observation, set -> indices of the members
+        # named up to it); see `known_members`.
+        self._members: dict[int, tuple] = {}
+        # (set, index variable) of the references `A[i]` of the contract.
+        self.bound_refs: set = set()
 
     def is_member(self, name: str, index: str | None) -> bool:
         """Whether `name` (index None) or `name[index]` is a declared actor
@@ -365,7 +402,7 @@ class _Evaluator:
         decl = self.actors.get(name)
         if decl is None:
             return False
-        indexed, lo, hi = decl
+        indexed, lo, hi = decl[:3]
         if not indexed or index is None:
             return not indexed and index is None
         if not index.isdigit():
@@ -379,26 +416,38 @@ class _Evaluator:
 
     # --- static -----------------------------------------------------------
 
-    def unsupported(self, expr: Any, temporal: bool) -> str | None:
-        """Why an expression cannot be evaluated, or None."""
+    def unsupported(self, expr: Any, temporal: bool, bound: dict | None = None) -> str | None:
+        """Why an expression cannot be evaluated, or None. `bound` maps the
+        variables of the enclosing quantifiers and comprehensions to their
+        set (None for a range of integers)."""
+        bound = bound or {}
         if isinstance(expr, (IntLiteral, FloatLiteral, BoolLiteral, StringLiteral, DurationLiteral)):
             return None
         if isinstance(expr, ActorRef):
             if expr.index == "*" or isinstance(expr.index, RangeExpr):
                 return "a wildcard or range actor reference is not evaluable"
             if expr.index is not None and not isinstance(expr.index, (str, int)):
-                return self.unsupported(expr.index, False)
+                return self.unsupported(expr.index, False, bound)
             return None
         if isinstance(expr, MemberAccess):
-            return self.unsupported(expr.obj, False)
+            obj = expr.obj
+            if obj.index is None and obj.name in bound and bound[obj.name] is None:
+                return (f"'{obj.name}' ranges over integers, not over the members of a "
+                        f"set, so '{obj.name}.{expr.member}' is not evaluable")
+            return self.unsupported(obj, False, bound)
         if isinstance(expr, UnaryOp):
-            return self.unsupported(expr.operand, temporal)
+            return self.unsupported(expr.operand, temporal, bound)
         if isinstance(expr, BinaryOp):
-            return self.unsupported(expr.left, temporal) or self.unsupported(expr.right, temporal)
+            return (self.unsupported(expr.left, temporal, bound)
+                    or self.unsupported(expr.right, temporal, bound))
+        if isinstance(expr, QuantifiedExpr):
+            return (self._domain_error(expr.domain, False)
+                    or self.unsupported(expr.predicate, temporal,
+                                        {**bound, expr.variable: expr.domain.name}))
         if isinstance(expr, FunctionCall):
             if expr.name == "__in__":
                 for a in expr.args:
-                    r = self.unsupported(a, False)
+                    r = self.unsupported(a, False, bound)
                     if r:
                         return r
                 return None
@@ -410,12 +459,33 @@ class _Evaluator:
                     return f"{expr.name}() does not have the arguments of F.4"
                 for i, a in enumerate(expr.args):
                     if i != dpos:
-                        r = self.unsupported(a, True)
+                        r = self.unsupported(a, True, bound)
                         if r:
                             return r
                 return None
+            if (expr.name in AGGREGATES and len(expr.args) == 1
+                    and isinstance(expr.args[0], Comprehension)):
+                comp = expr.args[0]
+                dom = comp.domain
+                return (self._domain_error(dom, True)
+                        or self.unsupported(comp.element, False, {
+                            **bound,
+                            comp.variable: None if isinstance(dom, RangeExpr) else dom.name}))
             return f"the function call {expr.name}() is not evaluable"
         return f"{type(expr).__name__} is not evaluable"
+
+    @staticmethod
+    def _domain_error(dom: Any, comprehension: bool) -> str | None:
+        """Why the domain of a quantifier or comprehension is not one the
+        engine evaluates (a set `A`, `A[*]` or `A[lo..hi]`, or for a
+        comprehension also a range `lo..hi`), or None."""
+        if comprehension and isinstance(dom, RangeExpr):
+            return None
+        if isinstance(dom, ActorRef) and (dom.index is None or dom.index == "*"
+                                          or isinstance(dom.index, RangeExpr)):
+            return None
+        return ("the domain of a quantifier or a comprehension must be a set of actors "
+                "(A, A[*] or A[lo..hi]), or for a comprehension a range lo..hi")
 
     # --- names ------------------------------------------------------------
 
@@ -432,6 +502,8 @@ class _Evaluator:
             name = idx if isinstance(idx, str) else idx.name
             if name.isdigit():
                 return f"{ref.name}[{name}]", True
+            if name in self._scope:
+                return f"{ref.name}[{self._scope[name][1]}]", True
             if name in self.bindings:
                 return f"{ref.name}[{self.bindings[name]}]", True
             self.warn(f"the index '{name}' of {ref.name}[{name}] is not bound by the trace "
@@ -455,6 +527,8 @@ class _Evaluator:
         return UNKNOWN
 
     def _name(self, name: str, k: int) -> Any:
+        if name in self._scope:
+            return self._scope[name][1]
         if name in self.bindings:
             return self.bindings[name]
         if name == "now":
@@ -489,6 +563,11 @@ class _Evaluator:
                         return UNKNOWN
                     cur = cur[part]
                 return UNKNOWN if cur is None else cur
+            if obj.index is None and obj.name in self._scope:
+                # `r.load` for a variable r over a set: the member's quantity
+                group, index = self._scope[obj.name]
+                return self._lookup(f"{group}[{index}].{expr.member}", k,
+                                    f"{group}.{expr.member}")
             text, _ = self.actor(obj, k)
             stripped = f"{obj.name}.{expr.member}" if obj.index is not None else None
             return self._lookup(f"{text}.{expr.member}", k, stripped)
@@ -497,8 +576,15 @@ class _Evaluator:
             return v if isinstance(v, _Marker) else (not v)
         if isinstance(expr, BinaryOp):
             return self._binary(expr, k, n)
+        if isinstance(expr, QuantifiedExpr):
+            return self._quantified(expr, k, n)
+        if isinstance(expr, FunctionCall) and expr.name in AGGREGATES and expr.args \
+                and isinstance(expr.args[0], Comprehension):
+            return self._aggregate(expr.name, expr.args[0], k, n)
         if isinstance(expr, FunctionCall) and expr.name in TEMPORAL_OPERATORS:
             key = (id(expr), k)
+            if self._scope:      # inside a quantifier: the value depends on its variables
+                key += tuple(sorted(self._scope.items()))
             if key in self._cache:
                 return self._cache[key][1]
             v = self._temporal(expr, k, n)
@@ -602,6 +688,177 @@ class _Evaluator:
 
     def holds(self, expr: Any, k: int, n: int) -> Any:
         return self.truth(self.value(expr, k, n), expr)
+
+    # --- quantifiers and aggregates (F.5) -------------------------------------
+
+    def known_members(self, k: int) -> dict:
+        """set -> indices of the members that the instance has named at or
+        before observation k: in the key of a value (`A[3].x`), as the
+        sender or receiver of a message, or by a binding `i` = v of an
+        index that the contract writes as `A[i]`. Later observations are
+        not used (F.5)."""
+        start = k
+        while start >= 0 and not (start in self._members
+                                  and self._members[start][0] is self.obs[start]):
+            start -= 1
+        found: dict = {} if start < 0 else {g: set(v) for g, v in self._members[start][1].items()}
+        if start < 0:
+            for group, var in self.bound_refs:
+                v = self.bindings.get(var)
+                if isinstance(v, float) and v.is_integer():
+                    v = int(v)
+                if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                    found.setdefault(group, set()).add(v)
+        for j in range(start + 1, k + 1):
+            o = self.obs[j]
+            names = list(o.values) + [a for m in o.messages for a in (m["from"], m["to"])]
+            for name in names:
+                m = _MEMBER_KEY_RE.match(name)
+                if m:
+                    found.setdefault(m.group(1), set()).add(int(m.group(2)))
+            self._members[j] = (o, {g: frozenset(v) for g, v in found.items()})
+        return self._members[k][1] if k >= 0 else {}
+
+    def _bound_value(self, name: str, k: int) -> int | None:
+        """The value of a symbolic bound at observation k: a binding of the
+        instance or an observed quantity with an integer value; None when
+        it has none."""
+        v = self._name(name, k)
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+        if not isinstance(v, (_Marker, _Sym)):
+            self.warn(f"the bound '{name}' has the value {v!r}, which is not an integer; "
+                      f"it is treated as a bound without a value")
+        return None
+
+    def domain(self, dom: Any, k: int) -> Any:
+        """The domain of a quantifier or comprehension at observation k:
+        (set or None, indices in increasing order, closed), or UNKNOWN.
+        A domain that is not closed is open: it holds the members known so
+        far, and further members may exist."""
+        if isinstance(dom, RangeExpr):
+            group, lo, uppers = None, dom.start, [dom.end]
+        else:
+            group, lo, uppers = dom.name, None, []
+            if self.actors is not None:
+                decl = self.actors.get(group)
+                if decl is None or not decl[0]:
+                    self.warn(f"'{group}' is not a declared set of actors; a quantifier or "
+                              f"aggregate over it is undefined")
+                    return UNKNOWN
+                lo = decl[1]
+                uppers.append(decl[2] if decl[2] is not None else decl[3])
+            if isinstance(dom.index, RangeExpr):
+                lo = dom.index.start if lo is None else max(lo, dom.index.start)
+                uppers.append(dom.index.end)
+        hi, unknown = None, False
+        for b in uppers:
+            if isinstance(b, str):
+                b = self._bound_value(b, k)
+                unknown = unknown or b is None
+            if isinstance(b, int):
+                hi = b if hi is None else min(hi, b)
+        start = 0 if lo is None else lo
+        if not unknown and hi is not None:
+            return group, list(range(start, hi + 1)), True
+        if group is None:
+            return None, [], False
+        known = self.known_members(k).get(group, ())
+        return group, sorted(i for i in known
+                             if i >= start and (hi is None or i <= hi)), False
+
+    def _with(self, var: str, member: tuple, fn: Any) -> Any:
+        """fn() with the variable `var` bound to `member` (set, index);
+        an inner variable of the same name hides the outer one."""
+        had = var in self._scope
+        old = self._scope.get(var)
+        self._scope[var] = member
+        try:
+            return fn()
+        finally:
+            if had:
+                self._scope[var] = old
+            else:
+                del self._scope[var]
+
+    def _open_domain(self, group: str) -> None:
+        self.warn(f"the set {group} has a symbolic bound without a value: members that the "
+                  f"trace has not named yet may exist, so a quantifier over it that no known "
+                  f"member decides, and an aggregate over it, are undefined")
+
+    def _quantified(self, q: QuantifiedExpr, k: int, n: int) -> Any:
+        """Kleene's for all / exists over the domain at observation k; on an
+        open domain only a known member decides, and otherwise the value is
+        undefined."""
+        dom = self.domain(q.domain, k)
+        if dom is UNKNOWN:
+            return UNKNOWN
+        group, members, closed = dom
+        decisive = q.quantifier == "exists"   # True decides exists, False for all
+        vals = []
+        for index in members:
+            v = self._with(q.variable, (group, index),
+                           lambda: self.holds(q.predicate, k, n))
+            if v is decisive:
+                return decisive
+            vals.append(v)
+        worst = self._worst(*vals)
+        if worst is not None:
+            return worst
+        if not closed:
+            self._open_domain(group)
+            return UNKNOWN
+        return not decisive
+
+    def _aggregate(self, name: str, comp: Comprehension, k: int, n: int) -> Any:
+        """sum, count, min, max or avg of a comprehension at observation k;
+        undefined on an open domain or when an element is undefined.
+        `count` counts the members for which the element is true."""
+        dom = self.domain(comp.domain, k)
+        if dom is UNKNOWN:
+            return UNKNOWN
+        group, members, closed = dom
+        if not closed:
+            if group is not None:
+                self._open_domain(group)
+            else:
+                self.warn(f"the range of '{comp.variable}' in {name}() has a bound without "
+                          f"a value; the aggregate is undefined")
+            return UNKNOWN
+        vals, markers = [], []
+        for index in members:
+            v = self._with(comp.variable, (group, index),
+                           lambda: self.value(comp.element, k, n))
+            if name == "count":
+                v = self.truth(v, comp.element)
+            elif isinstance(v, _Sym):
+                v = self._no_value(v)
+            elif not isinstance(v, _Marker) and (isinstance(v, bool)
+                                                  or not isinstance(v, (int, float))):
+                self.warn(f"{name}() of the value {v!r}, which is not a number; "
+                          f"the predicate does not hold")
+                v = UNKNOWN
+            if isinstance(v, _Marker):
+                markers.append(v)
+            else:
+                vals.append(v)
+        worst = self._worst(*markers)
+        if worst is not None:
+            return worst
+        if name == "count":
+            return sum(1 for v in vals if v is True)
+        if name == "sum":
+            return sum(vals)
+        if not vals:
+            self.warn(f"{name}() over an empty domain has no value; the predicate does not hold")
+            return UNKNOWN
+        if name == "min":
+            return min(vals)
+        if name == "max":
+            return max(vals)
+        return sum(vals) / len(vals)
 
     # --- temporal operators (F.4) -------------------------------------------
 
@@ -829,6 +1086,7 @@ class _Engine:
         self._init_states()
         self.ev = _Evaluator(trace, lc is not None, self.warnings)
         self.ev.actors = actors
+        self.ev.bound_refs = _bound_refs(contract)
         self.events = {r.creates for r in contract.counts_as if r.creates}
         self.norms = [_NormInst(d, self.events, self.ev) for d in contract.norms]
         self.by_id = {n.d.id: n for n in self.norms}
@@ -978,6 +1236,8 @@ class _Engine:
         old_ids = set(self.by_id)
         self.contract = new
         self.ev.has_lifecycle = new.lifecycle is not None
+        self.ev.bound_refs = _bound_refs(new)
+        self.ev._members = {}
         self.events = {r.creates for r in new.counts_as if r.creates}
         self._build_rules()
         self.targets = _targets_of(new)

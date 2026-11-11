@@ -6,6 +6,33 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Quantified predicates and aggregates in the dynamic semantics of the
+  norms extension (Appendix F, F.5, "Quantifiers and aggregates"):
+  `cadl norms-eval`, the generated `norms_monitor.py` and `cadl
+  agents-run` evaluate `exists x in D: p`, `for all x in D: p` and
+  `sum` / `count` / `min` / `max` / `avg` of a comprehension. Up to
+  0.3.22 a norm that used one was reported as not evaluable and never
+  judged. The domain is a declared set (`A`, `A[*]`, `A[lo..hi]`, for a
+  comprehension also `lo..hi`), and the variable is the index of a
+  member. With integer bounds the domain is closed (Kleene's logic). A
+  symbolic bound has a value when the instance binds it or it is a
+  quantity with an integer value at that observation; otherwise the
+  domain is open, its known members are those the instance has named so
+  far, `exists` is true only by a known witness, `for all` false only by
+  a known counterexample, and every other value and every aggregate is
+  undefined. The value at an observation depends only on the prefix up
+  to it. In the agent runtime an undefined quantified `trigger:` or
+  `until:` is missing data (G.5); the limit of G.13 that a prohibition
+  with a quantified trigger always applies is gone for quantifiers. A
+  wildcard or range reference outside a domain (`ROBOT[*].battery > 10`)
+  is still not evaluated.
+- `examples/norms_no_double_assignment.cadl` with three traces: the same
+  delivery must not be assigned to two robots at once.
+- `cadl check` warns about a prohibition whose message `trigger:` is
+  also an occurrence of its message `content:`, which violates it at the
+  observation that activates it (N-13).
+
 ## [0.3.22] — 2026-11-11
 
 Three parts of the extension appendices that were specified but not

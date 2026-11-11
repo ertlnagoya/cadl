@@ -1,0 +1,118 @@
+# Norms Extension Demo with a Quantified Prohibition (Appendix F, norms 0.1)
+#
+# The contract of norms_robot_delivery.cadl with one more norm: the
+# dispatcher must not assign the same delivery to two robots at the same
+# time. Its content quantifies over the set ROBOT[1..N] (F.5,
+# "Quantifiers and aggregates"). N has no value in the traces, so the
+# domain is open: the robots the trace has named so far are known, and
+# the predicate is true as soon as two of them carry the delivery of the
+# request; while no two known robots do, it is undefined (a robot not yet
+# named might), and an undefined content does not violate the
+# prohibition. Traces: examples/traces/norms_no_double_assignment_*.jsonl.
+
+sos:
+  name: "RobotDeliveryNoDoubleAssignment"
+  type: Acknowledged
+  version: "0.1.0"
+  description: "Robot-delivery SoS with a prohibition quantified over the robots."
+  extensions:
+    - sos-dsl: 0.1
+    - norms: 0.1
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities:
+        - assign_tasks
+        - reassign_tasks
+        - monitor_fleet
+      interface:
+        input:  [delivery_request, ack, failure_report, charging_request]
+        output: [route_assignment, replan_command, delivery_notification]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities:
+        - follow_path
+        - pick_up
+        - deliver
+      interface:
+        input:  [route_assignment, replan_command]
+        output: [ack, failure_report, charging_request]
+
+    - id: "CUSTOMER[1..M]"
+      role: "service_requester"
+      autonomy: medium
+      capabilities:
+        - submit_order
+        - confirm_receipt
+      interface:
+        input:  [delivery_notification]
+        output: [delivery_request]
+
+  contracts:
+    - id: DELIVERY_SLA
+      parties: [DISPATCHER, "ROBOT[*]", "CUSTOMER[*]"]
+      assume:
+        - "throughout(300s, DISPATCHER.is_operational == true)"
+      guarantee:
+        - "within(300s, ROBOT[i].status == Delivered)"
+
+      lifecycle:
+        states:   [Proposed, Assigned, Delivering, Completed, Violated]
+        initial:  Proposed
+        terminal: [Completed, Violated]
+        transitions:
+          - { id: assign,   from: Proposed,   to: Assigned,   on: "DISPATCHER -> ROBOT[i] : route_assignment" }
+          - { id: start,    from: Assigned,   to: Delivering, on: "ROBOT[i].status == InTransit" }
+          - { id: complete, from: Delivering, to: Completed,  on: "ROBOT[i].status == Delivered" }
+
+      counts_as:
+        - when: "DISPATCHER -> ROBOT[i] : replan_command"
+          creates: reassignment
+
+      norms:
+        - id: no_double_assignment
+          kind: prohibition
+          bearer: DISPATCHER
+          content: "exists j in ROBOT: exists k in ROBOT: j != k AND ROBOT[j].delivery == request.id AND ROBOT[k].delivery == request.id"
+          on_violation: { severity: Critical, sanction: "the delivery was assigned to two robots" }
+        - id: acknowledge
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: DISPATCHER
+          trigger: "DISPATCHER -> ROBOT[i] : route_assignment"
+          content: "ROBOT[i] -> DISPATCHER : ack(accepted)"
+          deadline: 5s
+          on_violation:
+            severity: Major
+            reparation: report_failure
+        - id: report_failure
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: DISPATCHER
+          content: "ROBOT[i] -> DISPATCHER : failure_report"
+          deadline: 2s
+          on_violation:
+            severity: Critical
+            transition: Violated
+        - id: no_low_battery_driving
+          kind: prohibition
+          bearer: "ROBOT[i]"
+          content: "ROBOT[i].battery < 10 AND ROBOT[i].status == InTransit"
+          on_violation:
+            severity: Critical
+            sanction: "removed from the dispatch pool for one period"
+        - id: may_return_to_charge
+          kind: permission
+          bearer: "ROBOT[i]"
+          content: "ROBOT[i] -> DISPATCHER : charging_request"
+        - id: reassign
+          kind: power
+          bearer: DISPATCHER
+          content: reassignment
+          effects:
+            discharge: [acknowledge, report_failure]
+          on_amendment: discharge

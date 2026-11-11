@@ -577,31 +577,47 @@ class _BoundaryEngine(_Engine):
         """The quantities that a predicate reads and that have no value at
         observation n."""
         import dataclasses
-        from .ast_nodes import MemberAccess
+        from .ast_nodes import Comprehension, MemberAccess, QuantifiedExpr
         values, out = self.obs[n].values, []
 
-        def walk(node: Any) -> None:
-            if isinstance(node, MemberAccess) and isinstance(node.obj, ActorRef):
+        def domain(dom: Any) -> None:
+            # the members of an open domain that the trace has not named yet
+            d = self.ev.domain(dom, n)
+            if d is not UNKNOWN and not d[2]:
+                out.append(f"a member of {d[0]} not yet named" if d[0] is not None
+                           else "the bound of a range")
+
+        def walk(node: Any, bound: frozenset) -> None:
+            if isinstance(node, (QuantifiedExpr, Comprehension)):
+                domain(node.domain)
+                inner = node.predicate if isinstance(node, QuantifiedExpr) else node.element
+                walk(inner, bound | {node.variable})
+            elif isinstance(node, MemberAccess) and isinstance(node.obj, ActorRef):
                 if node.obj.name == "request" and node.obj.index is None:
                     return
+                index = node.obj.index
+                if isinstance(index, ActorRef) and index.index is None:
+                    index = index.name
+                if node.obj.name in bound or index in bound:
+                    return              # a quantity of each member: see domain()
                 key = f"{self.ev.actor(node.obj, n)[0]}.{node.member}"
                 plain = f"{node.obj.name}.{node.member}"
                 if values.get(key) is None and values.get(plain) is None:
                     out.append(key)
             elif isinstance(node, ActorRef):
                 if node.index is None and node.name in self.ev.known \
-                        and node.name not in self.ev.bindings \
+                        and node.name not in self.ev.bindings and node.name not in bound \
                         and values.get(node.name) is None:
                     out.append(node.name)
             elif dataclasses.is_dataclass(node) and not isinstance(node, type):
                 for f in dataclasses.fields(node):
                     if f.name != "loc":
-                        walk(getattr(node, f.name))
+                        walk(getattr(node, f.name), bound)
             elif isinstance(node, (list, tuple)):
                 for item in node:
-                    walk(item)
+                    walk(item, bound)
 
-        walk(term.expr)
+        walk(term.expr, frozenset())
         return list(dict.fromkeys(out))
 
     def in_force(self, nid: str):
