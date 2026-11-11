@@ -42,6 +42,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   numbers for it are such integers. Without a domain such a norm is not
   translated, and the reason names the option.
   `examples/norms_check_arithmetic.cadl` sums loads against a capacity.
+- `cadl norms-check --instance i=1 --instance i=2` (or `--instances N`)
+  checks several instances of a contract together: one model whose
+  instances share the observations, the message events and the
+  quantities, start together and end each on its own; norms are named
+  `id@k`, conflicts are asked across instances, and every witness holds
+  the trace of each instance, which `cadl norms-eval` evaluates with the
+  bindings of that instance. At most 4 instances.
+  `examples/norms_check_instances.cadl` finds a conflict across two
+  robots' instances.
 
 ### Fixed
 

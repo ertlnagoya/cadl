@@ -372,6 +372,12 @@ def main(argv: list[str] | None = None) -> int:
     nchk_cmd.add_argument("--export", type=Path, default=None, metavar="DIR",
                           help="Write the PRISM model, the properties and the witness traces "
                                "to DIR")
+    nchk_cmd.add_argument("--instance", action="append", default=[], metavar="i=n,...",
+                          help="Bindings of one contract instance; repeat to check several "
+                               "instances together over the same observations (F.12)")
+    nchk_cmd.add_argument("--instances", type=int, default=None, metavar="N",
+                          help="Check N instances together, which bind the one open index to "
+                               "the first N members of its set")
     nchk_cmd.add_argument("--domain", action="append", default=[], metavar="Q=lo..hi",
                           help="Integer domain of a quantity used in arithmetic, sum or avg "
                                "(ROBOT[*].load=0..5); the answers then hold for traces whose "
@@ -1202,7 +1208,8 @@ def _cmd_norms_check(args: argparse.Namespace) -> int:
     try:
         report = check_file(args.file, args.contract, args.bindings, args.members,
                             args.step, args.horizon, args.export, timeout=args.timeout,
-                            domains=args.domain)
+                            domains=args.domain,
+                            instances=args.instance or args.instances)
     except NormsEvalError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

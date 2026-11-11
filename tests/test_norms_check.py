@@ -302,6 +302,25 @@ norms:
 ARITH_DOMAINS = ["R[1].x=0..3", "R[1].y=0..3", "R[*].load=0..1"]
 
 
+# one bearer, two instances: docking one robot is forbidden while another
+# is docked
+MULTI = """\
+norms:
+  - id: dock_when_low
+    kind: obligation
+    bearer: D
+    trigger: "R[i] -> D : low"
+    content: "D -> R[i] : dock"
+    deadline: 1s
+  - id: one_at_a_time
+    kind: prohibition
+    bearer: D
+    trigger: "R[i] -> D : docked"
+    content: "D -> R[*] : dock"
+"""
+MULTI_KW = {"members": ["R=2"], "instances": [{"i": 1}, {"i": 2}]}
+
+
 def make_sos(body: str):
     sos = parse(HEAD + textwrap.indent(body, "      "))
     result = type_check(sos)
@@ -315,11 +334,12 @@ _MODELS: dict = {}
 def model_of(name: str, **kw):
     """The model of an example file or of one of the contracts above,
     built once per test session."""
-    key = (name, json.dumps(kw, sort_keys=True))
+    key = (name, json.dumps(kw, sort_keys=True, default=str))
     if key not in _MODELS:
         texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS,
                  "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES, "QUANT": QUANT,
-                 "ARITH": ARITH}
+                 "ARITH": ARITH,
+                 "MULTI": MULTI}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
         _MODELS[key] = (sos, m, PrismModel(m.prism_text(), {"early_end": True}))
@@ -606,6 +626,46 @@ def test_arithmetic_needs_a_domain():
     assert tr.quantities["R[1].a"].order == 3
     with pytest.raises(NormsCheckError, match="--domain takes"):
         build_model(make_sos(ARITH), domains=["R[1].x=3..1"])
+
+
+def test_several_instances_differential():
+    """Two instances over the same observations: each instance's trace, up
+    to its own end, is evaluated by norms-eval with its bindings and
+    compared with the model at every observation."""
+    _sos, m, pm = model_of("MULTI", **MULTI_KW)
+    tr = m.tr
+    assert [n.uid for n in m.norms] == ["dock_when_low@1", "one_at_a_time@1",
+                                        "dock_when_low@2", "one_at_a_time@2"]
+    paths = (random_paths(tr, PATHS * 2, seed=21, instances=2)
+             + random_paths(tr, PATHS, seed=22, p_message=0.15, p_end=0.05, instances=2)
+             + random_paths(tr, PATHS, seed=23, full_length=True, instances=2)
+             + all_paths(tr, 1, instances=2))
+    for p in paths:
+        assert not compare_path(m, pm, p), p
+    # an instance that ends first does not change afterwards
+    p = [(0, 1)] + [(0, 0)] * 2 + [(0, 2)]
+    states = run_path(pm, p)
+    assert states[0]["k1_ended"] and not states[0]["k2_ended"]
+    assert len({s["st_k1_0_dock_when_low"] for s in states}) == 1
+
+
+@needs_prism
+def test_conflict_across_instances():
+    sos, m, _pm = model_of("MULTI", **MULTI_KW)
+    report = check(m, PRISM)
+    pairs = {tuple(c["norms"]) for c in report["conflicts"]}
+    assert ("dock_when_low@1", "one_at_a_time@2") in pairs
+    assert ("one_at_a_time@1", "dock_when_low@2") in pairs
+    for c in report["conflicts"]:
+        for w in c["witnesses"]:
+            assert w["confirmed"] and set(w["traces"]) == {"1", "2"}
+            for k, lines in w["traces"].items():
+                r = evaluate(sos, parse_trace(lines))
+                assert r["instance"]["bindings"]["i"] == int(k)
+                states = {n["id"]: n["state"] for n in r["norms"]}
+                keep_id, keep_k = w["keeps"].split("@")
+                if keep_k == k:
+                    assert states[keep_id] != "violated"
 
 
 def test_paths_cover_the_semantics():

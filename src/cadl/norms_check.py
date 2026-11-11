@@ -82,6 +82,7 @@ MAX_HORIZON = 1000
 MAX_CHOICES = 8192
 MAX_VALUATIONS = 20000
 MAX_ATOMS = 16
+MAX_INSTANCES = 4
 
 _UNIT_MS = {"ms": 1, "s": 1000, "min": 60000, "h": 3600000}
 
@@ -500,6 +501,8 @@ class NormInfo:
     bearer: Any = None                 # ("exact", actor) | ("set", name) | None
     effects: list = field(default_factory=list)
     content_text: str = ""
+    px: str = ""                       # prefix of the instance ("k2_"), "" for one
+    inst: int = 0                      # index of the instance
 
     @property
     def judged(self) -> bool:
@@ -507,7 +510,13 @@ class NormInfo:
 
     @property
     def stem(self) -> str:
-        return f"{self.index}_{re.sub(r'[^A-Za-z0-9_]', '_', self.id)}"
+        return f"{self.px}{self.index}_{re.sub(r'[^A-Za-z0-9_]', '_', self.id)}"
+
+    @property
+    def uid(self) -> str:
+        """The norm in the report: its id, and its instance when there are
+        several ("acknowledge@2")."""
+        return f"{self.id}@{self.inst + 1}" if self.px else self.id
 
 
 @dataclass
@@ -540,6 +549,7 @@ class Pred:
     expr: Any
     text: str
     keys: frozenset
+    owner: Any = None          # the Translator of its instance
 
 
 def _expr_text(expr: Any) -> str:
@@ -622,9 +632,7 @@ class Translator:
         self.rules = [self._rule(k, r) for k, r in enumerate(contract.counts_as)]
         self.items = [self._item(k, e) for k, e in enumerate(contract.assume)]
         self._propagate()
-        self._collect_atoms()
-        self._time(step_ms, horizon)
-        self._choices()
+        self.step_request = (step_ms, horizon)
 
     # --- the instance -------------------------------------------------------
 
@@ -639,6 +647,8 @@ class Translator:
         bound_vars = set(re.findall(r"(?:exists|for\s+all|for)\s+([A-Za-z_]\w*)\s+in\b",
                                     " ".join(texts)))
         refs = {(s_, v) for s_, v in _bound_refs(self.contract) if v not in bound_vars}
+        self.index_refs = refs
+        self.index_vars = {v for _s, v in refs if not v.isdigit()}
         for set_name, var in sorted(refs):
             if var not in self.bindings and not var.isdigit():
                 decl = self.actors.get(set_name)
@@ -1272,90 +1282,30 @@ class Translator:
     def model_norms(self) -> list[NormInfo]:
         return [n for n in self.norms if n.status == "model"]
 
-    def _collect_atoms(self) -> None:
-        terms = []
-        for n in self.model_norms():
-            terms += [t for t in (n.trigger, n.until, n.content) if t is not None]
-        terms += [r.when for r in self.rules if r.status == "model"]
-        raw: list = []
-        for t in terms:
-            if t.kind == "message":
-                for s, r, name, args in t.atoms:
-                    a = (s, r, name, args if args is not None else ())
-                    if a not in raw:
-                        raw.append(a)
-        if len(raw) > MAX_ATOMS:
-            raise NormsCheckError(
-                f"the contract instance has {len(raw)} message events; norms-check 0.1 "
-                f"translates at most {MAX_ATOMS} (use smaller --members)")
-        self.atoms = [Atom(*a) for a in raw]
-
-        def same(want: tuple, got: tuple) -> bool:
-            return len(want) == len(got) and all(
-                isinstance(w, bool) == isinstance(g, bool) and w == g for w, g in zip(want, got))
-
-        for t in terms:
-            if t.kind == "message":
-                idx = set()
-                for s, r, name, args in t.atoms:
-                    for i, a in enumerate(self.atoms):
-                        if (a.sender, a.receiver, a.name) == (s, r, name) and (
-                                args is None or same(args, a.args)):
-                            idx.add(i)
-                t.atoms = tuple(sorted(idx))
-
-    # --- time -------------------------------------------------------------------
-
-    def _durations(self) -> list[int]:
-        out = []
-        for n in self.model_norms():
-            if n.judged and n.deadline_ms is not None:
-                out.append(n.deadline_ms)
-            if n.content is not None and n.content.kind == "temporal":
-                out.append(n.content.window_ms)
-        for item in self.items:
-            if item["status"] == "model" and item["term"].kind == "temporal":
-                out.append(item["term"].window_ms)
-        return out
-
-    def _time(self, step_ms: int | None, horizon: int | None) -> None:
-        durations = self._durations()
-        positive = [d for d in durations if d > 0]
-        if step_ms is None:
-            step_ms = 0
-            for d in positive:
-                step_ms = math.gcd(step_ms, d)
-            step_ms = step_ms or 1000
-        else:
-            bad = [d for d in positive if d % step_ms]
-            if bad:
-                raise NormsCheckError(
-                    f"--step {step_ms}ms does not divide the duration(s) "
-                    f"{', '.join(f'{d}ms' for d in sorted(set(bad)))}; the model would not "
-                    f"be exact (F.12)")
-        self.step_ms = step_ms
-        for n in self.model_norms():
-            if n.judged and n.deadline_ms is not None:
-                n.deadline = n.deadline_ms // step_ms
-            if n.content is not None and n.content.kind == "temporal":
-                n.content.window = n.content.window_ms // step_ms
-        for item in self.items:
-            if item["status"] == "model" and item["term"].kind == "temporal":
-                item["term"].window = item["term"].window_ms // step_ms
-        default = 2
-        for n in self.model_norms():
-            if n.judged:
-                default += (n.deadline or 0) + (n.content.window if n.content.kind == "temporal"
-                                                else 0) + 2
-        self.horizon = default if horizon is None else horizon
-        if self.horizon < 1:
-            raise NormsCheckError("--horizon must be at least 1")
-        if self.horizon > MAX_HORIZON:
-            raise NormsCheckError(
-                f"the horizon is {self.horizon} observations; norms-check 0.1 refuses more than "
-                f"{MAX_HORIZON} (use a coarser --step or a smaller --horizon)")
-
     # --- the choices of the environment -----------------------------------------
+
+    def remap_preds(self, offset: int) -> None:
+        """Number the predicates of this instance from `offset` on."""
+        if not offset:
+            return
+
+        def term(t: Any) -> None:
+            if t is None:
+                return
+            if t.pred is not None:
+                t.pred += offset
+            t.preds = tuple(p + offset for p in t.preds)
+
+        for n in self.norms:
+            for t in (n.trigger, n.until, n.content):
+                term(t)
+        for r in self.rules:
+            term(r.when)
+            if r.cond is not None:
+                r.cond += offset
+        for it in self.items:
+            term(it.get("term"))
+        self.edge_preds = {p + offset for p in self.edge_preds}
 
     def _reps(self, q: Quantity) -> list:
         """One value per class of values of a quantity (F.12): no value,
@@ -1488,6 +1438,146 @@ class Translator:
             assert v is True or v is False or v is UNKNOWN, v
         return out
 
+
+
+class Environment:
+    """What the contract instances of one model share (F.12): the message
+    events, the quantities and their classes of values, the predicates,
+    the choices of the environment, the step and the horizon. One
+    Translator per instance translates its norms; the environment then
+    numbers the message events and predicates of all of them."""
+
+    def __init__(self, trs: list, step_ms: int | None, horizon: int | None) -> None:
+        self.trs = trs
+        self.notes: list[str] = []
+        # predicates: one list, each predicate evaluated with the bindings of
+        # its instance
+        self.preds: list = []
+        for tr in trs:
+            offset = len(self.preds)
+            for p in tr.preds:
+                self.preds.append(Pred(expr=p.expr, text=p.text, keys=p.keys, owner=tr))
+            tr.remap_preds(offset)
+        # quantities: the same key is the same quantity in every instance
+        self.quantities: dict = {}
+        self.links: list = []
+        for tr in trs:
+            self.links += tr.links
+            for key, q in tr.quantities.items():
+                g = self.quantities.setdefault(key, Quantity(key))
+                g.consts |= q.consts
+                g.atoms |= q.atoms
+                g.raw = g.raw or q.raw
+                g.domain = g.domain or q.domain
+        self._collect_atoms()
+        self._time(step_ms, horizon)
+        self._choices()
+        for tr in trs:
+            for name in ("atoms", "preds", "quantities", "components", "constant_preds",
+                         "choices", "step_ms", "horizon"):
+                setattr(tr, name, getattr(self, name))
+            for note in self.notes:
+                tr._note(note)
+
+    def _note(self, text: str) -> None:
+        if text not in self.notes:
+            self.notes.append(text)
+
+    def _value(self, pid: int, vals: dict) -> str:
+        p = self.preds[pid]
+        return p.owner._oracle([p.expr], vals)[0]
+
+    def _collect_atoms(self) -> None:
+        terms = []
+        for tr in self.trs:
+            for n in tr.model_norms():
+                terms += [t for t in (n.trigger, n.until, n.content) if t is not None]
+            terms += [r.when for r in tr.rules if r.status == "model"]
+        raw: list = []
+        for t in terms:
+            if t.kind == "message":
+                for s, r, name, args in t.atoms:
+                    a = (s, r, name, args if args is not None else ())
+                    if a not in raw:
+                        raw.append(a)
+        if len(raw) > MAX_ATOMS:
+            raise NormsCheckError(
+                f"the contract instance has {len(raw)} message events; norms-check 0.1 "
+                f"translates at most {MAX_ATOMS} (use smaller --members)")
+        self.atoms = [Atom(*a) for a in raw]
+
+        def same(want: tuple, got: tuple) -> bool:
+            return len(want) == len(got) and all(
+                isinstance(w, bool) == isinstance(g, bool) and w == g for w, g in zip(want, got))
+
+        for t in terms:
+            if t.kind == "message":
+                idx = set()
+                for s, r, name, args in t.atoms:
+                    for i, a in enumerate(self.atoms):
+                        if (a.sender, a.receiver, a.name) == (s, r, name) and (
+                                args is None or same(args, a.args)):
+                            idx.add(i)
+                t.atoms = tuple(sorted(idx))
+
+    # --- time -------------------------------------------------------------------
+
+    def _durations(self) -> list[int]:
+        out = []
+        for tr in self.trs:
+            for n in tr.model_norms():
+                if n.judged and n.deadline_ms is not None:
+                    out.append(n.deadline_ms)
+                if n.content is not None and n.content.kind == "temporal":
+                    out.append(n.content.window_ms)
+            for item in tr.items:
+                if item["status"] == "model" and item["term"].kind == "temporal":
+                    out.append(item["term"].window_ms)
+        return out
+
+    def _time(self, step_ms: int | None, horizon: int | None) -> None:
+        durations = self._durations()
+        positive = [d for d in durations if d > 0]
+        if step_ms is None:
+            step_ms = 0
+            for d in positive:
+                step_ms = math.gcd(step_ms, d)
+            step_ms = step_ms or 1000
+        else:
+            bad = [d for d in positive if d % step_ms]
+            if bad:
+                raise NormsCheckError(
+                    f"--step {step_ms}ms does not divide the duration(s) "
+                    f"{', '.join(f'{d}ms' for d in sorted(set(bad)))}; the model would not "
+                    f"be exact (F.12)")
+        self.step_ms = step_ms
+        defaults = []
+        for tr in self.trs:
+            for n in tr.model_norms():
+                if n.judged and n.deadline_ms is not None:
+                    n.deadline = n.deadline_ms // step_ms
+                if n.content is not None and n.content.kind == "temporal":
+                    n.content.window = n.content.window_ms // step_ms
+            for item in tr.items:
+                if item["status"] == "model" and item["term"].kind == "temporal":
+                    item["term"].window = item["term"].window_ms // step_ms
+            d = 2
+            for n in tr.model_norms():
+                if n.judged:
+                    d += (n.deadline or 0) + (n.content.window if n.content.kind == "temporal"
+                                              else 0) + 2
+            defaults.append(d)
+        default = max(defaults)
+        self.horizon = default if horizon is None else horizon
+        if self.horizon < 1:
+            raise NormsCheckError("--horizon must be at least 1")
+        if self.horizon > MAX_HORIZON:
+            raise NormsCheckError(
+                f"the horizon is {self.horizon} observations; norms-check 0.1 refuses more than "
+                f"{MAX_HORIZON} (use a coarser --step or a smaller --horizon)")
+
+    # --- the choices of the environment -----------------------------------------
+
     def _choices(self) -> None:
         # quantities compared with each other: groups, their sizes, and the
         # values of --domain quantities as literals of the others
@@ -1515,7 +1605,7 @@ class Translator:
                     if dom is not None and other != k:
                         q.consts.update(range(dom[0], dom[1] + 1))
         for q in self.quantities.values():
-            q.reps = self._reps(q)
+            q.reps = self.trs[0]._reps(q)
         for q in self.quantities.values():
             if q.domain is not None:
                 self._note(f"{q.key} takes the integers {q.domain[0]}..{q.domain[1]} of --domain "
@@ -1544,10 +1634,9 @@ class Translator:
         self.components: list = []      # (pred ids, [(vector, valuation)])
         for ids in groups.values():
             keys = sorted(set().union(*(self.preds[i].keys for i in ids)))
-            exprs = [self.preds[i].expr for i in ids]
             if not keys:
-                for i, v in zip(ids, self._oracle(exprs, {})):
-                    self.constant_preds[i] = v
+                for i in ids:
+                    self.constant_preds[i] = self._value(i, {})
                 continue
             size = 1
             for k in keys:
@@ -1559,7 +1648,7 @@ class Translator:
             seen: dict = {}
             for combo in itertools.product(*(self.quantities[k].reps for k in keys)):
                 vals = dict(zip(keys, combo))
-                vec = tuple(self._oracle(exprs, vals))
+                vec = tuple(self._value(i, vals) for i in ids)
                 if vec not in seen:
                     seen[vec] = vals
             self.components.append((ids, list(seen.items())))
@@ -1581,6 +1670,8 @@ class Translator:
                     vector.update(zip(ids, vec))
                     values.update(vals)
                 self.choices.append(Choice(len(self.choices), msgs, vector, values))
+
+
 
 
 
@@ -1637,48 +1728,47 @@ class Var:
 class NormsModel:
     """The finite model of one contract instance (F.12)."""
 
-    def __init__(self, tr: Translator) -> None:
-        self.tr = tr
-        self.H = tr.horizon
+    def __init__(self, tr) -> None:
+        trs = tr if isinstance(tr, list) else [tr]
+        self.trs = trs
+        self.tr = trs[0]
+        self.multi = len(trs) > 1
+        self.H = self.tr.horizon
         self.vars: list[Var] = []
         self._add("step", 0, self.H, 0, "index of the next observation")
-        self._add("ended", None, None, False, "the instance has ended (settled)")
-        self.items = [it for it in tr.items if it["status"] == "model"]
-        self.excuse_known = all(it["status"] != "untranslated" for it in tr.items)
-        if self.items:
-            self._add("af", None, None, False, "an assumption has failed (verdicts are excused)")
-        for k, it in enumerate(tr.items):
-            if it["status"] == "model" and it["term"].kind == "temporal":
-                it["var"] = f"as_{k}"
-                self._add(it["var"], 0, max(_codes(it["term"].op)), 1,
-                          f"assumption {k + 1} (0: decided)")
-        for pid in sorted(tr.edge_preds):
+        self.norms = []
+        self.items = []
+        self.excuse_known = True
+        for k, t in enumerate(trs):
+            t.px = f"k{k + 1}_" if self.multi else ""
+            t.inst = k
+            for n in t.norms:
+                n.px, n.inst = t.px, k
+        for t in trs:
+            px = t.px
+            self._add(f"{px}ended", None, None, False,
+                      f"instance {t.inst + 1} has ended (settled)" if self.multi
+                      else "the instance has ended (settled)")
+            t.model_items = [it for it in t.items if it["status"] == "model"]
+            self.items += t.model_items
+            self.excuse_known = self.excuse_known and all(
+                it["status"] != "untranslated" for it in t.items)
+            if t.model_items:
+                self._add(f"{px}af", None, None, False,
+                          "an assumption has failed (verdicts are excused)")
+            for k, it in enumerate(t.items):
+                if it["status"] == "model" and it["term"].kind == "temporal":
+                    it["var"] = f"{px}as_{k}"
+                    self._add(it["var"], 0, max(_codes(it["term"].op)), 1,
+                              f"assumption {k + 1} (0: decided)")
+        self.edge_preds = sorted(set().union(*(t.edge_preds for t in trs)))
+        for pid in self.edge_preds:
             self._add(f"pe_{pid}", None, None, False,
                       f"predicate {pid} held at the previous observation")
-        self.norms = tr.model_norms()
-        for n in self.norms:
-            self._add(f"st_{n.stem}", 0, 7, INACTIVE, f"state of {n.id}")
-            if n.judged:
-                self._add(f"jn_{n.stem}", None, None, False,
-                          f"{n.id} was activated at the last observation")
-            if n.judged and n.deadline is not None:
-                self._add(f"el_{n.stem}", 0, n.deadline + 1, 0,
-                          f"active steps of {n.id} (saturated)")
-            if n.judged and n.content.kind == "temporal":
-                top = max(_codes(n.content.op))
-                for a in range(n.content.window + 1):
-                    self._add(f"sl_{n.stem}_{a}", 0, top, 0,
-                              f"pending candidate of {n.id} of age {a}")
-                self._add(f"ht_{n.stem}", None, None, False,
-                          f"a candidate of {n.id} decided true, not yet judged")
-                self._add(f"sf_{n.stem}", None, None, False,
-                          f"a candidate of {n.id} decided not true, not yet judged")
-            if n.kind == "power":
-                self._add(f"ex_{n.stem}", None, None, False, f"{n.id} has been exercised")
-            rep = tr.by_id.get(n.reparation) if n.reparation and n.judged else None
-            if rep is not None and rep.status == "model":
-                self._add(f"rp_{n.stem}", None, None, False,
-                          f"the reparation of {n.id} has been activated")
+        for t in trs:
+            for n in t.model_norms():
+                self.norms.append(n)
+                self._add_norm(t, n)
         names = {v.name for v in self.vars}
         self.ir = _IR({v.name: (v.lo, v.hi) for v in self.vars if v.lo is not None},
                       {v.name for v in self.vars if v.lo is None})
@@ -1687,6 +1777,30 @@ class NormsModel:
         self._simplified: dict = {}
         self._init_map = {id(self.ir.V(v.name)): self.ir.C(v.init) for v in self.vars}
         self.commands = self._commands()
+
+    def _add_norm(self, tr: Translator, n: NormInfo) -> None:
+        self._add(f"st_{n.stem}", 0, 7, INACTIVE, f"state of {n.uid}")
+        if n.judged:
+            self._add(f"jn_{n.stem}", None, None, False,
+                      f"{n.uid} was activated at the last observation")
+        if n.judged and n.deadline is not None:
+            self._add(f"el_{n.stem}", 0, n.deadline + 1, 0,
+                      f"active steps of {n.uid} (saturated)")
+        if n.judged and n.content.kind == "temporal":
+            top = max(_codes(n.content.op))
+            for a in range(n.content.window + 1):
+                self._add(f"sl_{n.stem}_{a}", 0, top, 0,
+                          f"pending candidate of {n.uid} of age {a}")
+            self._add(f"ht_{n.stem}", None, None, False,
+                      f"a candidate of {n.uid} decided true, not yet judged")
+            self._add(f"sf_{n.stem}", None, None, False,
+                      f"a candidate of {n.uid} decided not true, not yet judged")
+        if n.kind == "power":
+            self._add(f"ex_{n.stem}", None, None, False, f"{n.uid} has been exercised")
+        rep = tr.by_id.get(n.reparation) if n.reparation and n.judged else None
+        if rep is not None and rep.status == "model":
+            self._add(f"rp_{n.stem}", None, None, False,
+                      f"the reparation of {n.uid} has been activated")
 
     def _add(self, name: str, lo, hi, init, note: str) -> None:
         self.vars.append(Var(name, lo, hi, init, note))
@@ -1714,27 +1828,55 @@ class NormsModel:
     def _vals(self, term: Term, ch: Choice) -> tuple:
         return tuple(ch.vector[p] for p in term.preds)
 
-    def step(self, ch: Choice, end: bool, first: bool = False) -> dict:
-        """The updates of the command for choice `ch` (and the end of the
-        instance at this observation when `end`): the steps of F.5 in their
-        order within one observation. `first`: the command of the first
-        observation, from the initial state (its updates are constants)."""
-        ir, tr = self.ir, self.tr
+    def step(self, ch: Choice, end: Any, first: bool = False) -> dict:
+        """The updates of the command for choice `ch` and the instances that
+        end at this observation (`end`: a boolean for one instance, a mask
+        of instances for several): the steps of F.5 in their order within
+        one observation, for every instance. `first`: the command of the
+        first observation, from the initial state (its updates are
+        constants)."""
+        ir = self.ir
+        step = ir.V("step")
+        out: dict = {}
+        for t in self.trs:
+            ends = bool(int(end) >> t.inst & 1)
+            part = self._inst_step(t, ch, ends)
+            if self.multi:
+                # an ended instance does not change
+                done = ir.V(f"{t.px}ended")
+                part = {k: ir.ITE(done, ir.V(k), v) for k, v in part.items()}
+            out.update(part)
+        for pid in self.edge_preds:
+            out[f"pe_{pid}"] = ir.C(ch.vector[pid] == "T")
+        if self.multi:
+            # the observations go on while an instance runs
+            after = [ir.OR(ir.V(f"{t.px}ended"), ir.C(bool(int(end) >> t.inst & 1)))
+                     for t in self.trs]
+            out["step"] = ir.ITE(ir.AND(*after), step, ir.ADD(step, 1))
+        else:
+            out["step"] = step if end else ir.ADD(step, 1)
+        return self._simplify(out, first)
+
+    def _inst_step(self, tr: Translator, ch: Choice, end: bool) -> dict:
+        """The updates of one instance (F.5, one observation)."""
+        ir = self.ir
+        px = tr.px
         msgs = set(ch.messages)
         step = ir.V("step")
-        S = {n.id: ir.V(f"st_{n.stem}") for n in self.norms}
+        norms = [n for n in self.norms if n.inst == tr.inst]
+        S = {n.id: ir.V(f"st_{n.stem}") for n in norms}
         out: dict = {}
         # active time up to this observation (the state between the previous
         # observation and this one is the state after the previous one)
         el = {}
-        for n in self.norms:
+        for n in norms:
             if n.judged and n.deadline is not None:
                 e = ir.V(f"el_{n.stem}")
                 el[n.id] = ir.ITE(ir.AND(ir.EQ(S[n.id], ACTIVE), ir.LE(e, n.deadline)),
                                   ir.ADD(e, 1), e)
         # pending candidates of temporal contents: one more observation
         slots, ht, sf = {}, {}, {}
-        for n in self.norms:
+        for n in norms:
             if n.judged and n.content.kind == "temporal":
                 t = n.content
                 vals = self._vals(t, ch)
@@ -1751,11 +1893,11 @@ class NormsModel:
                 ht[n.id] = ir.OR(ir.V(f"ht_{n.stem}"), *dts)
                 sf[n.id] = ir.OR(ir.V(f"sf_{n.stem}"), *dos)
         # start of the instance (F.5, item 1)
-        for n in self.norms:
+        for n in norms:
             if n.starts:
                 S[n.id] = ir.ITE(ir.EQ(step, 0), ir.C(ACTIVE), S[n.id])
         # assume: items
-        af = ir.V("af") if self.items else ir.FALSE
+        af = ir.V(f"{px}af") if tr.model_items else ir.FALSE
         for k, it in enumerate(tr.items):
             if it["status"] != "model":
                 continue
@@ -1813,7 +1955,7 @@ class NormsModel:
                     if key not in seen:
                         seen.add(key)
                         acts.append((p.content_text, a.sender))
-        model_powers = [p for p in self.norms if p.kind == "power"]
+        model_powers = [p for p in norms if p.kind == "power"]
         start_active = {p.id: ir.EQ(S[p.id], ACTIVE) for p in model_powers}
         ex = {p.id: ir.V(f"ex_{p.stem}") for p in model_powers}
         for text, performer in acts:
@@ -1828,7 +1970,7 @@ class NormsModel:
                         if name in S:
                             S[name] = ir.ITE(ir.AND(cond, ir.IN(S[name], src)), ir.C(tgt), S[name])
         # step 3: triggers
-        for n in self.norms:
+        for n in norms:
             if n.trigger is not None:
                 S[n.id] = ir.ITE(ir.AND(occurs(n.trigger), ir.EQ(S[n.id], INACTIVE)),
                                  ir.C(ACTIVE), S[n.id])
@@ -1836,7 +1978,7 @@ class NormsModel:
         viol_code = ir.ITE(af, ir.C(EXCUSED), ir.C(VIOLATED))
         newviol: dict = {}
         cands: dict = {}
-        for n in self.norms:
+        for n in norms:
             s = S[n.id]
             if n.judged:
                 act = ir.EQ(s, ACTIVE)
@@ -1867,20 +2009,20 @@ class NormsModel:
             S[n.id] = s
         # step 5: violations activate reparations
         rp: dict = {}
-        for n in self.norms:
+        for n in norms:
             if n.judged and self.has(f"rp_{n.stem}"):
                 r = tr.by_id[n.reparation]
                 cond = ir.AND(newviol[n.id], ir.EQ(S[r.id], INACTIVE))
                 rp[n.id] = ir.OR(ir.V(f"rp_{n.stem}"), cond)
                 S[r.id] = ir.ITE(cond, ir.C(ACTIVE), S[r.id])
         # candidates left (for the settlement and to clear final states)
-        for n in self.norms:
+        for n in norms:
             if n.judged and n.content.kind == "temporal":
                 cands[n.id] = ir.OR(ht[n.id], sf[n.id],
                                     *(ir.NOT(ir.EQ(x, 0)) for x in slots[n.id]))
         # step 6: the end of the instance settles every norm (F.5, item 6)
         if end:
-            for n in self.norms:
+            for n in norms:
                 s = S[n.id]
                 fresh = ir.EQ(ir.V(f"st_{n.stem}"), INACTIVE)   # activated at this observation
                 if n.kind == "obligation":
@@ -1898,7 +2040,7 @@ class NormsModel:
                 S[n.id] = ir.ITE(ir.IN(s, FINAL), s,
                                  ir.ITE(ir.IN(s, IN_FORCE), settled, ir.C(UNUSED)))
         # the next state
-        for n in self.norms:
+        for n in norms:
             s = S[n.id]
             out[f"st_{n.stem}"] = s
             if n.judged:
@@ -1917,12 +2059,14 @@ class NormsModel:
                 out[f"ex_{n.stem}"] = ex[n.id]
             if n.id in rp:
                 out[f"rp_{n.stem}"] = rp[n.id]
-        if self.items:
-            out["af"] = af
-        for pid in sorted(tr.edge_preds):
-            out[f"pe_{pid}"] = ir.C(ch.vector[pid] == "T")
-        out["step"] = step if end else ir.ADD(step, 1)
-        out["ended"] = ir.C(end)
+        if tr.model_items:
+            out[f"{px}af"] = af
+        out[f"{px}ended"] = ir.C(end)
+        return out
+
+    def _simplify(self, out: dict, first: bool) -> dict:
+        ir = self.ir
+        step = ir.V("step")
         order = [v.name for v in self.vars if v.name.startswith("st_")]
         res = {}
         for k, raw in out.items():
@@ -1954,14 +2098,39 @@ class NormsModel:
     def _commands(self) -> list:
         """(label, choice, end, guard, updates) for every command."""
         out = []
+        if not self.multi:
+            for first in (True, False):
+                for ch in self.tr.choices:
+                    for end in (False, True):
+                        guard = "!ended & step=0" if first else "!ended & step>0"
+                        guard += " & step<H" if not end else " & (early_end | step=H)"
+                        label = f"{'e' if end else 'o'}{ch.index}"
+                        out.append((label, ch, end, guard, self.step(ch, end, first)))
+            return out
+        n = len(self.trs)
+        alive = " | ".join(f"!{t.px}ended" for t in self.trs)
         for first in (True, False):
             for ch in self.tr.choices:
-                for end in (False, True):
-                    guard = "!ended & step=0" if first else "!ended & step>0"
-                    guard += " & step<H" if not end else " & (early_end | step=H)"
-                    label = f"{'e' if end else 'o'}{ch.index}"
-                    out.append((label, ch, end, guard, self.step(ch, end, first)))
+                for mask in range(2 ** n):
+                    ending = [t for t in self.trs if mask >> t.inst & 1]
+                    others = [t for t in self.trs if not mask >> t.inst & 1]
+                    parts = ["step=0" if first else "step>0", f"({alive})"]
+                    parts += [f"!{t.px}ended" for t in ending]
+                    if ending:
+                        parts.append("(early_end | step=H)")
+                    # at the horizon every running instance ends
+                    if others:
+                        parts.append("(step<H | " + " & ".join(f"{t.px}ended" for t in others)
+                                     + ")")
+                    out.append((f"c{ch.index}_{mask}", ch, mask, " & ".join(parts),
+                                self.step(ch, mask, first)))
         return out
+
+    def all_ended(self, s: dict) -> bool:
+        return all(s[f"{t.px}ended"] for t in self.trs)
+
+    def ended_expr(self) -> str:
+        return " & ".join(f"{t.px}ended" for t in self.trs)
 
     # --- PRISM text -----------------------------------------------------------
 
@@ -2027,7 +2196,7 @@ class NormsModel:
             body = " & ".join(f"({k}'={names.get(id(e)) or prism_expr(e)})"
                               for k, e in upd.items()) or "true"
             out.append(f"  [{label}] {guard} -> {body};")
-        out.append("  [] ended -> true;")
+        out.append(f"  [] {self.ended_expr()} -> true;")
         out.append("endmodule")
         out.append("")
         for n in self.norms:
@@ -2045,7 +2214,7 @@ class NormsModel:
             if self.has(f"rp_{n.stem}"):
                 out.append(f'label "r_{n.stem}" = rp_{n.stem};'
                            f'  // the reparation of {self._comment(n.id)} has been activated')
-        out.append('label "end" = ended;')
+        out.append(f'label "end" = {self.ended_expr()};')
         return "\n".join(out) + "\n"
 
     def choice_text(self, ch: Choice, end: bool) -> str:
@@ -2281,12 +2450,30 @@ def _t(step_ms: int, n: int) -> Any:
     return int(v) if v.denominator == 1 else float(v)
 
 
+def _ends(tr: Any, end: Any) -> bool:
+    """Whether the instance of `tr` ends at an observation of a path: `end`
+    is a boolean (one instance) or a mask of instances."""
+    return bool(int(end) >> getattr(tr, "inst", 0) & 1)
+
+
+def instance_path(tr: Any, path: list) -> list:
+    """The observations of a path that belong to the instance of `tr`: up
+    to the one at which it ends."""
+    out = []
+    for j, end in path:
+        out.append((j, end))
+        if _ends(tr, end):
+            break
+    return out
+
+
 def trace_lines(tr: Translator, path: list) -> list[str]:
     """The trace of a path of choices [(choice index, end), ...] as JSON
-    Lines for `cadl norms-eval`: one observation per step, at multiples of
-    the step, with the messages and the values of the choice."""
+    Lines for `cadl norms-eval`, for the instance of `tr`: one observation
+    per step, at multiples of the step, with the messages and the values
+    of the choice, up to the end of the instance."""
     lines = []
-    for n, (j, end) in enumerate(path):
+    for n, (j, end) in enumerate(instance_path(tr, path)):
         ch = tr.choices[j]
         obs: dict = {"t": _t(tr.step_ms, n)}
         if n == 0:
@@ -2295,14 +2482,25 @@ def trace_lines(tr: Translator, path: list) -> list[str]:
             obs["values"] = {k: ch.values.get(k) for k in sorted(tr.quantities)}
         if ch.messages:
             obs["messages"] = [tr.atoms[i].message() for i in ch.messages]
-        if end:
+        if _ends(tr, end):
             obs["end"] = True
         lines.append(json.dumps(obs))
     return lines
 
 
 def parse_label(label: str) -> tuple:
+    """(choice, end): end is a boolean for one instance (labels o<j>, e<j>)
+    and a mask of the instances that end for several (c<j>_<mask>)."""
+    if label[0] == "c":
+        j, mask = label[1:].split("_")
+        return int(j), int(mask)
     return int(label[1:]), label[0] == "e"
+
+
+def make_label(j: int, end: Any) -> str:
+    if isinstance(end, bool):
+        return f"{'e' if end else 'o'}{j}"
+    return f"c{j}_{end}"
 
 
 def run_path(pm: PrismModel, path: list) -> list[dict]:
@@ -2310,7 +2508,7 @@ def run_path(pm: PrismModel, path: list) -> list[dict]:
     s = pm.initial()
     out = []
     for j, end in path:
-        s = pm.apply(pm.by_label(s, f"{'e' if end else 'o'}{j}"), s)
+        s = pm.apply(pm.by_label(s, make_label(j, end)), s)
         out.append(s)
     return out
 
@@ -2325,23 +2523,28 @@ def compare_path(model: NormsModel, pm: PrismModel, path: list) -> list[str]:
     state of every translated norm after every observation, the final
     verdicts (when the assumptions are translated), the first exercise of
     every power and the first activation of every reparation."""
-    tr = model.tr
-    states = run_path(pm, path)
-    result = evaluate_path(tr, path)
-    times = {_t(tr.step_ms, n): n for n in range(len(path))}
+    all_states = run_path(pm, path)
+    times = {_t(model.tr.step_ms, n): n for n in range(len(path))}
     diffs = []
-    by_id = {r["id"]: r for r in result["norms"]}
+    results = {}
+    for t in model.trs:
+        results[t.inst] = evaluate_path(t, path)
     for n in model.norms:
+        tr = model.trs[n.inst]
+        result = results[n.inst]
+        length = len(instance_path(tr, path))
+        states = all_states[:length]
+        by_id = {r["id"]: r for r in result["norms"]}
         r = by_id[n.id]
-        seq = ["inactive"] * len(path)
+        seq = ["inactive"] * length
         for h in r["history"]:
             k = times[h["t"]]
-            for m in range(k, len(path)):
+            for m in range(k, length):
                 seq[m] = h["state"]
         for k, s in enumerate(states):
             got = STATE_NAMES[s[f"st_{n.stem}"]]
             if got != seq[k]:
-                diffs.append(f"{n.id} at observation {k}: model {got}, norms-eval {seq[k]}")
+                diffs.append(f"{n.uid} at observation {k}: model {got}, norms-eval {seq[k]}")
                 break
         code = states[-1][f"st_{n.stem}"]
         verdict = ("violated" if code == VIOLATED else "excused" if code == EXCUSED
@@ -2370,7 +2573,7 @@ def compare_path(model: NormsModel, pm: PrismModel, path: list) -> list[str]:
 
 def random_paths(tr: Translator, count: int, seed: int = 0, p_message: float = 0.3,
                  p_end: float = 0.12, full_length: bool = False,
-                 p_keep: float = 0.0) -> list[list]:
+                 p_keep: float = 0.0, instances: int = 1) -> list[list]:
     """Random paths of environment choices: each message of a choice with
     probability p_message, the classes of values of the previous
     observation kept with probability p_keep and otherwise drawn
@@ -2391,21 +2594,54 @@ def random_paths(tr: Translator, count: int, seed: int = 0, p_message: float = 0
             if path and rng.random() < p_keep:
                 prev = tr.choices[path[-1][0]].values
                 j = by_values[(msgs, json.dumps(prev, sort_keys=True))]
-            end = n == tr.horizon or (not full_length and rng.random() < p_end)
-            path.append((j, end))
-            if end:
+            if instances == 1:
+                end = n == tr.horizon or (not full_length and rng.random() < p_end)
+                path.append((j, end))
+                if end:
+                    break
+                continue
+            # several instances: each running one ends on its own
+            done = 0
+            for _j, m in path:
+                done |= m
+            mask = 0
+            for k in range(instances):
+                if not done >> k & 1 and (n == tr.horizon or (
+                        not full_length and rng.random() < p_end)):
+                    mask |= 1 << k
+            path.append((j, mask))
+            if (done | mask) == 2 ** instances - 1:
                 break
         paths.append(path)
     return paths
 
 
-def all_paths(tr: Translator, length: int) -> list[list]:
+def all_paths(tr: Translator, length: int, instances: int = 1) -> list[list]:
     """Every path of at most `length` observations (the last one ends the
-    instance)."""
+    instance); with several instances, every order in which they end."""
     out = []
-    for k in range(1, length + 1):
-        for combo in itertools.product(range(len(tr.choices)), repeat=k):
-            out.append([(j, i == k - 1) for i, j in enumerate(combo)])
+    if instances == 1:
+        for k in range(1, length + 1):
+            for combo in itertools.product(range(len(tr.choices)), repeat=k):
+                out.append([(j, i == k - 1) for i, j in enumerate(combo)])
+        return out
+    full = 2 ** instances - 1
+
+    def extend(path: list, done: int) -> None:
+        if done == full:
+            out.append(path)
+            return
+        if len(path) == length:
+            return
+        for j in range(len(tr.choices)):
+            for mask in range(full + 1):
+                if mask & done:
+                    continue
+                if len(path) + 1 == length and (done | mask) != full:
+                    continue
+                extend(path + [(j, mask)], done | mask)
+
+    extend([], 0)
     return out
 
 
@@ -2428,7 +2664,7 @@ def _parse_domains(items) -> dict:
 
 def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=None,
                 members=None, step: str | int | None = None,
-                horizon: int | None = None, domains=None) -> NormsModel:
+                horizon: int | None = None, domains=None, instances=None) -> NormsModel:
     """Translate one contract instance (F.12). `bindings` and `members`
     map names to integers (or are lists of "name=n" texts), `step` is a
     duration text or milliseconds."""
@@ -2442,8 +2678,40 @@ def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=Non
     step_ms = _parse_duration_ms(step) if isinstance(step, str) else step
     if not isinstance(domains, dict):
         domains = _parse_domains(domains)
+    if isinstance(instances, int):
+        instances = _numbered_instances(sos, contract, bindings, members, instances)
+    if instances:
+        sets = [i if isinstance(i, dict) else _parse_assignments([i], "--instance")
+                for i in instances]
+        if len(sets) > MAX_INSTANCES:
+            raise NormsCheckError(f"norms-check translates at most {MAX_INSTANCES} instances "
+                                  f"together")
+        trs = [Translator(sos, contract, {**bindings, **b}, members, step_ms, horizon, domains)
+               for b in sets]
+        Environment(trs, step_ms, horizon)
+        return NormsModel(trs)
     tr = Translator(sos, contract, bindings, members, step_ms, horizon, domains)
+    Environment([tr], step_ms, horizon)
     return NormsModel(tr)
+
+
+def _numbered_instances(sos: SoSDefinition, contract: ContractDef, bindings: dict,
+                        members: dict, count: int) -> list:
+    """--instances N: N instances that bind the one index of the contract
+    that --bindings leaves open to the first N members of its set."""
+    probe = Translator(sos, contract, bindings, members, None, None)
+    free = sorted({v for v in probe.index_vars if v not in bindings})
+    if len(free) != 1:
+        raise NormsCheckError(
+            f"--instances needs exactly one index that --bindings leaves open; the contract "
+            f"has {', '.join(free) or 'none'}: give the instances with --instance i=1 ...")
+    var = free[0]
+    sets = sorted(s_ for s_, v in probe.index_refs if v == var)
+    values = probe.members.get(sets[0], [])[:count] if sets else []
+    if len(values) < count:
+        raise NormsCheckError(f"--instances {count}: {sets[0] if sets else var} has only "
+                              f"{len(values)} member(s) in the instance (use --members)")
+    return [{var: v} for v in values]
 
 
 # === The questions (F.12) ==================================================
@@ -2464,33 +2732,34 @@ def questions(model: NormsModel) -> list[Question]:
     judged = [n for n in model.norms if n.judged]
     for n in model.norms:
         s = n.stem
-        out.append(Question("activatable", (n.id,), "any", f'Pmax=? [ F "a_{s}" ]',
+        out.append(Question("activatable", (n.uid,), "any", f'Pmax=? [ F "a_{s}" ]',
                             target_label=f"a_{s}"))
         if n.judged:
-            out.append(Question("violable", (n.id,), "any", f'Pmax=? [ F "v_{s}" ]',
+            out.append(Question("violable", (n.uid,), "any", f'Pmax=? [ F "v_{s}" ]',
                                 target_label=f"v_{s}"))
-            out.append(Question("fulfillable", (n.id,), "any", f'Pmax=? [ F "f_{s}" ]',
+            out.append(Question("fulfillable", (n.uid,), "any", f'Pmax=? [ F "f_{s}" ]',
                                 target_label=f"f_{s}"))
         if n.kind == "power":
-            out.append(Question("exercisable", (n.id,), "any", f'Pmax=? [ F "x_{s}" ]',
+            out.append(Question("exercisable", (n.uid,), "any", f'Pmax=? [ F "x_{s}" ]',
                                 target_label=f"x_{s}"))
         if model.has(f"rp_{s}"):
-            out.append(Question("reparation", (n.id,), "any", f'Pmax=? [ F "r_{s}" ]',
+            out.append(Question("reparation", (n.uid,), "any", f'Pmax=? [ F "r_{s}" ]',
                                 target_label=f"r_{s}"))
     for n in judged:
         s = n.stem
-        out.append(Question("unavoidable", (n.id,), "full", f'Pmin=? [ F "v_{s}" ]'))
+        out.append(Question("unavoidable", (n.uid,), "full", f'Pmin=? [ F "v_{s}" ]'))
         # a state from which some choice activates n and every choice that
         # activates it leads to a state from which every continuation
         # violates it (an MDP: P<=0 [ X a ] says that no choice leads to a)
         trap = (f'!"end" & !(P<=0 [ X "j_{s}" ]) & '
                 f'P<=0 [ X ("j_{s}" & !"v_{s}" & !(P>=1 [ F "v_{s}" ])) ]')
-        out.append(Question("trap", (n.id,), "full", f"Pmax=? [ F ({trap}) ]", target=trap))
+        out.append(Question("trap", (n.uid,), "full", f"Pmax=? [ F ({trap}) ]", target=trap))
     for a, b in itertools.combinations(judged, 2):
         va, vb = f'"v_{a.stem}"', f'"v_{b.stem}"'
         cs = (f"!{va} & !{vb} & !(P<1 [ G !{va} ]) & !(P<1 [ G !{vb} ]) & "
               f"P>=1 [ F ({va} | {vb}) ]")
-        out.append(Question("conflict", (a.id, b.id), "full", f"Pmax=? [ F ({cs}) ]", target=cs))
+        out.append(Question("conflict", (a.uid, b.uid), "full", f"Pmax=? [ F ({cs}) ]",
+                            target=cs))
     return out
 
 
@@ -2596,7 +2865,7 @@ def replay(model: NormsModel, pm: PrismModel, strategy: dict, start: dict | None
     s = dict(start) if start is not None else pm.initial()
     path, states = [], []
     limit = limit or model.H + 2
-    while not s["ended"] and len(path) < limit:
+    while not model.all_ended(s) and len(path) < limit:
         if stop is not None and stop(s):
             break
         label = strategy.get(pm.key(s))
@@ -2614,13 +2883,18 @@ def finish(model: NormsModel, pm: PrismModel, s: dict) -> tuple:
     the next observation when early_end allows it, else at the horizon."""
     path, states = [], []
     j = _default_choice(model)
-    while not s["ended"]:
-        try:
-            cmd = pm.by_label(s, f"e{j}")
-            label = f"e{j}"
-        except ValueError:
-            cmd = pm.by_label(s, f"o{j}")
-            label = f"o{j}"
+    while not model.all_ended(s):
+        if model.multi:
+            alive = sum(1 << t.inst for t in model.trs if not s[f"{t.px}ended"])
+            labels = [make_label(j, alive), make_label(j, 0)]
+        else:
+            labels = [f"e{j}", f"o{j}"]
+        for label in labels:
+            try:
+                cmd = pm.by_label(s, label)
+                break
+            except ValueError:
+                continue
         s = pm.apply(cmd, s)
         path.append(parse_label(label))
         states.append(s)
@@ -2635,9 +2909,11 @@ def confirm(model: NormsModel, path: list, claim: tuple) -> bool:
     """Whether norms-eval, on the trace of the path, agrees with the claim:
     ("violated", id), ("not violated", id), ("fulfilled", id), ("activated",
     id), ("exercised", id) or ("reparation", id)."""
-    tr = model.tr
-    result = evaluate_path(tr, path)
     kind, nid = claim
+    norm = next(n for n in model.norms if n.uid == nid)
+    tr = model.trs[norm.inst]
+    result = evaluate_path(tr, path)
+    nid = norm.id
     if kind == "exercised":
         return any(e["kind"] == "power" and e.get("norm") == nid for e in result["timeline"])
     if kind == "reparation":
@@ -2659,9 +2935,16 @@ _CLAIM = {"activatable": "activated", "violable": "violated", "fulfillable": "fu
 
 
 def _witness(model: NormsModel, path: list, claim: tuple, explain: str) -> dict:
-    return {"claim": f"{claim[1]} {claim[0]}", "explanation": explain,
-            "choices": [model.choice_text(model.tr.choices[j], end) for j, end in path],
-            "trace": trace_lines(model.tr, path), "confirmed": confirm(model, path, claim)}
+    norm = next(n for n in model.norms if n.uid == claim[1])
+    w = {"claim": f"{claim[1]} {claim[0]}", "explanation": explain,
+         "choices": [model.choice_text(model.tr.choices[j], end) for j, end in path],
+         "trace": trace_lines(model.trs[norm.inst], path),
+         "confirmed": confirm(model, path, claim)}
+    if model.multi:
+        # the trace of every instance over the same observations
+        w["instance"] = norm.inst + 1
+        w["traces"] = {str(t.inst + 1): trace_lines(t, path) for t in model.trs}
+    return w
 
 
 # === Check =================================================================
@@ -2773,7 +3056,8 @@ def _trap_witness(model: NormsModel, pm: PrismModel, path: list, state: dict,
     observations without messages and values up to the horizon, that the
     norm is violated. That every other continuation violates it too rests
     on the model checker."""
-    n = next(x for x in model.norms if x.id == nid)
+    n = next(x for x in model.norms if x.uid == nid)
+    tr = model.trs[n.inst]
     k = len(path)
     t_k = _t(model.tr.step_ms, k)
     cmds = pm.enabled(state)
@@ -2786,8 +3070,8 @@ def _trap_witness(model: NormsModel, pm: PrismModel, path: list, state: dict,
         step = [parse_label(cmd[0])]
         tail, _ = finish(model, pm, after)
         full = path + step + tail
-        result = evaluate_path(model.tr, full)
-        r = _norm_result(result, nid)
+        result = evaluate_path(tr, full)
+        r = _norm_result(result, n.id)
         model_j = bool(after[f"jn_{n.stem}"])
         eval_j = r["activated_at"] is not None and r["activated_at"] == t_k
         agree = agree and model_j == eval_j
@@ -2820,7 +3104,7 @@ def _conflict_witness(model: NormsModel, prism: str, text: str, pm: PrismModel, 
     norm and violates the second, and one the other way round."""
     init = {name: state[name] for name in pm.names}
     sub = model.prism_text(init)
-    stems = {n.id: n.stem for n in model.norms}
+    stems = {n.uid: n.stem for n in model.norms}
     props = [f'Pmax=? [ G !"v_{stems[nid]}" ]' for nid in subject]
     res = run_prism(prism, sub, props, False, timeout)
     out: dict = {"witnesses": []}
@@ -2862,13 +3146,18 @@ class _Budget:
 def _report_head(model: NormsModel) -> dict:
     tr = model.tr
     norms = []
-    for n in tr.norms:
-        norms.append({"id": n.id, "kind": n.kind, "status": n.status, "reason": n.reason})
+    for t in model.trs:
+        for n in t.norms:
+            entry = {"id": n.uid, "kind": n.kind, "status": n.status, "reason": n.reason}
+            if model.multi:
+                entry["instance"] = t.inst + 1
+            norms.append(entry)
     return {
         "contract": tr.contract.id,
         "norms_check_version": NORMS_CHECK_VERSION,
         "instance": {
             "bindings": dict(sorted(tr.bindings.items())),
+            "instances": [dict(sorted(t.bindings.items())) for t in model.trs],
             "members": {k: [v[0], v[-1]] for k, v in sorted(tr.members.items())},
             "step_ms": tr.step_ms,
             "horizon": model.H,
@@ -2885,7 +3174,7 @@ def _report_head(model: NormsModel) -> dict:
         "rules": [{"creates": r.creates, "status": r.status, "reason": r.reason}
                   for r in tr.rules],
         "excuse_known": model.excuse_known,
-        "notes": list(dict.fromkeys(tr.notes)),
+        "notes": list(dict.fromkeys(x for t in model.trs for x in t.notes)),
         "conflicts": [],
         "checked": True,
     }
@@ -2958,12 +3247,17 @@ def export(model: NormsModel, report: dict | None, directory) -> list[str]:
                     name = f"witness_{_file_stem(n['id'])}_{key}.jsonl"
                     files[name] = "\n".join(w["trace"]) + "\n"
                     w["file"] = str(d / name)
+                    for k, lines in w.get("traces", {}).items():
+                        files[name.replace(".jsonl", f"_instance{k}.jsonl")] = \
+                            "\n".join(lines) + "\n"
         for c in report["conflicts"]:
             for w in c.get("witnesses", []):
                 name = (f"witness_conflict_{_file_stem(c['norms'][0])}_"
                         f"{_file_stem(c['norms'][1])}_keep_{_file_stem(w['keeps'])}.jsonl")
                 files[name] = "\n".join(w["trace"]) + "\n"
                 w["file"] = str(d / name)
+                for k, lines in w.get("traces", {}).items():
+                    files[name.replace(".jsonl", f"_instance{k}.jsonl")] = "\n".join(lines) + "\n"
     for name, text in files.items():
         (d / name).write_text(text, encoding="utf-8")
     if report is not None:
@@ -3004,6 +3298,10 @@ def format_text(report: dict) -> str:
     inst = report["instance"]
     lines = [f"Contract {report['contract']} (norms-check {report['norms_check_version']})"]
     b = ", ".join(f"{k}={v}" for k, v in inst["bindings"].items()) or "none"
+    if len(inst.get("instances", [])) > 1:
+        b = "; ".join(f"instance {k + 1}: " + (", ".join(f"{x}={v}" for x, v in bs.items())
+                                               or "none")
+                      for k, bs in enumerate(inst["instances"]))
     mem = ", ".join(f"{k}[{lo}..{hi}]" for k, (lo, hi) in inst["members"].items()) or "none"
     lines.append(f"  instance: bindings {b}; members {mem}")
     lines.append(f"  time: one observation every {inst['step_ms'] / 1000:g}s, "
@@ -3097,11 +3395,11 @@ def format_text(report: dict) -> str:
 
 def check_file(path, contract_id=None, bindings=None, members=None, step=None,
                horizon=None, export_dir=None, prism=None, timeout: float = 600,
-               domains=None) -> dict:
+               domains=None, instances=None) -> dict:
     """`cadl norms-check`: build the model of a file, check it, export."""
     from .norms_eval import load_version
     sos = load_version(path)
-    model = build_model(sos, contract_id, bindings, members, step, horizon, domains)
+    model = build_model(sos, contract_id, bindings, members, step, horizon, domains, instances)
     if export_dir is not None:
         export(model, None, export_dir)       # the model, also when the check fails
     report = check(model, prism, timeout)
