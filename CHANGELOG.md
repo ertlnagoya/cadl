@@ -6,6 +6,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.25] — 2026-11-12
+
+Design-time checking of norms, norms monitors in two more generated
+runtimes, and a gateway for A2A. `cadl norms-check` translates the norms
+of one contract instance into a model for PRISM and asks whether each
+norm can be activated, violated and fulfilled, whether every activation
+can be kept, which obligations and prohibitions are in conflict, and
+whether powers and reparations are ever used, each answer with a trace
+that the norms engine confirms (Appendix F, F.12). `cadl codegen -t opa`
+and `-t solidity` now write a monitor of the norms that follows F.5
+observation by observation (Appendix D, D.5). `cadl a2a-gateway` decides
+the messages of an A2A 1.0.0 agent with the same decision function,
+approvals and audit log as the MCP gateway (Appendix G, G.13). Each part
+was reviewed independently, the gateway in five rounds, before the
+release.
+
+Known limits: `norms-check` does not translate quantified predicates,
+arithmetic, several instances or amendments, and assumes that values
+have the type of the literals they are compared with; the monitors
+compute arithmetic and times differently from `cadl norms-eval` in the
+ways D.5 lists, and the Solidity monitor is tested on an EVM outside CI;
+the A2A gateway was tested against a fake agent and client, supports
+the JSON-RPC binding without streaming, and cannot keep many hosts that
+connect together from filling its readers.
+
 ### Added
 
 - Norms monitors in the generated Rego and Solidity (Appendix F, F.5;
