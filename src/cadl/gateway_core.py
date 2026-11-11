@@ -318,13 +318,14 @@ class EnforcementPoint:
                                f"PLANNER or ROBOT[2]")
         return actor
 
-    def _approval_rules(self, own: dict | None = None) -> list[tuple[str, dict, str, str]]:
+    def _approval_rules(self, *candidates: dict) -> list[tuple[str, dict, str, str]]:
         """(event, sender reference, receiver, message name) of the
         counts_as rules of the enforced contracts that create `approval`
-        or `rejection` from a message with a receiver that the gateway can
-        name: a concrete actor, or a set or a range of which `own`, the
-        actor that the gateway stands in front of, is a member (then the
-        receiver is `own`)."""
+        or `rejection`. An inbox approval is only given to the runtime,
+        never delivered, so a receiver that is a set, a range or an indexed
+        variable is resolved to a concrete actor: the first of `candidates`
+        (the gateway's own actor, then its client) that it can match, else
+        the first declared member of the set."""
         out = []
         for c in self.sos.contracts:
             if c.enforcement is None:
@@ -335,25 +336,36 @@ class EnforcementPoint:
                 ev = G.parse_message_event(r.when)
                 if ev is None or ev.name is None:
                     continue
-                to = self._rule_receiver(ev.receiver, own)
+                to = self._rule_receiver(ev.receiver, candidates)
                 if to is not None:
                     out.append((r.creates, ev.sender, to, ev.name))
         return out
 
-    def _rule_receiver(self, recv: dict, own: dict | None) -> str | None:
+    def _rule_receiver(self, recv: dict, candidates=()) -> str | None:
         if recv["kind"] == "plain":
             return recv["name"]
         if recv["kind"] == "index":
             return f"{recv['name']}[{recv['index']}]"
-        if own is not None and G.ref_match(self.policy, recv, own, {}) is True:
-            return own["text"]
+        for own in candidates:
+            if own is not None and G.ref_match(self.policy, recv, own, {}) is not False:
+                return own["text"]
+        decl = self.policy["actors"].get(recv["name"])
+        if decl is None or not decl["indexed"] or decl["lo"] is None:
+            return None
+        start = decl["lo"]
+        if recv["kind"] == "range":
+            start = max(start, recv["lo"])
+        first = {"name": recv["name"], "index": start, "text": f"{recv['name']}[{start}]"}
+        if G.is_member(self.policy, recv["name"], first) \
+                and G.ref_match(self.policy, recv, first, {}) is not False:
+            return first["text"]
         return None
 
     def _check_approvable(self, own: dict) -> None:
         """Fail closed at the start: an enforced contract that `own` is a
         party of and whose prohibitions escalate needs a counts_as rule
-        that creates `approval` from a message that the gateway can name;
-        otherwise its holds could never be approved."""
+        that creates `approval`; otherwise its holds could never be
+        approved."""
         by_id = {c.id: c for c in self.sos.contracts}
         for c in self.policy["contracts"]:
             if not any(n.get("escalate") for n in c["norms"]):
@@ -361,22 +373,10 @@ class EnforcementPoint:
             if not any(G.ref_match(self.policy, ref, own, {}) is not False
                        for ref in c["parties"]):
                 continue
-            rules = []
-            for r in by_id[c["id"]].counts_as:
-                if r.creates != "approval":
-                    continue
-                ev = G.parse_message_event(r.when)
-                if ev is not None and ev.name is not None:
-                    rules.append(ev)
-            if rules and not any(self._rule_receiver(ev.receiver, own) is not None
-                                 for ev in rules):
+            if not any(r.creates == "approval" for r in by_id[c["id"]].counts_as):
                 raise GatewayError(
-                    f"contract {c['id']} escalates, and no counts_as rule that creates "
-                    f"approval has a receiver that this gateway can name ("
-                    + ", ".join(f"{ev.sender['text']} -> {ev.receiver['text']} : {ev.name}"
-                                for ev in rules)
-                    + f"; the gateway stands in front of {own['text']}): its holds could "
-                      f"never be approved")
+                    f"contract {c['id']} escalates and has no counts_as rule that creates "
+                    f"approval: its holds could never be approved")
 
     def _approval_names(self) -> set[str]:
         """The names of the messages from which a counts_as rule of an

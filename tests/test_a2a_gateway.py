@@ -951,28 +951,81 @@ class TestReviewFindings:
         assert [e for e, _ in events].count("approval_evidence") == 1
         loc.stop_and_replay()
 
-    def test_unapprovable_escalation_refused_at_start(self, tmp_path):
-        """A receiver set that does not contain the gateway's actor: the
-        holds of the contract could never be approved, so neither gateway
-        starts."""
+    def test_set_receiver_without_the_gateways_actor(self, tmp_path):
+        """A receiver range without the gateway's actor resolves to its first
+        member: the inbox approval is given to the runtime only."""
         f = workers_file(tmp_path, receiver="SUMMARIZER[2..2]")
-        with pytest.raises(GatewayError, match="could never be approved"):
-            Local(tmp_path, cadl=f, agent="SUMMARIZER[1]")
-        assert not (tmp_path / "audit.jsonl").exists()
-        Local(tmp_path, cadl=f, agent="SUMMARIZER[2]").gw.stop()    # a member: starts
-        g = tmp_path / "mcp.cadl"
-        g.write_text(ROOT.joinpath("examples", "agents_tool_governance.cadl").read_text()
-                     .replace("- id: PLANNER\n", "- id: PLANNER[1..2]\n")
-                     .replace("parties: [OPERATOR, PLANNER, SUMMARIZER, FILES, TICKETS]",
-                              'parties: [OPERATOR, "PLANNER[*]", SUMMARIZER, FILES, TICKETS]')
-                     .replace("-> PLANNER :", "-> PLANNER[*] :")
-                     .replace("bearer: PLANNER", "bearer: PLANNER[1]")
-                     .replace('"PLANNER ->', '"PLANNER[1] ->')
-                     .replace("to: [PLANNER, SUMMARIZER]", 'to: ["PLANNER[1]", SUMMARIZER]'))
+        approvers = {"OPERATOR": APPROVER_KEYS["OPERATOR"]}
+        loc = Local(tmp_path, cadl=f, agent="SUMMARIZER[1]", inbox=tmp_path / "inbox",
+                    approver_keys=approvers)
+        assert {to for _, _, to, _ in loc.gw.approval_rules} == {"SUMMARIZER[2]"}
+        loc.post(rpc("SendMessage", params("publish", returnImmediately=True)))
+        from cadl.gateway_core import _drop
+        _drop(tmp_path / "inbox", approval_file(tmp_path / "inbox", "h-1", "approve",
+                                                "OPERATOR", approvers["OPERATOR"]))
+        loc.gw.tick()
+        assert loc.gw.runtime.hold_state("h-1") == "approved"
+        wait_for(lambda: loc.sent, "the release")
+        loc.stop_and_replay()
+
+    @pytest.mark.parametrize("variant", ["summarizer_set", "planner_set"])
+    def test_mcp_set_receivers(self, tmp_path, variant):
+        """Two files that 0.3.24 accepted: `OPERATOR -> SUMMARIZER[*] :
+        approve` in front of FILES, and `OPERATOR -> PLANNER[*] : approve`
+        with the client PLANNER[1]. Both start, and an approval through the
+        inbox releases the call, bound to its arguments."""
+        from cadl.gateway_core import _drop
         from cadl.mcp_gateway import Gateway
-        with pytest.raises(GatewayError, match="could never be approved"):
-            Gateway(g, "PLANNER[1]", "FILES", tmp_path / "m.jsonl", tmp_path / "m.trace.jsonl",
-                    to_client=lambda _: None, to_server=lambda _: None)
+        text = ROOT.joinpath("examples", "agents_tool_governance.cadl").read_text()
+        agent = "PLANNER"
+        if variant == "summarizer_set":
+            text = (text.replace("- id: SUMMARIZER\n", "- id: SUMMARIZER[1..2]\n")
+                    .replace("PLANNER, SUMMARIZER, FILES", 'PLANNER, "SUMMARIZER[*]", FILES')
+                    .replace("to: [PLANNER, SUMMARIZER]", 'to: [PLANNER, "SUMMARIZER[*]"]')
+                    .replace("OPERATOR -> PLANNER : approve", "OPERATOR -> SUMMARIZER[*] : approve")
+                    .replace("OPERATOR -> PLANNER : reject", "OPERATOR -> SUMMARIZER[*] : reject"))
+            want = "SUMMARIZER[1]"
+        else:
+            text = (text.replace("- id: PLANNER\n", "- id: PLANNER[1..2]\n")
+                    .replace("parties: [OPERATOR, PLANNER, SUMMARIZER, FILES, TICKETS]",
+                             'parties: [OPERATOR, "PLANNER[*]", SUMMARIZER, FILES, TICKETS]')
+                    .replace("-> PLANNER :", "-> PLANNER[*] :")
+                    .replace("bearer: PLANNER", "bearer: PLANNER[1]")
+                    .replace('"PLANNER ->', '"PLANNER[1] ->')
+                    .replace("to: [PLANNER, SUMMARIZER]", 'to: ["PLANNER[1]", SUMMARIZER]'))
+            agent, want = "PLANNER[1]", "PLANNER[1]"
+        g = tmp_path / "mcp.cadl"
+        g.write_text(text)
+        out: list = []
+        inbox = tmp_path / "inbox"
+        gw = Gateway(g, agent, "FILES", tmp_path / "m.jsonl", tmp_path / "m.trace.jsonl",
+                     to_client=out.append, to_server=out.append, inbox=inbox,
+                     approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]})
+        assert {to for _, _, to, _ in gw.approval_rules} == {want}
+        gw.client_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "delete_file",
+                                              "arguments": {"path": "/x"}}}))
+        assert list(gw.held) == ["h-1"]
+        _drop(inbox, approval_file(inbox, "h-1", "approve", "OPERATOR",
+                                   APPROVER_KEYS["OPERATOR"]))
+        gw.tick()
+        assert gw.runtime.hold_state("h-1") == "approved"
+        assert any('"tools/call"' in x for x in out)
+        gw.stop()
+        replayed = tmp_path / "r.jsonl"
+        assert main(["agents-run", str(g), "--trace", str(tmp_path / "m.trace.jsonl"),
+                     "--audit", str(replayed)]) == 0
+        assert replayed.read_bytes() == (tmp_path / "m.jsonl").read_bytes()
+
+    def test_escalation_without_approval_rule_refused(self, tmp_path):
+        f = tmp_path / "noapproval.cadl"
+        text = CADL.read_text()
+        text = text.replace('        - { when: "OPERATOR -> SUMMARIZER : approve", creates: approval }\n', "")
+        f.write_text(text)
+        # G-9 makes the file an error; the gateway's own check is a second line.
+        with pytest.raises(GatewayError, match="counts_as rule that creates '?approval"):
+            Local(tmp_path, cadl=f)
+        assert not (tmp_path / "audit.jsonl").exists()
 
     def test_unauthenticated_records_are_limited(self, tmp_path):
         loc = Local(tmp_path)
@@ -1068,11 +1121,15 @@ class TestSecondReview:
                    upstream_token="secret-token").stop()
 
     def test_nonce_limit(self, tmp_path):
+        """The cap is per actor: PLANNER reaching it does not lock out
+        OPERATOR."""
         loc = Local(tmp_path, max_nonces=2)
         assert loc.post(rpc("SendMessage", params("summarize"))).status == 200
         assert loc.post(rpc("SendMessage", params("summarize"), 2)).status == 200
         assert loc.post(rpc("SendMessage", params("summarize"), 3)).status == 401
         assert host_events(loc.audit)[-1] == ("unauthenticated_request", "nonce_limit")
+        assert loc.post(rpc("SendMessage", params("translate"), 4),
+                        actor="OPERATOR").status == 200
         loc.stop_and_replay()
 
     def test_released_forward_that_raises(self, tmp_path, monkeypatch):
@@ -1108,3 +1165,86 @@ def test_overloaded(tmp_path, capsys):
                ((x["event"], x["reason"]) for x in read_records(r.audit) if x.get("event")))
     r.replay_check()
     capsys.readouterr()
+
+
+def _slow(port: int, n: int) -> list:
+    """`n` unauthenticated connections that send headers and one byte of a
+    body of 1000000 bytes."""
+    out = []
+    for _ in range(n):
+        sock = socket.create_connection(("127.0.0.1", port))
+        sock.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                     b"Content-Length: 1000000\r\n\r\n{")
+        out.append(sock)
+    return out
+
+
+def _events(path: Path, event: str) -> list:
+    return [r["reason"] for r in read_records(path) if r.get("event") == event]
+
+
+class TestThirdReview:
+    """Findings of the third review."""
+
+    def test_slow_loris_does_not_lock_out_a_client(self, tmp_path, capsys):
+        """Slow unauthenticated connections take no handler slot: with two
+        handler slots and ten slow connections, an authenticated client is
+        served at once, and the slow connections are closed at the read
+        deadline."""
+        r = Run(tmp_path, extra=("--max-handlers", "2", "--read-timeout", "1"))
+        socks = _slow(r.client.port, 10)
+        time.sleep(0.2)
+        body = r.call("PLANNER", "SendMessage", params("summarize"))
+        assert body["result"]["task"]["id"] == "up-task-1"
+        wait_for(lambda: len(_events(r.audit, "read_timeout")) >= 10, "the read deadlines")
+        for sock in socks:
+            sock.settimeout(5)
+            assert sock.recv(100) == b""                # closed by the gateway
+            sock.close()
+        r.stop()
+        r.replay_check()
+        capsys.readouterr()
+
+    def test_reader_cap_and_trickle(self, tmp_path, capsys):
+        """More slow connections than readers: the next connection gets 503
+        at once; a slow connection that keeps sending a byte now and then is
+        still closed at the deadline, and the client is served after it."""
+        r = Run(tmp_path, extra=("--max-readers", "3", "--read-timeout", "1"))
+        socks = _slow(r.client.port, 3)
+        time.sleep(0.2)
+        status, _, _ = r.client.post("PLANNER", rpc("SendMessage", params("summarize")))
+        assert status == 503
+        for _ in range(3):
+            time.sleep(0.4)
+            for sock in socks:
+                try:
+                    sock.sendall(b" ")
+                except OSError:
+                    pass
+        wait_for(lambda: len(_events(r.audit, "read_timeout")) >= 3, "the read deadlines")
+        body = r.call("PLANNER", "SendMessage", params("summarize"), id_=2)
+        assert body["result"]["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        for sock in socks:
+            sock.close()
+        r.stop()
+        assert "readers" in _events(r.audit, "overloaded")
+        assert r.agent.sent() == ["summarize"]
+        r.replay_check()
+        capsys.readouterr()
+
+    def test_held_requests_per_actor(self, tmp_path, capsys):
+        r = Run(tmp_path, extra=("--max-held-per-actor", "1"))
+        fut = r.later("PLANNER", "SendMessage", params("publish"))
+        r.wait_hold("h-1")
+        status, _, _ = r.client.post("PLANNER", rpc("SendMessage", params("publish"), 2))
+        assert status == 503                         # refused before a decision
+        body = r.call("PLANNER", "SendMessage", params("publish", returnImmediately=True), 3)
+        assert state(body) == "TASK_STATE_SUBMITTED"   # not a blocking request
+        r.approve("h-1", "reject")
+        r.approve("h-2", "reject")
+        assert state(fut.result(timeout=30)) == "TASK_STATE_REJECTED"
+        r.stop()
+        assert _events(r.audit, "overloaded") == ["held_per_actor PLANNER"]
+        result = r.replay_check()
+        assert [h["hold_id"] for h in result["holds"]] == ["h-1", "h-2"]
+        capsys.readouterr()

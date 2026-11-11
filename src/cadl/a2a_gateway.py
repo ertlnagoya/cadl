@@ -138,8 +138,11 @@ MAX_RESPONSE = 16 << 20
 MAX_ARGS = 16
 MAX_ARG_LEN = 256
 UNAUTH_PER_SECOND = 20         # records of refused requests a second, per event
-MAX_NONCES = 1_000_000         # authenticated requests in one run
-MAX_HANDLERS = 64              # requests handled at the same time
+MAX_NONCES = 1_000_000         # authenticated requests of one actor in one run
+MAX_HANDLERS = 64              # authenticated requests handled at the same time
+MAX_READERS = 64               # connections whose request is being read
+MAX_HELD_PER_ACTOR = 16        # held blocking requests of one actor
+READ_TIMEOUT = 10.0            # seconds to read the request line, headers and body
 
 _AUTH_RE = re.compile(r'CADL-HMAC actor="([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]{1,9}\])?)", '
                       r'nonce="([0-9a-f]{32})", mac="([0-9a-f]{64})"')
@@ -261,7 +264,9 @@ class A2AGateway(EnforcementPoint):
                  upstream_timeout: float = 300.0,
                  agent_card: dict | None = None,
                  post_upstream: Callable[[str], bytes] | None = None,
-                 max_nonces: int = MAX_NONCES) -> None:
+                 max_nonces: int = MAX_NONCES,
+                 max_handlers: int = MAX_HANDLERS,
+                 max_held_per_actor: int = MAX_HELD_PER_ACTOR) -> None:
         self._load(file)
         self.receiver = self._actor(agent_actor, "--agent-actor")
         decl = next((a for a in self.sos.actors if a.id.name == self.receiver["name"]), None)
@@ -315,8 +320,10 @@ class A2AGateway(EnforcementPoint):
         self.upstream_timeout = upstream_timeout
         self.agent_card = agent_card
         self.post_upstream = post_upstream or self._post
-        self.client_nonces: set = set()
+        self.client_nonces: dict[str, set] = {a: set() for a in client_keys}
         self.max_nonces = max_nonces
+        self.slots = threading.BoundedSemaphore(max_handlers)
+        self.max_held_per_actor = max_held_per_actor
         self.refusals: dict[str, list] = {}     # event -> [second, count, not recorded]
         self.tasks: dict[str, _Task] = {}          # the tasks of the gateway
         self.task_owner: dict[str, str] = {}       # tasks of the agent -> actor
@@ -407,6 +414,17 @@ class A2AGateway(EnforcementPoint):
             return Reply(401, _error(None, INVALID_REQUEST, "Unauthorized"),
                          self._headers({"WWW-Authenticate":
                                         f'{AUTH_SCHEME} run="{self.run_id}"'}))
+        # A slot only for an authenticated request: unauthenticated peers
+        # cannot take the slots of the clients.
+        if not self.slots.acquire(blocking=False):
+            return self.overloaded("handlers")
+        try:
+            return self._handle_authenticated(actor, headers, body, closed)
+        finally:
+            self.slots.release()
+
+    def _handle_authenticated(self, actor: str, headers, body: bytes,
+                              closed: Callable[[], bool]) -> Reply | None:
         ctype = headers.get_all("Content-Type") or []
         if len(ctype) != 1 or ctype[0].split(";")[0].strip().lower() != "application/json":
             return Reply(415, _error(None, INVALID_REQUEST,
@@ -479,10 +497,16 @@ class A2AGateway(EnforcementPoint):
             entry[2] = 0
         self._host_event(event, reason=reason)
 
-    def overloaded(self) -> Reply:
-        """A request beyond `MAX_HANDLERS` at the same time: 503."""
+    def refused(self, event: str, why: str) -> None:
+        """Record a refusal of the HTTP layer at the capped rate."""
         with self.lock:
-            self._refusal("overloaded", "handlers")
+            if not self.stopped:
+                self._refusal(event, why)
+
+    def overloaded(self, why: str = "handlers") -> Reply:
+        """A request beyond a limit of the gateway: 503."""
+        with self.lock:
+            self._refusal("overloaded", why)
         return Reply(503, _error(None, INTERNAL_ERROR, "the gateway is busy"),
                      self._headers({"Retry-After": "1"}))
 
@@ -503,11 +527,12 @@ class A2AGateway(EnforcementPoint):
         if not hmac.compare_digest(mac, want):
             return None, "bad_mac"
         with self.lock:
-            if nonce in self.client_nonces:
+            nonces = self.client_nonces[who["text"]]
+            if nonce in nonces:
                 return None, "replayed"
-            if len(self.client_nonces) >= self.max_nonces:
+            if len(nonces) >= self.max_nonces:
                 return None, "nonce_limit"
-            self.client_nonces.add(nonce)
+            nonces.add(nonce)
         return who["text"], ""
 
     # --- SendMessage ------------------------------------------------------------------
@@ -653,6 +678,10 @@ class A2AGateway(EnforcementPoint):
                                                         f"({e})")
         immediate = conf.get("returnImmediately") is True
         with self.lock:
+            if not immediate and sum(1 for h in self.held.values() if h.actor == actor
+                                     and not h.return_immediately) >= self.max_held_per_actor:
+                # Before the decision: one client cannot hold every slot.
+                return self.overloaded(f"held_per_actor {actor}")
             try:
                 out = self._step({"t": self.now(), "messages": [m]})
                 step = out["steps"][-1]
@@ -1017,7 +1046,7 @@ class A2AGateway(EnforcementPoint):
             else:
                 return self._task_refused("CancelTask", id_, "not a task of the client")
             # Recorded before it is passed on: it changes the state of the agent.
-            self._host_event("task_cancel", reason=f"agent task {upstream} ({actor})")
+            self._host_event("task_cancel", reason=f"agent task {upstream} ({actor})"[:200])
         return self._task_call(actor, id_, "CancelTask", params, upstream, tid)
 
     # --- end ----------------------------------------------------------------------------
@@ -1106,24 +1135,66 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             s.close()
 
+    def setup(self):
+        super().setup()
+        self._rlock = threading.Lock()
+        self._reading = True
+        self._reader_slot = False
+        self._timer = threading.Timer(self.server.read_timeout, self._read_expired)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _read_expired(self) -> None:
+        """The request was not read within the deadline: closed, and
+        recorded at the capped rate (`read_timeout`)."""
+        with self._rlock:
+            if not self._reading:
+                return
+            self._reading = False
+        self.server.gw.refused("read_timeout", "deadline")
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _done_reading(self) -> bool:
+        """The request has been read: the deadline and the reader slot end.
+        False when the deadline had already closed the connection."""
+        with self._rlock:
+            in_time = self._reading
+            self._reading = False
+            self._timer.cancel()
+            if self._reader_slot:
+                self._reader_slot = False
+                self.server.readers.release()
+            return in_time
+
+    def handle(self):
+        """At most `max_readers` connections are being read at the same
+        time; beyond that 503, recorded as `overloaded` (`readers`)."""
+        if not self.server.readers.acquire(blocking=False):
+            self._done_reading()
+            self.server.gw.refused("overloaded", "readers")
+            try:
+                self.connection.settimeout(2)
+                self.connection.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                        b"Retry-After: 1\r\nContent-Length: 0\r\n"
+                                        b"Connection: close\r\n\r\n")
+            except OSError:
+                pass
+            return
+        self._reader_slot = True
+        try:
+            super().handle()
+        finally:
+            self._done_reading()
+
     def do_GET(self):       # noqa: N802
-        self._limited(lambda: self._send(self.server.gw.handle_get(self.path)))
+        self._done_reading()
+        self._send(self.server.gw.handle_get(self.path))
 
     def do_POST(self):      # noqa: N802
-        self._limited(self._post)
-
-    def _limited(self, fn) -> None:
-        """At most `max_handlers` requests at the same time (a held
-        blocking request counts); beyond that 503, recorded as
-        `overloaded` at the rate of refused requests."""
-        slots = self.server.slots
-        if not slots.acquire(blocking=False):
-            self._send(self.server.gw.overloaded())
-            return
-        try:
-            fn()
-        finally:
-            slots.release()
+        self._post()
 
     def _post(self) -> None:
         gw = self.server.gw
@@ -1136,6 +1207,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif int(lengths[0]) > MAX_BODY:
             bad = (413, "the body is larger than 1 MiB")
         if bad is not None:
+            self._done_reading()
             self._send(Reply(bad[0], _error(None, INVALID_REQUEST,
                                             f"Invalid Request: {bad[1]}"),
                              {"CADL-Run-Id": gw.run_id}))
@@ -1147,6 +1219,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         if len(body) != n:
+            self.close_connection = True
+            return
+        if not self._done_reading():        # the deadline closed the connection
             self.close_connection = True
             return
         try:
@@ -1166,10 +1241,12 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = True
     request_queue_size = 128
 
-    def __init__(self, address, gw, family, max_handlers: int = MAX_HANDLERS):
+    def __init__(self, address, gw, family, max_readers: int = MAX_READERS,
+                 read_timeout: float = READ_TIMEOUT):
         self.address_family = family
         self.gw = gw
-        self.slots = threading.BoundedSemaphore(max_handlers)
+        self.readers = threading.BoundedSemaphore(max_readers)
+        self.read_timeout = read_timeout
         super().__init__(address, _Handler)
 
     def handle_error(self, request, client_address):
@@ -1198,7 +1275,8 @@ def _is_loopback(host: str) -> bool:
 
 def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None = None,
           tls_cert: Path | None = None, tls_key: Path | None = None,
-          poll: float = 0.05, max_handlers: int = MAX_HANDLERS) -> int:
+          poll: float = 0.05, max_readers: int = MAX_READERS,
+          read_timeout: float = READ_TIMEOUT) -> int:
     """Run the gateway until SIGTERM or SIGINT. Returns the exit status."""
     host, port = parse_listen(listen)
     if not _is_loopback(host) and tls_cert is None:
@@ -1221,7 +1299,7 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
         raise GatewayError(f"--listen {listen}: {e}") from None
     gw = A2AGateway(**gw_args)
     try:
-        server = _Server((host, port), gw, family, max_handlers)
+        server = _Server((host, port), gw, family, max_readers, read_timeout)
     except OSError as e:
         gw.stop()
         raise GatewayError(f"cannot listen on {listen}: {e}") from None
@@ -1297,17 +1375,20 @@ def cli_gateway(args) -> int:
                                            else str(args.audit)).with_suffix(".trace.jsonl")
         if Path(trace_out).resolve() == Path(args.audit).resolve():
             raise GatewayError("the trace and the audit log are the same file")
-        if args.poll <= 0 or args.upstream_timeout <= 0 or args.max_handlers < 1:
-            raise GatewayError("--poll, --upstream-timeout and --max-handlers must be "
-                               "positive")
+        if args.poll <= 0 or args.upstream_timeout <= 0 or args.read_timeout <= 0 \
+                or min(args.max_handlers, args.max_readers, args.max_held_per_actor) < 1:
+            raise GatewayError("--poll, --upstream-timeout, --read-timeout, --max-handlers, "
+                               "--max-readers and --max-held-per-actor must be positive")
         gw_args = dict(file=args.file, agent_actor=args.agent_actor, upstream=args.upstream,
                        client_keys=clients, audit=args.audit, trace_out=trace_out, key=key,
                        inbox=args.approvals, init=init, approver_keys=ring,
                        insecure_approvals=args.insecure_approvals, upstream_token=token,
-                       upstream_timeout=args.upstream_timeout, agent_card=card)
+                       upstream_timeout=args.upstream_timeout, agent_card=card,
+                       max_handlers=args.max_handlers,
+                       max_held_per_actor=args.max_held_per_actor)
         code = serve(gw_args, listen=args.listen, port_file=args.port_file,
                      tls_cert=args.tls_cert, tls_key=args.tls_key, poll=args.poll,
-                     max_handlers=args.max_handlers)
+                     max_readers=args.max_readers, read_timeout=args.read_timeout)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

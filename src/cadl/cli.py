@@ -242,8 +242,17 @@ def main(argv: list[str] | None = None) -> int:
                          metavar="SECONDS", help="Timeout of a request to the agent "
                                                  "(default 300)")
     a2a_cmd.add_argument("--max-handlers", type=int, default=64, metavar="N",
-                         help="Requests handled at the same time, held blocking "
-                              "requests included (default 64); beyond that 503")
+                         help="Authenticated requests handled at the same time, held "
+                              "blocking requests included (default 64); beyond that 503")
+    a2a_cmd.add_argument("--max-readers", type=int, default=64, metavar="N",
+                         help="Connections whose request is being read at the same time, "
+                              "before authentication (default 64); beyond that 503")
+    a2a_cmd.add_argument("--max-held-per-actor", type=int, default=16, metavar="N",
+                         help="Held blocking requests of one actor (default 16); a "
+                              "further blocking SendMessage gets 503 before its decision")
+    a2a_cmd.add_argument("--read-timeout", type=float, default=10.0, metavar="SECONDS",
+                         help="Time to read the request line, the headers and the body "
+                              "of a request (default 10)")
     a2a_cmd.add_argument("--poll", type=float, default=0.05, metavar="SECONDS",
                          help="Interval for the inbox and for deadlines (default 0.05)")
 

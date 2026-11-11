@@ -122,6 +122,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   declare the extension; `--upstream-token` is refused with a plain-HTTP
   agent off loopback; at most `--max-handlers` (64) requests at a time,
   more get 503 (`overloaded`); at most 1 000 000 nonces per run.
+- Third review of `cadl a2a-gateway`. A request has to be read within
+  `--read-timeout` (10 s) in all (`read_timeout`); at most `--max-readers`
+  (64) connections are read before authentication; a `--max-handlers`
+  slot is taken only after authentication; one actor may hold at most
+  `--max-held-per-actor` (16) blocking requests. Slow unauthenticated
+  connections could otherwise lock out every client. Approval rules with
+  a set, range or index-variable receiver resolve to the gateway's
+  actor, then (MCP) its client, then the first declared member, so files
+  that 0.3.24 accepted start again; only an escalation without any
+  approval rule is refused. The nonce cap is per actor.
 
 ### Changed
 - The audit file of `cadl agents-run --audit` has a header line, an end
