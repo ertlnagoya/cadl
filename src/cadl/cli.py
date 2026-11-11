@@ -248,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
                          help="Connections whose request is being read at the same time, "
                               "before authentication (default 64); beyond that 503")
     a2a_cmd.add_argument("--max-readers-per-address", type=int, default=4, metavar="N",
-                         help="Of those, connections of one remote address (default 4); "
+                         help="Of those, connections of one remote address, IPv4 address or IPv6 /64 (default 4); "
                               "beyond that the connection is closed at once")
     a2a_cmd.add_argument("--max-handlers-per-actor", type=int, default=16, metavar="N",
                          help="Authenticated requests of one actor handled at the same "

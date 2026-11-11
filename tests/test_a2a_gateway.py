@@ -1316,3 +1316,13 @@ class TestThirdReview:
         assert statuses == [200] * 20
         assert "address" in _events(loc.audit, "overloaded")
         loc.stop_and_replay()
+
+
+def test_peer_key_groups_ipv6_by_prefix():
+    from cadl.a2a_gateway import _Server
+    k = _Server.peer_key
+    assert k(("2001:db8::1", 1, 0, 0)) == k(("2001:db8::ffff:2", 2, 0, 0))
+    assert k(("2001:db8::1", 1, 0, 0)) != k(("2001:db8:0:1::1", 1, 0, 0))
+    assert k(("::ffff:192.0.2.7", 1, 0, 0)) == k(("192.0.2.7", 5)) == "192.0.2.7"
+    assert k(("192.0.2.7", 1)) != k(("192.0.2.8", 1))
+    assert k(("fe80::1%lo0", 1, 0, 0)) == "fe80::/64"

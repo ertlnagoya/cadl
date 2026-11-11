@@ -1296,8 +1296,20 @@ class _Server(ThreadingHTTPServer):
 
     @staticmethod
     def peer_key(client_address) -> Any:
-        """The remote address that the cap per address counts."""
-        return client_address[0]
+        """The remote address that the cap per address counts: an IPv4
+        address, or the /64 prefix of an IPv6 address (a single host
+        usually owns a whole /64). An IPv4-mapped IPv6 address counts as
+        its IPv4 address."""
+        host = client_address[0]
+        try:
+            ip = ipaddress.ip_address(str(host).split("%", 1)[0])
+        except ValueError:
+            return host
+        if ip.version == 6:
+            if ip.ipv4_mapped is not None:
+                return str(ip.ipv4_mapped)
+            return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+        return str(ip)
 
     def handle_error(self, request, client_address):
         _log(f"a connection failed: {sys.exc_info()[0].__name__}: {sys.exc_info()[1]}")

@@ -134,7 +134,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   approval rule is refused. The nonce cap is per actor.
 - Fourth review of `cadl a2a-gateway`. Peers of one address that
   reconnected at once kept every reader busy: at most
-  `--max-readers-per-address` (4) connections of one address are read at
+  `--max-readers-per-address` (4) connections of one address (an IPv4
+  address or the /64 prefix of an IPv6 address) are read at
   once (more are closed at once), and a connection waits up to one second
   for a reader before 503. One actor uses at most
   `--max-handlers-per-actor` (16) handlers, which replaces
