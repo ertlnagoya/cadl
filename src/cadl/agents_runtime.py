@@ -18,8 +18,10 @@ define on top of the stateless decision function:
   the instances of the contracts that govern it;
 - the audit records (G.8).
 
-The runtime is deterministic and offline: it reads a trace, it does not
-run agents or tools, and its only clock is the `t` of the trace.
+The runtime is deterministic: it does not run agents or tools, and its
+only clock is the `t` of the trace. `run` replays a whole trace offline;
+`AgentsRuntime.open` gives the same engine for online use, one line at a
+time (`observe`, `close`), as `cadl mcp-gateway` drives it.
 
 Trace format: the JSON Lines of `cadl norms-eval` (keys ``t``,
 ``bindings``, ``request``, ``values``, ``messages``, ``state``, ``amend``,
@@ -75,6 +77,7 @@ from .norms_eval import (
     Trace,
     TraceError,
     _Engine,
+    _TraceReader,
     _fmt_t,
     _table,
     _Term,
@@ -158,6 +161,53 @@ def _check_instances(value: Any, where: str) -> list[dict]:
     return out
 
 
+def _first_line_keys(rec: dict, where: str, first: bool) -> tuple:
+    """Take the keys of the first line (`epoch`, `quantities`,
+    `host_instances`) and `instances` out of one record and check them.
+    Returns (epoch, quantities, host_instances, entries, state); the first
+    three are None when the line does not give them."""
+    epoch = quantities = hosted = None
+    if "epoch" in rec:
+        if not first:
+            raise TraceError(f"{where}: 'epoch' is allowed only on the first line")
+        epoch = _parse_epoch(rec.pop("epoch"), where)
+    if "quantities" in rec:
+        if not first:
+            raise TraceError(f"{where}: 'quantities' is allowed only on the first line")
+        quantities = rec.pop("quantities")
+        if not isinstance(quantities, list) or any(
+                not isinstance(q, str) or not q.strip() for q in quantities):
+            raise TraceError(f"{where}: 'quantities' must be a list of names")
+        quantities = [q.strip() for q in quantities]
+    if "host_instances" in rec:
+        if not first:
+            raise TraceError(f"{where}: 'host_instances' is allowed only on the "
+                             f"first line")
+        hosted = rec.pop("host_instances")
+        if not isinstance(hosted, list) or any(
+                not isinstance(c, str) or not c.strip() for c in hosted):
+            raise TraceError(f"{where}: 'host_instances' must be a list of contract ids")
+        hosted = [c.strip() for c in hosted]
+    entries = _check_instances(rec.pop("instances", []), where)
+    if "bindings" in rec and isinstance(rec["bindings"], dict):
+        _check_bindings(rec["bindings"], where)
+    state = rec.get("state") if isinstance(rec.get("state"), str) else None
+    return epoch, quantities, hosted, entries, state
+
+
+def _check_epoch_range(epoch: datetime | None, t: float, lineno: int) -> None:
+    # Only with an epoch does a time have to be an instant that an
+    # ISO 8601 time stamp can express.
+    if epoch is None:
+        return
+    try:
+        epoch + timedelta(seconds=t)
+    except OverflowError:
+        raise TraceError(f"line {lineno}: t={_fmt_t(t)} seconds after 'epoch' "
+                         f"is not a time that an ISO 8601 time stamp can "
+                         f"express") from None
+
+
 def parse_run_trace(lines, path: str | None = None) -> RunTrace:
     """Read a trace from an iterable of JSON Lines. The keys of
     `cadl norms-eval` are read by its own parser."""
@@ -178,49 +228,58 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
         if not isinstance(rec, dict):
             plain.append(line)              # reported by parse_trace
             continue
-        if "epoch" in rec:
-            if extras:
-                raise TraceError(f"{where}: 'epoch' is allowed only on the first line")
-            epoch = _parse_epoch(rec.pop("epoch"), where)
-        if "quantities" in rec:
-            if extras:
-                raise TraceError(f"{where}: 'quantities' is allowed only on the first line")
-            quantities = rec.pop("quantities")
-            if not isinstance(quantities, list) or any(
-                    not isinstance(q, str) or not q.strip() for q in quantities):
-                raise TraceError(f"{where}: 'quantities' must be a list of names")
-            quantities = [q.strip() for q in quantities]
-        if "host_instances" in rec:
-            if extras:
-                raise TraceError(f"{where}: 'host_instances' is allowed only on the "
-                                 f"first line")
-            hosted = rec.pop("host_instances")
-            if not isinstance(hosted, list) or any(
-                    not isinstance(c, str) or not c.strip() for c in hosted):
-                raise TraceError(f"{where}: 'host_instances' must be a list of contract ids")
-            hosted = [c.strip() for c in hosted]
-        entries = _check_instances(rec.pop("instances", []), where)
-        if "bindings" in rec and isinstance(rec["bindings"], dict):
-            _check_bindings(rec["bindings"], where)
-        state = rec.get("state") if isinstance(rec.get("state"), str) else None
+        e, q, h, entries, state = _first_line_keys(rec, where, not extras)
+        epoch = e if e is not None else epoch
+        quantities = q if q is not None else quantities
+        hosted = h if h is not None else hosted
         extras.append((state, entries, lineno))
         plain.append(json.dumps(rec))
     base = parse_trace(plain, path=path)
-    if epoch is not None:
-        # Only with an epoch does a time have to be an instant that an
-        # ISO 8601 time stamp can express.
-        for o, (_, _, lineno) in zip(base.observations, extras):
-            try:
-                epoch + timedelta(seconds=o.t)
-            except OverflowError:
-                raise TraceError(f"line {lineno}: t={_fmt_t(o.t)} seconds after 'epoch' "
-                                 f"is not a time that an ISO 8601 time stamp can "
-                                 f"express") from None
+    for o, (_, _, lineno) in zip(base.observations, extras):
+        _check_epoch_range(epoch, o.t, lineno)
     return RunTrace(
         lines=[Line(obs=o, state=s, instances=e, lineno=n)
                for o, (s, e, n) in zip(base.observations, extras)],
         bindings=base.bindings, request=base.request, epoch=epoch, path=path,
         quantities=quantities, host_instances=hosted)
+
+
+class RunTraceReader:
+    """Reads a trace one line at a time, for the online runtime. A line is
+    a dict with the keys of a trace line; it is checked as
+    `parse_run_trace` checks it, and nothing changes when it is
+    malformed, except that a time outside the range of the `epoch` is
+    found after the line was read (the reader is then not used again).
+    The lines read so far are `trace.lines`."""
+
+    def __init__(self, path: str | None = None) -> None:
+        self.trace = RunTrace(lines=[], path=path)
+        self._base = Trace(observations=[], path=path)
+        self._reader = _TraceReader(self._base)
+        self._lineno = 0
+
+    def add(self, rec: Any) -> Line:
+        lineno = self._lineno + 1
+        where = f"line {lineno}"
+        if not isinstance(rec, dict):
+            raise TraceError(f"{where}: an observation must be a JSON object")
+        try:
+            # The line as `parse_run_trace` would read it from a file.
+            rec = loads_strict(json.dumps(rec, allow_nan=False))
+        except ValueError as e:
+            raise TraceError(f"{where}: not JSON ({e})") from None
+        first = not self.trace.lines
+        epoch, quantities, hosted, entries, state = _first_line_keys(rec, where, first)
+        obs = self._reader.add(rec, where)
+        self._lineno = lineno
+        trace = self.trace
+        if first:
+            trace.epoch, trace.quantities, trace.host_instances = epoch, quantities, hosted
+            trace.bindings, trace.request = self._base.bindings, self._base.request
+        _check_epoch_range(trace.epoch, obs.t, lineno)
+        line = Line(obs=obs, state=state, instances=entries, lineno=lineno)
+        trace.lines.append(line)
+        return line
 
 
 def load_run_trace(path) -> RunTrace:
@@ -700,8 +759,9 @@ def _plain(obj: Any) -> Any:
 class AgentsRuntime:
     """One logical enforcement point over the enforced contracts of a file."""
 
-    def __init__(self, sos: SoSDefinition, trace: RunTrace,
-                 versions: dict | None = None, check: bool = True) -> None:
+    def __init__(self, sos: SoSDefinition, trace: RunTrace | None = None,
+                 versions: dict | None = None, check: bool = True,
+                 path: str | None = None) -> None:
         if not G.agents_active(sos):
             raise NormsEvalError(
                 "the file does not declare the agent governance extension: add "
@@ -714,7 +774,18 @@ class AgentsRuntime:
             _require_valid(sos, "the file")
         self.sos = sos
         self.policy = G.build_policy(sos)
+        # Offline, `trace` holds every line; online (`open`), the reader
+        # fills it one line at a time and `path` is where versions named by
+        # `amend` are looked up.
+        self._reader: RunTraceReader | None = None
+        if trace is None:
+            self._reader = RunTraceReader(path)
+            trace = self._reader.trace
         self.trace = trace
+        self._started = False
+        self._last_t = 0.0
+        self._closed = False
+        self._failed: str | None = None
         self.versions = versions or {}
         self.instances: list[_Instance] = []
         self.holds: list[_Hold] = []
@@ -741,16 +812,20 @@ class AgentsRuntime:
                     self._bare |= G.bare_names(expr)
         self._bare -= set(self.policy["actors"]) | {"now", "state", "request"}
         self._valued: set[str] = set()
-        # Which contracts have host-created instances is known at the first
-        # line and not later: a contract that the first line names in
-        # `instances` with another instance than `default`, or lists under
-        # `host_instances`. Every other enforced contract has the instance
-        # `default` from the start. Nothing here reads a later line.
+        self.host_managed: set[str] = set()
+        if trace.lines:
+            self._begin(trace.lines[0])
+
+    def _begin(self, head: Line) -> None:
+        """Which contracts have host-created instances is known at the first
+        line and not later: a contract that the first line names in
+        `instances` with another instance than `default`, or lists under
+        `host_instances`. Every other enforced contract has the instance
+        `default` from the start. Nothing here reads a later line."""
         ids = [c["id"] for c in self.policy["contracts"]]
-        head = trace.lines[0]
         self.host_managed = {e["contract"] for e in head.instances
                              if e["instance"] != DEFAULT_INSTANCE}
-        for cid in trace.host_instances or []:
+        for cid in self.trace.host_instances or []:
             if cid not in ids:
                 raise TraceError(f"line {head.lineno}: 'host_instances' names '{cid}', "
                                  f"which is not an enforced contract of the file")
@@ -1475,9 +1550,87 @@ class AgentsRuntime:
         contract is denied with `no_instance`."""
         lines = self.trace.lines
         for k, line in enumerate(lines):
-            self._late_names(line)
-            self._line(line, k == 0, k == len(lines) - 1)
+            self._feed(line, k == len(lines) - 1)
         return self.result()
+
+    def _feed(self, line: Line, last: bool) -> None:
+        """Process one line of the trace; `last` ends the instances that
+        are still running (unless the line says `"end": false`)."""
+        first = not self._started
+        self._started = True
+        self._last_t = line.obs.t
+        self._late_names(line)
+        self._line(line, first, last)
+
+    # --- online ------------------------------------------------------------------------------
+
+    @classmethod
+    def open(cls, sos, versions: dict | None = None, check: bool = True,
+             path: str | None = None) -> "AgentsRuntime":
+        """An enforcement point that is driven one line at a time:
+        `observe` for each line as it happens, `close` at the end. `sos` is
+        a parsed file or the path of one. `path` is the path that a trace of
+        the run will have (a file named by `amend` is looked up beside it).
+
+        Feeding the lines of a trace to `observe` and then calling `close`
+        with the time of a last line gives the records, holds and results
+        that `run` gives for the trace that has these lines followed by the
+        line ``{"t": time}``: `run` is a loop over the same steps."""
+        if not isinstance(sos, SoSDefinition):
+            sos = load_version(sos)
+        return cls(sos, None, versions, check, path=path)
+
+    def observe(self, line: dict) -> dict:
+        """Process one trace line (a dict with the keys of a trace line) at
+        its time `t`. Returns what the line produced: `steps` (the decisions,
+        as in the result of `run`), `audit` (the records of G.8, in order)
+        and `holds` (the holds created or closed, as in the result of
+        `run`). Raises TraceError or NormsEvalError for a line that cannot
+        be processed; the enforcement point is then failed and refuses
+        every further line (fail-closed)."""
+        return self._online(line, last=False)
+
+    def close(self, t: float | None = None) -> dict:
+        """End the run with the line ``{"t": t}`` (the time of the last line
+        when `t` is None): the contract instances that are still running
+        end, as at the last line of a trace. Returns what `observe` does."""
+        if t is None:
+            t = self._last_t
+        out = self._online({"t": t}, last=True)
+        self._closed = True
+        return out
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def failed(self) -> str | None:
+        """Why the online enforcement point failed, or None."""
+        return self._failed
+
+    def _online(self, rec: dict, last: bool) -> dict:
+        if self._reader is None:
+            raise NormsEvalError("this runtime replays a trace; use AgentsRuntime.open "
+                                 "for an online enforcement point")
+        if self._closed:
+            raise NormsEvalError("the enforcement point is closed")
+        if self._failed is not None:
+            raise NormsEvalError(f"the enforcement point has failed and decides nothing "
+                                 f"more: {self._failed}")
+        steps, audit = len(self.steps), len(self.audit)
+        holds = {h.hold_id: h.state for h in self.holds}
+        try:
+            line = self._reader.add(rec)
+            if not self._started:
+                self._begin(line)
+            self._feed(line, last)
+        except Exception as e:
+            self._failed = f"{type(e).__name__}: {e}"
+            raise
+        changed = [h for h in self.holds if holds.get(h.hold_id) != h.state]
+        return {"steps": self.steps[steps:], "audit": self.audit[audit:],
+                "holds": [self._hold_entry(h) for h in changed]}
 
     def _late_names(self, line: Line) -> None:
         """Warn when a name that a predicate uses as a value gets its first
@@ -1495,6 +1648,24 @@ class AgentsRuntime:
                 f"'quantities' on the first line to make them quantities from the start")
 
     # --- result ---------------------------------------------------------------------------------------
+
+    def _hold_entry(self, h: _Hold) -> dict:
+        return {
+            "hold_id": h.hold_id, "state": h.state, "message": self._head(h.message),
+            "time": self._time(h.time), "approver": h.approver,
+            "deadline": None if h.deadline is None else self._time(h.deadline),
+            "contracts": h.contracts, "norms": h.norms,
+            "closed": None if h.closed_at is None or h.state == "held"
+            else self._time(h.closed_at),
+            "released": h.released,
+        }
+
+    def held(self) -> list[dict]:
+        """The holds that are `held`, with their deadline as a time of the
+        trace (`t`), for a host that has to observe their expiry."""
+        return [{"hold_id": h.hold_id, "deadline_t": h.deadline,
+                 "message": self._head(h.message), "approver": h.approver}
+                for h in self.holds if h.state == "held"]
 
     def result(self) -> dict:
         instances = []
@@ -1526,15 +1697,7 @@ class AgentsRuntime:
                 "unauthorised": r["unauthorised"],
                 "ok": r["ok"],
             })
-        holds = [{
-            "hold_id": h.hold_id, "state": h.state, "message": self._head(h.message),
-            "time": self._time(h.time), "approver": h.approver,
-            "deadline": None if h.deadline is None else self._time(h.deadline),
-            "contracts": h.contracts, "norms": h.norms,
-            "closed": None if h.closed_at is None or h.state == "held"
-            else self._time(h.closed_at),
-            "released": h.released,
-        } for h in self.holds]
+        holds = [self._hold_entry(h) for h in self.holds]
         delegations = [{
             "contract": inst.contract, "instance": inst.name,
             "norm": f"{inst.contract}.{d.norm}", "holder": d.holder, "chain": d.chain,

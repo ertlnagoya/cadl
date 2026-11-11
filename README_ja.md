@@ -156,10 +156,11 @@ cadl codegen examples/robot_delivery.cadl --target opa -o /tmp/rego_out
 cadl codegen examples/sos_dsl_robot_delivery.cadl --target unity-csharp -o /tmp/unity_out
 
 # エージェントガバナンス拡張（agents 0.1）：境界で1通のメッセージを判定し、
-# 記録済みのメッセージ列を再生し（保留、委任、監査記録）、
-# 境界ポリシーをRegoまたはCedarとして生成
+# 記録済みのメッセージ列を再生し（保留、委任、監査記録）、監査ログのハッシュ連鎖を検証し、
+# 境界ポリシーをRegoまたはCedarとして生成（MCPゲートウェイは後述のエージェントガバナンスの節）
 cadl agents-decide examples/agents_tool_governance.cadl --input examples/agents_inputs/delete_file.json
-cadl agents-run examples/agents_tool_governance.cadl --trace examples/traces/agents_tool_governance_a_approved.jsonl
+cadl agents-run examples/agents_tool_governance.cadl --trace examples/traces/agents_tool_governance_a_approved.jsonl --audit /tmp/audit.jsonl
+cadl audit-verify /tmp/audit.jsonl --source examples/agents_tool_governance.cadl
 cadl codegen examples/agents_tool_governance.cadl --target agent-rego -o /tmp/agent_rego
 cadl codegen examples/agents_tool_governance.cadl --target agent-cedar -o /tmp/agent_cedar
 
@@ -312,7 +313,7 @@ notify:      OPERATOR
 ```bash
 cadl agents-run examples/agents_tool_governance.cadl \
     --trace examples/traces/agents_tool_governance_a_approved.jsonl
-cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl]
+cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl [--audit-key FILE]]
 ```
 
 ランタイムは、トレースの順に、メッセージごとに次のことを行います。(a) 状態を導きます。静的でない規範の発効フラグは `cadl norms-eval` の判定エンジンから、有効な派生インスタンスはそれまでに見た付与と取り消しから、動作中の契約インスタンスとその束縛はトレースから得ます。(b) その状態から組み立てたポリシー入力に `cadl agents-decide` の判定関数を適用します。(c) 判定を適用します。許可したメッセージは、それを統治する契約のインスタンスにとって規範エンジンの観測になり、拒否したメッセージは観測になりません。`escalate` は保留を作ります（作った順に `h-1`、`h-2`、…）。(d) 監査記録を追記します。保留が終わるのは、承認者のメッセージが `counts_as:` 規則を通じて `approval` か `rejection` を作ったとき（保留のidは最初の引数。`approve("h-1")`）、タイムアウトが過ぎたとき、根拠の契約インスタンスが終了したか、その契約が改正されたときです。承認されたメッセージは、承認の時刻にもう一度判定し、拒否するものがなければ次の観測として解放します。解放したメッセージは、保留の根拠になった禁止に違反しません。この2回目の判定で、承認が許可と根拠の代わりになるのは、根拠の契約インスタンスの中だけです。それ以外で適用される禁止、終了した根拠の契約インスタンス、メッセージをもう許可しなくなった別の統治契約（委任の取り消し、インスタンスの終了、改正）は、解放を拒否します。ファイルは `norms: 0.1` と `agents: 0.1` を宣言し、`cadl check` に通る必要があります。終了ステータスは、判定の内容にかかわらずトレースを再生できれば0、使い方の誤りは2です。
@@ -371,7 +372,17 @@ cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl]
 {"time": "2026-11-10T09:03:40Z", "message": {"from": "PLANNER", "to": "FILES", "name": "delete_file"}, "instances": [{"contract": "ASSISTED_REPORTING", "instance": "default"}], "decision": "allow", "reason": "approved", "contracts": ["ASSISTED_REPORTING"], "norms": ["ASSISTED_REPORTING.no_delete"], "provenance": [], "escalate_to": "OPERATOR", "timeout": null, "fallback": [], "notify": [], "hold_id": "h-1", "outcome": "approved"}
 ```
 
-監査ファイルは、トレースの全体を再生した後にだけ書きます。実行が失敗したときはファイルを書かず、エラーメッセージにその旨を示します。規範の発効フラグの変化には、それ自体の記録はありません。記録されたメッセージ、時刻、トレースの `values` から導けます。ログに完全性の保護（ハッシュの連鎖や署名）はありません。G.8はそれを求めていません。
+監査ファイルは、トレースの全体を再生した後にだけ書きます。実行が失敗したときはファイルを書かず、エラーメッセージにその旨を示します。規範の発効フラグの変化には、それ自体の記録はありません。記録されたメッセージ、時刻、トレースの `values` から導けます。
+
+**ログの完全性。** 監査ファイルはハッシュ連鎖です（G.8「ログの完全性」）。1行目はヘッダ記録 `{"audit_format": "cadl-audit/1", "hash": "sha256", "key_id": null, "source_sha256": ..., "epoch": ...}` です（CADLファイルのバイト列のSHA-256と、トレースの `epoch` または `null`）。その後に上の記録がそのまま続き、完結したログは `{"audit_end": true, "records": N}` で終わります。各行は自身のフィールドの後に三つのフィールドを持ちます。`seq`（ヘッダが0）、`prev`（直前の行の `digest`。ヘッダでは0が64個）、`digest` です。`digest` は、`digest` を除いた行の正規形JSONのSHA-256です。正規形は、キーを整列し、区切りを空白なしの `,` と `:` とし、非ASCII文字を `\u` でエスケープしないUTF-8で、数はPythonの `json` が書く形とし、NaNを拒否します。行は `json.dumps(line, ensure_ascii=False)` の形で書き、検証ではこの形であることも求めるので、空白やエスケープの変更も検出します。`--audit-key FILE` を与えると、ダイジェストはFILEの鍵によるHMAC-SHA256になります（16バイト以上。末尾の改行一つは無視。コマンド行では与えない）。ヘッダは `hmac-sha256` となり、`key_id` はHMAC-SHA256(鍵, `cadl-audit key id`) の先頭16桁の16進数です。保護の範囲は次のとおりです。鍵なしでは、1バイトの変更、行の削除・挿入・入れ替え、ヘッダの変更、末尾の切り詰め（終了記録の欠落）を検出します。ただし、変更した行から後のログ全体の書き直しは検出しません。SHA-256は誰でも計算し直せるためです。これを検出するには、最後のダイジェスト（`audit-verify` が表示する）を別の場所に保管するか、鍵を使います。鍵ありでは、鍵の保持者だけがログを書き直せます。記録のバイト列とフィールドの順序は、連鎖がないときと同じです。`cadl.audit_log.read_records(path)` は、ヘッダ、終了記録、完全性のフィールドを除いた記録を返します。
+
+```bash
+cadl audit-verify AUDIT.jsonl [--key FILE] [--source FILE.cadl] [--open] [--format text|json]
+```
+
+`cadl audit-verify` はすべての行を検査し、検証できない最初の行を、期待した値と実際の値とともに報告します（`--format json` では `valid`、`line`・`what`・`expected`・`found` を持つ `error`、および `lines`、`records`、`hash`、`key_id`、`source_sha256`、`epoch`、`complete`、`last_digest`）。`--source` は、そのCADLファイルについて書かれたログであることも求めます。終了記録のないログは、`--open`（実行中のゲートウェイのログ）を与えない限り無効です。鍵つきのログを `--key` なしで検証するのは使い方の誤りです。鍵なしのログに `--key` を与えると無効になります。鍵なしのログは書き直されたかもしれないからです。終了ステータスは、有効なら0、無効なら1、使い方の誤りは2です。
+
+**オンラインでの利用。** 同じエンジンを1行ずつ動かせます。`rt = AgentsRuntime.open(FILE)` の後、トレースの各行を辞書として `rt.observe(line)` に渡し（その行の `steps`、`audit` の記録、変化した `holds` を返す）、最後に `rt.close(t)` を呼びます。これは最終行 `{"t": t}` にあたります。`agents-run` は同じ処理の繰り返しであり、トレースを `observe` に渡してから `close` を呼んだ結果は、そのトレースの後に `{"t": t}` を加えたものに対する `agents-run` の結果と一致します。誤りが起きた後は、オンラインのランタイムはそれ以降の行をすべて拒否します。
 
 **読み方。** G.5〜G.8が選択の余地を残す箇所は、次のように読みます。
 
@@ -395,6 +406,35 @@ cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl]
 - 改正は、二つの版で定義が異なる執行対象の契約に適用します。
 
 `examples/traces/` には `examples/agents_tool_governance.cadl` 用のトレースが三つあります。G.12の三つの呼び出し、すなわち委任の連鎖を通じた呼び出し、承認されるエスカレーション、取り消しの後の拒否（a）、却下と代替メッセージ、終了時に取り消される保留（b）、未宣言のツール、タイムアウト、遅れた承認（c）です。`examples/agents_change_control.cadl` は、トリガから `until:` までの間だけ発効する禁止と、`max_depth: 1` と `until:` を持つ委任の例です。そのトレースは、凍結中の承認・却下・期限切れ（a）と、深さの制限と委任の終了（b）を示します。
+
+#### MCPゲートウェイ
+
+`cadl mcp-gateway` は、MCPクライアント（エージェント）とMCPサーバ（ファイル中のツールサーバ）の間に判定点を置きます。通信はMCPのstdioトランスポートで、JSON-RPC 2.0のメッセージを1行に一つ、内部に改行を含めずに送ります（[MCP仕様 2026-07-28、stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio)）。クライアントはゲートウェイをサーバとして起動し、ゲートウェイがサーバを起動します。
+
+```bash
+cadl mcp-gateway FILE --agent ACTOR --server-actor TOOLSERVER --audit OUT.jsonl \
+    [--audit-key FILE] [--approvals DIR] [--trace-out TRACE.jsonl] [--init FIRST.json] \
+    [--no-filter-tools] [--poll SECONDS] -- SERVER_COMMAND [ARGS...]
+cadl mcp-approve DIR HOLD_ID approve|reject --as ACTOR
+cadl mcp-message DIR 'FROM -> TO : name' [--arg VALUE ...]
+```
+
+`TOOLSERVER` は、`agent: { kind: tool_server, protocol: mcp, tools: [...] }` を持つファイル中のアクタです。メッセージは両方向とも変更せずに転送します。例外は次のとおりです。
+
+| メッセージ | ゲートウェイの処理 |
+|---|---|
+| `tools/call` | 到着時刻のメッセージ `ACTOR -> TOOLSERVER : name` として、オンラインのランタイムが判定します。`allow` なら変更せずに転送し、サーバの応答も変更せずに返します。`deny` なら、`isError: true` のツール結果で応答し、その本文に理由、規範、保留、`fallback`、`notify` を書きます（MCPはこれをツール実行エラーと呼び、クライアントはモデルに渡して自己修正させます。JSON-RPCのエラーは、モデルが直せない要求のためのものです）。`escalate` なら保留し、まだ応答しません。他の要求は処理を続けます。保留が閉じたとき、承認されて解放された呼び出しは転送し、却下・期限切れ・取り消しになった呼び出しと、解放が拒否された呼び出し（G.6）には拒否で応答します |
+| `tools/list` の結果 | ファイルが `TOOLSERVER` について宣言したツールだけに絞ります（`--no-filter-tools` ではすべて残す。他のツールの呼び出しはいずれにせよG.5で拒否される） |
+| 保留中の呼び出しへの `notifications/cancelled` | 待機を終えます。その呼び出しは送らず、サーバにも伝えません |
+| 不正な入力 | サーバには届きません。JSONでない行には -32700、バッチ（MCPにはない）、メソッドなし、有効な `id` なしには -32600、文字列の `name` がない `tools/call`、オブジェクトでない `arguments`、CADLの識別子でない名前（どのファイルも宣言できない）には -32602 で応答します |
+
+判定は到着順に一つずつ行います。複数の呼び出しを同時に処理中にでき、保留中の呼び出しは他を止めません。ツールの引数は判定に使わず、トレースにもログにも書きません（G.8に引数はない）。ゲートウェイはフェイルクローズです。判定の処理が例外を出したとき、またはトレースやログに書けないときは、その呼び出しを拒否し、以後の呼び出しもすべて拒否します。保留中の呼び出しには拒否で応答し、ログには終了記録を書きません。サーバが終了したときは、処理中の要求と保留中の呼び出しにエラー -32603 で応答し、終了ステータス1で終わります。クライアントが入力を閉じたときは、サーバを止めて終了ステータス0で終わり、保留中の呼び出しには応答しません。
+
+**承認とその他のメッセージ。** `--approvals DIR` を与えると、ゲートウェイは受け箱ディレクトリDIRのJSONファイルを名前の順に読みます。`cadl mcp-approve DIR h-1 approve --as OPERATOR` が置くファイルは、ファイルの `counts_as:` 規則が `approval` に対応づける承認者のメッセージ（この例では `OPERATOR -> PLANNER : approve("h-1")`）になります。`reject` は `rejection` の規則を使います。`cadl mcp-message` は、エージェント間の付与（`OPERATOR -> PLANNER : grant_read`）などのその他のメッセージを置きます。各メッセージは、読んだ時刻に、トレースのメッセージと同じく判定します。保留が閉じるかどうかはG.6（承認者、保留の識別子、契約インスタンス）で決まります。使ったファイルは `DIR/done` に移します。読めないファイルや、規則のないアクタを名指すファイルは、理由を書いた `.why` ファイルとともに `DIR/invalid` に移し、承認とはみなしません。呼び出しは、有効な承認、却下、期限のいずれかまで保留のままです。ゲートウェイはファイルを認証しません。DIRに書き込める者は誰の名でも発言できるので、DIRへの書き込みは承認者の道具だけに許してください。
+
+**時刻、トレース、再生。** 時刻 `t` は、ゲートウェイの開始からの単調時計の経過時間で、秒単位、ミリ秒に丸めた値です。トレースの1行目は `t = 0` の実時刻を `epoch` として、また `"quantities": []` を持ち、`--init FIRST.json` のキー（`bindings`、`request`、`values`、`quantities`、`instances`、`host_instances`、`state`）を加えます。各処理は判定の前にトレース（`--trace-out`。既定は監査ログのパスの拡張子を `.trace.jsonl` にしたもの）に書きます。判定した各メッセージ、保留の期限が過ぎたときの行 `{"t": t}`、停止時の最終行 `{"t": t}` です。そのトレースに対する `cadl agents-run FILE --trace TRACE --audit A.jsonl` は、同じ判定をし、同じ監査ログをバイト単位で同じに書きます（同じ `--audit-key` を使う場合）。監査ログまたはトレースがすでにあるとき、ゲートウェイは起動しません。保留の時間切れがクライアントの要求の時間切れより長いと、先にクライアント側で終わります。`timeout:` はそれに合わせて選んでください。
+
+対象外：ゲートウェイは `values` を観測しません（量を読む規範は、その量を欠けたデータとして扱う。G.5）。また、1行目より後にホストが作る契約インスタンスを作成・終了しません。MCP 2026-07-28では、サーバが `input_required` で応答した `tools/call` をクライアントは新しい要求として再送し、それは改めて判定されます。クライアントが取り消した保留中の呼び出しを承認者が後で承認すると、ゲートウェイは送らないにもかかわらず、解放されたと記録されます。
 
 ### 運用モード遷移の分析
 
@@ -858,7 +898,9 @@ src/cadl/
   iec62853.py          IEC 62853を参考にした要約
   unparse.py           式ASTをCADLのソーステキストに戻す
   norms_eval.py        記録済みトレースに対する規範拡張の判定
-  agents_runtime.py    エージェントガバナンス拡張のランタイム：トレース上の判定、保留、委任、監査記録
+  agents_runtime.py    エージェントガバナンス拡張のランタイム：トレース上の判定、保留、委任、監査記録。オフラインまたは1行ずつ
+  audit_log.py         監査ログのハッシュ連鎖（SHA-256またはHMAC-SHA256）とその検証（`cadl audit-verify`）
+  mcp_gateway.py       ランタイムでツール呼び出しを判定するMCPのstdioゲートウェイ（`cadl mcp-gateway`、`mcp-approve`、`mcp-message`）
   norms_diff.py        改正が規範に及ぼす効果（二つの版の比較）
   grounding.py         根拠付け拡張：導出指標、規則J-1からJ-9とJ-13
   cli.py               コマンドラインインタフェース
@@ -936,6 +978,9 @@ tests/
   test_keyword_boundaries.py      キーワードが長い名前から切り出されないこと
   test_agents_extension.py        エージェントガバナンス拡張：G-1〜G-19、判定、agent-rego / agent-cedar
   test_agents_runtime.py          エージェントガバナンス拡張のランタイム（`cadl agents-run`）：保留、委任、監査記録
+  test_audit_log.py               監査ログのハッシュ連鎖：1バイトの変更、削除、挿入、入れ替え、鍵の有無（`cadl audit-verify`）
+  test_mcp_gateway.py             偽のサーバとクライアントによるMCPゲートウェイ：`cadl agents-run` で再生するシナリオ、不正な入力、異常終了、並行処理
+  mcp_fake_server.py              test_mcp_gateway.py 用の偽のMCPサーバ（stdio）
 
 examples/
   robot_delivery.cadl        ロボット配送SoS（認知型）
@@ -977,7 +1022,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | 規範拡張：生成したPythonパッケージのオンラインモニタ（`norms_monitor.py`） | 利用可能（Solidity・OPA・Unity C#は規範を監視しない。モデル検査器への変換は未実装） |
 | 根拠付け拡張（grounding 0.1）の規範側：導出指標とインセンティブ被覆率（`cadl norms-indices`）、規則J-1からJ-9、IR、二つの版の比較（`cadl norms-diff` のJ-13） | 利用可能 |
 | 戦略モデル拡張（games 0.1）：均衡検査と保証付きの均衡マップ（`cadl game-check`）、付録Jの規範との結び付け（`sanction_of:` / `reward_of:`、J-10からJ-12、J-14） | 利用可能（PRISM-games向けの出力はPRISM-gamesで実行していない） |
-| エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、監査記録。`cadl agents-run`）、Rego / Cedarの境界ポリシー | 利用可能（ランタイムはオフラインの参照実装で、トレースを再生するだけであり、プロトコルには接続しない） |
+| エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、ハッシュ連鎖つきの監査記録。`cadl agents-run`、`cadl audit-verify`）、MCPのstdioゲートウェイ（`cadl mcp-gateway`）、Rego / Cedarの境界ポリシー | 利用可能（ゲートウェイは参照実装で、偽のMCPサーバとクライアントでのみ試験している。A2Aには接続しない） |
 | 検証メソッド `model_check` / `simulation` / `proof` | 未対応（未対応である旨を明示的に報告） |
 
 ## 関連プロジェクト

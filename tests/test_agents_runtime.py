@@ -1009,7 +1009,10 @@ class TestCli:
                        "--audit", str(log)])
         result = json.loads(capsys.readouterr().out)
         assert status == 0
-        assert [json.loads(x) for x in log.read_text().splitlines()] == result["audit"]
+        # The records of G.8 in the log, without its header, end record and
+        # integrity fields (G.8, integrity of the log).
+        from cadl.audit_log import read_records
+        assert read_records(log) == result["audit"]
         assert format_text(result)
         assert result["summary"]["messages"] == len(result["steps"])
 

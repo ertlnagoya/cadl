@@ -6,6 +6,44 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Tamper-evident audit log (Appendix G, G.8, "Integrity of the log"):
+  `cadl agents-run --audit` writes a header record (format
+  `cadl-audit/1`, SHA-256 of the CADL file, epoch, hash algorithm), the
+  records of G.8, and an end record with their count; every line carries
+  `seq`, `prev` (the digest of the previous line) and `digest` (SHA-256
+  of its canonical JSON). `--audit-key FILE` keys the chain with
+  HMAC-SHA256. Standard library only. Without a key the chain detects
+  any changed byte, deleted, inserted or reordered line, changed header
+  and cut tail, but not a rewrite of the whole log; with a key only a
+  holder of the key can rewrite it.
+- `cadl audit-verify AUDIT.jsonl [--key FILE] [--source FILE.cadl]
+  [--open] [--format text|json]`: verifies the chain and reports the
+  first line that fails, with what was expected and found. Exit status
+  0 valid, 1 invalid, 2 usage error.
+- Online runtime: `AgentsRuntime.open(file)`, `.observe(line)` and
+  `.close(t)` drive the enforcement point one trace line at a time;
+  `cadl agents-run` is a loop over the same steps.
+- `cadl mcp-gateway FILE --agent ACTOR --server-actor TOOLSERVER --audit
+  OUT.jsonl [...] -- SERVER_COMMAND`: an MCP stdio proxy (JSON-RPC 2.0,
+  MCP specification 2026-07-28) that decides every `tools/call` with the
+  runtime. Allowed calls are forwarded; denied calls get a tool result
+  with `isError: true` that names the reason and the fallback; escalated
+  calls are held until an approval or rejection (`cadl mcp-approve DIR
+  HOLD_ID approve|reject --as ACTOR`) or the timeout. Other governed
+  messages, such as grants, come in with `cadl mcp-message`. `tools/list`
+  is filtered to the declared tools. Fail-closed on malformed input and
+  on a failure of the decision step. The gateway writes a trace that
+  `cadl agents-run` replays to the same decisions and the same audit log,
+  byte for byte.
+
+### Changed
+- The audit file of `cadl agents-run --audit` has a header line, an end
+  line, and three integrity fields at the end of every record line. The
+  records themselves, their fields and their order are unchanged; read
+  them with `cadl.audit_log.read_records`. `--format json` and the text
+  report are unchanged.
+
 ## [0.3.23] — 2026-11-11
 
 Two new extensions and an extension of the norms engine. The strategic
