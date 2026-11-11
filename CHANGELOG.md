@@ -132,8 +132,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   while the predicate `trigger:` of an inactive prohibition, or the
   predicate `until:` of an active permission, is undefined for want of a
   value, the in-force flag is left out of the policy input, so the
-  prohibition applies and the permission does not; the norm states stay
-  those of `cadl norms-eval`. `cadl.agents_runtime.run`
+  prohibition applies and the permission does not; the same when that
+  `trigger:` or `until:` is an institutional event that a `counts_as:`
+  rule creates from a predicate; the norm states stay those of
+  `cadl norms-eval`.
+- `cadl check`, G-19 (warning): an institutional event that a rule
+  creates under an `if:` and that is the trigger of a prohibition or the
+  `until:` of a permission of an enforced contract. A message that
+  arrives while the `if:` has no value creates no event; `cadl agents-run`
+  warns when that happens. `cadl.agents_runtime.run`
   refuses a file with errors of `cadl check`; `check=False` is an unsafe
   switch for tests. As defence in depth, an occurrence that depends on an
   unbound index is unknown and never has an effect that lets a message

@@ -10,7 +10,7 @@ Checks performed (per spec §6.2.2):
 6. SoS-DSL static semantics, rules L-1 to M-3 (Appendix E §E.4)
 7. Norms static semantics, rules N-1 to N-12 (Appendix F §F.7), when the
    file declares `norms: 0.1`
-8. Agent governance static semantics, rules G-1 to G-18 (Appendix G §G.9),
+8. Agent governance static semantics, rules G-1 to G-19 (Appendix G §G.9),
    when the file declares `agents: 0.1` (which requires `norms: 0.1`)
 9. Stochastic model static semantics, rules S-1 to S-15 (Appendix H §H.10),
    when the file declares `stochastic: 0.1`
@@ -1112,7 +1112,7 @@ class TypeChecker:
                 )
 
     def _check_agent_contract(self, contract: ContractDef, ctx: str) -> None:
-        """G-4 to G-18 for one contract."""
+        """G-4 to G-19 for one contract."""
         from .agents import (
             ENFORCEMENT_DEFAULTS, ENFORCEMENT_POINTS, HOLD_EVENTS,
             norm_message, parse_message_event, parse_ref, ref_text,
@@ -1501,6 +1501,22 @@ class TypeChecker:
         for d in contract.delegations:
             if d.until and d.until.strip() not in events:
                 items.append((f"until: of the delegation of '{d.norm}'", d.until, d.loc))
+        # G-19 (SHOULD): an event that a rule creates under an `if:` and that
+        # blocks. The message of the rule is a one-off: when it arrives
+        # while the `if:` has no value, the event is never created.
+        conditional = {r.creates for r in contract.counts_as if r.creates and r.if_}
+        for n in contract.norms:
+            for kind, key in (("prohibition", "trigger"), ("permission", "until")):
+                text = getattr(n, key)
+                if n.kind == kind and text and text.strip() in conditional:
+                    self.result.add_warning(
+                        f"The {key}: of the {kind} '{n.id}' in {ctx} is the institutional "
+                        f"event '{text.strip()}', which a counts_as rule creates only if "
+                        f"its if: holds; when the if: has no value at that moment the "
+                        f"event is not created and the boundary does not block (G-19)",
+                        n.loc,
+                    )
+
         # G-18 for every expression of the contract: a free variable that is
         # used as or inside an index, in a predicate or in the arguments of
         # a message event, and that no party binds. A quantifier or a

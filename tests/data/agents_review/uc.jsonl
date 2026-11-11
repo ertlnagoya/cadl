@@ -1,0 +1,6 @@
+{"t":0,"quantities":["a","b","c","level","limit"],"messages":[{"from":"AG","to":"TOOL","name":"act"},{"from":"AG","to":"TOOL","name":"read"},{"from":"AG","to":"TOOL","name":"wipe"},{"from":"AG","to":"TOOL","name":"xx"},{"from":"AG","to":"TOOL","name":"yy"}]}
+{"t":1,"values":{"a":0},"messages":[{"from":"AG","to":"TOOL","name":"act"},{"from":"AG","to":"TOOL","name":"read"}]}
+{"t":2,"values":{"a":5},"messages":[{"from":"AG","to":"TOOL","name":"act"},{"from":"AG","to":"TOOL","name":"read"}]}
+{"t":3,"values":{"b":5,"level":9},"messages":[{"from":"OP","to":"AG","name":"check"},{"from":"AG","to":"TOOL","name":"act"},{"from":"AG","to":"TOOL","name":"read"},{"from":"AG","to":"TOOL","name":"wipe"},{"from":"AG","to":"TOOL","name":"xx"},{"from":"AG","to":"TOOL","name":"yy"}]}
+{"t":4,"values":{"limit":3,"c":0},"messages":[{"from":"OP","to":"AG","name":"check"},{"from":"AG","to":"TOOL","name":"act"},{"from":"AG","to":"TOOL","name":"read"},{"from":"AG","to":"TOOL","name":"wipe"},{"from":"AG","to":"TOOL","name":"xx"},{"from":"AG","to":"TOOL","name":"yy"}]}
+{"t":5,"end":false}

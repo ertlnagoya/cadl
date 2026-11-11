@@ -3064,3 +3064,153 @@ class TestPrefixHarnessOfTheReview:
         assert checks == 18 * 30 and records >= 8000
         assert {("escalate", "prohibition"), ("deny", "prohibition"), ("allow", "permission"),
                 ("allow", "approved"), ("deny", "no_instance")} <= kinds
+
+
+# === Finding of the seventh review ===============================================================
+
+class TestMissingDataThroughAnEvent:
+    """M1: a prohibition whose trigger, or a permission whose until, is an
+    institutional event that a `counts_as` rule creates from a predicate."""
+
+    def uc(self) -> dict:
+        return replay(review("u_c.cadl"), (REVIEW / "uc.jsonl").read_text().splitlines())
+
+    def of(self, r: dict, name: str) -> list[tuple]:
+        return [(x[0],) + x[2:5] for x in decisions(r) if x[1] == f"AG>TOOL:{name}"]
+
+    def test_uc_predicate_when(self):
+        # `when: "level > limit", creates: alarm`; p_alarm has `trigger:
+        # alarm`. While `limit` has no value the flag of p_alarm is unknown
+        # and `wipe` is denied; at t=4 the rule creates the event.
+        r = self.uc()
+        assert self.of(r, "wipe") == [(t, "deny", "prohibition", ["p_alarm"]) for t in (0, 3, 4)]
+        flags = {s["time"]: s["input"]["instances"][0]["in_force"].get("p_alarm", "absent")
+                 for s in r["steps"] if s["message"]["name"] == "wipe"}
+        assert flags == {0: "absent", 3: "absent", 4: True}
+        warned = [w for w in r["warnings"] if "'p_alarm'" in w]
+        assert len(warned) == 1 and "'level > limit'" in warned[0]
+        assert "level, limit has no value yet" in warned[0]
+
+    def test_uc_message_when_with_if_is_a_known_limit(self):
+        # `when: "OP -> AG : check", if: "level > limit"`: the message of
+        # t=3 arrives while the `if:` has no value. No event, no latch: the
+        # permission may_xx goes on, and the run says so.
+        r = self.uc()
+        assert self.of(r, "xx") == [(0, "allow", "permission", ["may_xx"]),
+                                    (3, "allow", "permission", ["may_xx"]),
+                                    (4, "deny", "default", [])]
+        limit = [w for w in r["warnings"] if "arrived while the if:" in w]
+        assert len(limit) == 1 and "'checked_high'" in limit[0]
+        assert "(limit has no value yet)" in limit[0] and "known limit" in limit[0]
+
+    def test_one_warning_per_norm(self):
+        r = self.uc()
+        missing = [w for w in r["warnings"] if "a message was decided while" in w]
+        assert len(missing) == 4          # p_and, may_read, p_alarm, may_yy
+
+    SRC = source(
+        """
+        counts_as:
+          - { when: "level > limit", creates: alarm }
+          - { when: "heat > 90", creates: alarm }
+          - { when: "level > limit", creates: over }
+        """,
+        norms(
+            perm("p_wipe", "AG", "AG -> T : wipe"),
+            proh("no_wipe", "AG", "AG -> T : wipe", "trigger: alarm"),
+            perm("p_read", "AG", "AG -> T : read", "until: over")))
+
+    def run_src(self, *value_lines) -> list[tuple]:
+        rows = [(0, None, {"quantities": ["level", "limit", "heat"]})]
+        for k, values in enumerate(value_lines, start=1):
+            rows.append((k, [m("AG", "T", "wipe"), m("AG", "T", "read")], {"values": values}))
+        r = replay(self.SRC, trace(*rows, (99, None, {"end": False})))
+        return [x[2:4] for x in decisions(r)]
+
+    def test_nothing_is_latched_and_several_rules(self):
+        deny, allow = ("deny", "prohibition"), ("allow", "permission")
+        closed = ("deny", "default")
+        got = self.run_src(
+            {},                                   # nothing has a value
+            {"level": 1, "limit": 3},             # one rule defined and false, heat missing
+            {"heat": 10},                         # all defined, all false
+            {"heat": 95})                         # the second rule creates the event
+        assert got == [deny, closed,              # both flags unknown
+                       deny, allow,               # `over` is defined; `alarm` not yet
+                       allow, allow,              # nothing latched
+                       deny, allow]
+
+    def test_event_created_ends_the_permission(self):
+        got = self.run_src({"level": 1, "limit": 3, "heat": 1}, {"level": 9})
+        assert got == [("allow", "permission"), ("allow", "permission"),
+                       ("deny", "prohibition"), ("deny", "default")]
+
+    def test_checker_warns_about_an_event_with_if_that_blocks(self):
+        res = type_check(unchecked("u_c.cadl"))
+        assert res.ok
+        g19 = [str(w) for w in res.warnings if "(G-19)" in str(w)]
+        assert len(g19) == 1 and "'may_xx'" in g19[0] and "'checked_high'" in g19[0]
+        from .test_agents_extension import check, with_rule
+        rule = 'counts_as:\n  - { when: "OP -> AG : go", creates: gone, if: "T.load > 5" }\n'
+        blocks = lambda entry: check(rule, norms(perm("p", "AG", "AG -> T : wipe"), entry))
+        assert len(with_rule(blocks(proh("x", "AG", "AG -> T : wipe", "trigger: gone")).warnings,
+                             "G-19")) == 1
+        # An event with `if:` that lets through is no concern: it already blocks.
+        assert not with_rule(blocks(perm("y", "AG", "AG -> T : read", "trigger: gone")).warnings,
+                             "G-19")
+        assert not with_rule(blocks(proh("z", "AG", "AG -> T : wipe", "until: gone")).warnings,
+                             "G-19")
+        for path in sorted((ROOT / "examples").glob("*.cadl")):
+            res = type_check(parse_file(path))
+            assert not [w for w in res.warnings if "(G-19)" in str(w)], path.name
+
+    @pytest.mark.skipif(OPA is None, reason="the opa binary is not on PATH")
+    def test_generated_rego_agrees_on_the_recorded_inputs(self, tmp_path):
+        sos, r = review("u_c.cadl"), self.uc()
+        generate(sos, tmp_path, target="agent-rego")
+        f = tmp_path / "inputs.json"
+        f.write_text(json.dumps([s["input"] for s in r["steps"]]))
+        proc = subprocess.run(
+            [OPA, "eval", "--format", "json", "--data", str(tmp_path / "agent_policy.rego"),
+             "--input", str(f),
+             "[r | x := input[_]; r := data.cadl.agent_policy.result with input as x]"],
+            capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        values = json.loads(proc.stdout)["result"][0]["expressions"][0]["value"]
+        assert values == [s["result"] for s in r["steps"]] and len(values) == 21
+
+    def test_prefix_property(self):
+        lines = (REVIEW / "uc.jsonl").read_text().splitlines()
+        assert TestDecisionsAreCausal().prefix_holds(review("u_c.cadl"), lines, 1) >= 40
+
+    def test_grant_while_the_until_is_undefined(self):
+        # G.13: the permission is not in force for the grant either.
+        r = replay(review("u_c.cadl"), trace(
+            (0, m("AG", "SUB", "g"), {"quantities": ["a", "b", "c", "level", "limit"]}),
+            (1, m("AG", "SUB", "g"), {"values": {"c": 0}}),
+            (2, m("SUB", "TOOL", "yy")), (3, None, {"end": False})))
+        assert events(r) == [(0, "AG>SUB:g", "unauthorised_grant", "no_authority"),
+                             (1, "AG>SUB:g", "grant", ["SUB"])]
+        assert decisions(r)[-1][2:4] == ("allow", "permission")
+
+    def test_known_limit_obligation_whose_trigger_has_no_value(self):
+        # Not covered (G.13): the obligation is not activated while its
+        # trigger is undefined, so it is not violated and its reparation, a
+        # prohibition, does not arise.
+        src = source(norms(
+            """
+            - id: ob
+              kind: obligation
+              bearer: AG
+              trigger: "T.load > 5"
+              deadline: 5s
+              content: "AG -> OP : report"
+              on_violation: { reparation: lock }
+            """,
+            proh("lock", "AG", "AG -> T : read"), perm("p", "AG", "AG -> T : read")))
+        missing = replay(src, trace((0, None), (20, m("AG", "T", "read")),
+                                    (21, None, {"end": False})))
+        assert decisions(missing)[0][2:4] == ("allow", "permission")
+        given = replay(src, trace((0, None, {"values": {"T.load": 9}}),
+                                  (20, m("AG", "T", "read")), (21, None, {"end": False})))
+        assert decisions(given)[0][2:5] == ("deny", "prohibition", ["lock"])
