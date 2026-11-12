@@ -2435,6 +2435,10 @@ class NormsModel:
                     late = ir.AND(inforce, ir.NOT(ir.LE(el[o.id], nd.deadline)))
                     forced = ir.ITE(late, viol_code, st)
                     amend_viol[o.id] = late
+                elif nd.kind == "prohibition" and nd.deadline is not None and o.id in el:
+                    # the window has closed, also for a suspended instance
+                    late = ir.AND(inforce, ir.NOT(ir.LE(el[o.id], nd.deadline)))
+                    forced = ir.ITE(late, ir.C(FULFILLED), st)
             inactive_to = ir.C(ABSENT) if nd is None else ir.C(INACTIVE)
             S[o.id] = ir.ITE(ir.IN(st, FINAL), st,
                              ir.ITE(ir.EQ(st, INACTIVE), inactive_to, forced))

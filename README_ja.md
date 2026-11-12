@@ -287,7 +287,7 @@ SoS-DSL拡張（`lifecycle:` / `monitors:`）を使う契約からC#を生成：
 
 `agents: 0.1` を宣言したファイルの執行対象の契約から、エージェントガバナンス拡張（後述）の境界ポリシーを生成します。宣言がないファイルでは `cadl codegen` がエラーを報告します。どちらも `opa` ターゲットとは独立です。
 - `agent-rego` は `agent_policy.rego` を出力します。一つのRegoパッケージ（`cadl.agent_policy`）が、ポリシー入力を `input` として受け取り、結果オブジェクト全体を `result`（および `decision`）として返します。静的な規範もそうでない規範も扱い、静的でない規範の発効フラグと派生インスタンスは `input.instances` から読みます。ファイルの先頭に、静的でない規範の一覧を出力します
-- `agent-cedar` は `agent_policy.cedar` と `agent_policy_table.json` を出力します。ポリシーは静的に判定できる部分を扱います。未宣言のツールと静的な禁止は `forbid`、静的な許可は `permit` になり、許可のないツール呼び出しはCedarの既定の拒否に落ちます。Cedarの結果は2値なので、エスカレーションは拒否として返り、ランタイムが表（禁止ごとの `escalate_to`・`timeout`・`fallback`・`notify`）から解決します。ファイル先頭のREADMEコメントに、扱わないもの（静的でない規範、派生した許可、契約インスタンス）を明記します。どのポリシーも属性を読まないので、評価エラーでスキップされることはありません
+- `agent-cedar` は `agent_policy.cedar` と `agent_policy_table.json` を出力します。ポリシーは静的に判定できる部分を扱います。未宣言のツールと静的な禁止は `forbid`、静的な許可は `permit` になり、許可のないツール呼び出しはCedarの既定の拒否に落ちます。Cedarの結果は2値なので、エスカレーションは拒否として返り、ランタイムが表（禁止ごとの `escalate_to`・`timeout`・`fallback`・`notify`）から解決します。ファイル先頭のREADMEコメントに、扱わないもの（静的でない規範、派生した許可、契約インスタンス）と、Cedarの答えが方針の入力に対する決定と一致する場合（G.10）を明記します。どのポリシーも属性を読まないので、評価エラーでスキップされることはありません
 
 ### エージェントガバナンス（agents 0.1）
 
@@ -660,7 +660,7 @@ cadl norms-eval FILE --trace TRACE [--contract ID] [--format text|json]
 
 **改正。** `"amend": "new_version.cadl"` を持つ行は、その観測のほかの手順の前に、契約をそのファイルの同じidの契約に置き換え、規範インスタンスをF.6のとおりに扱います。有効または停止中のインスタンスは、旧版の `on_amendment:` に従います。`carry_over` は状態と経過時間を保ったまま新しい定義に引き継ぎます（idがなくなるか種別が変われば `discharged`、経過時間が新しい期限をすでに超えている義務はただちに `violated`）。`discharge` は解除します。`transform: X` は解除したうえで、未発効の `X` を経過時間を引き継いで有効にします。未発効のインスタンスは新しい定義に置き換わるか削除され、トリガのない新しい規範はただちに有効になり、確定済みのインスタンスは影響を受けません。新版の `counts_as:` 規則と `lifecycle:` はその時点から適用します。新しいファイルは `norms: 0.1` を宣言し、`cadl check` に通り、同じidの契約と現在のライフサイクル状態を持つ必要があります。そうでなければ終了ステータスは2です。F.6が定めていない点は次のように読みます。文面が変わらない `assume:` / `guarantee:` の項目は継続し、新しい項目は改正の時点から評価し、未決のまま消えた項目は `pending` のままとし、引き継いだ禁止の経過時間が新しい期間を超えていれば `fulfilled` とします。
 
-`cadl norms-diff OLD NEW [--contract ID] [--format text|json]` は、トレースなしで、この改正が何を引き起こすかを報告します。削除・追加・種別変更された規範、`content` か `deadline:` が変わって引き継がれる規範（F.6が求める報告）、新版にない `transform:` の対象、変更された `counts_as:` 規則です。各所見にはレベル（`error`、`warning`、`info`）があります。JSONは `old`、`new`、`contracts[]`（`id`、`findings[]`：`level`、`kind`、`text` と詳細）、`errors[]`、`ok` からなります。終了ステータスは、改正を妨げるものがなければ0、エラー（`transform:` の対象がない、新版が不正）があれば1、使い方の誤りは2です。
+`cadl norms-diff OLD NEW [--contract ID] [--format text|json]` は、トレースなしで、この改正が何を引き起こすかを報告します。削除・追加・種別変更された規範、`on_amendment:` が `discharge` または `transform:` である規範（対象とその種別を含む）、`content` か `deadline:` が変わって引き継がれる規範（F.6が求める報告。期限は厳密に比較し、期限が短くなる場合は、経過時間がそれを超える義務と禁止がどうなるかを述べます）、新版にない `transform:` の対象、変更された `counts_as:` 規則です。各所見にはレベル（`error`、`warning`、`info`）があります。JSONは `old`、`new`、`contracts[]`（`id`、`findings[]`：`level`、`kind`、`text` と詳細）、`errors[]`、`ok` からなります。終了ステータスは、改正を妨げるものがなければ0、エラー（`transform:` の対象がない、新版が不正）があれば1、使い方の誤りは2です。
 
 `examples/traces/` には `examples/norms_robot_delivery.cadl` 用のトレースが五つあります。すべての規範が履行される場合（a）、応答の不履行を障害報告で修復する場合（b）、両方とも不履行の場合（c）、配車係の停止により遅配が免責される場合（d）、再割当てにより義務が解除される場合（e）です。`norms_amendment_v1_to_v2.jsonl` は、`examples/norms_amendment_v1.cadl` のトレースで、障害報告の期限内に `examples/norms_amendment_v2.cadl` へ改正されます。
 
@@ -1081,6 +1081,8 @@ tests/
   test_unparse.py        式の往復変換テスト
   test_norms_eval.py     トレースに対する規範の判定（`cadl norms-eval`）
   test_norms_check.py    規範の設計時の検査と差分テスト（`cadl norms-check`）
+  test_norms_amend_diff.py  改正：ランダムなバージョンの組で `cadl norms-diff` と `cadl norms-eval` を比較し、ミューテーションで検出力を確かめる
+  norms_amend_diff.py    test_norms_amend_diff.py のバージョンの組とトレース
   test_grounding_extension.py  根拠付け拡張：指標、規則、IR、`cadl norms-indices`
   test_grounding_sos.py  根拠付け拡張：すべての契約の上のSoSの量
   test_norms_wildcards.py 述語の中のワイルドカード参照と範囲参照（F.5）：書き換え、限量子の形との一致、N-15
@@ -1099,6 +1101,8 @@ tests/
   test_codegen_deterministic.py   生成コードが実行ごとに同一であること
   test_keyword_boundaries.py      キーワードが長い名前から切り出されないこと
   test_agents_extension.py        エージェントガバナンス拡張：G-1〜G-19、判定、agent-rego / agent-cedar
+  test_agent_policy_diff.py       agent-cedar（cedar CLI）とagent-rego（OPA）を同じ入力空間で `cadl agents-decide` と比較（G.10、G.13）
+  agent_policy_diff.py            test_agent_policy_diff.py の入力、ランダムなファイル、G.10の規則
   test_agents_runtime.py          エージェントガバナンス拡張のランタイム（`cadl agents-run`）：保留、委任、監査記録
   test_audit_log.py               監査ログのハッシュ連鎖：1バイトの変更、削除、挿入、入れ替え、鍵の有無（`cadl audit-verify`）
   test_mcp_gateway.py             偽のサーバとクライアントによるMCPゲートウェイ：`cadl agents-run` で再生するシナリオ、不正な入力、異常終了、並行処理

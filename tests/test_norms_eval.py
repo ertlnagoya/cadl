@@ -1203,6 +1203,7 @@ class TestNormsDiff:
             ("warning", "norm_removed", "rep"),
             ("warning", "carry_over_changed", "quiet"),    # content
             ("info", "norm_changed", "may"),               # on_amendment
+            ("info", "discharge", "may"),                  # on_amendment: discharge
             ("info", "transform", "old_duty"),
             ("info", "norm_removed", "old_duty"),
             ("warning", "norm_removed", "gone"),
@@ -1217,7 +1218,8 @@ class TestNormsDiff:
             ("info", "counts_as_added", "greeting"),
         ])
         by = {(f["kind"], f.get("norm")): f for f in r["contracts"][0]["findings"]}
-        assert by[("carry_over_changed", "ack")]["changes"] == {"deadline": {"old": "10s", "new": "6s"}}
+        assert by[("carry_over_changed", "ack")]["changes"] == {"deadline": {
+            "old": "10s", "new": "6s", "old_s": "10", "new_s": "6"}}
         assert "violated when the new version takes effect" in by[("carry_over_changed", "ack")]["text"]
         assert by[("norm_added", "fresh")]["active_at_once"] is True
         assert by[("norm_added", "rep2")]["active_at_once"] is False

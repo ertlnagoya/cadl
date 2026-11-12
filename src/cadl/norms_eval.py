@@ -1997,6 +1997,14 @@ class _Engine:
                     self._set(inst, n, "violated", f"amendment: {why}", log=False)
                     self._amend_violated.append(inst)
                     effect(oid, "carry_over", state, "violated", why)
+                elif (nd.kind == "prohibition" and inst.deadline is not None
+                      and not inst.frozen and elapsed > inst.deadline):
+                    # F.6: the window has closed, also for a suspended
+                    # instance, before step 1 of this observation
+                    why = (f"the elapsed time of {_fmt_t(elapsed)}s exceeds the new deadline "
+                           f"of {_fmt_t(inst.deadline)}s; the window has closed")
+                    self._set(inst, n, "fulfilled", f"amendment: {why}", log=False)
+                    effect(oid, "carry_over", state, "fulfilled", why)
                 else:
                     effect(oid, "carry_over", state, state,
                            "; ".join(["continues under the new version"] + changes))

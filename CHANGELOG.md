@@ -6,6 +6,51 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Amendments (F.6): a carried-over prohibition whose elapsed time exceeds
+  its new deadline is `fulfilled` when the new version takes effect,
+  before step 1, also when it is suspended. Up to 0.3.26 `cadl
+  norms-eval`, the Python monitor and the model of `cadl norms-check`
+  left it active until step 4 of the observation (so that a power at the
+  same observation could suspend it) and left a suspended one suspended.
+  Reproducer: a prohibition without deadline, suspended at t=3 and
+  amended at t=5 to a version with `deadline: 2s`, stayed suspended.
+- `cadl norms-diff` reports every norm whose `on_amendment:` is
+  `discharge` (finding `discharge`), gives the kind of a `transform:`
+  target (`target_kind`), compares deadlines exactly (two numeric
+  deadlines that round to the same millisecond were reported as equal;
+  the changes now carry `old_s` and `new_s` in seconds), and says for a
+  shorter deadline what happens to an obligation or a prohibition, also
+  a suspended one, whose elapsed time exceeds it.
+- The README comment of `-t agent-cedar` said that a Deny by the forbid
+  of a static prohibition is final. It is not when the contract has no
+  running instance and the message is not a tool call: the contract then
+  decides by its default (G.5, step 3.1). The comment now states the
+  three cases of G.10 in which the Cedar answer is the decision.
+
+### Added
+
+- `tests/test_agent_policy_diff.py`: agent-cedar (with the cedar CLI)
+  and agent-rego (with OPA) compared with `cadl agents-decide` on one
+  input space: three variants of a file with two enforced contracts,
+  every message of 12 senders, 9 receivers and 9 names without
+  `instances` and with 16 instance sets (49,572 inputs), and random
+  files with one to three enforced contracts, static and non-static
+  norms, `default: allow`, `deny` or omitted, escalation, fallbacks and
+  delegations. The Cedar answer must equal the decision for the message
+  alone on the contracts without their non-static norms, and the
+  decision for the full input in the cases of G.10; each reason for
+  which G.10 leaves an input to the runtime is shown to be needed.
+  `CADL_AGENT_POLICY_FILES` and `CADL_AGENT_POLICY_OPA_ALL=1` set the
+  long run.
+- `tests/test_norms_amend_diff.py`: `cadl norms-diff` against what `cadl
+  norms-eval` does at an amendment, for every norm instance, on random
+  pairs of versions made from the bundled examples and random traces
+  from the models of `cadl norms-check`, with 15 injected errors that
+  the comparison must detect. `CADL_NORMS_AMEND_PAIRS` sets the number
+  of pairs.
+
 ## [0.3.26] — 2026-11-12
 
 Resolves the open items of 0.3.25. `cadl norms-check` now handles values
