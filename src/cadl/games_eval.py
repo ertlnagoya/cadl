@@ -1121,6 +1121,239 @@ def advantage_bounds(game: Game, proc: Process, cell: tuple, lower: list,
     return out
 
 
+def cell_corners(cell: tuple) -> list:
+    """The 2^n corners of a cell, as valuations of the open parameters."""
+    return list(itertools.product(*cell))
+
+
+class CornerTable:
+    """Exact values of the probabilities and step payoffs of a game at the
+    corners of one cell, computed when first asked for. The probabilities
+    of every command must be multi-affine in the open parameters
+    (`game.multi_affine`); a step payoff that is not multi-affine is
+    enclosed by `poly_bounds` instead."""
+
+    def __init__(self, game: Game, cell: tuple):
+        self.game = game
+        self.cell = cell
+        self.corners = cell_corners(cell)
+        self._rows: dict = {}
+        self._rho: dict = {}
+
+    def distribution(self, g: int, k: int, c: int) -> dict:
+        """The distribution of command k of the game state g at corner c,
+        as a dict from successor state indices to positive probabilities."""
+        cmd = self.game.commands[g][k]
+        key = (id(cmd.row), c)
+        if key not in self._rows:
+            self._rows[key] = [_p_eval(p, self.corners[c]) for p in cmd.row.polys]
+        out: dict = {}
+        for j, p in zip(cmd.targets, self._rows[key]):
+            if p != 0:
+                out[j] = out.get(j, ZERO) + p
+        return out
+
+    def reward(self, poly: tuple, c: int) -> tuple:
+        """Lower and upper bound of a step payoff at corner c: its value
+        there when it is multi-affine, its bounds on the cell otherwise."""
+        key = (poly, c)
+        if key not in self._rho:
+            if not poly:
+                self._rho[key] = (ZERO, ZERO)
+            elif _multi_affine(poly):
+                x = _p_eval(poly, self.corners[c])
+                self._rho[key] = (x, x)
+            else:
+                self._rho[key] = poly_bounds(poly, self.cell)
+        return self._rho[key]
+
+
+def _coupling(d1: dict, d2: dict) -> dict:
+    """A joint distribution with the marginals d1 and d2 (dicts from
+    states to positive probabilities, in the order of the updates of their
+    commands), as a dict from pairs to positive probabilities: the mass
+    min(d1(j), d2(j)) on the pair (j, j), and the rest matched in the
+    order of the updates (the north-west corner rule), so that two
+    commands with the same probabilities move two plays update by update
+    together."""
+    joint: dict = {}
+    rest1: list = []
+    rest2: list = []
+    for j, a in d1.items():
+        m = min(a, d2.get(j, ZERO))
+        if m > 0:
+            joint[(j, j)] = m
+        if a > m:
+            rest1.append([j, a - m])
+    for j, b in d2.items():
+        m = min(b, d1.get(j, ZERO))
+        if b > m:
+            rest2.append([j, b - m])
+    x = y = 0
+    while x < len(rest1) and y < len(rest2):
+        m = min(rest1[x][1], rest2[y][1])
+        key = (rest1[x][0], rest2[y][0])
+        joint[key] = joint.get(key, ZERO) + m
+        rest1[x][1] -= m
+        rest2[y][1] -= m
+        if rest1[x][1] == 0:
+            x += 1
+        if rest2[y][1] == 0:
+            y += 1
+    return joint
+
+
+# Whether the coupled bounds of the advantages are used (I.9) where PD+ and
+# PD− with the bounds of `advantage_bounds` fail; False gives the maps of
+# cadl 0.3.27.
+USE_COUPLING = True
+
+
+class CoupledPlays:
+    """The coupled relaxation of I.9 of the advantages of one player on one
+    cell. The probabilities of the game must be multi-affine in the open
+    parameters (`game.multi_affine`).
+
+    A_p(s, c, v) = Q_p(s, c, v) − Q_p(s, σ(s), v) is the difference of the
+    expected payoffs of two plays that start in s, one with c and one with
+    σ(s), and follow the profile afterwards. Write w_e(v) for the
+    multilinear weights of v with respect to the corners e of the cell
+    (non-negative, sum 1); every multi-affine function f satisfies f(v) =
+    Σ_e w_e(v) · f(e). Run the two plays together: in each step choose a
+    corner e with probability w_e(v) and move the pair by a joint
+    distribution whose marginals are the distributions of the two plays at
+    e (`_coupling`). Each play alone is then the Markov chain at v, and its
+    expected step payoff in each step is that at v, so the expected
+    difference of the accumulated payoffs is A_p(s, c, v). This joint
+    process is a randomised policy of the process on pairs in which every
+    pair chooses a corner, so the largest and least values of that
+    process bound A_p(s, c, v) at every valuation of the cell. A pair of
+    one state with itself moves to pairs of one state (the joint
+    distribution puts all mass on them) and adds 0, as does a pair of two
+    states in which the target holds; such pairs end the process. A step
+    payoff that is not multi-affine is replaced by its bound on the cell
+    in the direction of the bound sought.
+
+    Every policy of the process on pairs ends with probability 1, since
+    each play alone follows a policy of the relaxed process of I.9, all of
+    whose policies reach the target. Values of pairs are kept, so the
+    advantages of different commands share them."""
+
+    def __init__(self, game: Game, proc: Process, table: CornerTable):
+        self.game = game
+        self.proc = proc
+        self.table = table
+        self.rho = game.rho(proc.player)
+        self.local = {g: i for i, g in enumerate(proc.states)}
+        self._options: dict = {}
+        self._values: tuple = ({}, {})            # least, largest
+
+    def _moves(self, i: int, k: Any, c: int) -> tuple:
+        proc = self.proc
+        if proc.target[i] or k is None:
+            return {i: ONE}, (ZERO, ZERO)
+        g = proc.states[i]
+        d = self.table.distribution(g, k, c)
+        return ({self.local[j]: p for j, p in d.items()},
+                self.table.reward(self.rho[g][k], c))
+
+    def options(self, x: tuple) -> list:
+        """The options of x, a pair of local states or `("start", i, k)`
+        for the first step: `(least step payoff, largest step payoff,
+        joint distribution)`, one per distinct pair of distributions over
+        the corners; empty for a pair that ends the process."""
+        if x in self._options:
+            return self._options[x]
+        proc = self.proc
+        if x[0] == "start":
+            i, k = x[1], x[2]
+            a, b = (i, k), (i, proc.selected[i])
+        elif x[0] == x[1] or (proc.target[x[0]] and proc.target[x[1]]):
+            self._options[x] = []
+            return []
+        else:
+            a, b = (x[0], proc.selected[x[0]]), (x[1], proc.selected[x[1]])
+        groups: dict = {}
+        for c in range(len(self.table.corners)):
+            d1, r1 = self._moves(*a, c)
+            d2, r2 = self._moves(*b, c)
+            key = (tuple(d1.items()), tuple(d2.items()))
+            lo, hi = r1[0] - r2[1], r1[1] - r2[0]
+            if key in groups:
+                g = groups[key]
+                g[0], g[1] = min(g[0], lo), max(g[1], hi)
+            else:
+                groups[key] = [lo, hi, d1, d2]
+        out = [(lo, hi, _coupling(d1, d2)) for lo, hi, d1, d2 in groups.values()]
+        self._options[x] = out
+        return out
+
+    def bound(self, i: int, k: int, maximize: bool) -> Fraction:
+        """The largest (or least) value of the process on pairs from the
+        first step of the commands k and σ(s) in the local state i: an
+        upper (lower) bound of A_p(s, k, v) on the cell."""
+        start = ("start", i, k)
+        values = self._values[1 if maximize else 0]
+        pick = max if maximize else min
+        side = 1 if maximize else 0
+        # Values in the postorder of a depth-first search; a pair that is
+        # met again while it is on the stack means a cycle (then policy
+        # iteration, `_bound_cyclic`).
+        state = {start: 1}
+        stack = [(start, iter([y for _, _, d in self.options(start) for y in d]))]
+        while stack:
+            x, it = stack[-1]
+            for y in it:
+                if y in values:
+                    continue
+                if state.get(y) == 1:
+                    return self._bound_cyclic(start, maximize)
+                state[y] = 1
+                stack.append((y, iter([z for _, _, d in self.options(y) for z in d])))
+                break
+            else:
+                state[x] = 2
+                stack.pop()
+                values[x] = pick((o[side] + sum((p * values[y] for y, p in o[2].items()), ZERO)
+                                  for o in self.options(x)), default=ZERO)
+        return values.pop(start)
+
+    def _bound_cyclic(self, start: tuple, maximize: bool) -> Fraction:
+        """As `bound`, by policy iteration with exact linear solves
+        (`optimal_values`) on the pairs reachable from `start`."""
+        side = 1 if maximize else 0
+        keys = [start]
+        local = {start: 0}
+        for x in keys:
+            for _, _, d in self.options(x):
+                for y in d:
+                    if y not in local:
+                        local[y] = len(keys)
+                        keys.append(y)
+        opts = [self.options(x) for x in keys]
+        pairs = Process(game=self.game, player=self.proc.player, states=keys,
+                        target=[not o for o in opts], mine=[True] * len(keys),
+                        selected=[None] * len(keys),
+                        options=[[(a, [{local[y]: p for y, p in o[2].items()}])
+                                  for a, o in enumerate(os_)] for os_ in opts])
+        return optimal_values(pairs, lambda i: range(len(opts[i])),
+                              lambda i, a: opts[i][a][side], maximize)[0]
+
+
+def coupled_advantage_bounds(game: Game, proc: Process, table: CornerTable,
+                             keys: list, sides: tuple = (0, 1),
+                             plays: "CoupledPlays | None" = None) -> dict:
+    """Bounds of the advantages A_p(s, c, v) of I.9 on a cell from the
+    coupled relaxation (`CoupledPlays`), for the pairs `(i, k)` of a local
+    state i of the player and a command position k other than the
+    profile's: `{(i, k): (lower, upper)}`. With `sides` (0 lower, 1
+    upper) only these bounds are computed; the other is None."""
+    plays = plays or CoupledPlays(game, proc, table)
+    return {(i, k): tuple(plays.bound(i, k, side == 1) if side in sides else None
+                          for side in (0, 1))
+            for i, k in keys}
+
+
 def advantage_reward(proc: Process, bounds: dict, side: int) -> Callable:
     """`(i, k) -> number`: the lower (side 0) or upper (side 1) bound of the
     advantage of command k in the local state i, and 0 for the command of
@@ -1188,7 +1421,8 @@ class PlayerOnCell:
 
 def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Callable,
                    epsilon: Fraction, every_state: bool = False,
-                   use_advantages: bool | None = None) -> PlayerOnCell | None:
+                   use_advantages: bool | None = None, use_coupling: bool | None = None,
+                   table: "CornerTable | None" = None) -> PlayerOnCell | None:
     """The conditions of I.9 for one player on a cell, or None when the
     relaxed process of the player has a policy that misses the target
     (then nothing is established for the cell). With `every_state`, the
@@ -1232,20 +1466,8 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
     if use_advantages is None:
         use_advantages = USE_ADVANTAGES
     adv = advantage_bounds(game, proc, cell, lower, upper) if use_advantages else None
-    if adv is not None:
-        # PD+: the largest sum of the upper bounds of the advantages along a
-        # play of the relaxed process bounds V*_p(s) − V_p(s) (I.9).
-        gain_up = optimal_values(proc, _all(proc), advantage_reward(proc, adv, 1),
-                                 maximize=True)
-        out.gain_upper = min(out.gain_upper, max(ZERO, gain_up[0]))
-        free = [i for i in range(len(proc.states)) if not proc.target[i]]
-        if all(gain_up[i] <= 0 for i in free):
-            out.e2 = True          # V*_p = V_p on Reach_p
-            out.gain_upper = ZERO
-            return out
-        if all(gain_up[i] <= epsilon for i in (free if every_state else [0])):
-            out.e1 = True
-            return out
+    if adv is not None and pd_plus(proc, out, adv, epsilon, every_state):
+        return out
     # N, with the canonical best response at the centre of the cell as τ.
     centre = tuple((a + b_) / 2 for a, b_ in cell)
     at = player_at_point(game, profile, player, centre)
@@ -1258,20 +1480,71 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
             if every_state:
                 out.state, out.state_gain_lower = 0, d_tau - upper[0]
             return out
-        # PD−: the least sum of the lower bounds of the advantages of τ.
-        if adv is not None:
-            d_adv = optimal_values(proc, _strategy(proc, at.deviation),
-                                   advantage_reward(proc, adv, 0), maximize=False)[0]
-            out.gain_lower = max(out.gain_lower, d_adv)
-            if d_adv > epsilon:
-                out.n = True
-                out.deviation = at.deviation
-                if every_state:
-                    out.state, out.state_gain_lower = 0, d_adv
+        if adv is not None and pd_minus(proc, out, adv, at, epsilon, every_state):
+            return out
+    if adv is not None and game.multi_affine and \
+            (USE_COUPLING if use_coupling is None else use_coupling):
+        # PD+ and PD− again, with the bounds of the advantages narrowed by
+        # the coupled relaxation (I.9): the upper bounds that are positive,
+        # and the lower bounds of the commands of τ.
+        plays = CoupledPlays(game, proc, table or CornerTable(game, cell))
+        adv = dict(adv)
+        for key, (a, b) in adv.items():
+            if b > 0:
+                adv[key] = (a, min(b, plays.bound(*key, maximize=True)))
+        if pd_plus(proc, out, adv, epsilon, every_state):
+            return out
+        if at.admissible and at.state_gain > 0:
+            tau = at.best_response if every_state else at.deviation
+            local = {g: i for i, g in enumerate(proc.states)}
+            for g, k in tau.items():
+                key = (local.get(g), k)
+                if key in adv:
+                    a, b = adv[key]
+                    adv[key] = (max(a, plays.bound(*key, maximize=False)), b)
+            if at.deviation and pd_minus(proc, out, adv, at, epsilon, every_state):
                 return out
     if every_state and at.admissible and at.state_gain > epsilon:
         state_deviation(game, profile, proc, out, at, lo, upper, cell, epsilon, adv)
     return out
+
+
+def pd_plus(proc: Process, out: PlayerOnCell, adv: dict, epsilon: Fraction,
+            every_state: bool) -> bool:
+    """PD+ of I.9 with the bounds `adv` of the advantages: the largest sum
+    of their upper bounds along a play of the relaxed process bounds
+    V*_p(s) − V_p(s). Records the bound of the gain in `out` and returns
+    whether the player is shown not to gain more than ε."""
+    gain_up = optimal_values(proc, _all(proc), advantage_reward(proc, adv, 1),
+                             maximize=True)
+    if out.gain_upper is None or max(ZERO, gain_up[0]) < out.gain_upper:
+        out.gain_upper = max(ZERO, gain_up[0])
+    free = [i for i in range(len(proc.states)) if not proc.target[i]]
+    if all(gain_up[i] <= 0 for i in free):
+        out.e2 = True          # V*_p = V_p on Reach_p
+        out.gain_upper = ZERO
+        return True
+    if all(gain_up[i] <= epsilon for i in (free if every_state else [0])):
+        out.e1 = True
+        return True
+    return False
+
+
+def pd_minus(proc: Process, out: PlayerOnCell, adv: dict, at: PlayerAtPoint,
+             epsilon: Fraction, every_state: bool) -> bool:
+    """PD− of I.9 at the initial state with the bounds `adv` and τ the
+    canonical best response at the centre of the cell: the least sum of
+    the lower bounds of the advantages of τ along a play."""
+    d_adv = optimal_values(proc, _strategy(proc, at.deviation),
+                           advantage_reward(proc, adv, 0), maximize=False)[0]
+    out.gain_lower = max(out.gain_lower, d_adv)
+    if d_adv > epsilon:
+        out.n = True
+        out.deviation = at.deviation
+        if every_state:
+            out.state, out.state_gain_lower = 0, d_adv
+        return True
+    return False
 
 
 def state_deviation(game: Game, profile: str, proc: Process, out: PlayerOnCell,
@@ -1371,9 +1644,11 @@ def bound_verdict(game: Game, query: EquilibriumQuery, cell: EqCell) -> None:
     every = query.concept == "every_reachable_state"
     try:
         dists = cell_distributions(game, box)
+        table = CornerTable(game, box) if game.multi_affine else None
         players = []
         for p in game.model.players:
-            on = player_on_cell(game, query.profile, p.id, box, dists, query.epsilon, every)
+            on = player_on_cell(game, query.profile, p.id, box, dists, query.epsilon, every,
+                                table=table)
             if on is None:
                 # The face-centre check of I-9 settles admissibility on the
                 # region for a design with multi-affine probabilities; the
