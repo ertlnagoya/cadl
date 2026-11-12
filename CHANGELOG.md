@@ -6,7 +6,73 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Equilibrium maps (`cadl game-check --certify`) use the conditions PD+
+  and PD− of I.9, which bound a gain through the one-step advantages
+  Q_p(s, c) − V_p(s) of the deviating commands (the performance-difference
+  identity) instead of comparing bounds of two payoffs. On a cell, the
+  difference of the two step payoffs and of the two distributions is
+  bounded exactly as one polynomial each, the values of the successors by
+  the bounds of the relaxation; the largest sum of the upper bounds along
+  a play of the relaxed process bounds the gain (PD+, before N), and the
+  least sum of the lower bounds along the canonical best response at the
+  centre establishes a deviator (PD−, after N; from a state of R⁺_C(p)
+  for `every_reachable_state`). The three-parameter maps of I.14 that
+  exhausted the budget now reach the resolution in the first example
+  (CENTRALIZED, resolution 0.1: 7 987 cells analysed instead of 39 999
+  with 0.269 undecided); the second example still exhausts it, with 0.200
+  undecided instead of 0.260. `comply_by_lambda_and_failure` needs 567 and
+  115 cells instead of 3 849 and 271. Three deliberate soundness bugs of
+  the new conditions are in `tests/games_fuzz.py`
+  (`advantage_drop_successors`, `advantage_swap_sides`,
+  `advantage_centre_only`); the older mutants run with PD+ and PD−
+  switched off (`games_eval.USE_ADVANTAGES`).
+- `tests/test_games_prism_games.py` and `tests/prism_games_check.py` run
+  the export of I.11 through PRISM-games and compare the payoff and the
+  best-response value of every player, V_p and V\*_p − V_p at every state
+  of Reach_p, the status, the deviators and `from_every_state` with
+  `cadl game-check`, on the bundled examples and on games of
+  `tests/games_fuzz.py`. The exported file is used unchanged, followed by
+  a module that fixes the players other than one to the profile and by a
+  reward structure that is not negative (PRISM-games rejects negative
+  rewards; the shift telescopes along every play). Values are compared
+  with a tolerance relative to the shifted values they come from, and a
+  design on which the value iteration of PRISM-games does not converge
+  is reported as not compared. The tests are skipped
+  without PRISM-games (`CADL_PRISM_GAMES`, or `prism-games` on PATH). The
+  CI installs PRISM-games 3.2.4 (Linux x86-64 release, pinned by its
+  SHA-256) for Python 3.12.
+
+- `tests/test_agent_policy_diff.py`: agent-cedar (with the cedar CLI)
+  and agent-rego (with OPA) compared with `cadl agents-decide` on one
+  input space: three variants of a file with two enforced contracts,
+  every message of 12 senders, 9 receivers and 9 names without
+  `instances` and with 16 instance sets (49,572 inputs), and random
+  files with one to three enforced contracts, static and non-static
+  norms, `default: allow`, `deny` or omitted, escalation, fallbacks and
+  delegations. The Cedar answer must equal the decision for the message
+  alone on the contracts without their non-static norms, and the
+  decision for the full input in the cases of G.10; each reason for
+  which G.10 leaves an input to the runtime is shown to be needed.
+  `CADL_AGENT_POLICY_FILES` and `CADL_AGENT_POLICY_OPA_ALL=1` set the
+  long run.
+- `tests/test_norms_amend_diff.py`: `cadl norms-diff` against what `cadl
+  norms-eval` does at an amendment, for every norm instance, on random
+  pairs of versions made from the bundled examples and random traces
+  from the models of `cadl norms-check`, with injected errors that the
+  comparison must detect (16 in the two commands, 2 in the model of
+  `cadl norms-check`). `CADL_NORMS_AMEND_PAIRS` sets the number
+  of pairs.
+
 ### Fixed
+
+- `cadl model-export` of a strategic model writes every player, a player
+  that owns no command of the design without actions. A design in which
+  no command is owned gave an `smg` file without players, which
+  PRISM-games 3.2.4 rejects ("SMG model has no player definitions"), and
+  a player that was not written could not be named in a coalition
+  (I.11).
 
 - Amendments (F.6): a carried-over obligation or prohibition whose
   elapsed time exceeds its new deadline is decided when the new version
@@ -45,28 +111,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   decides by its default (G.5, step 3.1). The comment now states the
   three cases of G.10 in which the Cedar answer is the decision.
 
-### Added
-
-- `tests/test_agent_policy_diff.py`: agent-cedar (with the cedar CLI)
-  and agent-rego (with OPA) compared with `cadl agents-decide` on one
-  input space: three variants of a file with two enforced contracts,
-  every message of 12 senders, 9 receivers and 9 names without
-  `instances` and with 16 instance sets (49,572 inputs), and random
-  files with one to three enforced contracts, static and non-static
-  norms, `default: allow`, `deny` or omitted, escalation, fallbacks and
-  delegations. The Cedar answer must equal the decision for the message
-  alone on the contracts without their non-static norms, and the
-  decision for the full input in the cases of G.10; each reason for
-  which G.10 leaves an input to the runtime is shown to be needed.
-  `CADL_AGENT_POLICY_FILES` and `CADL_AGENT_POLICY_OPA_ALL=1` set the
-  long run.
-- `tests/test_norms_amend_diff.py`: `cadl norms-diff` against what `cadl
-  norms-eval` does at an amendment, for every norm instance, on random
-  pairs of versions made from the bundled examples and random traces
-  from the models of `cadl norms-check`, with injected errors that the
-  comparison must detect (16 in the two commands, 2 in the model of
-  `cadl norms-check`). `CADL_NORMS_AMEND_PAIRS` sets the number
-  of pairs.
 
 ## [0.3.26] — 2026-11-12
 

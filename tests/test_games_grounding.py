@@ -548,7 +548,10 @@ class TestPrismGamesKeywords:
         assert text.startswith("smg\n\nplayer player_\n  [endplayer_], [tptg_]\nendplayer\n")
         assert "  smg_ : [0..2] init 0;" in text
         assert "[csg_] smg_ = 1 -> (1) : (smg_'=2);" in text
-        assert "player OTHER" not in text            # owns no command
+        # A player that owns no command of the design is written without
+        # actions (PRISM-games 3.2.4 accepts it, and it can be named in a
+        # coalition).
+        assert "\nplayer OTHER\nendplayer\n" in text
 
     def test_the_example_is_unchanged(self):
         text = export_prism(LINKED_MODEL)["RobotDeliveryGame_CENTRALIZED.prism"]

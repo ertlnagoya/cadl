@@ -1128,8 +1128,12 @@ def game_to_ir(model: Model) -> dict:
 
 def prism_games_header(model: Model, design: Design) -> list:
     """The first lines of the model file of a design of a strategic model:
-    `smg` and one `player ... endplayer` construct per player that owns a
-    command of the design."""
+    `smg` and one `player ... endplayer` construct per player, in
+    declaration order. A player that owns no command of the design gets a
+    construct without actions: PRISM-games 3.2.4 rejects an `smg` file
+    without any player ("SMG model has no player definitions"), for
+    example a design in which every command is unowned, and a player that
+    is not written cannot be named in a coalition."""
     from .stochastic import ExportError
     written: dict = {}
     for player in model.players:
@@ -1144,11 +1148,10 @@ def prism_games_header(model: Model, design: Design) -> list:
         for c in model.commands:
             if c.owner == player.id and c.exists_in(design.name) and c.action not in labels:
                 labels.append(c.action)
-        if not labels:
-            continue
-        out += [f"player {_prism_name(player.id)}",
-                "  " + ", ".join(f"[{_prism_name(a)}]" for a in labels),
-                "endplayer", ""]
+        out.append(f"player {_prism_name(player.id)}")
+        if labels:
+            out.append("  " + ", ".join(f"[{_prism_name(a)}]" for a in labels))
+        out += ["endplayer", ""]
     return out
 
 

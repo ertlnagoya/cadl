@@ -1,0 +1,26 @@
+# Appendix I: a game whose expected number of steps is large (p = 0.9995), used by
+# tests/test_games_prism_games.py to compare with PRISM-games (from a review).
+sos:
+  name: "N"
+  type: Acknowledged
+  extensions: [ { stochastic: 0.1 }, { games: 0.1 } ]
+  actors: [ { id: ACT, role: "x" }, { id: ACT2, role: "y" } ]
+  model:
+    kind: smg
+    parameters: [ { id: p, range: [0, 1], value: 0.9995 } ]
+    variables: [ { id: loc, type: "[0..3]", init: 0 } ]
+    players: [ { id: A, actors: [ACT] }, { id: B, actors: [ACT2] } ]
+    commands:
+      - { action: stay, owner: A, guard: "loc == 0", updates: [ { prob: "p", set: { loc: 0 } }, { prob: rest, set: { loc: 1 } } ] }
+      - { action: go, owner: A, guard: "loc == 0", updates: [ { set: { loc: 1 } } ] }
+      - { action: x, owner: B, guard: "loc == 1", updates: [ { prob: "p", set: { loc: 1 } }, { prob: rest, set: { loc: 3 } } ] }
+      - { action: y, owner: B, guard: "loc == 1", updates: [ { set: { loc: 3 } } ] }
+    rewards:
+      - { id: r, items: [ { action: stay, value: 1 }, { action: x, value: 2 } ] }
+      - { id: c, items: [ { action: go, value: 3 }, { action: y, value: 1 } ] }
+    profiles: { sigma: [ { choose: go }, { choose: x } ] }
+    compliance: sigma
+    payoffs:
+      - { player: A, until: "loc == 3", terms: [ { reward: r, weight: 1 }, { reward: c, weight: -1 } ] }
+      - { player: B, until: "loc == 3", terms: [ { reward: r, weight: -0.001 }, { reward: c, weight: 1 } ] }
+    equilibria: [ { id: m } ]
