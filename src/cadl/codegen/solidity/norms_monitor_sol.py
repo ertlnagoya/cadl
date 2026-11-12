@@ -55,8 +55,8 @@ SOLC_CHECKED = ("0.8.24", "0.8.37")
 # the constructor). Measured with the versions above, the optimizer with 1
 # and with 200 runs, plus 3 %; tests/test_norms_monitor_targets.py checks
 # them against solc.
-RUNTIME_ESTIMATE = {"monitor": 16370, "CadlNormsValues": 7810, "CadlNormsEval": 8290,
-                    "CadlNormsItems": 2370, "CadlNormsWindows": 4410, "CadlNormsActs": 12170}
+RUNTIME_ESTIMATE = {"monitor": 16370, "CadlNormsValues": 7810, "CadlNormsEval": 10310,
+                    "CadlNormsItems": 2370, "CadlNormsWindows": 5070, "CadlNormsActs": 12170}
 
 
 def estimated_initcode(text: str) -> int:
@@ -224,40 +224,31 @@ def solidity_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
             continue
         where = f"norm '{nd['id']}', content"
         if len(ops) > 1:
-            reasons.append(f"{where}: two temporal operators (the Solidity monitor decides the "
-                           f"candidates of a content from one operator)")
+            reasons.append(f"{where}: {len(ops)} temporal operators (the Solidity monitor decides "
+                           f"the candidates of a content from one)")
             continue
-        path = _path_to(nodes, c["expr"], ops[0])
-        if any(nodes[k]["op"] not in ("and", "or", "not") for k in path[:-1]):
-            reasons.append(f"{where}: a temporal operator inside a comparison or an IN")
-            continue
-        neg = sum(1 for k in path[:-1] if nodes[k]["op"] == "not") % 2 == 1
-        if neg and nodes[ops[0]]["op"] == "until":
-            reasons.append(f"{where}: NOT until(...) (it has no dual among within, throughout "
-                           f"and until)")
-            continue
-        nd["temporal"] = {"node": ops[0], "neg": neg}
+        nd["temporal"] = {"node": ops[0]}
     if reasons:
         raise NormsTargetUnsupported(reasons)
     return ir
 
 
 _WINDOW_MODES = {"within": 1, "throughout": 2, "until": 3}
-_DUAL = {"within": "throughout", "throughout": "within"}
+
+
+def _op_args(ir: dict, k: int) -> str:
+    """mode, p, q, duration and node of a temporal operator."""
+    node = ir["exprs"][k]
+    p, q = (node["p"], node["q"]) if node["op"] == "until" else (node["x"], 0)
+    return (f"{_WINDOW_MODES[node['op']]}, {p}, {q}, {scaled(node['d'], 'a duration')}, {k}")
 
 
 def _window_line(ir: dict, nd: dict) -> str | None:
-    """The temporal operator of the content of a norm (`_temporal`): with
-    an odd number of NOT above it, the dual operator on the negated
-    operand."""
+    """The temporal operator of the content of a norm (`_temporal`)."""
     tm = nd.get("temporal")
     if tm is None:
         return None
-    node = ir["exprs"][tm["node"]]
-    op = _DUAL[node["op"]] if tm["neg"] else node["op"]
-    p, q = (node["p"], node["q"]) if node["op"] == "until" else (node["x"], 0)
-    return (f"        _temporal({_WINDOW_MODES[op]}, {str(tm['neg']).lower()}, {p}, {q}, "
-            f"{scaled(node['d'], 'a duration')}, {tm['node']}, {nd['content']['expr']});")
+    return f"        _temporal({_op_args(ir, tm['node'])}, {nd['content']['expr']});"
 
 
 def _node_lines(nodes: list[dict], skip: set) -> list[str]:

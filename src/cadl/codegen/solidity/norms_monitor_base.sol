@@ -35,6 +35,11 @@ uint8 constant B_ADD = 6;
 uint8 constant B_SUB = 7;
 
 struct Val { uint8 k; int256 n; string s; }
+// a truth value as a code: undecided, true, false, undefined
+uint8 constant X_D = 0;
+uint8 constant X_T = 1;
+uint8 constant X_F = 2;
+uint8 constant X_U = 3;
 // a value of an observation, of the request or a binding (k: K_U for null)
 struct ValIn { string name; uint8 k; int256 n; string s; }
 struct Msg { string from; string to; string name; ValIn[] args; }
@@ -85,9 +90,6 @@ struct EvalData {
     mapping(bytes32 => Scan) scans;       // incremental temporal operators, by (node, start)
     int256[] obsT;
     string[] obsSt;          // lifecycle state before each observation
-    // while `over`, node overNode evaluates to overVal (the content of a
-    // norm with its temporal operator replaced, F.5)
-    bool over; uint256 overNode; Val overVal;
 }
 
 // Functions of the monitor without state, in a library of their own (the
@@ -279,14 +281,100 @@ library CadlNormsEval {
         return ev(data, id, p, n);
     }
 
-    /// The truth of `root` at observation n with `node` read as `v`.
-    function evaluateWith(EvalData storage data, uint256 root, uint256 n, uint256 node, Val memory v)
-            public returns (Val memory r) {
-        data.over = true;
-        data.overNode = node;
-        data.overVal = v;
-        r = truth(ev(data, root, n, n));
-        data.over = false;
+    /// The truth of `root` at observation n for every combination of the
+    /// values of the nodes a and b (temporal operators): entry e reads a as
+    /// e % 4 and b as e / 4 (X_D, X_T, X_F, X_U); b may be no node. Returns
+    /// the entries at which the content is true and those at which it is
+    /// undecided. The rest of the content is read once.
+    function table(EvalData storage data, uint256 root, uint256 n, uint256 a, uint256 b)
+            public returns (uint256 ts, uint256 ds) {
+        Vt memory r = vt(data, root, n, a, b);
+        uint256 v = r.x ? r.v : spread(code(truth(r.s)));
+        for (uint256 e = 0; e < 16; e++) {
+            uint256 c = v >> (2 * e) & 3;
+            if (c == X_T) ts |= 1 << e;
+            if (c == X_D) ds |= 1 << e;
+        }
+    }
+
+    /// A node as one value s (no operator a or b below it), or (x) as the
+    /// codes v of its 16 entries (truth values: a value with a or b below it
+    /// is one).
+    struct Vt { bool x; Val s; uint256 v; }
+
+    function vt(EvalData storage data, uint256 id, uint256 n, uint256 a, uint256 b) internal returns (Vt memory) {
+        if (id == a) return Vt(true, mark(K_U), 0xe4e4e4e4);
+        if (id == b) return Vt(true, mark(K_U), 0xffaa5500);
+        Node storage nd = data.nodes[id];
+        uint8 op = nd.op;
+        if (op == OP_NOT || op == OP_AND || op == OP_OR || op == OP_BIN) {
+            Vt memory l = vt(data, nd.a, n, a, b);
+            Vt memory r = op == OP_NOT ? Vt(false, mark(K_U), 0) : vt(data, nd.b, n, a, b);
+            if (!l.x && !r.x) return Vt(false, combine(op, nd.bop, l.s, r.s), 0);
+            return Vt(true, mark(K_U), entries(op, nd.bop, l, r));
+        }
+        if (op == OP_IN) return inVec(data, nd, n, a, b);
+        return Vt(false, ev(data, id, n, n), 0);
+    }
+
+    function entries(uint8 op, uint8 bop, Vt memory l, Vt memory r) internal pure returns (uint256 out) {
+        uint256 seen = 0;
+        Val[16] memory memo;
+        for (uint256 e = 0; e < 16; e++) {
+            uint256 cl = l.v >> (2 * e) & 3;
+            uint256 cr = r.v >> (2 * e) & 3;
+            uint256 j = (l.x ? cl : 0) + 4 * (r.x ? cr : 0);
+            if (seen >> j & 1 == 0) {
+                memo[j] = combine(op, bop, l.x ? codeVal(cl) : l.s, r.x ? codeVal(cr) : r.s);
+                seen |= 1 << j;
+            }
+            out |= uint256(code(truth(memo[j]))) << (2 * e);
+        }
+    }
+
+    function combine(uint8 op, uint8 bop, Val memory l, Val memory r) internal pure returns (Val memory) {
+        if (op == OP_NOT) {
+            Val memory v = truth(l);
+            return v.k == K_B ? boolVal(v.n == 0) : v;
+        }
+        if (op == OP_BIN) return CadlNormsValues.binop(bop, l, r);
+        return andOr(op == OP_OR, truth(l), truth(r));
+    }
+
+    function inVec(EvalData storage data, Node storage nd, uint256 n, uint256 a, uint256 b)
+            internal returns (Vt memory) {
+        uint256 m = nd.items.length;
+        Vt[] memory xs = new Vt[](m + 1);
+        bool any = false;
+        for (uint256 j = 0; j <= m; j++) {
+            xs[j] = vt(data, j == 0 ? nd.a : nd.items[j - 1], n, a, b);
+            any = any || xs[j].x;
+        }
+        uint256 out = 0;
+        for (uint256 e = 0; e < (any ? 16 : 1); e++) {
+            Val[] memory items = new Val[](m);
+            for (uint256 j = 1; j <= m; j++) items[j - 1] = xs[j].x ? codeVal(xs[j].v >> (2 * e) & 3) : xs[j].s;
+            Val memory r = inVals(xs[0].x ? codeVal(xs[0].v >> (2 * e) & 3) : xs[0].s, items);
+            if (!any) return Vt(false, r, 0);
+            out |= uint256(code(truth(r))) << (2 * e);
+        }
+        return Vt(true, mark(K_U), out);
+    }
+
+    function code(Val memory v) internal pure returns (uint8) {
+        if (v.k == K_D) return X_D;
+        if (v.k == K_B) return v.n == 1 ? X_T : X_F;
+        return X_U;
+    }
+
+    function codeVal(uint256 c) internal pure returns (Val memory) {
+        if (c == X_D) return mark(K_D);
+        if (c == X_U) return mark(K_U);
+        return boolVal(c == X_T);
+    }
+
+    function spread(uint8 c) internal pure returns (uint256 v) {
+        for (uint256 e = 0; e < 16; e++) v |= uint256(c) << (2 * e);
     }
 
     function boolVal(bool b) internal pure returns (Val memory) {
@@ -351,7 +439,6 @@ library CadlNormsEval {
     }
 
     function ev(EvalData storage data, uint256 id, uint256 p, uint256 n) internal returns (Val memory) {
-        if (data.over && id == data.overNode) return data.overVal;
         Node storage nd = data.nodes[id];
         uint8 op = nd.op;
         if (op == OP_LIT) return nd.lit;
@@ -387,11 +474,18 @@ library CadlNormsEval {
     function inList(EvalData storage data, Node storage nd, uint256 p, uint256 n) internal returns (Val memory) {
         Val memory l = ev(data, nd.a, p, n);
         if (l.k == K_U || l.k == K_D) return l;
+        Val[] memory items = new Val[](nd.items.length);
+        for (uint256 i = 0; i < nd.items.length; i++) items[i] = ev(data, nd.items[i], p, n);
+        return inVals(l, items);
+    }
+
+    function inVals(Val memory l, Val[] memory items) internal pure returns (Val memory) {
+        if (l.k == K_U || l.k == K_D) return l;
         if (l.k == K_S) return mark(K_U);
         bool sawD = false;
         bool sawU = false;
-        for (uint256 i = 0; i < nd.items.length; i++) {
-            Val memory it = ev(data, nd.items[i], p, n);
+        for (uint256 i = 0; i < items.length; i++) {
+            Val memory it = items[i];
             if (it.k == K_S && l.k != K_T) it = mark(K_U);
             if (it.k == K_D) { sawD = true; continue; }
             if (it.k == K_U) { sawU = true; continue; }
@@ -470,34 +564,45 @@ library CadlNormsEval {
 }
 
 
-// The candidates of a norm whose content is one temporal operator (F.4,
+// The candidates of a norm whose content has one temporal operator (F.4,
 // F.5): the observations at which the content has to be decided, oldest
 // first, with what the observations since the last judgement say about
-// the operand. Each candidate is decided from these summaries; no
+// the operands. Each candidate is decided from these summaries; no
 // window is scanned per candidate, so the cost of an observation does
 // not grow with the number of candidates.
 struct Window {
     uint256 head; uint256 tail; uint256 purge;     // candidates [head, tail); entries before purge are deleted
     bool luSet; uint256 lu;                        // candidates at or before lu have an operand that was unknown
-    bool ffSet; int256 ff; bool fuSet; int256 fu;  // throughout: the first time false, unknown
+                                                   // (release: a p that was not true)
+    bool luqSet; uint256 luq;                      // release: candidates at or before luq have seen q not false
+    bool ffSet; int256 ff; uint256 ffi;            // throughout: the first time false; release: the first p false
+    bool fuSet; int256 fu;                         // throughout: the first time unknown
     bool ftSet; int256 ft;                         // within: the first time true
-    bool jSet; uint256 j; int256 jt;               // until: the first observation with q true
-    bool pSet; uint256 pFirst; bool pFalse; bool pUnknown;   // until: p not true
+    bool jSet; uint256 j; int256 jt;               // until, release: the first observation with q true
+    bool pSet; uint256 pFirst; bool pFalse; bool pUnknown;   // until, release: p not true
+    bool qnSet; uint256 qn; int256 qnt;            // release: the first observation with q not false
     uint256 at; uint8 pv; uint8 qv;                // the operands at observation at - 1
     mapping(uint256 => uint256) k;                 // the observation of a candidate
     mapping(uint256 => int256) t;                  // its time
 }
 
+// The three queues of a norm: the candidates that are true exactly when
+// the operator is true, those that are true exactly when it is false (the
+// dual operator on the negated operands: NOT within(d, p) is throughout(d,
+// NOT p), NOT throughout(d, p) is within(d, NOT p), NOT until(p, q, d) is
+// the release of D.5), and those that are never true but undecided until
+// the operator is decided.
+struct Windows { Window live; Window dual; Window dead; }
+
 uint8 constant W_WITHIN = 1;
 uint8 constant W_THROUGHOUT = 2;
 uint8 constant W_UNTIL = 3;
+uint8 constant W_RELEASE = 4;
 
-// The temporal operator of the content of a norm: its kind (with `neg`,
-// the dual operator on the negated operand: NOT within(d, p) is
-// throughout(d, NOT p) and NOT throughout(d, p) is within(d, NOT p)), its
-// operands (p, and q of until), its duration, the operator node and the
-// root of the content.
-struct Temporal { uint8 mode; bool neg; uint256 tp; uint256 tq; int256 td; uint256 node; uint256 root; }
+// The temporal operator of the content of a norm: its kind, its operands
+// (p, and q of until), its duration, the operator node and the root of the
+// content.
+struct Temporal { uint8 mode; uint256 tp; uint256 tq; int256 td; uint256 node; uint256 root; }
 
 /// The judgement of the candidates of a temporal content, with a cost per
 /// observation that does not depend on the number of candidates: a few
@@ -506,9 +611,10 @@ struct Temporal { uint8 mode; bool neg; uint256 tp; uint256 tq; int256 td; uint2
 /// The rest of the content is decided at the observation of a candidate
 /// (its names are fixed, see makeKnown), so a candidate is one of: true
 /// whatever the operator gives (a hit), never true (not kept), true
-/// exactly when the operator (or its dual) is true (`live`), or never
-/// true but undecided until the operator is decided (`dead`: it keeps
-/// the norm pending, as F.5 does).
+/// exactly when the operator is true (`live`), true exactly when it is
+/// false (`dual`), true when it is true or false (in both), or never true
+/// but undecided until the operator is decided (`dead`: it keeps the norm
+/// pending, as F.5 does).
 library CadlNormsWindows {
     // truth values of an operand
     uint8 internal constant F = 0;
@@ -519,15 +625,18 @@ library CadlNormsWindows {
     uint8 internal constant C_DROP = 1;
     uint8 internal constant C_LIVE = 2;
     uint8 internal constant C_DEAD = 3;
+    uint8 internal constant C_DUAL = 4;
+    uint8 internal constant C_BOTH = 5;
 
     /// What an observation says about the operands, for the candidates
     /// there are (also while the norm is suspended).
-    function note(Window storage live, Window storage dead, EvalData storage data,
-                  Temporal storage tm, uint256 n, int256 t) public {
-        if (live.head == live.tail && dead.head == dead.tail) return;
-        (uint8 pv, uint8 qv) = operands(live, data, tm, n);
-        summarize(live, tm.mode, n, t, pv, qv);
-        summarize(dead, tm.mode, n, t, pv, qv);
+    function note(Windows storage ws, EvalData storage data, Temporal storage tm, uint256 n, int256 t) public {
+        if (ws.live.head == ws.live.tail && ws.dual.head == ws.dual.tail && ws.dead.head == ws.dead.tail) return;
+        (uint8 pv, uint8 qv) = operands(ws.live, data, tm, n);
+        uint8 mode = tm.mode;
+        summarize(ws.live, mode, n, t, pv, qv);
+        summarize(ws.dual, dualMode(mode), n, t, dualP(mode, pv), qv);
+        summarize(ws.dead, mode, n, t, pv, qv);
     }
 
     function summarize(Window storage w, uint8 mode, uint256 n, int256 t, uint8 pv, uint8 qv) internal {
@@ -542,70 +651,111 @@ library CadlNormsWindows {
             if (pv != T && !w.pSet) { w.pSet = true; w.pFirst = n; }
             if (pv == F) w.pFalse = true;
             if (pv == U) w.pUnknown = true;
+            if (mode == W_RELEASE) {
+                if (qv != F && !w.qnSet) { w.qnSet = true; w.qn = n; w.qnt = t; }
+                if (pv == F && !w.ffSet) { w.ffSet = true; w.ff = t; w.ffi = n; }
+            }
         }
     }
 
     /// The judgement of observation n (F.5, items 2 and 3) when the norm
     /// is active: whether a candidate holds (hit), and whether none is left
     /// (empty). `open`: the deadline has not passed, so n is a candidate.
-    function judge(Window storage live, Window storage dead, EvalData storage data,
-                   Temporal storage tm, uint256 n, int256 t, bool open) public returns (bool hit, bool empty) {
-        (uint8 pv, uint8 qv) = operands(live, data, tm, n);
-        // the operator is true at n for a candidate of n itself
-        bool trueNow = (tm.mode == W_WITHIN && pv == T) || (tm.mode == W_UNTIL && qv == T);
+    function judge(Windows storage ws, EvalData storage data, Temporal storage tm, uint256 n, int256 t, bool open)
+            public returns (bool hit, bool empty) {
+        (uint8 pv, uint8 qv) = operands(ws.live, data, tm, n);
+        uint8 mode = tm.mode;
         uint8 cls = open ? classify(data, tm, n) : C_DROP;
-        hit = cls == C_HIT || (cls == C_LIVE && trueNow)
-            || (live.head < live.tail && oldHit(live, tm.mode, tm.td, t));
+        bool toLive = cls == C_LIVE || cls == C_BOTH;
+        bool toDual = cls == C_DUAL || cls == C_BOTH;
+        hit = cls == C_HIT || (toLive && trueNow(mode, pv, qv))
+            || (toDual && trueNow(dualMode(mode), dualP(mode, pv), qv))
+            || (ws.live.head < ws.live.tail && oldHit(ws.live, mode, tm.td, t))
+            || (ws.dual.head < ws.dual.tail && oldHit(ws.dual, dualMode(mode), tm.td, t));
         if (hit) {
-            live.head = live.tail;
-            dead.head = dead.tail;
+            clear(ws);
         } else {
-            advance(live, tm, n, t, pv, cls == C_LIVE, false);
-            advance(dead, tm, n, t, pv, cls == C_DEAD && !trueNow, true);
+            advance(ws.live, mode, tm.td, n, t, pv, qv, toLive);
+            advance(ws.dual, dualMode(mode), tm.td, n, t, dualP(mode, pv), qv, toDual);
+            advance(ws.dead, mode, tm.td, n, t, pv, qv, cls == C_DEAD && !trueNow(mode, pv, qv));
         }
-        reset(live);
-        reset(dead);
-        empty = live.head == live.tail && dead.head == dead.tail;
+        reset(ws.live);
+        reset(ws.dual);
+        reset(ws.dead);
+        empty = ws.live.head == ws.live.tail && ws.dual.head == ws.dual.tail && ws.dead.head == ws.dead.tail;
+    }
+
+    function clear(Windows storage ws) internal {
+        ws.live.head = ws.live.tail;
+        ws.dual.head = ws.dual.tail;
+        ws.dead.head = ws.dead.tail;
+    }
+
+    function pending(Windows storage ws) internal view returns (bool) {
+        return ws.live.head < ws.live.tail || ws.dual.head < ws.dual.tail || ws.dead.head < ws.dead.tail;
+    }
+
+    function dualMode(uint8 mode) internal pure returns (uint8) {
+        return mode == W_WITHIN ? W_THROUGHOUT : mode == W_THROUGHOUT ? W_WITHIN : W_RELEASE;
+    }
+
+    /// The operand p of the dual operator: NOT p for within and throughout;
+    /// the release reads p and q as they are.
+    function dualP(uint8 mode, uint8 pv) internal pure returns (uint8) {
+        if (mode == W_UNTIL || pv == U) return pv;
+        return pv == T ? F : T;
+    }
+
+    /// The operator is true at n for a candidate of n itself.
+    function trueNow(uint8 mode, uint8 pv, uint8 qv) internal pure returns (bool) {
+        if (mode == W_WITHIN) return pv == T;
+        if (mode == W_UNTIL) return qv == T;
+        if (mode == W_RELEASE) return qv == F && pv == F;
+        return false;
     }
 
     /// The candidates after an observation without a hit: false in every
-    /// window (throughout: an operand false; until: p false) removes them
-    /// all, an unknown operand marks them, the windows that are over go;
-    /// then the new candidate (unless the operator is decided at it).
-    function advance(Window storage w, Temporal storage tm, uint256 n, int256 t, uint8 pv, bool add,
-                     bool isDead) internal {
-        uint8 mode = tm.mode;
-        int256 d = tm.td;
-        if (isDead && mode == W_UNTIL && w.head < w.tail && w.jSet && (!w.pSet || w.j <= w.pFirst)) {
-            // until is decided (true) for the clean candidates whose window has j: never
-            // true for a dead candidate, so they go
+    /// window (throughout: an operand false; until: p false; release: p
+    /// false) removes them all, an unknown operand marks them, the windows
+    /// that are over go; then the new candidate (unless the operator is
+    /// decided at it).
+    function advance(Window storage w, uint8 mode, int256 d, uint256 n, int256 t, uint8 pv, uint8 qv, bool add)
+            internal {
+        bool until = mode == W_UNTIL || mode == W_RELEASE;
+        if (until && w.head < w.tail && w.jSet && (!w.pSet || w.j <= w.pFirst)) {
+            // until is true for the candidates with p true before j whose
+            // window has j: a candidate here is then decided (dead: never
+            // true; release: false), so they go
             uint256 from = firstFrom(w, w.jt - d);
             uint256 firstClean = firstAfterK(w, w.luSet, w.lu);
             uint256 cut = from > firstClean ? from : firstClean;
             if (cut < w.tail) w.tail = cut;
         }
         if (w.head < w.tail) {
-            if ((mode == W_THROUGHOUT && w.ffSet) || (mode == W_UNTIL && w.pFalse)
-                    || (mode == W_WITHIN && w.ftSet)) {
+            if ((mode == W_THROUGHOUT && w.ffSet) || (until && w.pFalse) || (mode == W_WITHIN && w.ftSet)) {
                 w.head = w.tail;
             } else {
-                if ((mode == W_THROUGHOUT && w.fuSet) || (mode == W_UNTIL && w.pUnknown)) {
+                if ((mode == W_THROUGHOUT && w.fuSet) || (until && w.pUnknown)) {
                     w.luSet = true;
                     w.lu = w.k[w.tail - 1];
+                }
+                if (mode == W_RELEASE && w.qnSet) {
+                    w.luqSet = true;
+                    w.luq = w.k[w.tail - 1];
                 }
                 w.head = firstFrom(w, t - d);
             }
         }
-        if (add && !((mode == W_THROUGHOUT || mode == W_UNTIL) && pv == F)) {
-            if ((mode == W_THROUGHOUT || mode == W_UNTIL) && pv == U) { w.luSet = true; w.lu = n; }
-            w.k[w.tail] = n;
-            w.t[w.tail] = t;
-            w.tail++;
-        }
+        if (!add || (mode != W_WITHIN && pv == F) || (mode == W_RELEASE && qv == T)) return;
+        if (mode != W_WITHIN && pv == U) { w.luSet = true; w.lu = n; }
+        if (mode == W_RELEASE && qv == U) { w.luqSet = true; w.luq = n; }
+        w.k[w.tail] = n;
+        w.t[w.tail] = t;
+        w.tail++;
     }
 
     function reset(Window storage w) internal {
-        w.ffSet = false; w.fuSet = false; w.ftSet = false;
+        w.ffSet = false; w.fuSet = false; w.ftSet = false; w.qnSet = false;
         w.jSet = false; w.pSet = false; w.pFalse = false; w.pUnknown = false;
         for (uint256 x = 0; x < 4 && w.purge < w.head; x++) {
             delete w.k[w.purge];
@@ -618,21 +768,20 @@ library CadlNormsWindows {
     /// undecided, true and false (F.5: an undefined content is false).
     function classify(EvalData storage data, Temporal storage tm, uint256 n) internal returns (uint8) {
         if (tm.root == tm.node) return C_LIVE;
-        Val memory g = CadlNormsEval.evaluateWith(data, tm.root, n, tm.node, Val(K_D, 0, ""));
-        if (g.k == K_B) return g.n == 1 ? C_HIT : C_DROP;
-        if (g.k != K_D) return C_DROP;
-        // the operator itself is true for a hit of the window when not neg
-        g = CadlNormsEval.evaluateWith(data, tm.root, n, tm.node, Val(K_B, tm.neg ? int256(0) : int256(1), ""));
-        return g.k == K_B && g.n == 1 ? C_LIVE : C_DEAD;
+        (uint256 ts, uint256 ds) = CadlNormsEval.table(data, tm.root, n, tm.node, type(uint256).max);
+        if (ts & 1 != 0) return C_HIT;
+        if (ds & 1 == 0) return C_DROP;
+        bool l = ts >> X_T & 1 != 0;
+        bool f = ts >> X_F & 1 != 0;
+        return l ? (f ? C_BOTH : C_LIVE) : (f ? C_DUAL : C_DEAD);
     }
 
     /// The operands at observation n (0 false, 1 true, 2 unknown), once per
-    /// observation; with neg, p is negated (Kleene).
+    /// observation.
     function operands(Window storage w, EvalData storage data, Temporal storage tm, uint256 n)
             internal returns (uint8 pv, uint8 qv) {
         if (w.at == n + 1) return (w.pv, w.qv);
         pv = code(CadlNormsEval.evaluate(data, tm.tp, n, n));
-        if (tm.neg && pv != U) pv = pv == T ? F : T;
         qv = tm.mode == W_UNTIL ? code(CadlNormsEval.evaluate(data, tm.tq, n, n)) : 0;
         w.at = n + 1;
         w.pv = pv;
@@ -655,6 +804,18 @@ library CadlNormsWindows {
         if (mode == W_WITHIN) return w.ftSet && w.t[last] + d >= w.ft;
         if (mode == W_UNTIL) {
             return w.jSet && (!w.pSet || w.j <= w.pFirst) && clean(w, last) && w.t[last] + d >= w.jt;
+        }
+        if (mode == W_RELEASE) {
+            // p false at ffi inside the window of the newest candidate, with
+            // q false before it and at it
+            if (w.ffSet && w.t[last] + d >= w.ff && (!w.luqSet || w.k[last] > w.luq)
+                && (!w.qnSet || w.qn > w.ffi)) return true;
+            // or a window that is over before p was false, with q false in it
+            int256 lim = t;
+            if (w.ffSet && w.ff < lim) lim = w.ff;
+            if (w.qnSet && w.qnt < lim) lim = w.qnt;
+            uint256 i = firstAfterK(w, w.luqSet, w.luq);
+            return i < w.tail && w.t[i] + d < lim;
         }
         // throughout: the newest candidate whose window ended before the
         // first value that is not true, and before now
@@ -781,7 +942,7 @@ struct NormDef {
     string severity; bool hasSanction; string sanction; int256 reparation;
     bool hasReparationId; string reparationId; bool hasTransition; string transition;
     uint256[] activate; uint256[] suspend; uint256[] resume; uint256[] discharge;
-    // a content with a temporal operator (see `temporals`), else 0
+    // a content with a temporal operator (1, see `temporals`), or none (0)
     uint8 tmode;
 }
 struct Rule { string creates; bool broken; int256 when; int256 cond; }
@@ -813,8 +974,7 @@ struct Monitor {
     // by norm, for a content with a temporal operator: the operator, and
     // the candidates that are true with it and those that are never true
     mapping(uint256 => Temporal) temporals;
-    mapping(uint256 => Window) windows;
-    mapping(uint256 => Window) deadWindows;
+    mapping(uint256 => Windows) windows;
     // --- the state of the contract instance
     uint256 observations;      // observations of the instance so far
     int256 lastT;
@@ -844,8 +1004,7 @@ function setSt(Monitor storage m, uint256 i, uint8 st, uint256 n, int256 t) {
     if (st == VIOLATED) r.verdict = m.failed ? V_EXCUSED : V_VIOLATED;
     else if (st == FULFILLED || st == DISCHARGED) r.verdict = V_FULFILLED;
     if (st >= FULFILLED) {
-        m.windows[i].head = m.windows[i].tail;
-        m.deadWindows[i].head = m.deadWindows[i].tail;
+        CadlNormsWindows.clear(m.windows[i]);
     }
 }
 
@@ -1298,7 +1457,7 @@ abstract contract CadlNormsMonitorBase {
         for (uint256 i = 0; i < m.normDefs.length; i++) {
             NormDef storage d = m.normDefs[i];
             if (d.tmode == 0 || d.frozen) continue;
-            CadlNormsWindows.note(m.windows[i], m.deadWindows[i], m.data, m.temporals[i], n, t);
+            CadlNormsWindows.note(m.windows[i], m.data, m.temporals[i], n, t);
         }
         uint256[] memory violated = judge(n, t, msgs, created);
         for (uint256 v = 0; v < violated.length; v++) onViolation(violated[v], n, t, true);
@@ -1356,7 +1515,7 @@ abstract contract CadlNormsMonitorBase {
 
     function judgeWindow(uint256 i, uint256 n, int256 t, bool open) internal returns (bool hit, bool closed) {
         bool empty;
-        (hit, empty) = CadlNormsWindows.judge(m.windows[i], m.deadWindows[i], m.data, m.temporals[i], n, t, open);
+        (hit, empty) = CadlNormsWindows.judge(m.windows[i], m.data, m.temporals[i], n, t, open);
         closed = !hit && !open && empty;
     }
 
@@ -1400,7 +1559,7 @@ abstract contract CadlNormsMonitorBase {
             bool inForce = r.state == ACTIVE || r.state == SUSPENDED;
             if (inForce && r.act == int256(n)) { setSt(m, i, DISCHARGED, n, t); continue; }
             if (inForce && (d.kind == OBLIGATION || d.kind == PROHIBITION)
-                && (m.windows[i].head < m.windows[i].tail || m.deadWindows[i].head < m.deadWindows[i].tail)) continue;
+                && CadlNormsWindows.pending(m.windows[i])) continue;
             if (inForce && d.kind == OBLIGATION) {
                 if (!d.hasDeadline) { setSt(m, i, VIOLATED, n, t); late[c++] = i; }
                 else if (elapsed(m, i, t) <= d.deadline) setSt(m, i, DISCHARGED, n, t);
@@ -1482,11 +1641,10 @@ abstract contract CadlNormsMonitorBase {
         r.act = -1;
     }
 
-    function _temporal(uint8 mode, bool neg, uint256 tp, uint256 tq, int256 td, uint256 node,
-                       uint256 root) internal {
+    function _temporal(uint8 mode, uint256 tp, uint256 tq, int256 td, uint256 node, uint256 root) internal {
         uint256 i = m.normDefs.length - 1;
-        m.normDefs[i].tmode = mode;
-        m.temporals[i] = Temporal(mode, neg, tp, tq, td, node, root);
+        m.normDefs[i].tmode = 1;
+        m.temporals[i] = Temporal(mode, tp, tq, td, node, root);
     }
 
     function _actor(string memory name, bool isIndexed_, bool hasLo, int256 lo, bool hasHi, int256 hi) internal {
