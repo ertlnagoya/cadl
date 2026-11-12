@@ -1749,6 +1749,7 @@ class _NormInst:
         self.activated_index: int | None = None
         self.active_since: float | None = None
         self.elapsed_before: Any = 0       # active time before the current stretch
+        self.elapsed_start: Any = 0        # active time counted at activation (transform)
         self.judge_from = 0
         self.candidates: list[int] = []    # observations whose content is undecided
         self.time: float | None = None
@@ -1763,6 +1764,24 @@ class _NormInst:
         if self.state == "active" and self.active_since is not None:
             return self.elapsed_before + (t - self.active_since)
         return self.elapsed_before
+
+    def closed_at(self, t: float) -> Any:
+        """The time at which the active time reached the deadline, from the
+        stretches of the history (also those before an amendment and a
+        suspension); None if it has not."""
+        acc, start = self.elapsed_start, None
+        if acc >= self.deadline:
+            first = next((h["t"] for h in self.history if h["state"] == "active"), None)
+            return first
+        for h in self.history + [{"t": t, "from": self.state, "state": None}]:
+            if start is not None and h["from"] == "active" and h["state"] != "active":
+                if acc + (h["t"] - start) >= self.deadline:
+                    return start + (self.deadline - acc)
+                acc += h["t"] - start
+                start = None
+            if h["state"] == "active" and start is None:
+                start = h["t"]
+        return None
 
 
 # === The engine ============================================================
@@ -2040,6 +2059,7 @@ class _Engine:
                 effect(o.d.id, "transform", state, "discharged", f"transformed to {target}")
                 timed = x.d.kind in ("obligation", "prohibition")
                 x.elapsed_before = elapsed if timed else 0
+                x.elapsed_start = x.elapsed_before
                 self._set(x, n, "active", f"amendment: transformed from {o.d.id}", log=False)
                 note = f" with {_fmt_t(elapsed)}s already elapsed" if timed else ""
                 effect(target, "activated", "inactive", "active",
@@ -2061,7 +2081,7 @@ class _Engine:
         inst = _NormInst(nd, self.events, self.ev)
         self._warn_frozen(inst)
         for attr in ("state", "verdict", "activated_at", "activated_index", "active_since",
-                     "elapsed_before", "judge_from", "time", "history"):
+                     "elapsed_before", "judge_from", "time", "history", "elapsed_start"):
             setattr(inst, attr, getattr(o, attr))
         if not inst.frozen:
             inst.reason = o.reason
@@ -2299,7 +2319,9 @@ class _Engine:
                         self._set(norm, n, "violated", f"content {verb}{at}: {norm.content.text}")
                         violated.append(norm)
                 elif not open_ and not norm.candidates:
-                    due = t - (elapsed - norm.deadline)
+                    due = norm.closed_at(t)
+                    if due is None:
+                        due = t - (elapsed - norm.deadline)
                     if kind == "obligation":
                         self._set(norm, n, "violated",
                                   f"deadline of {_fmt_t(norm.deadline)}s passed at "

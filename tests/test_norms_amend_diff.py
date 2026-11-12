@@ -262,24 +262,55 @@ def test_late_prohibition_is_fulfilled_by_the_amendment(pause_at):
     assert "fulfilled when the new version takes effect" in text
 
 
+WATCH = """\
+        - {id: hot, kind: prohibition, bearer: R, content: "throughout(2s, R.v > %(v)s)"%(d)s}
+        - id: duty
+          kind: obligation
+          bearer: R
+          content: "throughout(2s, R.v > %(v)s)"
+          deadline: %(dd)s
+          on_violation: {reparation: rep}
+        - {id: rep, kind: obligation, bearer: R, content: "R -> D : sorry", deadline: 2s}
+        - id: hold
+          kind: power
+          bearer: D
+          content: "D -> R : pause"
+          effects: {suspend: [hot, duty]}
+        - id: go
+          kind: power
+          bearer: D
+          content: "D -> R : resume"
+          effects: {resume: [hot, duty]}
+"""
+W1 = WATCH % {"v": 5, "d": "", "dd": "10s"}
+W2 = WATCH % {"v": 5, "d": ", deadline: 1s", "dd": "1s"}     # late, same content
+W3 = WATCH % {"v": 6, "d": ", deadline: 1s", "dd": "1s"}     # late, content changed
+
+
 def _model_pairs():
+    """(name, old, new, step, horizon, random paths, all paths up to)."""
     v1, v2 = _versions()
-    yield "pause", v1, v2
+    yield "pause", v1, v2, "1s", 6, 300, 3
     for kind, d1 in (("prohibition", ""), ("obligation", ", deadline: 10s")):
-        yield kind, parse(HEAD + HOT % (kind, d1)), parse(HEAD + HOT % (kind, ", deadline: 2s"))
+        yield (kind, parse(HEAD + HOT % (kind, d1)), parse(HEAD + HOT % (kind, ", deadline: 2s")),
+               "500ms", 6, 300, 3)
+    # suspended with a candidate decided while suspended (ht_/sf_), and a
+    # content that changes (its candidates are dropped)
+    yield "suspended", parse(HEAD + W1), parse(HEAD + W2), "500ms", 12, 400, 0
+    yield "content changed", parse(HEAD + W1), parse(HEAD + W3), "500ms", 12, 400, 0
 
 
 def check_models_of_late_norms():
-    """The model of F.12 against norms-eval on the pairs above: every path
-    of at most three observations, and random paths of seven observations
-    that amend with probability 0.3 at each and seldom end early, so that
-    the instance goes on after the amendment."""
-    for name, v1, v2 in _model_pairs():
-        m = build_model(v1, versions=[("v2", v2)], step="500ms" if name != "pause" else "1s",
-                        horizon=6)
+    """The model of F.12 against norms-eval on the pairs above: every short
+    path, and random full-length paths that amend with probability 0.25 to
+    0.3 at each observation, so that the instance goes on after the
+    amendment."""
+    for name, v1, v2, step, horizon, count, short in _model_pairs():
+        m = build_model(v1, versions=[("v2", v2)], step=step, horizon=horizon)
         pm = PrismModel(m.prism_text(), {"early_end": True})
-        paths = all_paths(m.tr, 3) + random_paths(m.tr, 300, seed=5, p_amend=0.3,
-                                                  p_message=0.4, full_length=True, p_keep=0.5)
+        paths = (all_paths(m.tr, short) if short else []) + random_paths(
+            m.tr, count, seed=5 if short else 11, p_amend=0.3 if short else 0.25,
+            p_message=0.4, full_length=True, p_keep=0.5)
         for p in paths:
             d = compare_path(m, pm, p)
             assert not d, (name, d, p)
@@ -295,6 +326,11 @@ IR_MUTANTS = {
         "elif False:"),
     "pending candidates are ignored": (
         "if o.id in slots and nd.content_text == o.content_text:", "if False:"),
+    "pending ignores candidates decided while suspended": (
+        'pending = ir.OR(ir.V(f"ht_{stem}"), ir.V(f"sf_{stem}"),',
+        "pending = ir.OR(ir.FALSE, ir.FALSE,"),
+    "pending kept when the content changes": (
+        "if o.id in slots and nd.content_text == o.content_text:", "if o.id in slots:"),
 }
 
 
@@ -303,6 +339,37 @@ def test_model_mutants_are_detected(mutant, monkeypatch):
     _patch(monkeypatch, NormsModel, "_amend_ir", *IR_MUTANTS[mutant])
     with pytest.raises(AssertionError):
         check_models_of_late_norms()
+
+
+C_TRACE = ['{"t": 0, "values": {"R.v": 7}}',
+           '{"t": 1.5, "messages": [{"from": "D", "to": "R", "name": "pause"}]}',
+           '{"t": 1.8, "values": {"R.v": 0}}', '{"t": 3, "amend": "new"}']
+
+
+def test_candidate_decided_while_suspended():
+    """The candidate of t=0 is decided false at t=1.8 while the instance is
+    suspended; it is still pending at the amendment (step 4 has not judged
+    it), so the late norms stay suspended. Resumed at t=4, step 4 decides
+    them, and the reason gives the time at which the window of 1s closed
+    (t=1), not a time computed from the last stretch (t=3.5 up to the
+    review). Never resumed, they end pending (F.5)."""
+    v1, v2 = parse(HEAD + W1), parse(HEAD + W2)
+    resumed = C_TRACE + ['{"t": 4, "messages": [{"from": "D", "to": "R", "name": "resume"}]}',
+                         '{"t": 5}']
+    r = evaluate(v1, parse_trace(resumed), versions={"new": v2})
+    n = {x["id"]: x for x in r["norms"]}
+    assert {e["norm"]: e["to_state"] for e in r["amendments"][0]["effects"]} == {
+        "hot": "suspended", "duty": "suspended", "hold": "active", "go": "active"}
+    assert (n["hot"]["state"], n["hot"]["time"]) == ("fulfilled", 4)
+    assert n["hot"]["reason"] == "window of 1s closed at t=1 without the content"
+    assert (n["duty"]["state"], n["duty"]["reason"]) == (
+        "violated", "deadline of 1s passed at t=1 without the content")
+    plain = evaluate(v2, parse_trace([x for x in resumed if "amend" not in x]))
+    assert [(x["state"], x["reason"]) for x in plain["norms"][:2]] == [
+        (n["hot"]["state"], n["hot"]["reason"]), (n["duty"]["state"], n["duty"]["reason"])]
+    never = evaluate(v1, parse_trace(C_TRACE + ['{"t": 5}']), versions={"new": v2})
+    assert [(x["state"], x["verdict"]) for x in never["norms"][:2]] == [
+        ("suspended", "pending")] * 2
 
 
 @pytest.mark.parametrize("kind", ["prohibition", "obligation"])

@@ -25,6 +25,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `deadline: 10s` and `R.v = 6` from t=0, amended at t=2.5 to `deadline:
   2s`, was violated at t=2.5, while the new version from the start
   fulfils it at t=4.
+- The reason of a norm decided because its window closed or its deadline
+  passed gives the time at which the active time reached the deadline,
+  computed from the active stretches of the norm (also before a
+  suspension and an amendment). It was computed from the last stretch
+  only, so that a norm resumed after a suspension said, for example,
+  "closed at t=3.5" for a window that closed at t=1.
 - `cadl norms-diff` reports every norm whose `on_amendment:` is
   `discharge` (finding `discharge`), gives the kind of a `transform:`
   target (`target_kind`), compares deadlines exactly (two numeric
