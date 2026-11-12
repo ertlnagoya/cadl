@@ -17,6 +17,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   instances start at the first observation. Conflicts that need
   instances with different starts are found, such as the one of the new
   example `examples/norms_check_starts.cadl`.
+- `cadl norms-check` translates amendments together with several
+  instances (`--version` with `--instance` / `--instances`): one
+  amendment applies at the same observation to every instance that runs
+  there, as `cadl norms-eval` applies the `amend` line of each trace; an
+  instance that starts after an amendment is an instance of the new
+  version, and its witness names that file (`files`). Example:
+  `examples/norms_check_amend_v1.cadl` and `norms_check_amend_v2.cadl`.
 
 ## [0.3.27] — 2026-11-12
 

@@ -36,6 +36,9 @@ from cadl.norms_check import (
     build_model,
     check,
     compare_path,
+    base_file,
+    base_version,
+    ABSENT,
     instance_span,
     format_text,
     prism_expr,
@@ -439,6 +442,61 @@ norms:
     content: "R[i] -> D : answer"
     deadline: 1s
 """
+
+# amendments together with several instances (F.12): two versions with a
+# carried-over deadline and reparation, a transform, a new norm without
+# trigger, and an assumption replaced by another one
+AM_MULTI_V1 = """\
+assume:
+  - "throughout(2s, R[i].ok == true)"
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 2s
+    on_violation: {reparation: repair}
+  - id: repair
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 1s
+  - id: start_duty
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 3s
+    on_amendment: {transform: new_duty}
+"""
+AM_MULTI_V2 = """\
+assume:
+  - "within(2s, R[i].ok == true)"
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 1s
+    on_violation: {reparation: repair}
+  - id: repair
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 2s
+  - id: new_duty
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 2s
+  - id: fresh
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 1s
+"""
+
 
 def make_sos(body: str):
     sos = parse(HEAD + textwrap.indent(body, "      "))
@@ -901,10 +959,97 @@ def test_amendment_refusals():
     other = make_sos(AM_V2.replace("kind: prohibition", "kind: obligation", 1))
     with pytest.raises(NormsCheckError, match="changes its kind"):
         build_model(v1, bindings={"i": 1}, versions=[("o.cadl", other)])
-    with pytest.raises(NormsCheckError, match="not translated together"):
-        build_model(v1, members=["R=2"], instances=[{"i": 1}, {"i": 2}],
-                    versions=[("v2.cadl", make_sos(AM_V2))])
 
+
+
+def _amend_multi_model():
+    key = ("AMEND_MULTI", "")
+    if key not in _MODELS:
+        v1, v2 = make_sos(AM_MULTI_V1), make_sos(AM_MULTI_V2)
+        m = build_model(v1, members=["R=2"], instances=[{"i": 1}, {"i": 2}],
+                        versions=[("v2.cadl", v2)])
+        _MODELS[key] = ((v1, v2), m, PrismModel(m.prism_text(), {"early_end": True}))
+    return _MODELS[key]
+
+
+def test_amendments_of_several_instances_differential():
+    """--version with several instances: one amendment applies to every
+    running instance at the same observation (each trace has the amend
+    line at that observation); an instance that starts after it is an
+    instance of the new version (its trace is evaluated with that file)."""
+    (v1, v2), m, pm = _amend_multi_model()
+    tr = m.tr
+    assert m.versioned and m.staggered
+    assert [n.uid for n in m.norms] == [
+        "carry@1", "repair@1", "start_duty@1", "new_duty@1", "fresh@1",
+        "carry@2", "repair@2", "start_duty@2", "new_duty@2", "fresh@2"]
+    paths = (random_paths(tr, PATHS * 3, seed=51, instances=2, p_amend=0.3)
+             + random_paths(tr, PATHS * 2, seed=52, p_message=0.15, p_end=0.05, instances=2,
+                            p_amend=0.2, p_keep=0.7)
+             + random_paths(tr, PATHS, seed=53, full_length=True, instances=2, p_amend=0.2,
+                            p_start=0.15))
+    late, effects = 0, set()
+    for p in paths:
+        assert not compare_path(m, pm, p), p
+        late += any(base_version(t, p) > 0 for t in m.trs)
+        for t in m.trs:
+            for a in evaluate_path(t, p).get("amendments", []):
+                effects.update((e["norm"], e["effect"]) for e in a["effects"])
+    assert late >= PATHS
+    assert {("carry", "carry_over"), ("start_duty", "transform"), ("new_duty", "activated"),
+            ("fresh", "added")} <= effects
+    # the amendment at observation 1 reaches instance 1 (running) and not
+    # instance 2, which starts at observation 2 as an instance of v2
+    a = len(tr.choices)
+    p = [(0, 1 << 2), (a, 0), (0, 2 << 2), (0, 3)]
+    assert not compare_path(m, pm, p)
+    assert [json.loads(x).get("amend") for x in trace_lines(m.trs[0], p)] == [
+        None, "v2.cadl", None, None]
+    assert all("amend" not in x for x in trace_lines(m.trs[1], p))
+    assert base_file(m.trs[1], p) == "v2.cadl" and base_file(m.trs[0], p) is None
+    states = run_path(pm, p)
+    assert states[2]["st_k2_2_start_duty"] == ABSENT          # not a norm of v2
+    assert states[2]["st_k2_4_fresh"] == ACTIVE               # active at the start
+
+
+def test_three_versions_of_several_instances():
+    """A sequence of amendments with two instances: an instance that
+    starts after the first amendment is an instance of version 2, and
+    its trace names only the later amendment."""
+    v1 = load_version(str(EXAMPLES / "norms_check_amend_v1.cadl"))
+    v2 = load_version(str(EXAMPLES / "norms_check_amend_v2.cadl"))
+    m = build_model(v1, members=["ROBOT=2"], instances=2,
+                    versions=[("v2.cadl", v2), ("v3.cadl", v1)])
+    pm = PrismModel(m.prism_text(), {"early_end": True})
+    tr = m.tr
+    paths = (random_paths(tr, PATHS * 2, seed=61, instances=2, p_amend=0.35)
+             + random_paths(tr, PATHS, seed=62, instances=2, p_amend=0.25, p_start=0.15,
+                            p_end=0.05))
+    late = 0
+    for p in paths:
+        assert not compare_path(m, pm, p), p
+        late += any(base_version(t, p) == 1 and any(
+            "amend" in x for x in trace_lines(t, p)) for t in m.trs)
+    assert late >= 2
+
+@needs_prism
+def test_conflicts_after_one_amendment_of_several_instances():
+    v1 = load_version(str(EXAMPLES / "norms_check_amend_v1.cadl"))
+    v2 = str(EXAMPLES / "norms_check_amend_v2.cadl")
+    m = build_model(v1, members=["ROBOT=2"], instances=2, versions=[v2])
+    report = check(m, PRISM)
+    assert report["unconfirmed"] == []
+    pairs = {tuple(c["norms"]) for c in report["conflicts"]}
+    assert {("serve@1", "curfew@2"), ("curfew@1", "serve@2")} <= pairs
+    for c in report["conflicts"]:
+        for w in c["witnesses"]:
+            assert w["confirmed"]
+            amends = {k: [json.loads(x).get("amend") for x in lines]
+                      for k, lines in w["traces"].items()}
+            # the instances running at the amendment are amended at the same time
+            times = {k: [json.loads(x)["t"] for x, a in zip(w["traces"][k], v) if a]
+                     for k, v in amends.items()}
+            assert len({tuple(t) for t in times.values() if t}) == 1
 
 
 AM_SMALL_V1 = """\
@@ -1648,3 +1793,4 @@ def test_cli_refusal():
     p = cli(str(ROBOT), "--step", "3s")
     assert p.returncode == 2
     assert "does not divide" in p.stderr
+

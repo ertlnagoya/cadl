@@ -3401,8 +3401,6 @@ def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=Non
     step_ms = _parse_duration_ms(step) if isinstance(step, str) else step
     if not isinstance(domains, dict):
         domains = _parse_domains(domains)
-    if versions and instances:
-        raise NormsCheckError("--version and several instances are not translated together")
     if isinstance(instances, int):
         instances = _numbered_instances(sos, contract, bindings, members, instances)
     if instances:
@@ -3413,6 +3411,13 @@ def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=Non
                                   f"together")
         trs = [Translator(sos, contract, {**bindings, **b}, members, step_ms, horizon, domains)
                for b in sets]
+        if versions:
+            # one amendment applies to every running instance at the same
+            # observation: each instance has the same sequence of versions
+            vts = [_version_translators(t, sos, contract, versions, {**bindings, **b}, members,
+                                        step_ms, horizon, domains) for t, b in zip(trs, sets)]
+            Environment(trs + [v for vt in vts for v in vt], step_ms, horizon)
+            return NormsModel(trs, versions=vts, starts=starts)
         Environment(trs, step_ms, horizon)
         return NormsModel(trs, starts=starts)
     tr = Translator(sos, contract, bindings, members, step_ms, horizon, domains)

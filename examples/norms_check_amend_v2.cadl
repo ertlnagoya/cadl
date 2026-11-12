@@ -1,0 +1,47 @@
+# Norms Extension Demo: Amendments of Several Contract Instances (F.12), version 2
+#
+# The new version of norms_check_amend_v1.cadl: it adds the curfew, a
+# prohibition without trigger that is active from the amendment on.
+
+sos:
+  name: "GateAccess"
+  type: Acknowledged
+  version: "2.0.0"
+  description: "Access to one gate shared by the robots of a fleet (version 2)."
+  extensions:
+    - norms: 0.1
+
+  actors:
+    - id: GATE
+      role: "access_control"
+      autonomy: low
+      capabilities: [grant_access]
+      interface:
+        input:  [request]
+        output: [grant]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities: [deliver]
+      interface:
+        input:  [grant]
+        output: [request]
+
+  contracts:
+    - id: ACCESS
+      parties: [GATE, "ROBOT[*]"]
+
+      norms:
+        - id: serve
+          kind: obligation
+          bearer: GATE
+          counterparty: "ROBOT[i]"
+          trigger: "ROBOT[i] -> GATE : request"
+          content: "GATE -> ROBOT[i] : grant"
+          deadline: 2s
+        - id: curfew
+          kind: prohibition
+          bearer: GATE
+          content: "GATE -> ROBOT[*] : grant"
+          deadline: 2s
