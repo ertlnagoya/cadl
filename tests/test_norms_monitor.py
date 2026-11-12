@@ -206,7 +206,10 @@ class TestGeneratedModule:
         """The evaluation code is not a second implementation: every line
         between the monitor-runtime marks of norms_eval.py is in the
         generated module, in order."""
-        text = (ROOT / "src" / "cadl" / "norms_eval.py").read_text(encoding="utf-8")
+        # The module that is imported, so that the test also runs against an
+        # installed package, where the repository's src/ is not present.
+        import cadl.norms_eval as norms_eval_module
+        text = Path(norms_eval_module.__file__).read_text(encoding="utf-8")
         runtime = runtime_source()
         inside, regions, current = False, [], []
         for line in text.splitlines():
