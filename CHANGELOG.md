@@ -6,6 +6,49 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- The Solidity norms monitor decides `NOT until(p, q, d)` through the
+  release of ¬p and ¬q (Appendix D, D.5, which proves the duality in
+  Kleene's three-valued logic with undefined values). A norm with one
+  temporal operator keeps three queues of candidates: those that hold
+  when the operator is true, those that hold when it is false (the dual
+  operator on the negated operands), and those that wait for it.
+- The Solidity monitor decides a temporal operator inside a comparison
+  or `IN` (`within(3s, p) == flag`, `until(p, q, 3s) <= A.y`): the content
+  is read at the observation of a candidate with the operator undecided,
+  true and false (`CadlNormsEval.table`), which says which queue the
+  candidate joins.
+- The Solidity monitor decides a content with two temporal operators,
+  also a comparison of the two, with the new library `CadlNormsMulti`:
+  the candidates are the leaves of a segment tree in storage whose nodes
+  record, for each state of the two operators and each future they can
+  reach, whether a candidate holds and whether one is undecided; an
+  observation decides each operator for a few ranges of candidates,
+  propagated lazily, in steps that grow with the logarithm of the number
+  of candidates. At one observation per second into 1000 s windows an
+  observation costs 5.9 × 10^5 gas at the 320th and at the 1000th
+  observation (one operator: 4.4 to 5.2 × 10^5). A content with three or more temporal
+  operators is refused, with the reason.
+- Differential tests of these contents against `cadl norms-eval` on OPA
+  and on the EVM (random traces with suspension, reparations, undefined
+  values and epoch timestamps, traces at the boundaries of the summaries,
+  and long traces), gas tests at 320 observations, and
+  `scripts/norms_monitor_mutations.py`, which runs 14 mutants of the
+  temporal parts of the Solidity monitor against these traces on the EVM
+  (each one gives a verdict that differs from `cadl norms-eval`).
+
+### Changed
+
+- The Solidity monitor keeps its model and state in one struct in storage
+  (`Monitor`), and the new library `CadlNormsActs` holds the events,
+  messages, counts-as rules and powers. The runtime code of the main
+  contract goes from 23.7 KB to 16.3 KB (estimate 16 840 bytes, more
+  than 7 KB below EIP-170); the gas of an observation of the example of
+  F.8 is unchanged (6.4 × 10^5). The libraries are deployed and linked
+  in the order `CadlNormsValues`, `CadlNormsEval`, `CadlNormsWindows`,
+  `CadlNormsMulti`, `CadlNormsItems`, `CadlNormsActs`.
+
 ## [0.3.27] — 2026-11-12
 
 Resolves the remaining verification items. The strategic export is run
