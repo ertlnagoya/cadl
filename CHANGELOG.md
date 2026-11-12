@@ -44,6 +44,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   CI installs PRISM-games 3.2.4 (Linux x86-64 release, pinned by its
   SHA-256) for Python 3.12.
 
+- `tests/test_agent_policy_diff.py`: agent-cedar (with the cedar CLI)
+  and agent-rego (with OPA) compared with `cadl agents-decide` on one
+  input space: three variants of a file with two enforced contracts,
+  every message of 12 senders, 9 receivers and 9 names without
+  `instances` and with 16 instance sets (49,572 inputs), and random
+  files with one to three enforced contracts, static and non-static
+  norms, `default: allow`, `deny` or omitted, escalation, fallbacks and
+  delegations. The Cedar answer must equal the decision for the message
+  alone on the contracts without their non-static norms, and the
+  decision for the full input in the cases of G.10; each reason for
+  which G.10 leaves an input to the runtime is shown to be needed.
+  `CADL_AGENT_POLICY_FILES` and `CADL_AGENT_POLICY_OPA_ALL=1` set the
+  long run.
+- `tests/test_norms_amend_diff.py`: `cadl norms-diff` against what `cadl
+  norms-eval` does at an amendment, for every norm instance, on random
+  pairs of versions made from the bundled examples and random traces
+  from the models of `cadl norms-check`, with injected errors that the
+  comparison must detect (16 in the two commands, 2 in the model of
+  `cadl norms-check`). `CADL_NORMS_AMEND_PAIRS` sets the number
+  of pairs.
+
 ### Fixed
 
 - `cadl model-export` of a strategic model writes every player, a player
@@ -52,6 +73,44 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   PRISM-games 3.2.4 rejects ("SMG model has no player definitions"), and
   a player that was not written could not be named in a coalition
   (I.11).
+
+- Amendments (F.6): a carried-over obligation or prohibition whose
+  elapsed time exceeds its new deadline is decided when the new version
+  takes effect, before step 1, also when it is suspended (an obligation
+  `violated`, a prohibition `fulfilled`), unless a candidate of its
+  temporal content is still pending; then it stays in force and step 4
+  decides it when the candidates are decided, which gives the verdict of
+  the new version applied from the start. Applied in `cadl norms-eval`,
+  the Python monitor and the model of `cadl norms-check`. Up to 0.3.26 a
+  late prohibition stayed active until step 4 (so that a power at the
+  same observation could suspend it) and a suspended one stayed
+  suspended; and a late obligation was violated at the amendment even
+  when a pending candidate fulfilled it later. Reproducers: a prohibition
+  without deadline, suspended at t=3 and amended at t=5 to `deadline:
+  2s`, stayed suspended; an obligation `throughout(3s, R.v > 5)` with
+  `deadline: 10s` and `R.v = 6` from t=0, amended at t=2.5 to `deadline:
+  2s`, was violated at t=2.5, while the new version from the start
+  fulfils it at t=4.
+- The reason of a norm decided because its window closed or its deadline
+  passed gives the time at which the active time reached the deadline,
+  computed from the active stretches of the norm (also before a
+  suspension and an amendment). It was computed from the last stretch
+  only, so that a norm resumed after a suspension said, for example,
+  "closed at t=3.5" for a window that closed at t=1.
+- `cadl norms-diff` reports every norm whose `on_amendment:` is
+  `discharge` (finding `discharge`), gives the kind of a `transform:`
+  target (`target_kind`), compares deadlines exactly (two numeric
+  deadlines that round to the same millisecond were reported as equal;
+  the changes now carry `old_s` and `new_s` in seconds), and says for a
+  shorter deadline what happens to an obligation or a prohibition, also
+  a suspended one, whose elapsed time exceeds it. It no longer reports
+  `discharge` for a norm that the new version removes.
+- The README comment of `-t agent-cedar` said that a Deny by the forbid
+  of a static prohibition is final. It is not when the contract has no
+  running instance and the message is not a tool call: the contract then
+  decides by its default (G.5, step 3.1). The comment now states the
+  three cases of G.10 in which the Cedar answer is the decision.
+
 
 ## [0.3.26] — 2026-11-12
 

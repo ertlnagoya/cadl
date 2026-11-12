@@ -15,7 +15,9 @@ version asks), ``warning`` (running instances are affected) or ``info``.
 from __future__ import annotations
 
 from .ast_nodes import ContractDef, NormDef, SoSDefinition
-from .norms_eval import NormsEvalError, _fmt_d, _targets_of
+from fractions import Fraction
+
+from .norms_eval import NormsEvalError, _deadline, _targets_of
 
 _FIELDS = ("bearer", "counterparty", "trigger", "until", "on_violation", "effects",
            "on_amendment", "transform_to")
@@ -23,6 +25,31 @@ _FIELDS = ("bearer", "counterparty", "trigger", "until", "on_violation", "effect
 
 def _finding(level: str, kind: str, text: str, **more) -> dict:
     return {"level": level, "kind": kind, **more, "text": text}
+
+
+def _decimal_text(v: Fraction) -> str:
+    """A finite decimal fraction as text, exactly, without a precision
+    limit (a deadline is one: written in decimal or in milliseconds)."""
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    k = 0
+    while (v * 10 ** k).denominator != 1:
+        k += 1
+    digits = str((v * 10 ** k).numerator).rjust(k + 1, "0")
+    if k == 0:
+        return sign + digits
+    whole, frac = digits[:-k], digits[-k:].rstrip("0")
+    return sign + whole + ("." + frac if frac else "")
+
+
+def _seconds(d: NormDef) -> str | None:
+    """The deadline of a norm in seconds, exactly, as text (None: none)."""
+    v = _deadline(d)
+    return None if v is None else _decimal_text(v)
+
+
+def _fmt_s(text: str | None) -> str:
+    return "none" if text is None else f"{text}s"
 
 
 def _policy(d: NormDef) -> str:
@@ -38,6 +65,11 @@ def _diff_contract(old: ContractDef, new: ContractDef) -> list[dict]:
     for nid, o in old_norms.items():
         n = new_norms.get(nid)
         policy = o.on_amendment
+        if policy == "discharge" and n is not None:
+            out.append(_finding(
+                "info", "discharge",
+                f"{nid}: on_amendment is discharge; an active or suspended instance is "
+                f"discharged", norm=nid))
         if policy == "transform":
             target = o.transform_to
             if target not in new_norms:
@@ -50,8 +82,9 @@ def _diff_contract(old: ContractDef, new: ContractDef) -> list[dict]:
                 out.append(_finding(
                     "info", "transform",
                     f"{nid}: an active instance is discharged and {target} "
-                    f"({new_norms[target].kind}, deadline {_fmt_d(new_norms[target].deadline_ms)}) "
-                    f"is activated with the time already elapsed", norm=nid, target=target))
+                    f"({new_norms[target].kind}, deadline {_fmt_s(_seconds(new_norms[target]))}) "
+                    f"is activated with the time already elapsed", norm=nid, target=target,
+                    target_kind=new_norms[target].kind))
         if n is None:
             level = "warning" if policy == "carry_over" else "info"
             tail = ("an active instance is discharged, an inactive one removed"
@@ -70,15 +103,27 @@ def _diff_contract(old: ContractDef, new: ContractDef) -> list[dict]:
         changed = {}
         if o.content.strip() != n.content.strip():
             changed["content"] = {"old": o.content, "new": n.content}
-        if o.deadline_ms != n.deadline_ms:
-            changed["deadline"] = {"old": _fmt_d(o.deadline_ms), "new": _fmt_d(n.deadline_ms)}
+        old_d, new_d = _deadline(o), _deadline(n)
+        old_s, new_s = _seconds(o), _seconds(n)
+        if old_d != new_d:
+            # exactly, as norms-eval reads them (F.5): two numeric deadlines
+            # that round to the same millisecond still differ
+            changed["deadline"] = {"old": _fmt_s(old_s), "new": _fmt_s(new_s),
+                                   "old_s": old_s, "new_s": new_s}
         if changed and policy == "carry_over" and o.kind == n.kind:
             parts = [f"{k} changes from '{v['old']}' to '{v['new']}'" for k, v in changed.items()]
             tail = ""
-            if ("deadline" in changed and n.deadline_ms is not None and n.kind == "obligation"
-                    and (o.deadline_ms is None or n.deadline_ms < o.deadline_ms)):
-                tail = ("; an active instance whose elapsed time exceeds the new deadline is "
-                        "violated when the new version takes effect")
+            shorter = ("deadline" in changed and new_d is not None
+                       and (old_d is None or new_d < old_d))
+            pending = ("; one with a pending candidate of its temporal content is decided "
+                       "by that candidate (step 4)")
+            if shorter and n.kind == "obligation":
+                tail = ("; an active or suspended instance whose elapsed time exceeds the new "
+                        "deadline is violated when the new version takes effect" + pending)
+            elif shorter and n.kind == "prohibition":
+                tail = ("; an active or suspended instance whose elapsed time exceeds the new "
+                        "deadline is fulfilled when the new version takes effect, because "
+                        "its window has closed" + pending)
             out.append(_finding(
                 "warning", "carry_over_changed",
                 f"{nid}: carries over, and {'; '.join(parts)}{tail}", norm=nid, changes=changed))
