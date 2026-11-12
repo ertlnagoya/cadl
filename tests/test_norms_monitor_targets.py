@@ -920,7 +920,9 @@ RANGE_ITEMS = ("      guarantee:\n        - \"A.x > 0\"\n        - \"A.x == 0.00
 @needs_opa
 @pytest.mark.parametrize("number", ["1e-7", "1E-7", "-0.0", "1e400", "1e-400", "1e-700",
                                     "123456789012345678901234567890.5", "0e5000",
-                                    "1" + "0" * 300, "1" + "0" * 400])
+                                    "1" + "0" * 300, "1" + "0" * 400, "1e308",
+                                    "1.7976931348623157e308", "-1.7976931348623157e308",
+                                    "1.7976931348623158e308", "1e309", "1" + "0" * 308])
 def test_opa_range_of_exact_numbers(number, tmp_path):
     """p12 of the review: the scales of 10^-309 and below used to compare as
     equal in Rego. Inside the range of F.5 OPA agrees with norms-eval,
@@ -931,6 +933,38 @@ def test_opa_range_of_exact_numbers(number, tmp_path):
     got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]), monitor_package("C"),
                     [lines], refs, tmp_path)
     assert S.compare(refs, got) == []
+
+
+@needs_opa
+@pytest.mark.parametrize("number", ["1e-5", "1e-700", "1.7976931348623157e308", "1e309",
+                                    "1" + "0" * 308, "1" + "0" * 309])
+def test_opa_range_of_request_and_bindings(number, tmp_path):
+    """p15 of the review: the request and the bindings are checked like the
+    observation, whether they come with the first observation or as
+    input.request / input.bindings."""
+    sos = _small("      guarantee:\n        - \"request.x > 0\"\n        - \"A.z == 1\"\n")
+    rego = generate_norms_monitor_rego(sos, sos.contracts[0])
+    lines = ['{"t": 0, "request": {"x": %s}, "values": {"A.z": 1}}' % number,
+             '{"t": 1, "end": true}']
+    refs = [S.reference(sos, lines)]
+    got = S.run_opa(rego, monitor_package("C"), [lines], refs, tmp_path)
+    assert S.compare(refs, got) == []
+    refused = "error" in refs[0]
+    assert refused == (number in ("1e-700", "1e309", "1" + "0" * 309))
+    # a binding is an integer: the other numbers are refused for that
+    for key in ("request", "bindings") if number.isdigit() else ("request",):
+        tmp = tmp_path / key
+        tmp.mkdir()
+        (tmp / "m.rego").write_text(rego, encoding="utf-8")
+        (tmp / "in.json").write_text(
+            '{"state": null, "observation": {"t": 0, "values": {"A.z": 1}, "end": true}, '
+            '"%s": {"x": %s}}' % (key, number), encoding="utf-8")
+        proc = subprocess.run([S.opa_binary(), "eval", "-d", str(tmp / "m.rego"), "-i",
+                               str(tmp / "in.json"), "--format", "json",
+                               f"data.{monitor_package('C')}.result"],
+                              capture_output=True, text=True)
+        out = json.loads(proc.stdout)["result"][0]["expressions"][0]["value"]
+        assert ("outside the range" in (out.get("error") or "")) == refused, (key, out)
 
 
 def test_rego_refuses_a_product_beyond_its_scales():
@@ -975,7 +1009,7 @@ def test_runtime_estimate_is_above_solc(tmp_path):
     from cadl.codegen.solidity.norms_monitor_sol import RUNTIME_ESTIMATE, RUNTIME_LIMIT
     sos = parse_file(RICH)
     text = generate_norms_monitor_sol(sos, sos.contracts[0])
-    assert "pragma solidity >=0.8.24 <0.9.0;" in text
+    assert "pragma solidity >=0.8.24 <=0.8.37;" in text
     for runs in (1, 200):
         compiled = S.compile_solidity(text, "CNormsMonitor", tmp_path / str(runs), runs=runs)
         for name, c in compiled.items():

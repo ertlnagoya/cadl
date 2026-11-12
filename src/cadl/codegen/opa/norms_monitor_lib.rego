@@ -21,13 +21,16 @@ _D := {"$": "undecided"}
 _MAX_T := {"$q": [9007199254740992, 0]}
 
 # The range of the exact numbers, as in cadl norms-eval (F.5): at most 400
-# significant digits, at most 400 decimals, an absolute value below 10^308.
+# significant digits, at most 400 decimals, an absolute value of at most
+# 1.7976931348623157e308 (the largest finite double, _MAX_ABS).
 # The scales of the model are below 4096 (cadl codegen refuses a product
 # that could exceed it), so that pow10 and the operations below are
 # defined for every number the monitor computes with.
 _LIMIT := 400
 
 _MAX_SCALE := 4095
+
+_MAX_ABS := {"$q": [17976931348623157 * pow10(292), 0]}
 
 _NUM_RE := `^(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$`
 
@@ -100,7 +103,13 @@ digit_chunk(s, i) := to_number(substring(s, i * 18, 18)) * pow10(rest) if {
 # A number of the input as the decimal it is written as (its JSON text):
 # n / 10^k with mantissa digits m and exponent e of its last digit.
 # Undefined outside the range of the exact numbers.
-dec(v) := {"$q": [0, 0]} if {
+dec(v) := q if {
+	q := dec_digits(v)
+	qle(q, _MAX_ABS)
+	qle({"$q": [0 - qn(_MAX_ABS), 0]}, q)
+}
+
+dec_digits(v) := {"$q": [0, 0]} if {
 	m := regex.find_all_string_submatch_n(_NUM_RE, json.marshal(v), 1)[0]
 	trim_left(concat("", [m[2], m[3]]), "0") == ""
 	exp_of(m[4]) - count(m[3]) >= 0 - _LIMIT
@@ -126,7 +135,7 @@ in_range(mant, e) if {
 	nd := count(trim_left(mant, "0"))
 	nd <= _LIMIT
 	e >= 0 - _LIMIT
-	nd + e <= 308
+	nd + e <= 309
 }
 
 
@@ -1377,13 +1386,22 @@ errs[6] := sprintf("time %v is before the previous observation (%v)", [obs.t, qf
 	qcmp(tq, S.t) < 0
 }
 
-errs[16] := "a number of the observation is outside the range of exact numbers (at most 400 significant digits, at most 400 decimals, an absolute value below 10^308)" if {
+errs[16] := _RANGE_ERR if {
 	not finishing
 	is_object(obs)
 	walk(obs, [_, x])
 	is_number(x)
 	not dec(x)
+} else := _RANGE_ERR if {
+	not finishing
+	first
+	some src in [B, R]
+	walk(src, [_, x])
+	is_number(x)
+	not dec(x)
 }
+
+_RANGE_ERR := "a number of the observation, its request or its bindings is outside the range of exact numbers (at most 400 significant digits, at most 400 decimals, an absolute value of at most 1.7976931348623157e308)"
 
 errs[7] := sprintf("'%s' is allowed only on the first line", [key]) if {
 	not finishing

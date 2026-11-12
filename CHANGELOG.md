@@ -70,8 +70,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - `cadl codegen -t solidity` refuses a norms monitor whose estimated
   runtime code exceeds the 24576 bytes of EIP-170 (the estimate is
   above what solc 0.8.24 to 0.8.37 gives with 1 or 200 runs). The
-  pragma is `>=0.8.24 <0.9.0`, the versions checked are 0.8.24 to
-  0.8.37.
+  pragma is `>=0.8.24 <=0.8.37`, the versions checked.
 - Numbers and times are exact (Appendix F, F.5). `cadl norms-eval`, the
   generated `norms_monitor.py` and `cadl agents-run` read a number of a
   trace as the decimal number it is written as (a float of the API as
@@ -90,10 +89,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   monitor is unchanged. For the inputs that meet their limits, the
   three monitors agree with `cadl norms-eval`.
 - A number of a trace with more than 400 significant digits, more than
-  400 decimals or an absolute value of 10^308 or more is a trace error
+  400 decimals or an absolute value above 1.7976931348623157e308 (the
+  largest finite double, so every float is inside) is a trace error
   with its line in `cadl norms-eval`, the generated `norms_monitor.py`,
   `cadl agents-run` and the Rego monitor (F.5 lets a processor refuse
-  them); `{"t": 1e-100000000}` used to run without end. A predicate
+  them; the Rego monitor checks the request and the bindings it is
+  given too); `{"t": 1e-100000000}` used to run without end. A predicate
   with such a literal is not evaluated. The Rego monitor builds powers
   of ten by squaring, so scales of 309 and more no longer compare as
   equal, and refuses a product that could have more than 4095

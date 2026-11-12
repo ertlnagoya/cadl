@@ -1614,11 +1614,11 @@ class TestExactNumbers:
 
 class TestRangeOfNumbers:
     """Exact numbers have a range (F.5): at most 400 significant digits,
-    at most 400 decimals, an absolute value below 10^308. A number of a
+    at most 400 decimals, an absolute value of at most 1.7976931348623157e308. A number of a
     trace outside it is a trace error with its line; written exactly it
     would take time and memory without bound."""
 
-    @pytest.mark.parametrize("number", ["1e-100000000", "1e-401", "1e308", "1e400",
+    @pytest.mark.parametrize("number", ["1e-100000000", "1e-401", "1.7976931348623158e308", "1e309", "1e400",
                                         "1" + "0" * 400, "0." + "1" * 401])
     def test_refused_with_the_line(self, number):
         import time
@@ -1627,7 +1627,9 @@ class TestRangeOfNumbers:
             parse_trace(['{"t": 0}', '{"t": 1, "values": {"A.x": %s}}' % number])
         assert time.time() - start < 1
 
-    @pytest.mark.parametrize("number", ["1e-400", "9.99e307", "1" + "0" * 300, "0e5000", "-0.0"])
+    @pytest.mark.parametrize("number", ["1e-400", "9.99e307", "1" + "0" * 300, "0e5000", "-0.0",
+                                        "1e308", "1.7976931348623157e308",
+                                        "-1.7976931348623157e308"])
     def test_accepted(self, number):
         parse_trace(['{"t": 0, "values": {"A.x": %s}}' % number])
 

@@ -189,12 +189,15 @@ class _Written(float):
 
 # The range of the exact numbers (F.5): at most NUMBER_LIMIT significant
 # digits, at most NUMBER_LIMIT digits after the decimal point, and an
-# absolute value below 10**308 (the floats of JSON). A number outside it
+# absolute value of at most MAX_ABS, the largest finite double (every float
+# of JSON and of the API is inside it). A number outside it
 # is refused: written exactly, 1e-100000000 takes time and memory without
 # bound.
 NUMBER_LIMIT = 400
+MAX_ABS = "1.7976931348623157e308"
+_MAX_ABS = Decimal(MAX_ABS)
 _RANGE_TEXT = (f"at most {NUMBER_LIMIT} significant digits, at most {NUMBER_LIMIT} "
-               f"decimals and an absolute value below 10**308")
+               f"decimals and an absolute value of at most {MAX_ABS}")
 
 
 class NumberRangeError(ValueError):
@@ -208,7 +211,7 @@ def _in_range(d: Decimal) -> bool:
     while len(digits) > 1 and digits[0] == 0:
         digits = digits[1:]
     return (len(digits) <= NUMBER_LIMIT and exp >= -NUMBER_LIMIT
-            and (digits == (0,) or len(digits) + exp <= 308))
+            and (digits == (0,) or (len(digits) + exp <= 309 and abs(d) <= _MAX_ABS)))
 
 
 def _checked(text: str) -> Decimal:
