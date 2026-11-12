@@ -6,6 +6,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Equilibrium maps (`cadl game-check --certify`) bound the one-step
+  advantages of PD+ and PD− also by a coupled relaxation (I.9), in
+  designs whose probabilities are multi-affine in the open parameters:
+  the play after the deviating command and the play after the profile's
+  command move together, with the same corner of the cell in each step
+  and a joint distribution that keeps them in the same state where it
+  can and otherwise takes corresponding updates together. The largest
+  and least values of this process on pairs bound the advantage at
+  every valuation of the cell. The coupled bounds are computed only for
+  a player that E1, E2, PD+, N and PD− leave open, only for PD+ when the
+  player does not gain more than ε at the centre of the cell and only
+  for PD− otherwise, and only where both plays reach states whose values
+  depend on the valuation. The second three-parameter example of I.14
+  (λ, κ, p_fail, CENTRALIZED, `comply_if_watched`) now reaches the
+  resolution 0.1 within the default budget: 13 853 cells analysed
+  instead of 39 999, 0.100 undecided instead of 0.200, 52 s instead of
+  127 s in the same measurement. The first three-parameter example and
+  the maps of I.12 are unchanged. `games_eval.USE_COUPLING = False`
+  gives the maps of 0.3.27.
+- `tests/games_fuzz.py` checks the coupled bounds directly against the
+  advantages of the independent oracle at sample points, counts the
+  players decided by them, and has three new deliberate soundness bugs
+  (`coupling_swap_sides`, `coupling_drop_first_payoff`,
+  `coupling_drop_later_payoffs`) and the option `--no-direct`;
+  `tests/test_games_coupling.py` tests the coupled bounds.
+
 ## [0.3.27] — 2026-11-12
 
 Resolves the remaining verification items. The strategic export is run
