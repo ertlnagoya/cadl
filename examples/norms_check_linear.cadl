@@ -1,0 +1,68 @@
+# Norms Extension Demo: Linear Arithmetic in Design-Time Checking (F.12)
+#
+# over_capacity compares the sum of the loads of the robots and twice the
+# reserve of the depot with its capacity; spread compares the average load
+# with the smallest one; exact_third needs a reserve of one third of a
+# capacity of 1, which no number of a trace is (a JSON number is a finite
+# decimal), so it is never violated. The arithmetic is linear, so no
+# --domain is needed: the numbers are the points of the regions of the
+# linear arrangement of these comparisons, and the answers hold for every
+# trace:
+#
+#   cadl norms-check examples/norms_check_linear.cadl --members ROBOT=2
+#
+# The product of two quantities in no_oversize is not linear: its
+# quantities get a domain inferred from the literals, which the report
+# states as an assumption (give --domain to choose another one).
+
+sos:
+  name: "DepotLinear"
+  type: Acknowledged
+  version: "0.1.0"
+  description: "Loads of delivery robots against the capacity of a depot."
+  extensions:
+    - norms: 0.1
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities: [monitor_fleet]
+      interface:
+        output: [rebalance]
+
+    - id: DEPOT
+      role: "storage"
+      autonomy: low
+      capabilities: [store]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities: [follow_path, deliver]
+      interface:
+        input: [rebalance]
+
+  contracts:
+    - id: DEPOT_LOADS
+      parties: [DISPATCHER, DEPOT, "ROBOT[*]"]
+
+      norms:
+        - id: over_capacity
+          kind: prohibition
+          bearer: DISPATCHER
+          content: "sum(r.load for r in ROBOT) + 2 * DEPOT.reserve > DEPOT.capacity"
+        - id: spread
+          kind: obligation
+          bearer: DISPATCHER
+          trigger: "DISPATCHER -> ROBOT[1] : rebalance"
+          content: "avg(r.load for r in ROBOT) - min(r.load for r in ROBOT) <= 0.5"
+          deadline: 2s
+        - id: exact_third
+          kind: prohibition
+          bearer: DISPATCHER
+          content: "3 * DEPOT.reserve == DEPOT.capacity AND DEPOT.capacity == 1"
+        - id: no_oversize
+          kind: prohibition
+          bearer: DISPATCHER
+          content: "ROBOT[1].length * ROBOT[1].width > 6"

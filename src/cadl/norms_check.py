@@ -560,6 +560,8 @@ class Quantity:
     atoms: set = field(default_factory=set)     # (op, literal), ("in", literals), ("truth",)
     raw: bool = False      # its value is used otherwise than in an atom
     domain: tuple | None = None     # (lo, hi) of --domain, for arithmetic
+    assumed: bool = False  # the domain is inferred from the literals, not given
+    linear: bool = False   # used in linear arithmetic without a domain
     order: int = 1         # quantities compared with each other in its group
     list_order: int = 1    # quantities ordered (<, <=, >, >=) against each other
 
@@ -715,6 +717,65 @@ class Choice:
 
 class _Refuse(Exception):
     pass
+
+
+class _NonLinear(Exception):
+    """Arithmetic that is not linear in the quantities without a domain."""
+
+
+def _ladd(x: tuple, y: tuple) -> tuple:
+    c = dict(x[0])
+    for k, v in y[0].items():
+        c[k] = c.get(k, Fraction(0)) + v
+        if c[k] == 0:
+            del c[k]
+    return c, x[1] + y[1]
+
+
+def _lscale(x: tuple, f: Any) -> tuple:
+    f = Fraction(f)
+    if f == 0:
+        return {}, Fraction(0)
+    return {k: v * f for k, v in x[0].items()}, x[1] * f
+
+
+def _ldedupe(xs: list) -> list:
+    out, seen = [], set()
+    for x in xs:
+        key = (tuple(sorted(x[0].items())), x[1])
+        if key not in seen:
+            seen.add(key)
+            out.append(x)
+    return out
+
+
+def _inferred_domain(expr: Any) -> tuple:
+    """The integers from below the smallest to above the largest numeric
+    literal of a predicate (and 0): a domain assumed for nonlinear
+    arithmetic without --domain (F.12)."""
+    nums = [Fraction(0)]
+
+    def walk(e: Any) -> None:
+        if isinstance(e, BoolLiteral):
+            return
+        if isinstance(e, IntLiteral):
+            nums.append(Fraction(e.value))
+        elif isinstance(e, FloatLiteral):
+            from .norms_eval import _literal_number
+            nums.append(Fraction(_literal_number(e)))
+        if hasattr(e, "__dict__"):
+            for v in vars(e).values():
+                for x in (v if isinstance(v, list) else [v]):
+                    if hasattr(x, "__dict__"):
+                        walk(x)
+
+    walk(expr)
+    return math.floor(min(nums)) - 1, math.ceil(max(nums)) + 1
+
+
+def expr_text_short(expr: Any) -> str:
+    text = _expr_text(expr)
+    return repr(text if len(text) <= 60 else text[:57] + "...")
 
 
 
@@ -1235,7 +1296,7 @@ class Translator:
                       "links": [], "order_links": []}
         self._cond(expr, {}, info)
         if info["domain"]:
-            self._needs_domain(info["domain"])
+            self._arith(expr, info["domain"])
         self.links += info["links"]
         self.order_links += info["order_links"]
         for k, cs in info["consts"].items():
@@ -1257,15 +1318,171 @@ class Translator:
                 return dom
         return None
 
-    def _needs_domain(self, keys: set) -> None:
-        missing = sorted(k for k in keys if self.domain_of(k) is None)
-        if missing:
-            raise _Refuse(
-                f"arithmetic, sum or avg uses {', '.join(missing)} without a finite domain: "
-                f"give one with --domain (such as --domain {missing[0]}=0..10); the answers "
-                f"then hold for traces whose numbers for it are integers in that range")
+    def _arith(self, expr: Any, keys: set) -> None:
+        """Quantities used in arithmetic, sum or avg (F.12): a quantity with
+        --domain takes the integers of its domain; when the arithmetic of
+        the predicate is linear in the other quantities, they take the
+        numbers of the regions of the linear arrangement (exact, computed
+        by the environment); otherwise they get a domain inferred from the
+        literals of the predicate, which the report states as an
+        assumption."""
         for k in keys:
-            self._quantity(k).domain = self.domain_of(k)
+            if self.domain_of(k) is not None:
+                self._quantity(k).domain = self.domain_of(k)
+        missing = sorted(k for k in keys if self.domain_of(k) is None)
+        if not missing:
+            return
+        fixed = {k: Fraction(1) for k in self.quantities if self.domain_of(k) is not None}
+        try:
+            self.lin_cond(expr, {}, fixed, [])
+        except _NonLinear as e:
+            lo, hi = _inferred_domain(expr)
+            for k in missing:
+                q = self._quantity(k)
+                q.domain = (lo, hi)
+                q.assumed = True
+            self._note(
+                f"{expr_text_short(expr)} is not linear ({e}): {', '.join(missing)} "
+                f"take{'s' if len(missing) == 1 else ''} the integers {lo}..{hi}, a domain "
+                f"assumed from the literals of the predicate (as --domain "
+                f"{missing[0]}={lo}..{hi}); the answers hold only for traces whose numbers "
+                f"for {'it' if len(missing) == 1 else 'them'} are such integers. Give "
+                f"--domain to choose another one")
+            return
+        for k in missing:
+            self._quantity(k).linear = True
+
+    # --- linear forms (F.12) ------------------------------------------------
+    #
+    # A linear form is (coefficients, constant): sum of c * quantity +
+    # constant. `lin` gives the alternatives of the value of a numeric
+    # expression (several for min, max and count), or None when the value
+    # is not a number (undefined, a text or a name); `lin_cond` collects
+    # the forms whose signs decide every comparison and condition of a
+    # predicate. `fixed` gives the values of the quantities that are not
+    # variables of the arrangement.
+
+    def _lin_key(self, e: MemberAccess, scope: dict, fixed: dict) -> Any:
+        keys = self._member_keys(e, scope)
+        if len(keys) != 1:
+            return None                # no member: undefined (F.5)
+        k = next(iter(keys))
+        if k not in fixed:
+            return [({k: Fraction(1)}, Fraction(0))]
+        v = fixed[k]
+        if isinstance(v, bool):
+            # an ordering compares true as 1 (arithmetic refuses it: this
+            # only refines the arrangement)
+            return [({}, Fraction(int(v)))]
+        if isinstance(v, (int, float, Fraction)):
+            return [({}, exact_value(v))]
+        return None
+
+    def lin(self, e: Any, scope: dict, fixed: dict, forms: list) -> Any:
+        from .ast_nodes import Comprehension, QuantifiedExpr
+        if isinstance(e, BoolLiteral):
+            return [({}, Fraction(int(e.value)))]
+        if isinstance(e, FloatLiteral):
+            from .norms_eval import _literal_number
+            return [({}, Fraction(_literal_number(e)))]
+        if isinstance(e, IntLiteral):
+            return [({}, Fraction(e.value))]
+        if isinstance(e, StringLiteral):
+            return None
+        if isinstance(e, UnaryOp) and e.op == "-":
+            a = self.lin(e.operand, scope, fixed, forms)
+            return None if a is None else [_lscale(x, -1) for x in a]
+        if isinstance(e, ActorRef) and e.index is None:
+            if e.name in scope and scope[e.name][0] is None:
+                return [({}, Fraction(v)) for v in scope[e.name][1]]
+            if e.name in self.bindings and not isinstance(self.bindings[e.name], str):
+                return [({}, Fraction(self.bindings[e.name]))]
+            return None
+        if isinstance(e, MemberAccess):
+            return self._lin_key(e, scope, fixed)
+        if isinstance(e, BinaryOp) and e.op in ("+", "-", "*", "/"):
+            a = self.lin(e.left, scope, fixed, forms)
+            b = self.lin(e.right, scope, fixed, forms)
+            if a is None or b is None:
+                return None
+            out = []
+            for x in a:
+                for y in b:
+                    if e.op == "+":
+                        out.append(_ladd(x, y))
+                    elif e.op == "-":
+                        out.append(_ladd(x, _lscale(y, -1)))
+                    elif e.op == "*":
+                        if x[0] and y[0]:
+                            raise _NonLinear("a product of two quantities")
+                        out.append(_lscale(y, x[1]) if not x[0] else _lscale(x, y[1]))
+                    else:
+                        if y[0]:
+                            raise _NonLinear("a division by a quantity")
+                        if y[1] != 0:
+                            out.append(_lscale(x, 1 / y[1]))
+            return _ldedupe(out) or None
+        if isinstance(e, FunctionCall) and e.name in AGGREGATES and len(e.args) == 1 \
+                and isinstance(e.args[0], Comprehension):
+            comp = e.args[0]
+            group, values = self._domain_values(comp.domain, True)
+            inner = [{**scope, comp.variable: (group, [v])} for v in values]
+            if e.name == "count":
+                for sc in inner:
+                    self.lin_cond(comp.element, sc, fixed, forms)
+                return [({}, Fraction(j)) for j in range(len(values) + 1)]
+            elems = [self.lin(comp.element, sc, fixed, forms) for sc in inner]
+            if e.name in ("min", "max"):
+                # min and max of the defined elements (F.5): an expression
+                # built from them with +, -, scaling, min and max is a min
+                # and max of its alternatives, so its sign is decided by
+                # the signs of the alternatives
+                elems = [x for x in elems if x is not None]
+                return _ldedupe([x for el in elems for x in el]) or None
+            if any(x is None for x in elems):
+                return None
+            if not elems:
+                return None if e.name == "avg" else [({}, Fraction(0))]
+            total = [({}, Fraction(0))]
+            for el in elems:
+                total = _ldedupe([_ladd(x, y) for x in total for y in el])
+                if len(total) > 256:
+                    raise _NonLinear("too many alternatives")
+            if e.name == "avg":
+                total = [_lscale(x, Fraction(1, len(elems))) for x in total]
+            return total
+        if isinstance(e, (BinaryOp, UnaryOp, QuantifiedExpr)):
+            # a condition used as a value: its own comparisons
+            self.lin_cond(e, scope, fixed, forms)
+            return None
+        if isinstance(e, ActorRef):
+            return None
+        raise _NonLinear(f"{type(e).__name__} in arithmetic")
+
+    def lin_cond(self, e: Any, scope: dict, fixed: dict, forms: list) -> None:
+        from .ast_nodes import QuantifiedExpr
+        if isinstance(e, BinaryOp) and e.op in ("AND", "OR"):
+            self.lin_cond(e.left, scope, fixed, forms)
+            self.lin_cond(e.right, scope, fixed, forms)
+        elif isinstance(e, UnaryOp) and e.op == "NOT":
+            self.lin_cond(e.operand, scope, fixed, forms)
+        elif isinstance(e, QuantifiedExpr):
+            group, values = self._domain_values(e.domain, False)
+            for v in values:
+                self.lin_cond(e.predicate, {**scope, e.variable: (group, [v])}, fixed, forms)
+        elif isinstance(e, BinaryOp) and e.op in ("==", "!=", "<", "<=", ">", ">="):
+            a = self.lin(e.left, scope, fixed, forms)
+            if isinstance(e.right, FunctionCall) and e.right.name == "__in__":
+                items = [self.lin(x, scope, fixed, forms) for x in e.right.args]
+            else:
+                items = [self.lin(e.right, scope, fixed, forms)]
+            for b in items:
+                if a is not None and b is not None:
+                    forms += [_ladd(x, _lscale(y, -1)) for x in a for y in b]
+        else:
+            a = self.lin(e, scope, fixed, forms)
+            if a is not None:
+                forms += a                  # a number as a condition: zero or not
 
     def _parse_pred(self, text: str) -> Any:
         from .parser import parse_rule
@@ -1657,6 +1874,8 @@ class Environment:
                 g.atoms |= q.atoms
                 g.raw = g.raw or q.raw
                 g.domain = g.domain or q.domain
+                g.assumed = g.assumed or q.assumed
+                g.linear = g.linear or q.linear
         self._collect_atoms()
         self._time(step_ms, horizon)
         self._choices()
@@ -1670,6 +1889,77 @@ class Environment:
     def _note(self, text: str) -> None:
         if text not in self.notes:
             self.notes.append(text)
+
+    def _too_many(self, ids: list, keys: list, size: int) -> None:
+        sizes = ", ".join(f"{k} ({len(self.quantities[k].reps)} classes)" for k in keys)
+        sets = sorted({m.group(1) for k in keys
+                       for m in [re.match(r"([A-Za-z_]\w*)\[\d+\]", k)] if m})
+        raise NormsCheckError(
+            f"the predicates {', '.join(repr(self.preds[i].text) for i in ids)} read "
+            f"{sizes}: {size} combinations together, and norms-check refuses more than "
+            f"{MAX_VALUATIONS}. Use fewer --members"
+            + (f" ({', '.join(sets)})" if sets else "")
+            + " or, for quantities used in arithmetic, a smaller --domain")
+
+    def _linear_valuations(self, ids: list, keys: list) -> list:
+        """The valuations of a component with linear arithmetic (F.12): each
+        quantity without a domain is a number (a variable of the linear
+        arrangement) or one of its classes that are not numbers; a quantity
+        with a domain takes its classes. For every such choice, one decimal
+        point in every face of the arrangement of the forms of the
+        predicates, with the other values fixed."""
+        free = [k for k in keys if self.quantities[k].domain is None]
+        NUM = object()
+
+        def is_number(v: Any) -> bool:
+            return isinstance(v, (int, float, Fraction)) and not isinstance(v, bool)
+
+        options = []
+        for k in keys:
+            reps = self.quantities[k].reps
+            options.append([v for v in reps if not is_number(v)] + [NUM] if k in free else reps)
+        seen: dict = {}
+        cache: dict = {}
+        total = 0
+        for combo in itertools.product(*options):
+            _generation_time()
+            fixed = {k: v for k, v in zip(keys, combo) if v is not NUM}
+            variables = [k for k, v in zip(keys, combo) if v is NUM]
+            forms: list = []
+            for i in ids:
+                p = self.preds[i]
+                p.owner.lin_cond(p.expr, {}, fixed, forms)
+            norm = {f for f in (_lnorm(f) for f in forms) if f is not None}
+            key = (frozenset(norm), tuple(variables))
+            points = cache.get(key)
+            if points is None:
+                budget = [MAX_VALUATIONS - total]
+                try:
+                    cells = _cad(norm, variables, budget)
+                except _TooMany:
+                    cells = None
+                if cells is None:
+                    self._too_many(ids, keys, MAX_VALUATIONS + 1)
+                ordered = sorted(norm)
+                by_face: dict = {}
+                for c in cells:
+                    face = tuple(_sign(_leval(f, c)) for f in ordered)
+                    by_face.setdefault(face, c)
+                points = []
+                for c in by_face.values():
+                    q = _decimal_in_face(ordered, c, variables)
+                    if q is not None:
+                        points.append({k: _num(v) for k, v in q.items()})
+                cache[key] = points
+            total += max(1, len(points))
+            if total > MAX_VALUATIONS:
+                self._too_many(ids, keys, total)
+            for pt in points:
+                vals = {**fixed, **pt}
+                vec = tuple(self._value(i, vals) for i in ids)
+                if vec not in seen:
+                    seen[vec] = vals
+        return list(seen.items())
 
     def _value(self, pid: int, vals: dict) -> str:
         p = self.preds[pid]
@@ -1816,13 +2106,6 @@ class Environment:
                     dom = self.quantities[other].domain
                     if dom is not None and other != k:
                         q.consts.update(range(dom[0], dom[1] + 1))
-        for q in self.quantities.values():
-            q.reps = self.trs[0]._reps(q)
-        for q in self.quantities.values():
-            if q.domain is not None:
-                self._note(f"{q.key} takes the integers {q.domain[0]}..{q.domain[1]} of --domain "
-                           f"and the values that are not numbers: the answers hold for traces in "
-                           f"which its numbers are such integers")
         # components of predicates that share quantities
         parent = list(range(len(self.preds)))
 
@@ -1842,6 +2125,24 @@ class Environment:
         groups: dict = {}
         for i in range(len(self.preds)):
             groups.setdefault(find(i), []).append(i)
+        # a component with linear arithmetic over a quantity without a
+        # domain: the numbers of its quantities without a domain are the
+        # points of the faces of the linear arrangement (F.12)
+        linear_ids = set()
+        for ids in groups.values():
+            keys = set().union(*(self.preds[i].keys for i in ids))
+            if any(self.quantities[k].linear and self.quantities[k].domain is None
+                   for k in keys):
+                linear_ids.add(min(ids))
+                for k in keys:
+                    self.quantities[k].raw = True
+        for q in self.quantities.values():
+            q.reps = self.trs[0]._reps(q)
+        for q in self.quantities.values():
+            if q.domain is not None and not q.assumed:
+                self._note(f"{q.key} takes the integers {q.domain[0]}..{q.domain[1]} of --domain "
+                           f"and the values that are not numbers: the answers hold for traces in "
+                           f"which its numbers are such integers")
         self.constant_preds: dict = {}
         self.components: list = []      # (pred ids, [(vector, valuation)])
         for ids in groups.values():
@@ -1850,19 +2151,14 @@ class Environment:
                 for i in ids:
                     self.constant_preds[i] = self._value(i, {})
                 continue
+            if min(ids) in linear_ids:
+                self.components.append((ids, self._linear_valuations(ids, keys)))
+                continue
             size = 1
             for k in keys:
                 size *= len(self.quantities[k].reps)
             if size > MAX_VALUATIONS:
-                sizes = ", ".join(f"{k} ({len(self.quantities[k].reps)} classes)" for k in keys)
-                sets = sorted({m.group(1) for k in keys
-                               for m in [re.match(r"([A-Za-z_]\w*)\[\d+\]", k)] if m})
-                raise NormsCheckError(
-                    f"the predicates {', '.join(repr(self.preds[i].text) for i in ids)} read "
-                    f"{sizes}: {size} combinations together, and norms-check refuses more than "
-                    f"{MAX_VALUATIONS}. Use fewer --members"
-                    + (f" ({', '.join(sets)})" if sets else "")
-                    + " or, for quantities used in arithmetic, a smaller --domain")
+                self._too_many(ids, keys, size)
             seen: dict = {}
             for count_, combo in enumerate(
                     itertools.product(*(self.quantities[k].reps for k in keys))):
@@ -1894,6 +2190,170 @@ class Environment:
 
 
 
+
+
+
+# === Regions of a linear arrangement (F.12) ================================
+#
+# For quantities used in linear arithmetic without a domain, the numbers
+# of a trace are cut by the hyperplanes form = 0 of the linear forms of
+# the predicates. Every predicate has one value on each face of this
+# arrangement (a set of points with the same sign of every form), so one
+# point per face that holds a value of a trace suffices. The faces are
+# found by a cylindrical decomposition: the last variable is eliminated by
+# taking, besides the forms without it, the differences of the roots of
+# the forms with it; a point in every cell of the projection is extended
+# by the roots in the last variable and a point below, between and above
+# them. A value of a trace is an integer or a float, that is a finite
+# decimal: a point of a face with other coordinates is moved to a decimal
+# point of the same face, or the face is left out when it holds none.
+
+def _lnorm(f: tuple) -> Any:
+    """A form scaled so that its first coefficient is 1 (None: constant)."""
+    co, c = f
+    if not co:
+        return None
+    lead = co[min(co)]
+    return tuple(sorted((k, v / lead) for k, v in co.items())), c / lead
+
+
+def _leval(f: tuple, p: dict) -> Fraction:
+    co, c = f
+    return sum((v * p[k] for k, v in co), Fraction(0)) + c
+
+
+def _sign(x: Fraction) -> int:
+    return (x > 0) - (x < 0)
+
+
+def _short_between(a: Fraction, b: Fraction) -> Fraction:
+    """A short decimal strictly between a and b (a < b)."""
+    for digits in range(0, 200):
+        t = (a + b) / 2
+        c = Fraction(round(t * 10 ** digits), 10 ** digits)
+        if a < c < b:
+            return c
+    return (a + b) / 2
+
+
+def _cad(forms: set, variables: list, budget: list) -> list:
+    """Points (dicts) in every cell of the arrangement of the normalized
+    forms over the variables."""
+    if not variables:
+        return [{}]
+    x = variables[-1]
+    with_x, proj = [], set()
+    for co, c in forms:
+        d = dict(co)
+        if x in d:
+            cx = d.pop(x)
+            with_x.append(({k: -v / cx for k, v in d.items()}, -c / cx))
+        else:
+            proj.add((co, c))
+    for i in range(len(with_x)):
+        for j in range(i + 1, len(with_x)):
+            f = _lnorm(_ladd(with_x[i], _lscale(with_x[j], -1)))
+            if f is not None:
+                proj.add(f)
+    out = []
+    for p in _cad(proj, variables[:-1], budget):
+        roots = sorted({sum((v * p[k] for k, v in co.items()), Fraction(0)) + c
+                        for co, c in with_x})
+        if not roots:
+            samples = [Fraction(0)]
+        else:
+            samples = [Fraction(math.floor(roots[0]) - 1)]
+            for i, r in enumerate(roots):
+                samples.append(r)
+                if i + 1 < len(roots):
+                    samples.append(_short_between(r, roots[i + 1]))
+            samples.append(Fraction(math.ceil(roots[-1]) + 1))
+        for s in samples:
+            out.append({**p, x: s})
+        budget[0] -= len(samples)
+        if budget[0] < 0:
+            raise _TooMany()
+    return out
+
+
+class _TooMany(Exception):
+    pass
+
+
+def _coprime10(n: int) -> int:
+    for q in (2, 5):
+        while n % q == 0:
+            n //= q
+    return n
+
+
+def _decimal_in_face(forms: list, p: dict, variables: list) -> dict | None:
+    """A point with finite decimal coordinates in the face of p (the points
+    where every form has the sign it has at p), or None when the face
+    holds none. The face is open in its affine hull (the forms that are 0
+    at p are 0); the decimal points of the hull, when there are any, are
+    dense in it, so they are found by a congruence modulo the part of the
+    denominators prime to 10 and approached to p."""
+    if all(_is_decimal(p[v]) for v in variables):
+        return p
+    sig = [_sign(_leval(f, p)) for f in forms]
+    # the hull: the forms that are 0 at p, in reduced row echelon form
+    rows = [dict(f[0]) | {None: f[1]} for f, s in zip(forms, sig) if s == 0]
+    pivots: list = []
+    for v in variables:
+        r = next((row for row in rows if row.get(v, 0) != 0 and row not in
+                  [pr for _pv, pr in pivots]), None)
+        if r is None:
+            continue
+        a = r[v]
+        for k in list(r):
+            r[k] = r[k] / a
+        for other in rows:
+            if other is not r and other.get(v, 0) != 0:
+                f = other[v]
+                for k, val in r.items():
+                    other[k] = other.get(k, Fraction(0)) - f * val
+        pivots.append((v, r))
+    piv = {v for v, _r in pivots}
+    free = [v for v in variables if v not in piv]
+    # x_pivot = -(const + sum of coef * free)
+    expr = {v: ({f: -r.get(f, Fraction(0)) for f in free}, -r.get(None, Fraction(0)))
+            for v, r in pivots}
+
+    def point(t: dict) -> dict:
+        out = dict(t)
+        for v, (co, c) in expr.items():
+            out[v] = c + sum((co[f] * t[f] for f in free), Fraction(0))
+        return out
+
+    def same_face(q: dict) -> bool:
+        return all(_sign(_leval(f, q)) == s for f, s in zip(forms, sig))
+
+    den = 1
+    for co, c in expr.values():
+        for x in list(co.values()) + [c]:
+            den = math.lcm(den, x.denominator)
+    m = _coprime10(den)
+    if not free:
+        q = point({})
+        return q if all(_is_decimal(q[v]) for v in variables) else None
+    if m ** len(free) > 4096:
+        return None
+    for n in range(0, 60):
+        scale = 10 ** n
+        # residues of t * 10^n modulo m that give decimal pivots
+        for res in itertools.product(range(m), repeat=len(free)):
+            t = {f: Fraction(r, scale) for f, r in zip(free, res)}
+            if not all(_is_decimal(x) for x in point(t).values()):
+                continue
+            # the decimal point of this class nearest to p
+            t = {f: Fraction(r + m * round((p[f] * scale - r) / m), scale)
+                 for f, r in zip(free, res)}
+            q = point(t)
+            if same_face(q) and all(_is_decimal(q[v]) for v in variables):
+                return q
+            break
+    return None
 
 
 
@@ -4009,6 +4469,14 @@ def _report_head(model: NormsModel) -> dict:
             "choices": len(tr.choices),
             "domains": {q.key: list(q.domain) for q in tr.quantities.values()
                         if q.domain is not None},
+            # domains inferred from the literals for nonlinear arithmetic:
+            # the answers hold only for traces within them (F.12)
+            "assumed_domains": {q.key: list(q.domain) for q in tr.quantities.values()
+                                if q.domain is not None and q.assumed},
+            # quantities whose numbers are the points of the faces of the
+            # linear arrangement of their predicates
+            "linear": sorted(q.key for q in tr.quantities.values()
+                             if q.linear and q.domain is None),
         },
         "model": {"variables": len(model.vars), "commands": len(model.commands), "states": None},
         "norms": norms,

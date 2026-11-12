@@ -24,6 +24,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   instance that starts after an amendment is an instance of the new
   version, and its witness names that file (`files`). Example:
   `examples/norms_check_amend_v1.cadl` and `norms_check_amend_v2.cadl`.
+- `cadl norms-check` translates linear arithmetic, `sum` and `avg`
+  without `--domain` (F.12): the numbers of the quantities are one finite
+  decimal point in every face of the linear arrangement of the
+  comparisons, found by a cylindrical decomposition and a congruence
+  modulo the part of the denominators prime to 10; a face without a
+  finite decimal point is left out. Nonlinear arithmetic without
+  `--domain` gets a domain inferred from the literals of the predicate,
+  which the report states as an assumption (`assumed_domains`). Example:
+  `examples/norms_check_linear.cadl`.
 
 ### Changed
 

@@ -410,7 +410,9 @@ def main(argv: list[str] | None = None) -> int:
     nchk_cmd.add_argument("--domain", action="append", default=[], metavar="Q=lo..hi",
                           help="Integer domain of a quantity used in arithmetic, sum or avg "
                                "(ROBOT[*].load=0..5); the answers then hold for traces whose "
-                               "numbers for it are such integers; may be repeated")
+                               "numbers for it are such integers. Linear arithmetic needs none; "
+                               "for other arithmetic without it a domain is assumed from the "
+                               "literals and reported; may be repeated")
     nchk_cmd.add_argument("--timeout", type=float, default=600, metavar="SECONDS",
                           help="Time for all runs of the model checker together; exit status 2 "
                                "when it is exceeded (default: 600)")
