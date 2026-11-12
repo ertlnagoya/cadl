@@ -14,9 +14,10 @@ it on generated traces."""
 from __future__ import annotations
 
 import re
+from fractions import Fraction
 
 import yaml
-UNIT = {"ms": .001, "s": 1, "min": 60, "h": 3600}
+UNIT = {"ms": Fraction(1, 1000), "s": 1, "min": 60, "h": 3600}
 def dur(x):
     m = re.fullmatch(r"(\d+)\s*(ms|s|min|h)", str(x)); return int(m[1]) * UNIT[m[2]]
 def pref(s):
@@ -202,8 +203,10 @@ class Model:
         self.observe(m, txt, h["args"], t)
     # --- trace
     def tick(self, t):
-        for h in sorted([h for h in self.holds.values() if h["state"] == "held" and h["deadline"] is not None and t > h["deadline"] + 1e-9], key=lambda h: (h["deadline"], h["n"])):
-            h["state"] = "expired"; self.out.append((h["deadline"], h["txt"], "deny", "expired", h["id"], "expired"))
+        # times are exact (F.5): a time of the trace is the decimal number it is written as
+        t = Fraction(repr(t))
+        for h in sorted([h for h in self.holds.values() if h["state"] == "held" and h["deadline"] is not None and t > h["deadline"]], key=lambda h: (h["deadline"], h["n"])):
+            h["state"] = "expired"; self.out.append((float(h["deadline"]), h["txt"], "deny", "expired", h["id"], "expired"))
     def start(self, cid, name, b):
         self.create(next(C for C in self.cs if C["id"] == cid), name, b)
     def end(self, cid, name, t):
@@ -220,6 +223,6 @@ class Model:
             self.nh += 1; hid = f"h-{self.nh}"
             gr = [(C["id"], n["id"], I["name"]) for C in self.cs if self.governs(C, m) for n, I in self.grounds(C, m)]
             self.holds[hid] = dict(id=hid, n=self.nh, m=m, txt=txt, args=args, state="held", approver=appr,
-                deadline=None if timeout is None else t + timeout, grounds=set(gr), insts={(c, i) for c, _, i in gr})
+                deadline=None if timeout is None else Fraction(repr(t)) + Fraction(timeout), grounds=set(gr), insts={(c, i) for c, _, i in gr})
         self.out.append((t, txt, dec, reason, hid, None) + ((tuple(map(tuple, prov)),) if prov else ()))
         if dec == "allow": self.observe(m, txt, args, t)

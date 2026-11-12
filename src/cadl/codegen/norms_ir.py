@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import math
 import re
+from fractions import Fraction
 from typing import Any
 
 from ..ast_nodes import (
@@ -117,8 +118,12 @@ class _Exprs:
     def convert(self, expr: Any, where: str) -> int:
         if isinstance(expr, BoolLiteral):
             return self.add({"op": "lit", "v": bool(expr.value)})
-        if isinstance(expr, (IntLiteral, FloatLiteral)):
-            return self.add({"op": "lit", "v": _number(expr.value, where)})
+        if isinstance(expr, IntLiteral):
+            return self.add({"op": "lit", "v": expr.value})
+        if isinstance(expr, FloatLiteral):
+            from ..norms_eval import _literal_number
+            _number(expr.value, where)
+            return self.add({"op": "lit", "v": _literal_number(expr)})
         if isinstance(expr, StringLiteral):
             return self.add({"op": "lit", "v": str(expr.value)})
         if isinstance(expr, DurationLiteral):
@@ -186,9 +191,89 @@ def check_contract_id(contract_id: str) -> None:
         raise UnsafeCodegenInput(f"contract id {contract_id!r}: must be an identifier")
 
 
-def duration_seconds(expr: DurationLiteral) -> float:
-    from ..norms_eval import _UNIT_SECONDS
-    return expr.value * _UNIT_SECONDS.get(expr.unit, 1.0)
+def decimal_parts(value: Any) -> tuple[int, int]:
+    """An exact decimal number as (n, k) with value n / 10^k."""
+    fr = Fraction(value)
+    k, den = 0, fr.denominator
+    for p in (2, 5):
+        e = 0
+        while den % p == 0:
+            den //= p
+            e += 1
+        k = max(k, e)
+    if den != 1:
+        raise ValueError(f"{value} is not a decimal number")
+    return fr.numerator * 10 ** k // fr.denominator, k
+
+
+def apply_limits(ir: dict, problem) -> dict:
+    """What a target cannot evaluate on top of `build_ir`: `problem(nodes,
+    root)` gives the reason for a predicate, or None. A guarantee item is
+    then marked unsupported (left out); anything else refuses the
+    contract."""
+    nodes = ir["exprs"]
+    reasons = []
+
+    def roots_of(term: dict | None) -> list[int]:
+        if not term or term.get("error"):
+            return []
+        if term["kind"] == "predicate":
+            return [term["expr"]]
+        if term["kind"] == "message":
+            return list(term["args"] or [])
+        return []
+
+    for nd in ir["norms"]:
+        for key in ("trigger", "until", "content"):
+            for r in roots_of(nd.get(key)):
+                why = problem(nodes, r)
+                if why:
+                    reasons.append(f"norm '{nd['id']}', {key}: {why}")
+    for rule in ir["rules"]:
+        for key in ("when", "if"):
+            for r in roots_of(rule.get(key)):
+                why = problem(nodes, r)
+                if why:
+                    reasons.append(f"counts_as rule creating '{rule['creates']}', {key}: {why}")
+    for key in ("assume", "guarantee"):
+        for pos, it in enumerate(ir["items"][key], start=1):
+            if it["expr"] is None or it.get("unsupported"):
+                continue
+            why = problem(nodes, it["expr"])
+            if why and key == "assume":
+                reasons.append(f"assume item {pos}: {why}")
+            elif why:
+                it["unsupported"] = why
+    if reasons:
+        raise NormsTargetUnsupported(reasons)
+    return ir
+
+
+def subtree(nodes: list[dict], root: int) -> list[int]:
+    out, todo = [], [root]
+    while todo:
+        k = todo.pop()
+        out.append(k)
+        todo.extend(children(nodes[k]))
+    return out
+
+
+def children(node: dict) -> list[int]:
+    op = node["op"]
+    if op in ("not", "within", "throughout"):
+        return [node["x"]]
+    if op in ("and", "or", "bin"):
+        return [node["l"], node["r"]]
+    if op == "in":
+        return [node["l"], *node["items"]]
+    if op == "until":
+        return [node["p"], node["q"]]
+    return []
+
+
+def duration_seconds(expr: DurationLiteral) -> Fraction:
+    from ..norms_eval import _duration
+    return Fraction(_duration(expr))
 
 
 def _pattern(ref: ActorRef, ranges: dict, where: str, exprs: _Exprs) -> dict:
@@ -244,7 +329,7 @@ def build_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
         where = f"norm '{d.id}'"
         entry: dict = {
             "id": d.id, "kind": d.kind, "frozen": x.frozen,
-            "deadline": None if x.deadline is None else _number(x.deadline, where),
+            "deadline": x.deadline,
             "target": d.id in eng.targets,
         }
         try:

@@ -18,9 +18,21 @@ _U := {"$": "unknown"}
 
 _D := {"$": "undecided"}
 
-_EPS := 0.000000001
+_MAX_T := {"$q": [9007199254740992, 0]}
 
-_MAX_T := 9007199254740992
+# The range of the exact numbers, as in cadl norms-eval (F.5): at most 400
+# significant digits, at most 400 decimals, an absolute value of at most
+# 1.7976931348623157e308 (the largest finite double, _MAX_ABS).
+# The scales of the model are below 4096 (cadl codegen refuses a product
+# that could exceed it), so that pow10 and the operations below are
+# defined for every number the monitor computes with.
+_LIMIT := 400
+
+_MAX_SCALE := 4095
+
+_MAX_ABS := {"$q": [17976931348623157 * pow10(292), 0]}
+
+_NUM_RE := `^(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$`
 
 _FORMAT := "cadl-norms-monitor-state/1"
 
@@ -44,7 +56,132 @@ _MSG_KEYS := {"from", "to", "name", "args"}
 # --- values: numbers, booleans, strings, and the markers below ------------------
 # {"$": "unknown"}: no value (final); {"$": "undecided"}: later observations
 # decide; {"$sym": text}: a name without value (an enum-like literal);
-# {"$o": object}: a field of request that is an object.
+# {"$o": object}: a field of request that is an object; {"$q": [n, k]}: the
+# exact decimal number n / 10^k (F.5: numbers and times are exact).
+
+# --- exact decimal numbers ------------------------------------------------------
+
+# 10^k for 0 <= k <= _MAX_SCALE, by repeated squaring (integers only)
+_p0 := 10
+
+_p1 := _p0 * _p0
+
+_p2 := _p1 * _p1
+
+_p3 := _p2 * _p2
+
+_p4 := _p3 * _p3
+
+_p5 := _p4 * _p4
+
+_p6 := _p5 * _p5
+
+_p7 := _p6 * _p6
+
+_p8 := _p7 * _p7
+
+_p9 := _p8 * _p8
+
+_p10 := _p9 * _p9
+
+_p11 := _p10 * _p10
+
+_POWERS := [_p0, _p1, _p2, _p3, _p4, _p5, _p6, _p7, _p8, _p9, _p10, _p11]
+
+pow10(k) := product([_POWERS[i] | some i in numbers.range(0, 11); bits.and(k, bits.lsh(1, i)) != 0]) if {
+	k >= 0
+	k <= _MAX_SCALE
+}
+
+# a string of decimal digits as an integer, in chunks that to_number reads exactly
+digits_int(s) := sum([digit_chunk(s, i) | some i in numbers.range(0, floor((count(s) - 1) / 18))])
+
+digit_chunk(s, i) := to_number(substring(s, i * 18, 18)) * pow10(rest) if {
+	rest := count(s) - (i * 18 + count(substring(s, i * 18, 18)))
+}
+
+# A number of the input as the decimal it is written as (its JSON text):
+# n / 10^k with mantissa digits m and exponent e of its last digit.
+# Undefined outside the range of the exact numbers.
+dec(v) := q if {
+	q := dec_digits(v)
+	qle(q, _MAX_ABS)
+	qle({"$q": [0 - qn(_MAX_ABS), 0]}, q)
+}
+
+dec_digits(v) := {"$q": [0, 0]} if {
+	m := regex.find_all_string_submatch_n(_NUM_RE, json.marshal(v), 1)[0]
+	trim_left(concat("", [m[2], m[3]]), "0") == ""
+	exp_of(m[4]) - count(m[3]) >= 0 - _LIMIT
+} else := {"$q": [sgn(m[1]) * digits_int(mant) * pow10(e), 0]} if {
+	m := regex.find_all_string_submatch_n(_NUM_RE, json.marshal(v), 1)[0]
+	mant := concat("", [m[2], m[3]])
+	e := exp_of(m[4]) - count(m[3])
+	in_range(mant, e)
+	e >= 0
+} else := {"$q": [sgn(m[1]) * digits_int(mant), 0 - e]} if {
+	m := regex.find_all_string_submatch_n(_NUM_RE, json.marshal(v), 1)[0]
+	mant := concat("", [m[2], m[3]])
+	e := exp_of(m[4]) - count(m[3])
+	in_range(mant, e)
+	e < 0
+}
+
+sgn(s) := -1 if {
+	s == "-"
+} else := 1
+
+in_range(mant, e) if {
+	nd := count(trim_left(mant, "0"))
+	nd <= _LIMIT
+	e >= 0 - _LIMIT
+	nd + e <= 309
+}
+
+
+exp_of(e) := 0 if {
+	e == ""
+} else := to_number(trim_left(e, "+"))
+
+qn(x) := x["$q"][0]
+
+qk(x) := x["$q"][1]
+
+# the numerators of a and b at the larger of their scales
+qal(a, b) := [qn(a) * pow10(k - qk(a)), qn(b) * pow10(k - qk(b)), k] if {
+	k := max([qk(a), qk(b)])
+}
+
+qadd(a, b) := {"$q": [x[0] + x[1], x[2]]} if x := qal(a, b)
+
+qsub(a, b) := {"$q": [x[0] - x[1], x[2]]} if x := qal(a, b)
+
+qmul(a, b) := {"$q": [qn(a) * qn(b), qk(a) + qk(b)]}
+
+# -1, 0 or 1
+qcmp(a, b) := -1 if {
+	x := qal(a, b)
+	x[0] < x[1]
+} else := 1 if {
+	x := qal(a, b)
+	x[0] > x[1]
+} else := 0 if {
+	x := qal(a, b)
+	x[0] == x[1]
+}
+
+qle(a, b) if qcmp(a, b) <= 0
+
+qmax0(a) := a if {
+	qn(a) > 0
+} else := {"$q": [0, 0]}
+
+# for the reader of a result (the state keeps the exact value)
+qf(x) := qn(x) if {
+	qk(x) == 0
+} else := qn(x) / pow10(qk(x))
+
+qz := {"$q": [0, 0]}
 
 vk(v) := "U" if {
 	is_object(v)
@@ -55,10 +192,11 @@ vk(v) := "U" if {
 } else := "S" if {
 	is_object(v)
 	is_string(v["$sym"])
+} else := "N" if {
+	is_object(v)
+	is_array(v["$q"])
 } else := "B" if {
 	is_boolean(v)
-} else := "N" if {
-	is_number(v)
 } else := "T" if {
 	is_string(v)
 } else := "X"
@@ -69,7 +207,7 @@ truth(v) := v if {
 	vk(v) in {"U", "D", "B"}
 } else := false if {
 	vk(v) == "N"
-	v == 0
+	qn(v) == 0
 } else := true if {
 	vk(v) == "N"
 } else := _U
@@ -115,6 +253,14 @@ plain(v) := v["$sym"] if {
 eq(a, b) := false if {
 	is_boolean(a) != is_boolean(b)
 } else := r if {
+	vk(a) == "N"
+	vk(b) == "N"
+	r := qcmp(a, b) == 0
+} else := false if {
+	vk(a) == "N"
+} else := false if {
+	vk(b) == "N"
+} else := r if {
 	r := plain(a) == plain(b)
 }
 
@@ -130,11 +276,14 @@ sym_bad(o, s, x) if {
 
 numeric(v) if vk(v) in {"N", "B"}
 
-num(v) := 1 if {
+num(v) := {"$q": [1, 0]} if {
 	v == true
-} else := 0 if {
+} else := qz if {
 	v == false
 } else := v
+
+# a comparison of two numbers
+ordq(o, a, b) := ordc(o, qcmp(a, b), 0)
 
 ordc(o, a, b) := r if {
 	o == "<"
@@ -166,7 +315,7 @@ binop(o, l, r) := _U if {
 	o == "=="
 } else := not3(eq(l, r)) if {
 	o == "!="
-} else := ordc(o, num(l), num(r)) if {
+} else := ordq(o, num(l), num(r)) if {
 	o in {"<", "<=", ">", ">="}
 	numeric(l)
 	numeric(r)
@@ -180,21 +329,15 @@ binop(o, l, r) := _U if {
 	not vk(l) == "N"
 } else := _U if {
 	not vk(r) == "N"
-} else := _U if {
-	o == "/"
-	r == 0
 } else := x if {
 	o == "+"
-	x := l + r
+	x := qadd(l, r)
 } else := x if {
 	o == "-"
-	x := l - r
+	x := qsub(l, r)
 } else := x if {
 	o == "*"
-	x := l * r
-} else := x if {
-	o == "/"
-	x := l / r
+	x := qmul(l, r)
 } else := _U
 
 nosym(i) := _U if {
@@ -240,9 +383,9 @@ temporal(vals, over, dec) := dec if {
 } else := true
 
 # positions of the window [t_p, t_p + d] and whether it is over
-window(p, d) := [j | some j in numbers.range(p, last); buf[j].t <= (buf[p].t + d) + _EPS]
+window(p, d) := [j | some j in numbers.range(p, last); qle(buf[j].t, qadd(buf[p].t, d))]
 
-over(p, d) if buf[last].t > (buf[p].t + d) + _EPS
+over(p, d) if not qle(buf[last].t, qadd(buf[p].t, d))
 
 u_stop(ps) := min([i | some i, v in ps; v == false]) if {
 	some v in ps
@@ -309,7 +452,7 @@ lc := model.lifecycle
 
 init_norm(i, nd) := {
 	"id": nd.id, "state": "inactive", "verdict": "pending", "at": null, "act": null,
-	"since": null, "before": 0, "from": 0, "cands": [],
+	"since": null, "before": qz, "from": 0, "cands": [],
 }
 
 init_item := {"value": null, "seen": false, "verdict": "pending", "time": null}
@@ -335,6 +478,9 @@ n := S.n
 first if n == 0
 
 t := obs.t
+
+# the time of the observation, exact
+tq := dec(obs.t)
 
 has(o, k) if k in object.keys(o)
 
@@ -388,7 +534,7 @@ msgs := [{"from": m.from, "to": m.to, "name": m.name, "args": object.get(m, "arg
 	some m in object.get(obs, "messages", [])
 ]
 
-entry := {"i": n, "t": t, "values": V, "st": lc_before}
+entry := {"i": n, "t": tq, "values": V, "st": lc_before}
 
 buf := array.concat(S.buffer, [entry])
 
@@ -400,11 +546,16 @@ pos(k) := k - base
 
 # --- names ---------------------------------------------------------------------
 
+# a value of the input with its number exact
+val(v) := dec(v) if is_number(v)
+
+else := v
+
 lookup(vals, key) := _U if {
 	not has(vals, key)
 } else := _U if {
 	vals[key] == null
-} else := vals[key]
+} else := val(vals[key])
 
 lookup2(vals, key, stripped) := lookup(vals, key) if {
 	has(vals, key)
@@ -428,7 +579,7 @@ bound_index(idx) if is_string(idx.lit)
 
 bound_index(idx) if has(B, idx.var)
 
-name_val(nm, p) := B[nm] if {
+name_val(nm, p) := val(B[nm]) if {
 	has(B, nm)
 } else := buf[p].t if {
 	nm == "now"
@@ -453,7 +604,7 @@ req_val(path) := _U if {
 } else := {"$o": v} if {
 	v := object.get(R, path, null)
 	is_object(v)
-} else := object.get(R, path, null)
+} else := val(object.get(R, path, null))
 
 # --- messages and actors -------------------------------------------------------
 
@@ -522,7 +673,9 @@ eq_raw(w, a) := false if {
 } else := r if {
 	vk(w) == "X"
 	r := w["$o"] == a
-} else := eq(w, a)
+} else := false if {
+	is_object(a)
+} else := eq(w, val(a))
 
 args_ok(_, term, _) if term.args == null
 
@@ -602,7 +755,7 @@ occurs(j) if {
 
 # --- norm instances ------------------------------------------------------------
 
-elapsed(rec, tt) := rec.before + (tt - rec.since) if {
+elapsed(rec, tt) := qadd(rec.before, qsub(tt, rec.since)) if {
 	rec.state == "active"
 	rec.since != null
 } else := rec.before
@@ -640,7 +793,7 @@ cands_of(rec, new) := [] if {
 	new in _FINAL
 } else := rec.cands
 
-set_now(rec, new) := setst(rec, new, t, n, FA)
+set_now(rec, new) := setst(rec, new, tq, n, FA)
 
 # step 0: the norms without trigger that are not activated by a violation or power
 N0 := [start_norm(S.norms[i], nd) | some i, nd in model.norms] if {
@@ -785,7 +938,7 @@ cval(i, k) := content_vals[i][k] if {
 
 is_open(rec, nd) if nd.deadline == null
 
-is_open(rec, nd) if elapsed(rec, t) <= nd.deadline + _EPS
+is_open(rec, nd) if qle(elapsed(rec, tq), nd.deadline)
 
 judge_cands(rec, nd) := array.concat(rec.cands, [n]) if {
 	is_open(rec, nd)
@@ -917,7 +1070,7 @@ settle(rec, nd, tt, k, fa) := rec if {
 } else := setst(rec, "discharged", tt, k, fa) if {
 	rec.state in {"active", "suspended"}
 	nd.kind == "obligation"
-	elapsed(rec, tt) <= nd.deadline + _EPS
+	qle(elapsed(rec, tt), nd.deadline)
 } else := setst(rec, "violated", tt, k, fa) if {
 	rec.state in {"active", "suspended"}
 	nd.kind == "obligation"
@@ -929,7 +1082,7 @@ settle(rec, nd, tt, k, fa) := rec if {
 settled(norms, tt, k, fa) := [settle(norms[i], nd, tt, k, fa) | some i, nd in model.norms]
 
 late_violations(before, after, tt) := [{
-	"t": tt, "norm": nd.id, "severity": nd.severity, "verdict": after[i].verdict,
+	"t": qf(tt), "norm": nd.id, "severity": nd.severity, "verdict": after[i].verdict,
 	"sanction": nd.sanction, "reparation": nd.reparation_id,
 	"reparation_activated": false, "transition": null,
 } |
@@ -938,7 +1091,7 @@ late_violations(before, after, tt) := [{
 	before[i].state != "violated"
 ]
 
-N5 := settled(N4, t, n, FA) if {
+N5 := settled(N4, tq, n, FA) if {
 	ended_now
 } else := N4
 
@@ -1019,20 +1172,20 @@ assume_status(it) := "holds" if {
 	it.value == false
 } else := "pending"
 
-changes(old, new, tt) := array.concat(array.concat(
-	[{"t": tt, "kind": "norm", "id": nd.id, "state": new.norms[i].state,
+changes(old, new, tq_) := array.concat(array.concat(
+	[{"t": qf(tq_), "kind": "norm", "id": nd.id, "state": new.norms[i].state,
 		"verdict": new.norms[i].verdict, "previous_state": old.norms[i].state,
 		"previous_verdict": old.norms[i].verdict} |
 		some i, nd in model.norms
 		[old.norms[i].state, old.norms[i].verdict] != [new.norms[i].state, new.norms[i].verdict]
 	],
-	[{"t": tt, "kind": "assumption", "index": i + 1, "text": md.text,
+	[{"t": qf(tq_), "kind": "assumption", "index": i + 1, "text": md.text,
 		"status": assume_status(new.items.assume[i]), "previous": assume_status(old.items.assume[i])} |
 		some i, md in model.items.assume
 		assume_status(new.items.assume[i]) != assume_status(old.items.assume[i])
 	],
 ),
-	[{"t": tt, "kind": "guarantee", "index": i + 1, "text": md.text,
+	[{"t": qf(tq_), "kind": "guarantee", "index": i + 1, "text": md.text,
 		"verdict": new.items.guarantee[i].verdict, "previous": old.items.guarantee[i].verdict} |
 		some i, md in model.items.guarantee
 		new.items.guarantee[i].verdict != old.items.guarantee[i].verdict
@@ -1058,12 +1211,9 @@ ok_of(st) := false if {
 	it.verdict == "violated"
 } else := true
 
-due(rec, nd, tt) := tt + rest if {
-	rest := nd.deadline - elapsed(rec, tt)
-	rest > 0
-} else := tt
+due(rec, nd, tt) := qadd(tt, qmax0(qsub(nd.deadline, elapsed(rec, tt))))
 
-next_deadline(st) := min(dues) if {
+next_deadline(st) := qf(first) if {
 	not st.ended
 	dues := [due(st.norms[i], nd, st.t) |
 		some i, nd in model.norms
@@ -1071,9 +1221,12 @@ next_deadline(st) := min(dues) if {
 		nd.deadline != null
 		nd.kind in {"obligation", "prohibition"}
 		st.norms[i].state == "active"
-		elapsed(st.norms[i], st.t) <= nd.deadline + _EPS
+		qle(elapsed(st.norms[i], st.t), nd.deadline)
 	]
-	count(dues) > 0
+	some first in dues
+	every d in dues {
+		qle(first, d)
+	}
 } else := null
 
 # --- the new state -------------------------------------------------------------------
@@ -1084,7 +1237,7 @@ ended_now := true if {
 
 end_t := t if not finishing
 
-end_t := S.t if finishing
+end_t := qf(S.t) if finishing
 
 items_now := finish_items({"assume": I_assume, "guarantee": I_guarantee}, ended_now)
 
@@ -1110,7 +1263,7 @@ new_buffer := [] if {
 } else := [e | some e in buf; e.i >= keep_from]
 
 step_state := {
-	"format": _FORMAT, "contract": model.contract, "n": n + 1, "t": t,
+	"format": _FORMAT, "contract": model.contract, "n": n + 1, "t": tq,
 	"ended": ended_now, "end_index": end_index, "ignored": S.ignored,
 	"bindings": B, "request": R, "known": sort([k | some k in known]), "values": V,
 	"lc": lc_after, "buffer": new_buffer, "norms": N5, "items": items_now, "failed_at": FA,
@@ -1120,11 +1273,11 @@ end_index := n if {
 	ended_now
 } else := null
 
-all_violations := array.concat(step_violations, late_violations(N4, N5, t))
+all_violations := array.concat(step_violations, late_violations(N4, N5, tq))
 
 step_result := {
 	"state": step_state,
-	"changes": changes(S, step_state, t),
+	"changes": changes(S, step_state, tq),
 	"violations": all_violations,
 	"institutional_events": created,
 	"powers_exercised": exercised,
@@ -1168,7 +1321,7 @@ ended_result := {
 }
 
 ignored_result := {
-	"state": object.union(S, {"ignored": S.ignored + 1, "t": t}),
+	"state": object.union(S, {"ignored": S.ignored + 1, "t": tq}),
 	"changes": [],
 	"violations": [],
 	"institutional_events": [],
@@ -1218,15 +1371,37 @@ errs[4] := "'t' must be a number (seconds)" if {
 errs[5] := "'t' must be a finite number of at most 2**53 in absolute value" if {
 	not finishing
 	is_number(obs.t)
-	abs(obs.t) > _MAX_T
+	not tq_in_range
 }
 
-errs[6] := sprintf("time %v is before the previous observation (%v)", [obs.t, S.t]) if {
+tq_in_range if {
+	qle(tq, _MAX_T)
+	qle({"$q": [0 - qn(_MAX_T), 0]}, tq)
+}
+
+errs[6] := sprintf("time %v is before the previous observation (%v)", [obs.t, qf(S.t)]) if {
 	not finishing
 	is_number(obs.t)
 	S.t != null
-	obs.t < S.t
+	qcmp(tq, S.t) < 0
 }
+
+errs[16] := _RANGE_ERR if {
+	not finishing
+	is_object(obs)
+	walk(obs, [_, x])
+	is_number(x)
+	not dec(x)
+} else := _RANGE_ERR if {
+	not finishing
+	first
+	some src in [B, R]
+	walk(src, [_, x])
+	is_number(x)
+	not dec(x)
+}
+
+_RANGE_ERR := "a number of the observation, its request or its bindings is outside the range of exact numbers (at most 400 significant digits, at most 400 decimals, an absolute value of at most 1.7976931348623157e308)"
 
 errs[7] := sprintf("'%s' is allowed only on the first line", [key]) if {
 	not finishing

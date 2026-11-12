@@ -1510,7 +1510,7 @@ class TestTraceValues:
     @pytest.mark.parametrize("line, text", [
         ('{"t": NaN}', "not JSON"),
         ('{"t": Infinity}', "not JSON"),
-        ('{"t": 1e999}', "not JSON"),
+        ('{"t": 1e999}', "outside the range"),
         ('{"t": 1e16}', "at most"),
         ('{"t": 1, "messages": [{"from": "D D", "to": "R[1]", "name": "x"}]}', "concrete actor"),
         ('{"t": 1, "messages": [{"from": "D", "to": "R[ 1 ]", "name": "x"}]}', "concrete actor"),
@@ -1544,3 +1544,109 @@ class TestSymbolicUpperBound:
         assert trace.observations[1].t == 1700000000001.5
         with pytest.raises(TraceError, match="at most"):
             parse_trace(['{"t": 9007199254740994}'])
+
+
+# === Exact numbers and times (F.5) ===============================================
+
+_EXACT = """\
+sos:
+  name: Exact
+  extensions:
+    - norms: 0.1
+  actors:
+    - {id: A, role: a}
+    - {id: B, role: b}
+  contracts:
+    - id: C
+      parties: [A, B]
+      guarantee:
+        - "A.x + A.y == 0.3"
+        - "within(100ms, A.z == 1)"
+      norms:
+        - id: o
+          kind: obligation
+          bearer: A
+          trigger: "A -> B : req"
+          content: "A -> B : ack"
+          deadline: 100ms
+"""
+
+
+class TestExactNumbers:
+    """A number of a trace is the decimal it is written as, times are
+    compared without tolerance, and arithmetic is exact: 0.1 + 0.2 == 0.3,
+    and epoch seconds with milliseconds compare exactly."""
+
+    def _run(self, *records):
+        return evaluate(parse(_EXACT), parse_trace([json.dumps(r) for r in records]))
+
+    def test_sum_of_decimals(self):
+        r = self._run({"t": 0, "values": {"A.x": 0.1, "A.y": 0.2}}, {"t": 1, "end": True})
+        assert r["guarantees"][0]["verdict"] == "fulfilled"
+
+    def test_epoch_milliseconds_at_the_deadline_are_in_time(self):
+        msg = {"from": "A", "to": "B"}
+        r = self._run({"t": 1700000000.1, "messages": [dict(msg, name="req")]},
+                      {"t": 1700000000.2, "values": {"A.z": 1},
+                       "messages": [dict(msg, name="ack")]})
+        assert [n["state"] for n in r["norms"]] == ["fulfilled"]
+        assert r["guarantees"][1]["verdict"] == "fulfilled"
+        assert r["norms"][0]["time"] == 1700000000.2       # written as a float
+
+    def test_one_microsecond_after_the_deadline_is_late(self):
+        """Written in the trace with more digits than a float near 1.7e9
+        holds (its spacing there is 2.4e-7 s)."""
+        m = '"messages": [{"from": "A", "to": "B", "name": "%s"}]'
+        lines = ['{"t": 1700000000.1, %s}' % (m % "req"),
+                 '{"t": 1700000000.2000001, %s}' % (m % "ack")]
+        r = evaluate(parse(_EXACT), parse_trace(lines))
+        assert [n["state"] for n in r["norms"]] == ["violated"]
+        lines[1] = lines[1].replace("2000001", "2000000")
+        r = evaluate(parse(_EXACT), parse_trace(lines))
+        assert [n["state"] for n in r["norms"]] == ["fulfilled"]
+
+    def test_digits_beyond_a_float_are_kept(self):
+        lines = ['{"t": 0, "values": {"A.x": 0.10000000000000000001, "A.y": 0.2}}',
+                 '{"t": 1, "end": true}']
+        r = evaluate(parse(_EXACT), parse_trace(lines))
+        assert r["guarantees"][0]["verdict"] == "violated"
+
+
+class TestRangeOfNumbers:
+    """Exact numbers have a range (F.5): at most 400 significant digits,
+    at most 400 decimals, an absolute value of at most 1.7976931348623157e308. A number of a
+    trace outside it is a trace error with its line; written exactly it
+    would take time and memory without bound."""
+
+    @pytest.mark.parametrize("number", ["1e-100000000", "1e-401", "1.7976931348623158e308", "1e309", "1e400",
+                                        "1" + "0" * 400, "0." + "1" * 401])
+    def test_refused_with_the_line(self, number):
+        import time
+        start = time.time()
+        with pytest.raises(TraceError, match="line 2: the number .* outside the range"):
+            parse_trace(['{"t": 0}', '{"t": 1, "values": {"A.x": %s}}' % number])
+        assert time.time() - start < 1
+
+    @pytest.mark.parametrize("number", ["1e-400", "9.99e307", "1" + "0" * 300, "0e5000", "-0.0",
+                                        "1e308", "1.7976931348623157e308",
+                                        "-1.7976931348623157e308"])
+    def test_accepted(self, number):
+        parse_trace(['{"t": 0, "values": {"A.x": %s}}' % number])
+
+    def test_literal_outside_the_range_is_not_evaluated(self):
+        sos = parse(_EXACT.replace('"A.x + A.y == 0.3"', '"A.x > 1e-500"'))
+        r = evaluate(sos, parse_trace(['{"t": 0, "values": {"A.x": 1}}', '{"t": 1}']))
+        assert "outside the range of exact numbers" in r["guarantees"][0]["reason"]
+
+
+class TestExactDeadline:
+    """A numeric deadline in seconds is exact too: 0.0005 is half a
+    millisecond (deadline_ms rounds it to 0 for the other checks)."""
+
+    def test_half_a_millisecond(self):
+        text = _EXACT.replace("deadline: 100ms", "deadline: 0.0005")
+        m = '"messages": [{"from": "A", "to": "B", "name": "%s"}]'
+        for at, state in (("0.0005", "fulfilled"), ("0.0006", "violated")):
+            r = evaluate(parse(text), parse_trace(
+                ['{"t": 0, %s}' % (m % "req"), '{"t": %s, %s}' % (at, m % "ack")]))
+            assert r["norms"][0]["state"] == state, at

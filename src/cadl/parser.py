@@ -107,7 +107,7 @@ class ExprTransformer(Transformer):
         if value in (float("inf"), float("-inf")):
             # 1e999: no finite value; an expression with it is not one
             raise ValueError(f"the number {items[0]} is too large")
-        return FloatLiteral(value=value)
+        return FloatLiteral(value=value, text=str(items[0]))
 
     def int_lit(self, items):
         return IntLiteral(value=int(items[0]))
@@ -221,7 +221,8 @@ class ExprTransformer(Transformer):
         if isinstance(operand, IntLiteral):
             return IntLiteral(value=-operand.value)
         if isinstance(operand, FloatLiteral):
-            return FloatLiteral(value=-operand.value)
+            text = None if operand.text is None else "-" + operand.text
+            return FloatLiteral(value=-operand.value, text=text)
         return BinaryOp(op="-", left=IntLiteral(value=0), right=operand)
 
     def quantified_expr(self, items):
@@ -783,6 +784,9 @@ def _build_norm(data: dict) -> NormDef:
         until=_opt_text(_get(data, 'until')),
         content=_opt_text(_get(data, 'content')) or '',
         deadline_ms=deadline_ms,
+        deadline_text=(repr(raw_deadline) if deadline_ms is not None
+                       and isinstance(raw_deadline, (int, float))
+                       and not isinstance(raw_deadline, bool) else None),
         invalid_deadline=(
             _value_as_text(raw_deadline)
             if raw_deadline is not None and deadline_ms is None

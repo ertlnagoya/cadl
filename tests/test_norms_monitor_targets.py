@@ -54,9 +54,19 @@ NO_DOUBLE = EXAMPLES / "norms_no_double_assignment.cadl"
 
 needs_opa = pytest.mark.skipif(S.opa_binary() is None, reason="the opa binary is not on PATH")
 needs_solc = pytest.mark.skipif(S.solc_binary() is None, reason="no solc (CADL_SOLC, PATH, ~/.solcx)")
-needs_evm = pytest.mark.skipif(S.solc_binary() is None or S.evm_python() is None,
-                               reason="no solc, or no EVM (CADL_EVM_PYTHON: a Python with "
-                                      "eth-tester[py-evm])")
+# CADL_REQUIRE_EVM=1 (CI): the EVM tests run, and fail when there is no EVM
+REQUIRE_EVM = os.environ.get("CADL_REQUIRE_EVM") == "1"
+needs_evm = pytest.mark.skipif(
+    not REQUIRE_EVM and (S.solc_binary() is None or S.evm_python() is None),
+    reason="no solc, or no EVM (CADL_EVM_PYTHON: a Python with eth-tester[py-evm])")
+
+
+def test_evm_is_there_when_required():
+    """With CADL_REQUIRE_EVM=1 a missing EVM or solc is a failure, not a skip."""
+    if not REQUIRE_EVM:
+        pytest.skip("CADL_REQUIRE_EVM is not set")
+    assert S.solc_binary() is not None, "no solc (CADL_SOLC, PATH or ~/.solcx)"
+    assert S.evm_python() is not None, "no EVM (CADL_EVM_PYTHON: eth-tester[py-evm])"
 
 
 def _count(default: int) -> int:
@@ -185,7 +195,8 @@ class TestGeneration:
     def test_solidity_refuses_what_its_fixed_point_cannot_hold(self, content, match):
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
                      f"content: \"{content}\"}}\n")
-        generate_norms_monitor_rego(sos, sos.contracts[0])          # OPA monitors it
+        if "/" not in content:
+            generate_norms_monitor_rego(sos, sos.contracts[0])      # OPA monitors it
         with pytest.raises(NormsTargetUnsupported, match=match):
             generate_norms_monitor_sol(sos, sos.contracts[0])
 
@@ -222,18 +233,28 @@ class TestGeneration:
         assert temporal_names(solidity_ir(sos, sos.contracts[0])) == ["flag"]
         assert "temporalName[keccak256" in generate_norms_monitor_sol(sos, sos.contracts[0])
 
-    def test_cli_warns_about_the_gas_of_temporal_contents(self, tmp_path):
-        proc = subprocess.run(
-            [sys.executable, "-m", "cadl.cli", "codegen", str(RICH), "-t", "solidity",
-             "-o", str(tmp_path / "out")], capture_output=True, text=True)
-        assert proc.returncode == 0, proc.stderr
-        gas = [l for l in proc.stderr.splitlines() if "4 x 10^4 gas" in l]
-        assert {l.split("norm '")[1].split("'")[0] for l in gas} == {"stay_ok", "steady"}
-        assert all("cannot record any further observation" in l for l in gas)
-        proc = subprocess.run(
-            [sys.executable, "-m", "cadl.cli", "codegen", str(RICH), "-t", "opa",
-             "-o", str(tmp_path / "out2")], capture_output=True, text=True)
-        assert "4 x 10^4 gas" not in proc.stderr
+    @pytest.mark.parametrize("content,match", [
+        ("within(3s, A.x > 1) OR throughout(2s, A.y == 1)", "two temporal operators"),
+        ("NOT until(A.x > 1, A.y == 1, 3s)", "NOT until"),
+        ("within(3s, A.x > 1) == true", "inside a comparison"),
+    ])
+    def test_solidity_temporal_content_limits(self, content, match):
+        """The Solidity monitor decides the candidates of a content from its
+        one temporal operator (NOT turns within and throughout into their
+        duals); OPA monitors these contents too."""
+        sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
+                     f"content: \"{content}\"}}\n")
+        generate_norms_monitor_rego(sos, sos.contracts[0])
+        with pytest.raises(NormsTargetUnsupported, match=match):
+            generate_norms_monitor_sol(sos, sos.contracts[0])
+
+    @pytest.mark.parametrize("content", ["within(3s, A.x > 1) OR A.y == 1",
+                                         "NOT throughout(2s, A.x > 1) AND A.ok == true",
+                                         "NOT (within(2s, A.x == 0) OR A.z == 1)"])
+    def test_solidity_reduces_a_content_to_its_operator(self, content):
+        sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
+                     f"content: \"{content}\"}}\n")
+        assert "_temporal(" in generate_norms_monitor_sol(sos, sos.contracts[0])
 
     def test_rego_carries_the_contract_as_one_json_text(self):
         """No text of the .cadl file is Rego code: the model is one JSON
@@ -423,7 +444,7 @@ class TestRegoStep:
         late = S.opa_step(robot_rego, PKG, {"state": f["state"], "observation": {"t": 5}},
                           tmp_path)
         assert late["changes"] == [] and late["state"]["ignored"] == 1
-        assert late["state"]["t"] == 5
+        assert late["state"]["t"] == {"$q": [5, 0]}           # exact: 5 / 10^0
         none = S.opa_step(robot_rego, PKG, {"finish": True}, tmp_path)
         assert "no observation" in none["error"]
 
@@ -683,6 +704,8 @@ def test_evm_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
         if case["versions"] or any('"amend"' in l for l in case["lines"]):
             continue
         sos = pickle.loads(base64.b64decode(case["sos"]))
+        if not S.six_decimals(case["lines"]):
+            continue                    # its host cannot pass such a number
         try:
             contract = select_contract(sos, case["contract"])
             text = generate_norms_monitor_sol(sos, contract)
@@ -690,6 +713,15 @@ def test_evm_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
             continue
         groups.setdefault(text, (sos, contract, []))[2].append(case)
     assert sum(len(g[2]) for g in groups.values()) >= 100
+    # CADL_NORMS_EVM_CASES: only the first so many traces (CI)
+    limit = int(os.environ.get("CADL_NORMS_EVM_CASES", "0")) or None
+    if limit:
+        kept: dict = {}
+        for text, (sos, contract, cases) in groups.items():
+            room = limit - sum(len(g[2]) for g in kept.values())
+            if room > 0:
+                kept[text] = (sos, contract, cases[:room])
+        groups = kept
     steps: list = []
     from cadl.codegen.norms_ir import unsupported_items
     from cadl.codegen.solidity.norms_monitor_sol import solidity_ir
@@ -704,7 +736,7 @@ def test_evm_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
                         tmp_path / f"m{k}")
         got = S.sol_results(raw, runs, [n.id for n in contract.norms], skip)
         assert S.compare(refs, got, steps) == [], cases[0]["lines"]
-    assert len(steps) >= 300
+    assert len(steps) >= (300 if not limit else limit)
 
 
 @needs_evm
@@ -729,3 +761,260 @@ def test_evm_refuses_a_temporal_name_that_becomes_known_late(tmp_path):
     assert "error" not in raw[0][0] and "error" in raw[0][1]
     got = S.sol_results(raw[1:], [given], [n.id for n in contract.norms])
     assert S.compare(refs, got) == []
+
+
+# === Exact numbers and times (F.5) ===================================================
+
+from tests.test_norms_eval import _EXACT   # noqa: E402
+
+_M = '"messages": [{"from": "A", "to": "B", "name": "%s"}]'
+EXACT_TRACES = [
+    ['{"t": 0, "values": {"A.x": 0.1, "A.y": 0.2}}', '{"t": 1, "end": true}'],
+    ['{"t": 1700000000.1, %s}' % (_M % "req"),
+     '{"t": 1700000000.2, "values": {"A.z": 1}, %s}' % (_M % "ack")],
+    ['{"t": 1700000000.1, %s}' % (_M % "req"),
+     '{"t": 1700000000.200001, "values": {"A.z": 1}, %s}' % (_M % "ack")],
+    ['{"t": 1700000000.123456, "values": {"A.x": 0.000001, "A.y": 0.299999}}',
+     '{"t": 1700000000.223456, "values": {"A.z": 1}}', '{"t": 1700000000.223457}'],
+]
+
+
+@needs_opa
+def test_opa_numbers_and_times_are_exact(tmp_path):
+    """As norms-eval: 0.1 + 0.2 == 0.3, and epoch seconds with fractions
+    are compared exactly, also with more digits than a float holds."""
+    sos = parse(_EXACT)
+    traces = EXACT_TRACES + [[
+        '{"t": 1700000000.1, %s}' % (_M % "req"),
+        '{"t": 1700000000.2000001, %s}' % (_M % "ack")]]
+    refs = [S.reference(sos, l) for l in traces]
+    assert [r["steps"][-1]["norms"]["o"][0] for r in refs] == [
+        "discharged", "fulfilled", "violated", "discharged", "violated"]
+    assert refs[0]["steps"][0]["guarantee"][0] == "pending"
+    assert refs[0]["steps"][-1]["guarantee"][0] == "fulfilled"
+    got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]),
+                    monitor_package("C"), traces, refs, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+@needs_evm
+def test_evm_numbers_and_times_are_exact(tmp_path):
+    """With at most six decimals the Solidity monitor agrees too."""
+    refs, got = _evm(parse(_EXACT), EXACT_TRACES, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+def test_rego_refuses_division():
+    sos = _small("      norms:\n        - {id: n, kind: prohibition, bearer: A, "
+                 "content: \"A.x / 2 > 3\"}\n")
+    with pytest.raises(NormsTargetUnsupported, match="the operator /"):
+        generate_norms_monitor_rego(sos, sos.contracts[0])
+    sos = _small("      guarantee:\n        - \"A.x / 2 > 3\"\n        - \"A.x > 3\"\n")
+    [m] = norms_monitors(sos, "opa")
+    assert m["text"] is not None and [p for _, p, _, _ in m["left_out"]] == [1]
+
+
+# === Temporal contents: bounded cost per observation (Solidity) ======================
+
+WINDOWS = """\
+      norms:
+        - {id: w, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(3s, A.x > 5)", deadline: 6s}
+        - {id: th, kind: prohibition, bearer: A, content: "throughout(2s, A.x > 8)"}
+        - {id: un, kind: obligation, bearer: A, trigger: "B -> A : start",
+           content: "until(A.ok == true, A.done == true, 4s)", deadline: 5s}
+        - {id: th2, kind: obligation, bearer: A, content: "throughout(1s, A.y == 1)",
+           deadline: 8s}
+        - {id: wz, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(3s, A.x > 5) OR A.z == 1", deadline: 4s}
+        - {id: nt, kind: prohibition, bearer: A, trigger: "B -> A : start",
+           content: "NOT throughout(2s, A.x > 2) AND A.ok == true", deadline: 6s}
+        - {id: ua, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "until(A.ok == true, A.done == true, 3s) AND A.y == 1", deadline: 5s}
+        - {id: nw, kind: obligation, bearer: A, content: "NOT (within(2s, A.x == 0) OR A.z == 1)",
+           deadline: 7s}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [w, th, un, th2, wz, nt, ua, nw]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [w, th, un, th2, wz, nt, ua, nw]}}
+"""
+
+
+def _window_trace(rng: random.Random) -> list:
+    t, lines = 0.0, []
+    for k in range(rng.randint(2, 24)):
+        rec: dict = {"t": t}
+        values = {}
+        for name, choices in (("A.x", [0, 3, 6, 9, 10, None]), ("A.ok", [True, True, False, None]),
+                              ("A.done", [False, False, True, None]), ("A.y", [1, 1, 1, 0, None]),
+                              ("A.z", [0, 0, 1, None])):
+            if rng.random() < (0.8 if k == 0 else 0.35):
+                values[name] = rng.choice(choices)
+        if values:
+            rec["values"] = values
+        msgs = [{"from": "B", "to": "A", "name": rng.choice(["go", "start", "pause", "resume"])}
+                for _ in range(rng.choice([0, 0, 0, 1, 1, 2]))]
+        if msgs:
+            rec["messages"] = msgs
+        lines.append(json.dumps(rec))
+        t = round(t + rng.choice([0, 0.5, 1, 1, 1.5, 2, 3, 4, 7]), 3)
+    if rng.random() < 0.3:
+        rec = json.loads(lines[-1])
+        rec["end"] = False
+        lines[-1] = json.dumps(rec)
+    return lines
+
+
+@needs_evm
+def test_evm_temporal_contents(tmp_path, monkeypatch):
+    """within, throughout and until as contents, with deadlines and
+    suspension: the candidates decided from the summaries of their
+    windows give what norms-eval gives."""
+    _memoize_parser(monkeypatch)
+    sos = _small(WINDOWS)
+    rng = random.Random(20261201)
+    traces = [_window_trace(rng) for _ in range(_count(12))]
+    refs, got = _evm(sos, traces, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+@needs_opa
+def test_opa_temporal_contents(tmp_path, monkeypatch):
+    _memoize_parser(monkeypatch)
+    sos = _small(WINDOWS)
+    rng = random.Random(20261202)
+    traces = [_window_trace(rng) for _ in range(_count(150))]
+    refs = [S.reference(sos, l) for l in traces]
+    got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]), monitor_package("C"),
+                    traces, refs, tmp_path, steps=24)
+    assert S.compare(refs, got) == []
+    seen = _seen(refs)
+    assert {"fulfilled", "violated", "suspended", "discharged"} <= seen["states"]
+
+
+@needs_evm
+def test_evm_gas_of_a_temporal_content_is_bounded(tmp_path):
+    """gas2 of the review: a prohibition with content throughout(1000s, ...)
+    at one observation per second. Each observation adds a candidate; the
+    cost of an observation stays the same (it grew by 4 x 10^4 gas per
+    candidate before)."""
+    sos = _small("      norms:\n        - {id: p, kind: prohibition, bearer: A, "
+                 "content: \"throughout(1000s, A.x >= 0)\"}\n")
+    contract = sos.contracts[0]
+    lines = [json.dumps({"t": k, "values": {"A.x": k}}) for k in range(320)]
+    compiled = S.compile_solidity(generate_norms_monitor_sol(sos, contract),
+                                  monitor_name(contract.id), tmp_path)
+    run = S.sol_run(lines, ["A.x"])
+    run["steps"] = [s for s in run["steps"] if "finish" not in s]
+    [raw] = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", [run], tmp_path)
+    gas = [r["gas"] for r in raw]
+    assert max(gas[20:]) < 1.05 * min(gas[20:]) and max(gas) < 500_000, (min(gas), max(gas))
+
+
+# === The range of exact numbers, exact deadlines, runtime size =======================
+
+RANGE_ITEMS = ("      guarantee:\n        - \"A.x > 0\"\n        - \"A.x == 0.0000001\"\n"
+               "        - \"A.x * 10 == 0.000001\"\n        - \"A.x + 1000 > 1000\"\n")
+
+
+@needs_opa
+@pytest.mark.parametrize("number", ["1e-7", "1E-7", "-0.0", "1e400", "1e-400", "1e-700",
+                                    "123456789012345678901234567890.5", "0e5000",
+                                    "1" + "0" * 300, "1" + "0" * 400, "1e308",
+                                    "1.7976931348623157e308", "-1.7976931348623157e308",
+                                    "1.7976931348623158e308", "1e309", "1" + "0" * 308])
+def test_opa_range_of_exact_numbers(number, tmp_path):
+    """p12 of the review: the scales of 10^-309 and below used to compare as
+    equal in Rego. Inside the range of F.5 OPA agrees with norms-eval,
+    outside it both refuse the observation."""
+    sos = _small(RANGE_ITEMS)
+    lines = ['{"t": 0, "values": {"A.x": %s}}' % number, '{"t": 1e0, "end": true}']
+    refs = [S.reference(sos, lines)]
+    got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]), monitor_package("C"),
+                    [lines], refs, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+@needs_opa
+@pytest.mark.parametrize("number", ["1e-5", "1e-700", "1.7976931348623157e308", "1e309",
+                                    "1" + "0" * 308, "1" + "0" * 309])
+def test_opa_range_of_request_and_bindings(number, tmp_path):
+    """p15 of the review: the request and the bindings are checked like the
+    observation, whether they come with the first observation or as
+    input.request / input.bindings."""
+    sos = _small("      guarantee:\n        - \"request.x > 0\"\n        - \"A.z == 1\"\n")
+    rego = generate_norms_monitor_rego(sos, sos.contracts[0])
+    lines = ['{"t": 0, "request": {"x": %s}, "values": {"A.z": 1}}' % number,
+             '{"t": 1, "end": true}']
+    refs = [S.reference(sos, lines)]
+    got = S.run_opa(rego, monitor_package("C"), [lines], refs, tmp_path)
+    assert S.compare(refs, got) == []
+    refused = "error" in refs[0]
+    assert refused == (number in ("1e-700", "1e309", "1" + "0" * 309))
+    # a binding is an integer: the other numbers are refused for that
+    for key in ("request", "bindings") if number.isdigit() else ("request",):
+        tmp = tmp_path / key
+        tmp.mkdir()
+        (tmp / "m.rego").write_text(rego, encoding="utf-8")
+        (tmp / "in.json").write_text(
+            '{"state": null, "observation": {"t": 0, "values": {"A.z": 1}, "end": true}, '
+            '"%s": {"x": %s}}' % (key, number), encoding="utf-8")
+        proc = subprocess.run([S.opa_binary(), "eval", "-d", str(tmp / "m.rego"), "-i",
+                               str(tmp / "in.json"), "--format", "json",
+                               f"data.{monitor_package('C')}.result"],
+                              capture_output=True, text=True)
+        out = json.loads(proc.stdout)["result"][0]["expressions"][0]["value"]
+        assert ("outside the range" in (out.get("error") or "")) == refused, (key, out)
+
+
+def test_rego_refuses_a_product_beyond_its_scales():
+    product = " * ".join(["A.x"] * 11)
+    sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
+                 f"content: \"{product} > 1\"}}\n")
+    with pytest.raises(NormsTargetUnsupported, match="more than 4095 decimals"):
+        generate_norms_monitor_rego(sos, sos.contracts[0])
+
+
+DEADLINE = ("      norms:\n        - {id: o, kind: obligation, bearer: A, trigger: \"B -> A : req\",\n"
+            "           content: \"B -> A : ack\", deadline: 0.0005}\n")
+
+
+@needs_opa
+def test_opa_numeric_deadline_is_exact(tmp_path):
+    sos = _small(DEADLINE)
+    m = '"messages": [{"from": "B", "to": "A", "name": "%s"}]'
+    traces = [['{"t": 0, %s}' % (m % "req"), '{"t": %s, %s}' % (at, m % "ack")]
+              for at in ("0.0005", "0.0006")]
+    refs = [S.reference(sos, l) for l in traces]
+    assert [r["steps"][-1]["norms"]["o"][0] for r in refs] == ["fulfilled", "violated"]
+    got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]), monitor_package("C"),
+                    traces, refs, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+@needs_evm
+def test_evm_numeric_deadline_is_exact(tmp_path):
+    m = '"messages": [{"from": "B", "to": "A", "name": "%s"}]'
+    traces = [['{"t": 0, %s}' % (m % "req"), '{"t": %s, %s}' % (at, m % "ack")]
+              for at in ("0.0005", "0.0006")]
+    refs, got = _evm(_small(DEADLINE), traces, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+@needs_solc
+def test_runtime_estimate_is_above_solc(tmp_path):
+    """The runtime code does not depend on the CADL contract; cadl codegen
+    refuses a monitor whose estimate exceeds EIP-170, and the estimate is
+    above what solc writes with 1 and with 200 runs."""
+    from cadl.codegen.solidity.norms_monitor_sol import RUNTIME_ESTIMATE, RUNTIME_LIMIT
+    sos = parse_file(RICH)
+    text = generate_norms_monitor_sol(sos, sos.contracts[0])
+    assert "pragma solidity >=0.8.24 <=0.8.37;" in text
+    for runs in (1, 200):
+        compiled = S.compile_solidity(text, "CNormsMonitor", tmp_path / str(runs), runs=runs)
+        for name, c in compiled.items():
+            if not c["bin"]:
+                continue
+            short = name.split(":")[1]
+            key = "monitor" if short == "CNormsMonitor" else short
+            assert c["runtime"] <= RUNTIME_ESTIMATE[key] <= RUNTIME_LIMIT, (runs, short)

@@ -50,6 +50,9 @@ class IntLiteral:
 class FloatLiteral:
     value: float
     loc: SourceLocation | None = None
+    # The literal as written ("0.1"), for exact arithmetic (norms 0.1, F.5);
+    # None when the node was not parsed from text.
+    text: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -399,6 +402,9 @@ class NormDef:
     until: str | None = None
     content: str = ""
     deadline_ms: int | None = None
+    # A numeric `deadline:` in seconds as written ("0.0005"), which deadline_ms
+    # rounds to milliseconds; norms 0.1 compares deadlines exactly (F.5).
+    deadline_text: str | None = field(default=None, compare=False, repr=False)
     # A `deadline:` that is not a duration, kept as written for `cadl check`.
     invalid_deadline: str | None = None
     on_violation: NormViolationSpec | None = None

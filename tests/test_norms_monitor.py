@@ -191,8 +191,8 @@ class TestGeneratedModule:
             elif isinstance(node, ast.ImportFrom):
                 assert node.level == 0, "relative import"
                 modules.add(node.module.split(".")[0])
-        assert modules <= {"__future__", "argparse", "copy", "dataclasses", "json", "re",
-                           "math", "sys", "typing"}, modules
+        assert modules <= {"__future__", "argparse", "copy", "dataclasses", "decimal",
+                           "fractions", "json", "re", "math", "sys", "typing"}, modules
 
     def test_is_python_3_9_syntax(self):
         source = generate_norms_monitor_module(parse_file(EXAMPLE))
@@ -404,6 +404,18 @@ class TestExamples:
         assert got.stderr == expected.stderr
         got = _run_module(packages, mod, EXAMPLE_TRACES[0], "--contract", "NOPE")
         assert got.returncode == 2 and "no contract 'NOPE'" in got.stderr
+
+    def test_number_outside_the_range_is_a_trace_error(self, packages, tmp_path):
+        """F.5: a number beyond the range of exact numbers is refused with
+        its line, at once (1e-100000000 written exactly would not end)."""
+        mod = "norms_robot_delivery.norms_monitor"
+        bad = tmp_path / "far.jsonl"
+        bad.write_text('{"t": 0}\n{"t": 1e-100000000}\n', encoding="utf-8")
+        got = _run_module(packages, mod, bad)
+        expected = _cli_norms_eval(EXAMPLE, bad, "json")
+        assert got.returncode == expected.returncode == 2
+        assert got.stderr == expected.stderr
+        assert "line 2" in got.stderr and "outside the range" in got.stderr
 
     @pytest.mark.parametrize("cadl_file", sorted(EXAMPLES.glob("*.cadl")), ids=lambda p: p.stem)
     def test_every_example_generates_and_loads(self, cadl_file, tmp_path):
@@ -1238,7 +1250,7 @@ def _mutated(name: str, old: str, new: str, count: int = 1) -> dict:
 
 _HELPERS = '''
 def _rv_open(elapsed, deadline):
-    return deadline is None or elapsed <= deadline + 1e-9
+    return deadline is None or elapsed <= deadline
 
 
 def _rv_describe(op, left, right):
@@ -1246,7 +1258,6 @@ def _rv_describe(op, left, right):
 
 
 # >>> monitor-runtime
-_EPS = 1e-9
 '''
 
 
@@ -1265,8 +1276,8 @@ class TestSelfCheck:
         check_module(text)
 
     def test_m1_helper_outside_the_copied_region(self):
-        sources = _mutated("norms_eval", "# >>> monitor-runtime\n_EPS = 1e-9\n", _HELPERS.lstrip("\n"))
-        old = "open_ = norm.deadline is None or elapsed <= norm.deadline + _EPS"
+        sources = _mutated("norms_eval", "# >>> monitor-runtime\n# Numbers are exact", _HELPERS.lstrip("\n") + "# Numbers are exact")
+        old = "open_ = norm.deadline is None or elapsed <= norm.deadline"
         assert sources["norms_eval"].count(old) == 1
         sources["norms_eval"] = sources["norms_eval"].replace(
             old, "open_ = _rv_open(elapsed, norm.deadline)")
@@ -1275,8 +1286,8 @@ class TestSelfCheck:
     def test_m2_helper_used_on_a_rare_path(self):
         """No test of the monitor reaches this warning, so only the check
         of the names finds it."""
-        sources = _mutated("norms_eval", "# >>> monitor-runtime\n_EPS = 1e-9\n", _HELPERS.lstrip("\n"))
-        old = ("self.warn(f\"'{op}' cannot be applied to {left!r} and {right!r}; "
+        sources = _mutated("norms_eval", "# >>> monitor-runtime\n# Numbers are exact", _HELPERS.lstrip("\n") + "# Numbers are exact")
+        old = ("self.warn(f\"'{op}' cannot be applied to {_show(left)} and {_show(right)}; "
                "the predicate does not hold\")")
         assert sources["norms_eval"].count(old) == 1
         sources["norms_eval"] = sources["norms_eval"].replace(

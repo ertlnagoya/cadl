@@ -82,6 +82,31 @@ jobs:
           java -version
           "$HOME/.local/prism/bin/prism" -version
 
+      # The norms monitor of the Solidity target runs on an EVM from PyPI in
+      # tests/test_norms_monitor_targets.py. The EVM goes into a venv of its
+      # own (CADL_EVM_PYTHON), with the versions of tests/evm-constraints.txt,
+      # not into the dependencies of cadl, and solc comes from py-solc-x
+      # (CADL_SOLC). CADL_REQUIRE_EVM=1 turns a missing EVM into a failure
+      # of these tests instead of a skip. One Python version is enough. The
+      # EVM tests take the first CADL_NORMS_EVM_CASES traces of
+      # tests/test_norms_eval.py, so that the job stays short.
+      - name: Set up an EVM and solc for the Solidity monitor tests
+        if: ${{ matrix.python-version == '3.12' }}
+        env:
+          SOLCX_BINARY_PATH: ${{ runner.temp }}/solcx
+        run: |
+          python -m venv "$RUNNER_TEMP/venv-evm"
+          "$RUNNER_TEMP/venv-evm/bin/pip" install -c tests/evm-constraints.txt "eth-tester[py-evm]" py-evm py-solc-x
+          mkdir -p "$SOLCX_BINARY_PATH"
+          solc=$("$RUNNER_TEMP/venv-evm/bin/python" -c "import solcx; from solcx.install import get_executable; print(get_executable(solcx.install_solc('0.8.24')))")
+          "$solc" --version
+          {
+            echo "CADL_EVM_PYTHON=$RUNNER_TEMP/venv-evm/bin/python"
+            echo "CADL_SOLC=$solc"
+            echo "CADL_NORMS_EVM_CASES=40"
+            echo "CADL_REQUIRE_EVM=1"
+          } >> "$GITHUB_ENV"
+
       # -rs lists the tests that were skipped and why.
       - name: Run tests
         run: pytest -rs --cov=cadl --cov-report=term-missing --cov-report=xml tests/

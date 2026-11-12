@@ -76,9 +76,8 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
     per contract: ``{"contract", "file", "text", "reasons", "left_out"}``.
     ``text`` is None when the contract cannot be monitored (``reasons``
     says why); ``left_out`` lists the (key, position, text, reason) of the
-    items the monitor leaves out; ``gas`` (Solidity) lists the norms whose
-    content has a temporal window, whose cost grows with the observations
-    inside it. An empty list for other files and targets."""
+    items the monitor leaves out. An empty list for other files and
+    targets."""
     from ..norms import norms_declared
     from .norms_ir import NormsTargetUnsupported, build_ir, unsupported_items
     if target not in ("opa", "solidity") or not norms_declared(sos):
@@ -86,7 +85,7 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
     ir_of = build_ir
     if target == "opa":
         from .opa.norms_monitor_rego import generate_norms_monitor_rego as gen
-        from .opa.norms_monitor_rego import monitor_filename
+        from .opa.norms_monitor_rego import monitor_filename, rego_ir as ir_of
     else:
         from .solidity.norms_monitor_sol import generate_norms_monitor_sol as gen
         from .solidity.norms_monitor_sol import monitor_name, solidity_ir as ir_of
@@ -96,13 +95,10 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
     out = []
     for contract in sos.contracts:
         entry = {"contract": contract.id, "file": monitor_filename(contract.id),
-                 "text": None, "reasons": [], "left_out": [], "gas": []}
+                 "text": None, "reasons": [], "left_out": []}
         try:
             ir = ir_of(sos, contract)
             entry["left_out"] = unsupported_items(ir)
-            if target == "solidity":
-                from .solidity.norms_monitor_sol import windowed_contents
-                entry["gas"] = windowed_contents(ir)
             entry["text"] = gen(sos, contract)
         except NormsTargetUnsupported as e:
             entry["reasons"] = e.reasons

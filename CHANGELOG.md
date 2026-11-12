@@ -123,6 +123,70 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   refused. A false conflict between two norms over such quantities is no
   longer reported. The limit on combinations of classes in one group is
   raised from 20000 to 50000.
+- The Solidity norms monitor decides the candidates of a norm whose
+  content is one temporal operator together: a queue of the candidates,
+  oldest first, and what the observations since the last judgement say
+  about the operands (the first time `within`'s operand is true, the
+  first time `throughout`'s is false or undefined, the first observation
+  at which `until`'s `q` is true or `p` is not), compared with the times
+  of the candidates by binary search; decided candidates are deleted a
+  few per observation (library `CadlNormsWindows`). The gas of an
+  observation no longer grows with the observations inside a window:
+  `throughout(1000s, …)` at one observation per second costs 3.8 x 10^5
+  gas at the 320th observation and 3.9 x 10^5 at the 1000th (1.3 x 10^7
+  at the 320th before), and the warning of `cadl codegen` about it is
+  gone. The rest of a content with a temporal operator is decided when
+  the candidate is created: the candidate holds at once, is not
+  created, or waits for the operator (`within(3s, p) OR q` with `q`
+  true holds at once); under `NOT` the operator becomes its dual on the
+  negated operand. Two temporal operators in one content,
+  `NOT until(...)` and a temporal operator inside a comparison are
+  refused, with the reason; nesting is refused as before. The items
+  moved to a fourth library, `CadlNormsItems`, deployed after
+  `CadlNormsWindows`.
+- `cadl codegen -t solidity` refuses a norms monitor whose estimated
+  runtime code exceeds the 24576 bytes of EIP-170 (the estimate is
+  above what solc 0.8.24 to 0.8.37 gives with 1 or 200 runs). The
+  pragma is `>=0.8.24 <=0.8.37`, the versions checked.
+- Numbers and times are exact (Appendix F, F.5). `cadl norms-eval`, the
+  generated `norms_monitor.py` and `cadl agents-run` read a number of a
+  trace as the decimal number it is written as (a float of the API as
+  the decimal Python writes for it), compare times without the
+  tolerance of 1e-9 s, and compute `+`, `-`, `*`, `/` and `avg` with
+  rational numbers: `0.1 + 0.2 == 0.3` holds, and epoch seconds with
+  milliseconds or microseconds compare exactly. The JSON results still
+  write times and numbers as floats. A verdict changes only for a time
+  within 1e-9 s of a deadline or of the end of a window, or within the
+  spacing of the floats at that time (about 2.4e-7 s near epoch
+  seconds), and for arithmetic whose float result was rounded; the
+  example traces, the traces of the test suite and 1,800 random traces
+  give the same verdicts as in 0.3.25. There is no switch back. The
+  Rego monitor now computes with exact decimals too (its state keeps
+  numbers and times as `{"$q": [n, k]}`) and refuses `/`; the Solidity
+  monitor is unchanged. For the inputs that meet their limits, the
+  three monitors agree with `cadl norms-eval`.
+- A number of a trace with more than 400 significant digits, more than
+  400 decimals or an absolute value above 1.7976931348623157e308 (the
+  largest finite double, so every float is inside) is a trace error
+  with its line in `cadl norms-eval`, the generated `norms_monitor.py`,
+  `cadl agents-run` and the Rego monitor (F.5 lets a processor refuse
+  them; the Rego monitor checks the request and the bindings it is
+  given too); `{"t": 1e-100000000}` used to run without end. A predicate
+  with such a literal is not evaluated. The Rego monitor builds powers
+  of ten by squaring, so scales of 309 and more no longer compare as
+  equal, and refuses a product that could have more than 4095
+  decimals.
+- A numeric `deadline:` is exact (`0.0005` is half a millisecond); it
+  was rounded to milliseconds.
+- CI runs the EVM tests of the Solidity norms monitor
+  (`tests/test_norms_monitor_targets.py`) in the Python 3.12 job: it
+  builds a venv with eth-tester and py-evm, gets solc 0.8.24 with
+  py-solc-x, and sets `CADL_EVM_PYTHON`, `CADL_SOLC` and
+  `CADL_NORMS_EVM_CASES=40` (the number of traces of
+  `tests/test_norms_eval.py` the EVM runs; all by default) and
+  `CADL_REQUIRE_EVM=1`, which makes a missing EVM a failure. The
+  versions of the EVM venv are pinned by `tests/evm-constraints.txt`. The
+  dependencies of cadl are unchanged.
 
 
 ### Fixed

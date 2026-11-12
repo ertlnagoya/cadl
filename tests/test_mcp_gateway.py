@@ -572,6 +572,16 @@ class TestOnlineRuntime:
         assert produced == rt.audit == offline["audit"]
         assert rt.result() == offline
 
+    @pytest.mark.parametrize("number", [1e308, 1.7976931348623157e308, -1.7976931348623157e308,
+                                        5e-324, 0.1])
+    def test_every_finite_float_is_accepted(self, number):
+        """The range of exact numbers (F.5) holds every finite double, so a
+        float of the API is never refused (as in 0.3.25)."""
+        rt = AgentsRuntime.open(EXAMPLE)
+        rt.observe({"t": 1, "messages": [{"from": "OPERATOR", "to": "PLANNER",
+                                          "name": "grant_read", "args": [number]}]})
+        assert not rt.failed
+
     def test_closed_and_failed(self, tmp_path):
         from cadl.norms_eval import NormsEvalError, TraceError
         rt = AgentsRuntime.open(EXAMPLE)
