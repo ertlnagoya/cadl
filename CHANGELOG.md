@@ -6,6 +6,58 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `cadl a2a-gateway --client-ca CA.pem`: mutual TLS. A client presents a
+  certificate of the CA whose subject has exactly one common name, an
+  actor of `--client-keys`; the handshake runs before the connection
+  takes a reader slot, within the read deadline and at most
+  `--max-handshakes` (256) at the same time, so peers without a
+  certificate cannot hold the readers of the gateway. The `CADL-HMAC`
+  header stays and has to name the same actor (`certificate_mismatch`),
+  which keeps the nonce replay protection and the binding of a request to
+  its body and run. A failed handshake or a certificate of no actor is
+  recorded as the new host event `handshake_failed`. G.13 states what
+  remains: a handshake that is slow but valid.
+- The HTTP+JSON binding of A2A 1.0.0 (11) at `cadl a2a-gateway`: the
+  routes of 11.3 on the port of the JSON-RPC binding, authenticated with
+  the HTTP method and the request target in the MAC, and decided, held,
+  recorded and replayed as JSON-RPC requests, streams included. Errors
+  are `google.rpc.Status` objects with the HTTP status of 5.4 and an
+  `ErrorInfo`; unknown routes, tenant paths, unknown query parameters and
+  bodies that disagree with the path are refused. `--upstream-binding
+  rest` speaks the binding to the agent. `SubscribeToTask` is taken with
+  `POST` (11.3.2) and `GET` (the `a2a.proto`). New module
+  `cadl.a2a_rest`.
+- Push notifications at `cadl a2a-gateway` with `--push-allow ENTRY`
+  (URL, URL prefix, `HOST[:PORT]`, IP address or network), `--push-url`,
+  `--push-timeout` and `--push-ca`. The agent gets a configuration of
+  the gateway (its URL, secret token and credentials); the gateway relays
+  each notification to the client's URL, only for the task of the
+  configuration and its owner. Callback URLs are `https` unless loopback,
+  resolve only to global unicast addresses unless an IP entry contains
+  them (metadata addresses only when named), and are called at the
+  checked address, without redirects, within the deadline, reading at
+  most 64 KiB. New host events `push_config`, `push_refused`,
+  `push_sent`, `push_failed`, `push_dropped`. Without `--push-allow`
+  push notifications are refused as before. New module `cadl.a2a_push`.
+- The gRPC binding of A2A 1.0.0 (10) at `cadl a2a-gateway
+  --grpc-listen HOST:PORT`, as the optional extra
+  `pip install 'cadl-lang[grpc]'` (`a2a-sdk[grpc]`, whose `a2a_pb2` is
+  generated from the normative `a2a.proto`; Python 3.10 or later). No new
+  required dependency. New module `cadl.a2a_grpc`.
+- Tests: `tests/test_a2a_bindings.py` with the fake agent (which now also
+  speaks the HTTP+JSON binding and sends push notifications) and a test
+  CA made with `openssl`; `tests/test_sdk_interop.py` with `a2a-sdk`
+  1.3.0 over mutual TLS, HTTP+JSON (agent over JSON-RPC and over
+  HTTP+JSON), push notifications of the SDK agent, and gRPC.
+
+### Fixed
+
+- `cadl a2a-gateway`: closing a stream of one event (a denial, or a
+  submitted task of `returnImmediately`) raised an error that was only
+  logged.
+
 ## [0.3.27] — 2026-11-12
 
 Resolves the remaining verification items. The strategic export is run

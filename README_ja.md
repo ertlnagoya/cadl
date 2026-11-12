@@ -346,7 +346,7 @@ cadl agents-run FILE --trace TRACE [--format text|json] [--audit OUT.jsonl [--au
 | `run_id` | 先頭行のみ。監査ログの実行ID（小文字の16進数32桁）。ないときは `--audit` が乱数で決めます |
 | `approvals` | 先頭行のみ。ホストが承認をどう読んだか（`authenticated`、`insecure`、`none`）。監査ヘッダに写します |
 | `withdraw` | この行でホストが保留中のメッセージを取り下げる保留のID（クライアントが呼び出しを取り消した）。まだ `held` の保留は `withdrawn` で閉じ（閉じる記録は `deny`、理由 `withdrawn`）、その後の承認は `not_held` になります |
-| `host_events` | この行でのホストの事象の記録。行を処理する前に書きます。項目は `event`（`method_refused`、`unsolicited_response`、`unauthorised_approval`、`unauthorised_rejection`、`unauthorised_message`、`approval_evidence`、`approval_unauthenticated`、`forward_failed`、0.3.25からは `unauthenticated_request`、`task_refused`、`invalid_response`、`task_cancel`、`overloaded`、`read_timeout`）と、省略可能な `reason`、`hold_id`、`message` です。判定は変えません。MCPゲートウェイとA2Aゲートウェイが書きます |
+| `host_events` | この行でのホストの事象の記録。行を処理する前に書きます。項目は `event`（`method_refused`、`unsolicited_response`、`unauthorised_approval`、`unauthorised_rejection`、`unauthorised_message`、`approval_evidence`、`approval_unauthenticated`、`forward_failed`、0.3.25からは `unauthenticated_request`、`task_refused`、`invalid_response`、`task_cancel`、`overloaded`、`read_timeout`、0.3.28からは `handshake_failed`、`push_config`、`push_refused`、`push_sent`、`push_failed`、`push_dropped`）と、省略可能な `reason`、`hold_id`、`message` です。判定は変えません。MCPゲートウェイとA2Aゲートウェイが書きます |
 
 一つの行は次の順に処理します。期限が `t` より前の保留を期限切れにします。`withdraw` の保留を閉じます。`host_events` を記録します。インスタンスを作ります。行の時刻と `values`（および `amend`）を、メッセージを持たない一つの観測として処理します。これにより、過ぎた期限や期間を、メッセージを判定する前に確定させます。各メッセージを判定し、許可したメッセージを一つの観測にします。`state` の変更と `end` は、メッセージを持たない最後の観測になります。
 
@@ -455,13 +455,16 @@ cadl mcp-message DIR 'FROM -> TO : name' [--arg VALUE ...] --key FROM.key
 
 #### A2Aゲートウェイ
 
-`cadl a2a-gateway`（0.3.25から）は、一つのA2Aエージェント、つまりファイル中のアクター `ACTOR` の前に判定点を置きます。[A2A 1.0.0](https://a2a-protocol.org/v1.0.0/specification/) のJSON-RPCバインディングを受けるHTTPサーバです。要求は、パス `/` へのHTTP POSTで送るJSON-RPC 2.0で、`Content-Type: application/json` とヘッダ `A2A-Version: 1.0` を持ちます。ストリームのメソッドにはServer-Sent Eventsで応答します（0.3.26から）。許可した要求は、`--upstream URL` のエージェントに送ります。
+`cadl a2a-gateway`（0.3.25から）は、一つのA2Aエージェント、つまりファイル中のアクター `ACTOR` の前に判定点を置きます。[A2A 1.0.0](https://a2a-protocol.org/v1.0.0/specification/) のJSON-RPCバインディングを受けるHTTPサーバです。要求は、パス `/` へのHTTP POSTで送るJSON-RPC 2.0で、`Content-Type: application/json` とヘッダ `A2A-Version: 1.0` を持ちます。ストリームのメソッドにはServer-Sent Eventsで応答します（0.3.26から）。0.3.28からは、同じポートでA2A 11.3の経路によるHTTP+JSONのバインディングも受けます。追加の依存 `pip install 'cadl-lang[grpc]'` を入れれば、`--grpc-listen` でgRPCのバインディングも受けます。クライアント証明書を求めること（相互TLS、`--client-ca`）と、許可リストのもとでプッシュ通知を中継すること（`--push-allow`）もできます。許可した要求は、`--upstream URL` のエージェントにJSON-RPCで送ります。`--upstream-binding rest` を与えたときは、HTTP+JSONのバインディングで送ります。
 
 ```bash
 cadl a2a-gateway FILE --agent-actor ACTOR --upstream URL --client-keys CLIENTS.json \
     --audit OUT.jsonl [--audit-key FILE] [--approvals DIR --approver-keys KEYS.json] \
     [--trace-out TRACE.jsonl] [--init FIRST.json] [--listen HOST:PORT] [--port-file FILE] \
-    [--tls-cert CERT.pem --tls-key KEY.pem] [--agent-card CARD.json] \
+    [--tls-cert CERT.pem --tls-key KEY.pem [--client-ca CA.pem] [--max-handshakes N]] \
+    [--agent-card CARD.json] [--upstream-binding jsonrpc|rest] \
+    [--push-allow ENTRY ... [--push-url URL] [--push-timeout SECONDS] [--push-ca CA.pem]] \
+    [--grpc-listen HOST:PORT [--grpc-port-file FILE]] \
     [--upstream-token FILE] [--upstream-timeout SECONDS] [--read-timeout SECONDS] \
     [--max-readers N] [--max-readers-per-address N] [--max-readers-per-prefix N] \
     [--max-handlers N] [--max-handlers-per-actor N] [--max-holds-per-actor N] \
@@ -481,20 +484,28 @@ cadl a2a-gateway FILE --agent-actor ACTOR --upstream URL --client-keys CLIENTS.j
 | `SubscribeToTask`（0.3.26から） | クライアント自身のタスクについてだけ、判定も記録もせずに、そのタスクのエージェントのストリームを渡します。保留中のゲートウェイのタスクには、保留が閉じるまでコメントを送り、その後、エージェントのストリームをゲートウェイのタスクのIDで渡すか、最後のタスクを送ります |
 | `GetTask`、`CancelTask` | クライアント自身のタスクについてだけ、判定せずにエージェントに渡します。`CancelTask` は渡す前に `task_cancel` として記録し、`GetTask` は記録しません。他のクライアントのタスクと以前の実行のタスクは `TaskNotFoundError`（-32001）とし、`task_refused` として記録します。保留中の要求に対する `CancelTask` は、その要求を取り下げ（G.6）、`TASK_STATE_CANCELED` を返します。保留の期限がすでに過ぎていたときは、拒否のタスクを返します。`returnImmediately` の要求を解放した後も、そのタスクはゲートウェイのIDのままです。ゲートウェイはエージェントにそのタスクを問い合わせ、ゲートウェイのIDで示します |
 | `ListTasks`、`GetExtendedAgentCard` | `UnsupportedOperationError`（-32004）で拒否し、`method_refused` として記録します |
-| プッシュ通知のメソッドと `configuration.taskPushNotificationConfig` | `PushNotificationNotSupportedError`（-32003）で拒否し、`method_refused` として記録します。ゲートウェイが、ゲートウェイを置いたネットワークの中から、クライアントの選んだURLに要求を送ることになるためです（サーバサイドリクエストフォージェリ） |
+| プッシュ通知のメソッドと `configuration.taskPushNotificationConfig` | `--push-allow` がなければ、`PushNotificationNotSupportedError`（-32003）で拒否し、`method_refused` として記録します。ゲートウェイが、ゲートウェイを置いたネットワークの中から、クライアントの選んだURLに要求を送ることになるためです（サーバサイドリクエストフォージェリ）。`--push-allow` があるとき（0.3.28から）は、下の「プッシュ通知」のとおりです |
 | その他のメソッド | -32601で拒否し、`method_refused` として記録します |
 
 `SendMessage` が名指せるのは、この実行の中でエージェントまたはゲートウェイが同じアクターに与えたタスク（`taskId`、`referenceTaskIds`）とコンテキスト（`contextId`）だけです。それ以外は `TaskNotFoundError` とし、`task_refused` として記録します。`tenant` は拒否します（-32602）。クライアントのタスクをIDだけで区別しているためです。エージェントが別のアクターに与えたタスクやコンテキストは、そのアクターには示しません（`InvalidAgentResponseError`、-32006。`invalid_response` として記録する）。
 
 **HTTPと本文の扱い。** HTTPでは、`Content-Length` が一つで1 MiB以下であること、`Transfer-Encoding` がないこと、一つの接続に要求が一つであることを求めます。コロンの前にスペースまたはタブのあるヘッダ行（標準ライブラリの構文解析器はこれをヘッダの終わりとみなします）、折り返したヘッダ行、単独の復帰文字には400で応答します（0.3.26から）。本文は、MCPゲートウェイの行と同じく厳密に構文解析し（重複したキー、NaN、`1e999`、深い入れ子、対になっていないサロゲート、不正なUTF-8は拒否する）、構文解析したオブジェクトを、ASCII以外の文字をすべてエスケープした詰めたJSONとして送ります。`A2A-Version` は、前後のスペースを除いて `1.0` または `1.0.N` でなければなりません。ないとき、または別の値のときは `VersionNotSupportedError`（-32009）です。A2A 1.0.0では、ヘッダがないことは0.3を意味します。失敗しうる処理は判定の前にすべて行います。許可または解放の後にそれでも要求を送れなかったときは、クライアントに -32603 を返し、ログに `forward_failed` を書きます。送った後に正しい応答が返らなかったときは、クライアントに -32006 を返し、ログに `invalid_response` を書きます。保留中の応答を待つ（ブロッキングの）要求について、クライアントが接続を閉じたとき、または送信側だけを閉じたときは、その要求を取り下げます。要求が保留されている間にクライアントが送るバイトは、読んで捨てます。`returnImmediately` の要求を解放した後に渡せなかったときは、そのタスクを `TASK_STATE_FAILED` にし、ログに `forward_failed` を書きます。要求行、ヘッダ、本文は、合わせて `--read-timeout` 秒（既定は10）以内に届かなければなりません。届かないときは接続を閉じ、`read_timeout` として記録します。認証の前に同時に読む接続は、一つのリモートアドレス（IPv4のアドレス、またはIPv6のアドレスの/64のプレフィックス。IPv4射影アドレスはそのIPv4アドレスとして数えます）について `--max-readers-per-address` 個（既定は4）まで、一つのIPv4の/24またはIPv6の/48について `--max-readers-per-prefix` 個（既定は16、0.3.26から）まで、全体で `--max-readers` 個（既定は64）までです。上限に達したアドレスまたはプレフィックスからの接続には、すぐにHTTP 503で応答します（`overloaded`、`address` または `prefix`）。全体の上限に達しているときは、接続は空きを最大1秒待ち、空かなければHTTP 503を受け取ります（`overloaded`、`readers`）。`--max-handlers`（既定は64）に数えるのは、認証された後の要求と保留中の要求だけで、それを超えるとHTTP 503で応答します（`overloaded`、`handlers`）。一つのアクターについては、同時に処理する要求を `--max-handlers-per-actor` 個（既定は16。保留中の応答を待つ要求と、遅いエージェントへの要求も数える）まで、保留を応答を待つかどうかにかかわらず `--max-holds-per-actor` 個（既定は64）までとし、それを超える要求には判定の前にHTTP 503で応答します（`overloaded`、`handlers_per_actor ACTOR` または `holds_per_actor ACTOR`）。保留の上限に達したアクターは、保留にならないメッセージも送れません。`unauthenticated_request`、`overloaded`、`read_timeout` の記録は、事象ごとに1秒に20件までです。すべての接続の読み込みの期限は、一つのスレッドで管理します。残る問題は次のとおりです。少なくとも四つの/24（または/48）のネットワークにあるホストが、ネットワークごとに16個ずつ接続し続ければ、64個の読み込みをすべて使い続けることができ、その間ゲートウェイは新しい接続をすべて拒否します。一つのプロセスは、認証の前にそのようなホストをクライアントと区別できません。これが問題になる場合は、接続の数を制限するプロキシやファイアウォールの後ろにゲートウェイを置いてください。プロキシの後ろでは、すべてのクライアントがプロキシのアドレスを持つので、`--max-readers-per-address` を大きくするか、要求を受け取り終えてから渡すプロキシを使ってください。SIGTERMまたはSIGINTを受けると、保留中の応答を待つ（ブロッキングの）要求に -32603 で応答し、トレースとログの終わりを書きます。判定点が失敗していたときは終了ステータス1で終わります。
 
+**相互TLS（0.3.28から）。** `--client-ca CA.pem`（と `--tls-cert`、`--tls-key`）を与えると、クライアントはそのCAの証明書を示す必要があります。証明書のサブジェクトはコモンネームをちょうど一つ持ち、それは `--client-keys` のアクター（`CN=PLANNER`、`CN=WORKER[2]`）でなければなりません。TLSのハンドシェイクは、接続が読み込みの枠を取る前に、読み込みの期限の中で行い、同時に行うのは `--max-handshakes` 個（既定は256）までです（それを超える接続は空きを最大1秒待ち、空かなければ閉じます。`overloaded`、`handshakes`）。ハンドシェイクに失敗した接続と、そのようなアクターを名指さない証明書の接続は閉じ、`handshake_failed` として記録します（1秒に20件まで）。したがって、証明書を持たない相手が読み込みの枠を使うことはありません。証明書はヘッダ `CADL-HMAC` の代わりにはなりません。ヘッダは同じアクターを名指す必要があり（違えば `certificate_mismatch`）、そのMAC、ノンス、実行IDによって、再送の防止と、要求を本文と実行に結びつけることを保ちます。TLSのセッションだけではこれらはできません。残る問題は、遅いが正しいハンドシェイクです。ハンドシェイクが終わるまで相手が誰かはわからないので、遅いハンドシェイクは、アドレスごととプレフィックスごとの上限の範囲で、読み込みの期限までスレッドを一つとハンドシェイクの枠を一つ使います。少なくとも16個の/24（または/48）のネットワークにあるホストは、続けている間、256個の枠をすべて使えます。プッシュ通知を使うときは、エージェントのアクターも証明書を示せます。その証明書でできるのは通知を届けることだけです。
+
+**HTTP+JSONのバインディング（0.3.28から）。** `POST /message:send`、`POST /message:stream`、`GET /tasks/{id}`（クエリ `historyLength`）、`POST /tasks/{id}:cancel`、`POST` または `GET /tasks/{id}:subscribe`、`--push-allow` があれば `/tasks/{id}/pushNotificationConfigs` の経路を、JSON-RPCと同じポートで受けます。要求はJSON-RPCの要求と同じく認証します。MACの `method` と `path` には、HTTPのメソッドと、送られたとおりの要求ターゲットの全体（パスとクエリ）を使います（`authorization(..., path=target, method=...)`）。その後、要求をJSON-RPCの要求に直し、判定、保留、記録、転送はJSON-RPCと同じに行います。したがってトレースとログもJSON-RPCの場合と同じです。本文は `application/json` または `application/a2a+json` で、`GET` と `DELETE` は本文を持ちません。未知の経路（`/{tenant}/...` も含む）、未知のクエリパラメータ、パスと食い違う本文は拒否します。エラーは、A2A 5.4のHTTPステータスと `ErrorInfo`（`reason` は `TASK_NOT_FOUND` など、ドメインは `a2a-protocol.org`）を持つ `google.rpc.Status` のオブジェクトです。ストリームは `StreamResponse` のオブジェクトを `data` に持ち、エラーは `error` のイベントで送ります。`GET /tasks` と `GET /extendedAgentCard` は拒否します（`UNSUPPORTED_OPERATION`）。`--upstream-binding rest` を与えると、ゲートウェイはこのバインディングでエージェントに送り（`--upstream` はその経路の基点）、応答をJSON-RPCの応答と同じく厳密に検査します。A2Aの `ErrorInfo` を持たないエラーの応答は `invalid_response` です。
+
+**プッシュ通知（0.3.28から）。** `--push-allow ENTRY`（繰り返し可）を与えると、ゲートウェイは、クライアント自身のタスクについて、`SendMessage` またはA2A 3.1.7から3.1.10のメソッドによるプッシュ通知の設定を受け付けます。ENTRYは、URL（`/` で終わるパスは前方一致）、`HOST[:PORT]`、IPアドレスまたはネットワークのいずれかです。エージェントはクライアントのURLを知りません。エージェントには、`--push-url`（既定は `--listen` のアドレスで、そのときはループバックでなければならない）に `/cadl-push/<id>` を加えたURLと、ゲートウェイの秘密のトークンと資格情報を持つ、ゲートウェイの設定を渡します。そこに届いた通知を検査し（秘密の値、設定のタスクの `StreamResponse` が一つであること、そのタスクの所有者が設定のクライアントであること）、クライアントのトークンと資格情報を付けてクライアントのURLに中継します。クライアントのURLは、ENTRYのどれかに一致し、ホストがループバックでなければ `https` であり、解決したアドレスがすべてグローバルユニキャストか、IPのENTRYに含まれるものでなければなりません（クラウドのメタデータのアドレスは、そのアドレス自体をENTRYに挙げたときだけ）。これは設定を受け取るときと、通知のたびに検査します。要求は検査したアドレスに送り、リダイレクトには従わず、接続から応答まで `--push-timeout`（既定は10秒）以内に終え、応答は64 KiBまでしか読みません。`https` のURLのためのCAは `--push-ca` で与えます。記録は、`push_config`（エージェントに渡した設定、または削除した設定）、`push_refused`、`push_sent`、`push_failed`、`push_dropped`（1秒に20件まで）です。`SendMessage` の設定のトークンと資格情報は、公開する保留には表示しません。GetとListにはゲートウェイが応答します。Deleteは中継をすぐに止め、エージェントにも渡します。
+
+**gRPC（0.3.28から、追加の依存）。** `pip install 'cadl-lang[grpc]'` は `a2a-sdk[grpc]` を入れます。その `a2a.types.a2a_pb2` は規範である `a2a.proto` から生成したものです。`--grpc-listen HOST:PORT` は、その `lf.a2a.v1.A2AService` を受けます（TLSと相互TLSは `--listen` と同じオプションで指定し、ループバック以外のアドレスにはTLSが必要です）。メタデータ `authorization: CADL-HMAC ...` のMACは、`POST`、RPCのパス（`/lf.a2a.v1.A2AService/SendMessage`）、届いたとおりの直列化された要求のSHA-256を対象とします。メタデータ `a2a-version` は `1.0` でなければなりません。`a2a.proto` が定義しないフィールドを持つメッセージは拒否します。エラーは、`grpc-status-details-bin` に `ErrorInfo` を持つgRPCのステータスで、ストリームはサーバストリーミングのRPCです。HTTPの待ち受けの読み込みとハンドシェイクの上限は、gRPCの待ち受けには適用しません。接続はgRPCが扱い、同時に処理するRPCは `--max-handlers` に16を加えた数まで、要求のメッセージは1 MiBまでです。
+
 **承認。** 承認とその他のメッセージは、MCPゲートウェイと同じく受け箱から届きます（`--approvals DIR --approver-keys KEYS.json`、`cadl mcp-approve`、`cadl mcp-message`）。保留中のメッセージの `params`（`SendMessage` の要求の全体）は `DIR/holds/h-N.json` に公開し、承認はそのSHA-256に結びつきます。承認はA2Aのメッセージとしては受け付けません。受け箱からの承認はランタイムに与えるだけなので、承認の規則の受信者が集合、範囲、または添字変数であるとき（`OPERATOR -> SUMMARIZER[*] : approve`）は、具体的なアクターとします。添字変数の値は、保留の根拠の契約インスタンスの束縛から取ります（0.3.26から）。それ以外では、参照が `ACTOR` に一致しうるなら `ACTOR`（MCPゲートウェイでは、ツールサーバ、次に `--agent`）、そうでなければ集合の最初に宣言された要素です。ゲートウェイのアクターの契約が保留を作るのに、`approval` を作る規則を持たないとき、ゲートウェイは起動しません（このファイルはすでにG-9によって誤りです）。時刻、トレース、再生はMCPゲートウェイと同じです。そのトレースに対する `cadl agents-run` は、バイト単位で同じ監査ログを書きます。
 
 **署名した保留（0.3.26から）。** `--hold-key FILE` を与えると（どちらのゲートウェイも）、公開する保留はすべて `"kind": "hold"` と `hold_mac` を持ちます。`hold_mac` は、保留（保留中のメッセージ、時刻、引数とそのSHA-256）の正規形JSONに対する、その鍵でのHMAC-SHA256です。`run.json` は `"holds_signed": true` を持ちます。`cadl mcp-approve --hold-key FILE` は、保留を表示または署名する前にこれを検証し、署名のない保留と署名の誤った保留を拒否します。`--hold-key` がないときは、署名された保留を拒否します。署名のない保留には警告を出しますが、受け箱の `run.json` が `holds_signed` を示すとき、または `--require-signed-hold`（受け箱に依存しません）を与えたときは拒否します。どの場合も、表示する引数が保留の示すSHA-256を持たないときは拒否し、引数はそのままの形で表示されない文字をすべて `\uXXXX` として表示します（制御文字、双方向の上書き、幅のない文字などの書式文字、私用の文字、サロゲート、未割り当てのコードポイント、行と段落の区切り）。保留の鍵はゲートウェイの鍵で、監査ログの鍵とも、どの承認者の鍵とも、A2Aゲートウェイのどのクライアントの鍵とも異なっていなければなりません。承認者は検証のためにこの鍵を持ち、受け箱に書けても鍵を読めない者が保留を書き換えたとき、その改ざんを検出できます。承認の認証はこの鍵に依存しません。保留の鍵がなくても、ゲートウェイは保留中のものと異なる引数の承認を拒否します（`wrong_message`）。後方互換性のため、このオプションは任意です。承認者にとって保留が認証されるのは、`mcp-approve` に `--hold-key` を与えたときだけです。
 
-**SDK。** `tests/test_sdk_interop.py` は、公式のSDKに対してゲートウェイを試験します。`mcp` 2.3.0のMCPサーバを `cadl mcp-gateway` の後ろに置き、SDKの `ClientSession`（リビジョン2025-11-25）と `Client`（2026-07-28、`server/discover`）から呼び出します。`a2a-sdk` 1.3.0のエージェントを `cadl a2a-gateway` の後ろに置き、`a2a-sdk` のクライアントから、ストリーミングの有無の両方で呼び出します。ヘッダ `CADL-HMAC` は、そのクライアントの `httpx` のイベントフックで加えます。SDKがなければこれらの試験は飛ばし、CIのジョブ `sdk-interop` がPython 3.12にSDKを入れて実行します。SDKはcadlの依存ではありません。
+**SDK。** `tests/test_sdk_interop.py` は、公式のSDKに対してゲートウェイを試験します。`mcp` 2.3.0のMCPサーバを `cadl mcp-gateway` の後ろに置き、SDKの `ClientSession`（リビジョン2025-11-25）と `Client`（2026-07-28、`server/discover`）から呼び出します。`a2a-sdk` 1.3.0のエージェントを `cadl a2a-gateway` の後ろに置き、`a2a-sdk` のクライアントから、ストリーミングの有無の両方で呼び出します。ヘッダ `CADL-HMAC` は、そのクライアントの `httpx` のイベントフックで加えます。0.3.28からは、相互TLS、HTTP+JSONのバインディング（エージェントへはJSON-RPCとHTTP+JSONの両方）、SDKのエージェントのプッシュ通知の送信、gRPC（直列化した要求に署名する `grpc.aio` のインターセプタを使う）でも試験します。SDKがなければこれらの試験は飛ばし、CIのジョブ `sdk-interop` がPython 3.12にSDKを入れて実行します。SDKはcadlの依存ではありません。
 
-対象外：プッシュ通知、`ListTasks`、テナント、HTTP+JSONのバインディング、ヘッダ `A2A-Extensions` と `ExtensionSupportRequiredError`（-32008）、クエリパラメータとしての `A2A-Version`、部分 `raw` がbase64であることの検査、`CADL-HMAC` 以外のA2Aの認証方式（A2Aクライアントがこのヘッダを計算する必要がある）、gRPCのバインディング（HTTP/2とProtocol Buffersが必要で、標準ライブラリにはなく、cadlは実行時の依存を加えません）、未知のコンテキストIDを指定する要求。ゲートウェイは、タスクの所有者を実行をまたいで保持しません。試験は偽のA2Aエージェントと偽のクライアント、および `a2a-sdk` 1.3.0で行っています。
+対象外：`ListTasks`、`GetExtendedAgentCard`、テナント、ヘッダ `A2A-Extensions` と `ExtensionSupportRequiredError`（-32008）、クエリパラメータとしての `A2A-Version`、部分 `raw` がbase64であることの検査、`CADL-HMAC` 以外のA2Aの認証方式（A2Aクライアントがこのヘッダを計算する必要があり、クライアント証明書はそれに加えて使う）、ゲートウェイの保留中のタスクに対する `CreateTaskPushNotificationConfig`（設定は `SendMessage` で与える）、失敗した通知の再送、未知のコンテキストIDを指定する要求。ゲートウェイは、タスクの所有者とプッシュ通知の設定を実行をまたいで保持しません。試験は偽のA2Aエージェントと偽のクライアント、および `a2a-sdk` 1.3.0で行っています。
 
 ### 運用モード遷移の分析
 
@@ -1010,7 +1021,10 @@ src/cadl/
   audit_log.py         監査ログのハッシュ連鎖（SHA-256またはHMAC-SHA256）とその検証（`cadl audit-verify`）
   gateway_core.py      ゲートウェイに共通の部分：判定点、トレース、監査ログ、保留、受け箱、`mcp-approve`、`mcp-message`
   mcp_gateway.py       ランタイムでツール呼び出しを判定するMCPのstdioゲートウェイ（`cadl mcp-gateway`、`mcp-approve`、`mcp-message`）
-  a2a_gateway.py       ランタイムでSendMessageを判定するA2Aゲートウェイ（HTTP上のJSON-RPC。`cadl a2a-gateway`）
+  a2a_gateway.py       ランタイムでSendMessageを判定するA2Aゲートウェイ（JSON-RPCとHTTP+JSON。`cadl a2a-gateway`）
+  a2a_rest.py          ゲートウェイのためのA2AのHTTP+JSONのバインディング：経路、エラー、JSON-RPCとの変換
+  a2a_push.py          A2Aゲートウェイのプッシュ通知：許可リスト、アドレスの検査、送信
+  a2a_grpc.py          A2AゲートウェイのgRPCのバインディング（追加の依存 cadl-lang[grpc]）
   norms_diff.py        改正が規範に及ぼす効果（二つの版の比較）
   grounding.py         根拠付け拡張：導出指標、規則J-1からJ-9とJ-13
   cli.py               コマンドラインインタフェース
@@ -1108,7 +1122,9 @@ tests/
   test_mcp_gateway.py             偽のサーバとクライアントによるMCPゲートウェイ：`cadl agents-run` で再生するシナリオ、不正な入力、異常終了、並行処理
   mcp_fake_server.py              test_mcp_gateway.py 用の偽のMCPサーバ（stdio）
   test_a2a_gateway.py             偽のエージェントとクライアントによるA2Aゲートウェイ：`cadl agents-run` で再生するシナリオ、認証、不正な入力、タスクの分離
-  a2a_fake_agent.py               test_a2a_gateway.py 用の偽のA2Aエージェント（HTTP、JSON-RPC）
+  a2a_fake_agent.py               A2Aゲートウェイの試験用の偽のA2Aエージェント（JSON-RPCとHTTP+JSON、プッシュ通知）
+  test_a2a_bindings.py            A2Aゲートウェイ：相互TLS、HTTP+JSON、プッシュ通知とSSRFの検査、gRPC
+  a2a_certs.py                    test_a2a_bindings.py 用の試験用CAと証明書（openssl）
   test_sdk_interop.py             公式のMCPとA2AのSDKに対するゲートウェイの試験（SDKがなければ飛ばす）
   sdk_mcp_server.py               test_sdk_interop.py 用の mcp SDK のMCPサーバ
   sdk_a2a_agent.py                test_sdk_interop.py 用の a2a-sdk のA2Aエージェント
@@ -1155,7 +1171,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | 規範拡張：PRISMによる1つの契約インスタンスの設計時の検査（`cadl norms-check`） | 利用可能（限量子を含む述語、複数のインスタンス、改正は変換しない） |
 | 根拠付け拡張（grounding 0.1）の規範側：導出指標とインセンティブ被覆率（`cadl norms-indices`）、規則J-1からJ-9、IR、二つの版の比較（`cadl norms-diff` のJ-13） | 利用可能 |
 | 戦略モデル拡張（games 0.1）：均衡検査と保証付きの均衡マップ（`cadl game-check`）、付録Jの規範との結び付け（`sanction_of:` / `reward_of:`、J-10からJ-12、J-14） | 利用可能（出力はPRISM-games 3.2.4と比較済み） |
-| エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、ハッシュ連鎖つきの監査記録。`cadl agents-run`、`cadl audit-verify`）、MCPのstdioゲートウェイ（`cadl mcp-gateway`）、JSON-RPCによるA2Aゲートウェイ（`cadl a2a-gateway`）、Rego / Cedarの境界ポリシー | 利用可能（ゲートウェイは参照実装で、偽のサーバ、エージェント、クライアントと、公式のMCPとA2AのSDKで試験している） |
+| エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、ハッシュ連鎖つきの監査記録。`cadl agents-run`、`cadl audit-verify`）、MCPのstdioゲートウェイ（`cadl mcp-gateway`）、JSON-RPC、HTTP+JSON、gRPCによるA2Aゲートウェイ（`cadl a2a-gateway`）、Rego / Cedarの境界ポリシー | 利用可能（ゲートウェイは参照実装で、偽のサーバ、エージェント、クライアントと、公式のMCPとA2AのSDKで試験している） |
 | 検証メソッド `model_check` / `simulation` / `proof` | 未対応（未対応である旨を明示的に報告） |
 
 ## 関連プロジェクト
