@@ -191,6 +191,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `cadl norms-check` wrote a decimal value of a quantity into a witness
+  that norms-eval did not read as the value of its class, and so did not
+  confirm the witness (exit status 3): with `speed > 0.1 AND speed < 0.2`
+  the witness showed `speed=0.1`. The predicates of the model are now
+  evaluated on the values as the trace reader of norms-eval stores them
+  (exact numbers), the values of the classes are exact decimals with short
+  digits (0.15 in that gap), and every place that writes them (witness
+  traces, exported witnesses, the text report, the PRISM comments, the
+  JSON report) writes their exact digits. Decimal literals of message
+  arguments are kept as written. Tests: every choice of every test
+  contract and bundled example, written into a trace, is read back by
+  norms-eval with the values of the model; random pairs of decimal
+  literals with 1 to 6 places, negative values, close values (0.1 and
+  0.10001) and values beyond a float; the reproducer with PRISM.
 - `cadl game-check` and `cadl model-check` no longer stop with
   `ValueError: Exceeds the limit (4300 digits) for integer string
   conversion` when an exact result (I.13, H.8) has a numerator or
