@@ -184,10 +184,11 @@ def main(argv: list[str] | None = None) -> int:
         "a2a-gateway",
         usage="cadl a2a-gateway FILE --agent-actor ACTOR --upstream URL "
               "--client-keys KEYS.json --audit OUT.jsonl [options]",
-        help="Run an A2A gateway (JSON-RPC over HTTP) in front of an A2A agent that "
+        help="Run an A2A gateway (JSON-RPC and HTTP+JSON) in front of an A2A agent that "
              "decides every SendMessage with the enforcement point (agents 0.1)",
         description="An HTTP server in front of the A2A agent ACTOR of the file, "
-                    "reached at URL (A2A 1.0.0, JSON-RPC binding). Every request is "
+                    "reached at URL (A2A 1.0.0, JSON-RPC binding at / and HTTP+JSON "
+                    "binding at its routes). Every request is "
                     "authenticated with the key of its actor (header Authorization: "
                     "CADL-HMAC). A SendMessage names its CADL message with the "
                     "extension of G.11 and is decided by the online runtime of "
@@ -206,6 +207,12 @@ def main(argv: list[str] | None = None) -> int:
                               "of every message")
     a2a_cmd.add_argument("--upstream", required=True, metavar="URL",
                          help="The JSON-RPC endpoint of the A2A agent (http or https)")
+    a2a_cmd.add_argument("--upstream-binding", choices=["jsonrpc", "rest"],
+                         default="jsonrpc",
+                         help="The binding of A2A that the agent speaks: jsonrpc (the "
+                              "default; URL is its JSON-RPC endpoint) or rest (the "
+                              "HTTP+JSON binding; URL is the base of its routes). Clients "
+                              "may use either binding")
     a2a_cmd.add_argument("--client-keys", type=Path, required=True, metavar="FILE",
                          help="JSON object from actor to the key file (or {\"hex\": ...}) "
                               "with which its requests are authenticated (HMAC-SHA256)")
@@ -241,6 +248,15 @@ def main(argv: list[str] | None = None) -> int:
                          help="Certificate chain (PEM) for HTTPS")
     a2a_cmd.add_argument("--tls-key", type=Path, default=None, metavar="FILE",
                          help="Private key (PEM) for HTTPS")
+    a2a_cmd.add_argument("--client-ca", type=Path, default=None, metavar="FILE",
+                         help="Mutual TLS: CA certificates (PEM) of the client "
+                              "certificates. A client presents a certificate whose "
+                              "subject common name is its actor, and its CADL-HMAC header "
+                              "names the same actor; a connection without one fails the "
+                              "handshake before its request is read. Needs --tls-cert")
+    a2a_cmd.add_argument("--max-handshakes", type=int, default=256, metavar="N",
+                         help="TLS handshakes at the same time with --client-ca "
+                              "(default 256); beyond that the connection is closed")
     a2a_cmd.add_argument("--agent-card", type=Path, default=None, metavar="FILE.json",
                          help="Agent card served at /.well-known/agent-card.json")
     a2a_cmd.add_argument("--upstream-token", type=Path, default=None, metavar="FILE",

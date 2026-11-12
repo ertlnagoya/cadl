@@ -175,7 +175,10 @@ HOST_EVENTS = ("method_refused", "unsolicited_response", "unauthorised_approval"
                "approval_unauthenticated", "forward_failed",
                # cadl a2a-gateway (0.3.25)
                "unauthenticated_request", "task_refused", "invalid_response",
-               "task_cancel", "overloaded", "read_timeout")
+               "task_cancel", "overloaded", "read_timeout",
+               # cadl a2a-gateway: mutual TLS and push notifications
+               "handshake_failed", "push_config", "push_refused", "push_sent",
+               "push_failed", "push_dropped")
 _HOST_EVENT_KEYS = {"event", "reason", "hold_id", "message"}
 
 

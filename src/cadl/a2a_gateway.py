@@ -97,6 +97,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from . import a2a_rest as A2ARest
 from . import agents as G
 from .audit_log import AuditKeyError, canonical, loads_unique, read_key
 from .gateway_core import (
@@ -158,6 +159,7 @@ READER_WAIT = 1.0              # seconds a connection waits for a free reader sl
 MAX_HANDLERS_PER_ACTOR = 16    # authenticated requests of one actor at the same time
 MAX_HOLDS_PER_ACTOR = 64       # holds of one actor, blocking or not
 READ_TIMEOUT = 10.0            # seconds to read the request line, headers and body
+MAX_HANDSHAKES = 256           # TLS handshakes at the same time, with --client-ca
 
 _AUTH_RE = re.compile(r'CADL-HMAC actor="([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]{1,9}\])?)", '
                       r'nonce="([0-9a-f]{32})", mac="([0-9a-f]{64})"')
@@ -204,6 +206,22 @@ class Reply:
 
 STREAM_KEYS = ("task", "message", "statusUpdate", "artifactUpdate")
 KEEPALIVE = 1.0                         # seconds between comments of a held stream
+
+
+def _rest_chunk(chunk: bytes) -> bytes:
+    """One event of a stream of the gateway (`sse`) as an event of the
+    HTTP+JSON binding (11.7): the `result` of the JSON-RPC response as data,
+    an error as a `google.rpc.Status` in an `error` event. Comments pass."""
+    error = chunk.startswith(b"event: error\n")
+    head = b"event: error\ndata: " if error else b"data: "
+    if not chunk.startswith(head):
+        return chunk
+    obj = json.loads(chunk[len(head):])
+    if "result" in obj:
+        return b"data: " + wire(obj["result"]).encode("ascii") + b"\n\n"
+    err = obj.get("error") or {}
+    _, body = A2ARest.error(err.get("code"), str(err.get("message")))
+    return b"event: error\ndata: " + wire(body).encode("ascii") + b"\n\n"
 
 
 def sse(obj: dict, error: bool = False) -> bytes:
@@ -319,7 +337,8 @@ class A2AGateway(EnforcementPoint):
                  max_handlers: int = MAX_HANDLERS,
                  max_handlers_per_actor: int = MAX_HANDLERS_PER_ACTOR,
                  max_holds_per_actor: int = MAX_HOLDS_PER_ACTOR,
-                 hold_key: bytes | None = None) -> None:
+                 hold_key: bytes | None = None,
+                 upstream_binding: str = "jsonrpc") -> None:
         self._load(file)
         self.receiver = self._actor(agent_actor, "--agent-actor")
         decl = next((a for a in self.sos.actors if a.id.name == self.receiver["name"]), None)
@@ -372,6 +391,10 @@ class A2AGateway(EnforcementPoint):
                     isinstance(e, dict) and e.get("uri") == EXTENSION_URI for e in exts):
                 raise GatewayError(f"--agent-card does not declare the extension "
                                    f"{EXTENSION_URI} under capabilities.extensions")
+        if upstream_binding not in ("jsonrpc", "rest"):
+            raise GatewayError(f"--upstream-binding {upstream_binding!r} is jsonrpc or rest")
+        self.upstream_binding = upstream_binding
+        self.rest_ids = itertools.count(1)
         self.upstream_token = upstream_token
         self.upstream_timeout = upstream_timeout
         self.agent_card = agent_card
@@ -401,6 +424,11 @@ class A2AGateway(EnforcementPoint):
                     hold_id: str | None = None, message: dict | None = None) -> None:
         if not self.stopped:
             super()._host_event(event, reason, hold_id, message)
+
+    def cert_actors(self) -> set:
+        """The actors whose client certificates the gateway accepts (with
+        --client-ca): the actors of --client-keys."""
+        return set(self.client_keys)
 
     # --- replies -----------------------------------------------------------------
 
@@ -457,26 +485,33 @@ class A2AGateway(EnforcementPoint):
         return Reply(404, None, self._headers())
 
     def handle_post(self, path: str, headers, body: bytes,
-                    closed: Callable[[], bool] = lambda: False) -> Reply | None:
+                    closed: Callable[[], bool] = lambda: False,
+                    peer: str | None = None) -> Reply | None:
         """One HTTP POST. `headers` has `get_all`; `closed` tells whether
-        the client has closed the connection. Returns the reply, or None
-        when the client has gone."""
+        the client has closed the connection; `peer` is the actor that the
+        client certificate names (mutual TLS), or None. Returns the reply,
+        or None when the client has gone."""
         if self.stopped:
             return Reply(503, None, self._headers())
         if path != "/":
             return Reply(404, None, self._headers())
-        actor, why = self._authenticate(headers.get_all("Authorization") or [], path, body)
+        actor, why = self._authenticate(headers.get_all("Authorization") or [], path, body,
+                                        peer)
         if actor is None:
             with self.lock:
                 self._unauthenticated(why)
             return Reply(401, _error(None, INVALID_REQUEST, "Unauthorized"),
                          self._headers({"WWW-Authenticate":
                                         f'{AUTH_SCHEME} run="{self.run_id}"'}))
-        # A slot only for an authenticated request: unauthenticated peers
-        # cannot take the slots of the clients.
-        # One actor takes at most `max_handlers_per_actor` of them, so that
-        # one client cannot take every slot (with held requests, or with
-        # requests to a slow agent).
+        return self._in_slot(actor, lambda: self._handle_authenticated(actor, headers, body,
+                                                                       closed))
+
+    def _in_slot(self, actor: str, handle: Callable[[], Reply | None]) -> Reply | None:
+        """Run `handle` for an authenticated request in a handler slot.
+        A slot only for an authenticated request: unauthenticated peers
+        cannot take the slots of the clients. One actor takes at most
+        `max_handlers_per_actor` of them, so that one client cannot take
+        every slot (with held requests, or with requests to a slow agent)."""
         with self.lock:
             if self.actor_handlers.get(actor, 0) >= self.max_handlers_per_actor:
                 return self.overloaded(f"handlers_per_actor {actor}")
@@ -490,7 +525,7 @@ class A2AGateway(EnforcementPoint):
             self.slots.release()
         streaming = False
         try:
-            reply = self._handle_authenticated(actor, headers, body, closed)
+            reply = handle()
             if reply is not None and reply.stream is not None:
                 # A stream keeps its slot until it ends.
                 inner = reply.stream
@@ -500,6 +535,143 @@ class A2AGateway(EnforcementPoint):
         finally:
             if not streaming:
                 release()
+
+    # --- the HTTP+JSON binding ------------------------------------------------------
+
+    def handle_request(self, method: str, target: str, headers, body: bytes,
+                       closed: Callable[[], bool] = lambda: False,
+                       peer: str | None = None) -> Reply | None:
+        """One HTTP request of any binding: the agent card, a JSON-RPC
+        request at `/`, or a request of the HTTP+JSON binding."""
+        if method == "GET" and target == AGENT_CARD_PATH:
+            return self.handle_get(target)
+        if method == "POST" and target == "/":
+            return self.handle_post(target, headers, body, closed, peer)
+        return self.handle_rest(method, target, headers, body, closed, peer)
+
+    def _rest_error(self, code: int, message: str, status: int | None = None,
+                    headers: dict | None = None) -> Reply:
+        http_status, obj = A2ARest.error(code, message, status)
+        return Reply(http_status, obj, self._headers(headers))
+
+    def handle_rest(self, method: str, target: str, headers, body: bytes,
+                    closed: Callable[[], bool] = lambda: False,
+                    peer: str | None = None) -> Reply | None:
+        """A request of the HTTP+JSON binding (A2A 1.0.0, 11): authenticated
+        as a JSON-RPC request, with the HTTP method and the request target
+        (path and query) in the MAC; then translated into the JSON-RPC
+        request that the gateway decides, and its answer back."""
+        if self.stopped:
+            return Reply(503, None, self._headers())
+        actor, why = self._authenticate(headers.get_all("Authorization") or [], target, body,
+                                        peer, method)
+        if actor is None:
+            with self.lock:
+                self._unauthenticated(why)
+            return self._rest_error(INVALID_REQUEST, "Unauthorized", 401,
+                                    {"WWW-Authenticate": f'{AUTH_SCHEME} run="{self.run_id}"'})
+        return self._in_slot(actor, lambda: self._rest_authenticated(
+            actor, method, target, headers, body, closed))
+
+    def _rest_authenticated(self, actor: str, method: str, target: str, headers, body: bytes,
+                            closed: Callable[[], bool]) -> Reply | None:
+        found = A2ARest.route(method, target)
+        if found is None:
+            with self.lock:
+                self._host_event("method_refused", reason=f"{method} {target}"[:200])
+            return self._rest_error(METHOD_NOT_FOUND, f"Method not found: {method} "
+                                                      f"{target[:200]} is not a route of the "
+                                                      f"gateway")
+        op, path_params = found
+        version = headers.get_all("A2A-Version") or []
+        if len(version) != 1 or not _VERSION_RE.fullmatch(version[0].strip()):
+            return self._rest_error(VERSION_NOT_SUPPORTED,
+                                    "VersionNotSupportedError: the gateway speaks A2A 1.0 "
+                                    "only (header A2A-Version: 1.0)")
+        allowed = {"historyLength": "int"} if op == "GetTask" else {}
+        q, why = A2ARest.query(target, allowed)
+        if q is None:
+            return self._rest_error(INVALID_PARAMS, f"Invalid params: {why}")
+        obj: Any = {}
+        if body:
+            ctype = headers.get_all("Content-Type") or []
+            if len(ctype) != 1 or ctype[0].split(";")[0].strip().lower() \
+                    not in A2ARest.MEDIA_TYPES:
+                return self._rest_error(INVALID_REQUEST, "Content-Type is application/json "
+                                                         "or application/a2a+json", 415)
+            try:
+                text = body.decode("utf-8")
+            except UnicodeDecodeError:
+                return self._rest_error(PARSE_ERROR, "Parse error: not UTF-8")
+            obj, code, why = parse_json(text)
+            if code is not None:
+                return self._rest_error(code, ("Parse error" if code == PARSE_ERROR
+                                               else "Invalid Request") + f": {why}")
+            if not isinstance(obj, dict):
+                return self._rest_error(INVALID_REQUEST, "Invalid Request: the body is a "
+                                                         "JSON object")
+        elif op in ("SendMessage", "SendStreamingMessage", "CreateTaskPushNotificationConfig"):
+            return self._rest_error(INVALID_PARAMS, f"Invalid params: {op} has a body")
+        if op in ("GetTask", "ListTasks", "GetExtendedAgentCard",
+                  "ListTaskPushNotificationConfigs", "GetTaskPushNotificationConfig",
+                  "DeleteTaskPushNotificationConfig") and body:
+            return self._rest_error(INVALID_REQUEST, f"Invalid Request: {op} has no body")
+        # The parameters of the path win only when the body agrees with them.
+        for k, v in path_params.items():
+            if k in obj and obj[k] != v:
+                return self._rest_error(INVALID_PARAMS, f"Invalid params: {k} of the body "
+                                                        f"differs from the path")
+        params = dict(obj, **path_params, **q)
+        with self.lock:
+            id_ = f"rest-{next(self.rest_ids)}"
+        reply = self._dispatch(actor, op, id_, params, closed)
+        return self._to_rest(reply)
+
+    def _to_rest(self, reply: Reply | None) -> Reply | None:
+        """The answer of the gateway to a JSON-RPC request as the answer of
+        the HTTP+JSON binding: a result as the body, an error as in 11.6,
+        a stream with `StreamResponse` objects as data."""
+        if reply is None:
+            return None
+        if reply.stream is not None:
+            inner = reply.stream
+            reply.stream = _Stream((_rest_chunk(c) for c in inner), inner.close)
+            return reply
+        body = reply.body
+        if isinstance(body, dict) and "result" in body and reply.status == 200:
+            return Reply(200, body["result"], reply.headers)
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            err = body["error"]
+            status, obj = A2ARest.error(err.get("code"), str(err.get("message")),
+                                        reply.status)
+            return Reply(status, obj, reply.headers)
+        return reply
+
+    def _dispatch(self, actor: str, method: str, id_: Any, params: Any,
+                  closed: Callable[[], bool]) -> Reply | None:
+        """A JSON-RPC request of an authenticated actor, after its envelope
+        and its version have been checked."""
+        if method == "SendMessage":
+            return self._send_message(actor, id_, params, closed)
+        if method == "SendStreamingMessage":
+            return self._send_message(actor, id_, params, closed, stream=True)
+        if method == "SubscribeToTask":
+            return self._subscribe(actor, id_, params, closed)
+        if method == "GetTask":
+            return self._get_task(actor, id_, params)
+        if method == "CancelTask":
+            return self._cancel_task(actor, id_, params)
+        with self.lock:
+            self._host_event("method_refused", reason=method[:200])
+        if method in REFUSED_METHODS:
+            code = REFUSED_METHODS[method]
+            name = ("PushNotificationNotSupportedError" if code == PUSH_NOT_SUPPORTED
+                    else "UnsupportedOperationError")
+            return self._rpc_error(id_, code, f"{name}: {method} is not supported by the "
+                                              f"CADL gateway")
+        return self._rpc_error(id_, METHOD_NOT_FOUND,
+                               f"Method not found: {method[:200]} is not permitted by the "
+                               f"gateway")
 
     def _handle_authenticated(self, actor: str, headers, body: bytes,
                               closed: Callable[[], bool]) -> Reply | None:
@@ -534,28 +706,7 @@ class A2AGateway(EnforcementPoint):
             return self._rpc_error(id_, VERSION_NOT_SUPPORTED,
                                    "VersionNotSupportedError: the gateway speaks A2A 1.0 "
                                    "only (header A2A-Version: 1.0)")
-        params = obj.get("params")
-        if method == "SendMessage":
-            return self._send_message(actor, id_, params, closed)
-        if method == "SendStreamingMessage":
-            return self._send_message(actor, id_, params, closed, stream=True)
-        if method == "SubscribeToTask":
-            return self._subscribe(actor, id_, params, closed)
-        if method == "GetTask":
-            return self._get_task(actor, id_, params)
-        if method == "CancelTask":
-            return self._cancel_task(actor, id_, params)
-        with self.lock:
-            self._host_event("method_refused", reason=method[:200])
-        if method in REFUSED_METHODS:
-            code = REFUSED_METHODS[method]
-            name = ("PushNotificationNotSupportedError" if code == PUSH_NOT_SUPPORTED
-                    else "UnsupportedOperationError")
-            return self._rpc_error(id_, code, f"{name}: {method} is not supported by the "
-                                              f"CADL gateway")
-        return self._rpc_error(id_, METHOD_NOT_FOUND,
-                               f"Method not found: {method[:200]} is not permitted by the "
-                               f"gateway")
+        return self._dispatch(actor, method, id_, obj.get("params"), closed)
 
     def _unauthenticated(self, why: str) -> None:
         self._refusal("unauthenticated_request", why)
@@ -592,7 +743,11 @@ class A2AGateway(EnforcementPoint):
         return Reply(503, _error(None, INTERNAL_ERROR, "the gateway is busy"),
                      self._headers({"Retry-After": "1"}))
 
-    def _authenticate(self, values: list, path: str, body: bytes) -> tuple[str | None, str]:
+    def _authenticate(self, values: list, path: str, body: bytes, peer: str | None = None,
+                      method: str = "POST") -> tuple[str | None, str]:
+        """The actor of a request, or None and the reason. With mutual TLS
+        (`peer` is the actor of the client certificate) the header has to
+        name the same actor; its MAC and nonce are checked as without."""
         if not values:
             return None, "missing"
         if len(values) != 1:
@@ -605,9 +760,11 @@ class A2AGateway(EnforcementPoint):
         key = self.client_keys.get(who["text"]) if who else None
         if key is None:
             return None, "unknown_actor"
-        want = request_mac(key, who["text"], self.run_id, nonce, "POST", path, body)
+        want = request_mac(key, who["text"], self.run_id, nonce, method, path, body)
         if not hmac.compare_digest(mac, want):
             return None, "bad_mac"
+        if peer is not None and peer != who["text"]:
+            return None, "certificate_mismatch"
         with self.lock:
             nonces = self.client_nonces[who["text"]]
             if nonce in nonces:
@@ -869,8 +1026,8 @@ class A2AGateway(EnforcementPoint):
                                    h.message, rec)
             yield sse(reply.body)
 
-    def _open_stream(self, text: str):
-        """POST a streamed request to the agent: (connection, response), or
+    def _connect(self, method: str, target: str, body: bytes | None, accept: str):
+        """Send one request to the agent: (connection, response); raises
         _NotSent or _NoResponse."""
         u = self.upstream
         cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
@@ -878,12 +1035,13 @@ class A2AGateway(EnforcementPoint):
             conn = cls(u.hostname, u.port, timeout=self.upstream_timeout)
         except Exception as e:      # noqa: BLE001
             raise _NotSent(f"{type(e).__name__}: {e}") from None
-        headers = {"Content-Type": "application/json", "A2A-Version": A2A_VERSION,
-                   "Accept": "text/event-stream"}
+        headers = {"A2A-Version": A2A_VERSION, "Accept": accept}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         if self.upstream_token is not None:
             headers["Authorization"] = f"Bearer {self.upstream_token}"
         try:
-            conn.request("POST", u.path or "/", body=text.encode("ascii"), headers=headers)
+            conn.request(method, target, body=body, headers=headers)
         except (OSError, ValueError, http.client.HTTPException) as e:
             conn.close()
             raise _NotSent(f"{type(e).__name__}: {e}") from None
@@ -892,10 +1050,34 @@ class A2AGateway(EnforcementPoint):
         except (OSError, http.client.HTTPException) as e:
             conn.close()
             raise _NoResponse(f"{type(e).__name__}: {e}") from None
+        return conn, resp
+
+    def _rest_request(self, text: str) -> tuple[str, str, bytes | None, int]:
+        """The request of the HTTP+JSON binding for a JSON-RPC request of
+        the gateway (`text`, which the gateway wrote): method, target, body
+        and the JSON-RPC id that the answer is given."""
+        obj = json.loads(text)
+        method, target, body = A2ARest.path_of(self.upstream.path or "/", obj["method"],
+                                               obj["params"])
+        data = None if body is None else wire(body).encode("ascii")
+        if method == "POST" and data is None:
+            data = b""
+        return method, target, data, obj["id"]
+
+    def _open_stream(self, text: str):
+        """POST a streamed request to the agent: (connection, response, the
+        JSON-RPC id of a request of the HTTP+JSON binding or None), or
+        _NotSent or _NoResponse."""
+        if self.upstream_binding == "rest":
+            method, target, data, upstream_id = self._rest_request(text)
+            conn, resp = self._connect(method, target, data, "text/event-stream")
+            return conn, resp, upstream_id
+        conn, resp = self._connect("POST", self.upstream.path or "/", text.encode("ascii"),
+                                   "text/event-stream")
         if resp.status != 200:
             conn.close()
             raise _NoResponse(f"HTTP status {resp.status}")
-        return conn, resp
+        return conn, resp, None
 
     @staticmethod
     def _sse_events(resp):
@@ -992,7 +1174,7 @@ class A2AGateway(EnforcementPoint):
         re-serialised with the client's id (and, with `own`, the task of the
         gateway in place of `upstream_task`)."""
         try:
-            conn, resp = self._open_stream(text)
+            conn, resp, rest_id = self._open_stream(text)
         except _NotSent as e:
             _log(f"a stream was decided but could not be sent to the agent: {e}")
             with self.lock:
@@ -1007,10 +1189,20 @@ class A2AGateway(EnforcementPoint):
         stop = threading.Event()
         try:
             ctype = (resp.getheader("Content-Type") or "").split(";")[0].strip().lower()
-            if ctype == "application/json":
+            if rest_id is not None and (resp.status != 200 or ctype in A2ARest.MEDIA_TYPES):
+                # An answer of the HTTP+JSON binding that is not a stream:
+                # an error of 11.6 before the stream began.
+                answer = A2ARest.to_jsonrpc(rest_id, resp.status, self._json_answer(resp))
+                if answer is None:
+                    raise _NoResponse(f"HTTP status {resp.status} without an A2A error")
+                events = iter([("message", answer)])
+            elif ctype == "application/json":
                 events = iter([("message", self._json_answer(resp))])
             elif ctype == "text/event-stream":
                 events = self._sse_events(resp)
+                if rest_id is not None:
+                    events = ((name, A2ARest.event_to_jsonrpc(rest_id, name, data))
+                              for name, data in events)
             else:
                 yield sse(self._invalid_body(id_, f"Content-Type {ctype!r}", m), error=True)
                 return
@@ -1265,33 +1457,34 @@ class A2AGateway(EnforcementPoint):
     # --- the agent ---------------------------------------------------------------------
 
     def _post(self, text: str) -> bytes:
-        """POST one JSON-RPC request to the agent; raises _NotSent or
-        _NoResponse."""
-        u = self.upstream
-        cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
-        try:
-            conn = cls(u.hostname, u.port, timeout=self.upstream_timeout)
-        except Exception as e:      # noqa: BLE001
-            raise _NotSent(f"{type(e).__name__}: {e}") from None
-        headers = {"Content-Type": "application/json", "A2A-Version": A2A_VERSION,
-                   "Accept": "application/json"}
-        if self.upstream_token is not None:
-            headers["Authorization"] = f"Bearer {self.upstream_token}"
+        """Send one JSON-RPC request to the agent, or its counterpart of the
+        HTTP+JSON binding; raises _NotSent or _NoResponse. Returns the
+        JSON-RPC response (for the binding, the one its answer stands
+        for)."""
+        rest_id = None
+        if self.upstream_binding == "rest":
+            method, target, data, rest_id = self._rest_request(text)
+            conn, resp = self._connect(method, target, data, "application/json")
+        else:
+            conn, resp = self._connect("POST", self.upstream.path or "/",
+                                       text.encode("ascii"), "application/json")
         try:
             try:
-                conn.request("POST", u.path or "/", body=text.encode("ascii"),
-                             headers=headers)
-            except (OSError, ValueError, http.client.HTTPException) as e:
-                raise _NotSent(f"{type(e).__name__}: {e}") from None
-            try:
-                resp = conn.getresponse()
                 data = resp.read(MAX_RESPONSE + 1)
             except (OSError, http.client.HTTPException) as e:
                 raise _NoResponse(f"{type(e).__name__}: {e}") from None
-            if resp.status != 200:
-                raise _NoResponse(f"HTTP status {resp.status}")
             if len(data) > MAX_RESPONSE:
                 raise _NoResponse("the response is larger than 16 MiB")
+            if rest_id is not None:
+                try:
+                    answer = A2ARest.to_jsonrpc(rest_id, resp.status, data.decode("utf-8"))
+                except UnicodeDecodeError:
+                    raise _NoResponse("the response is not UTF-8") from None
+                if answer is None:
+                    raise _NoResponse(f"HTTP status {resp.status} without an A2A answer")
+                return answer.encode("ascii")
+            if resp.status != 200:
+                raise _NoResponse(f"HTTP status {resp.status}")
             return data
         finally:
             conn.close()
@@ -1600,6 +1793,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._reader_slot = False
         self._address_key = None
         self._prefix_key = None
+        self.peer = None
         self._timer = self.server.deadlines.add(self.server.read_timeout, self._read_expired)
 
     def _read_expired(self) -> None:
@@ -1691,7 +1885,12 @@ class _Handler(BaseHTTPRequestHandler):
                 srv.prefix_count[prefix] = srv.prefix_count.get(prefix, 0) + 1
                 self._address_key, self._prefix_key = key, prefix
         if full is not None:
-            self._refuse(full)
+            if srv.mtls:
+                self._drop("overloaded", full)
+            else:
+                self._refuse(full)
+            return
+        if srv.mtls and not self._mutual_tls():
             return
         if not srv.readers.acquire(timeout=READER_WAIT):
             self._refuse("readers")
@@ -1702,30 +1901,75 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             self._done_reading()
 
+    def _drop(self, event: str, why: str) -> None:
+        """Close a connection before its TLS handshake has ended, recorded
+        at the capped rate; nothing can be answered on it. Not recorded
+        again when the read deadline has closed it (`read_timeout`)."""
+        if self._done_reading():
+            self.server.gw.refused(event, why)
+
+    def _mutual_tls(self) -> bool:
+        """The TLS handshake of a connection to a gateway with --client-ca,
+        before the connection takes a reader slot: the client has to present
+        a certificate of the CA whose subject has exactly one common name,
+        which is an actor of the gateway (`cert_actors`). The handshake runs
+        under the read deadline and takes one of the `max_handshakes`
+        places. False when the connection was dropped."""
+        srv = self.server
+        if not srv.handshakes.acquire(timeout=READER_WAIT):
+            self._drop("overloaded", "handshakes")
+            return False
+        try:
+            try:
+                self.connection.do_handshake()
+            except ssl.SSLError as e:
+                self._drop("handshake_failed", _tls_reason(e))
+                return False
+            except OSError as e:
+                self._drop("handshake_failed", type(e).__name__)
+                return False
+        finally:
+            srv.handshakes.release()
+        actor = certificate_actor(self.connection.getpeercert())
+        if actor is None or actor not in srv.gw.cert_actors():
+            self._drop("handshake_failed", "unknown_certificate")
+            return False
+        self.peer = actor
+        return True
+
     def do_GET(self):       # noqa: N802
-        self._done_reading()
-        self._send(self.server.gw.handle_get(self.path))
+        self._request("GET")
+
+    def do_DELETE(self):    # noqa: N802
+        self._request("DELETE")
 
     def do_POST(self):      # noqa: N802
-        self._post()
+        self._request("POST")
 
-    def _post(self) -> None:
+    def _request(self, method: str) -> None:
+        """Read one request: the body of `Content-Length` (none without the
+        header, and none for GET and DELETE), never `Transfer-Encoding`."""
         gw = self.server.gw
         bad = None
         lengths = self.headers.get_all("Content-Length") or []
         if self.headers.get_all("Transfer-Encoding"):
             bad = (501, "Transfer-Encoding is not supported; send Content-Length")
-        elif len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,9}", lengths[0].strip()):
+        elif len(lengths) > 1 or (lengths and not re.fullmatch(r"[0-9]{1,9}",
+                                                               lengths[0].strip())):
             bad = (411, "one Content-Length is required")
-        elif int(lengths[0]) > MAX_BODY:
+        elif lengths and int(lengths[0]) > MAX_BODY:
             bad = (413, "the body is larger than 1 MiB")
+        elif lengths and int(lengths[0]) and method != "POST":
+            bad = (400, f"a {method} request has no body")
+        elif not lengths and method == "POST" and self.path == "/":
+            bad = (411, "one Content-Length is required")
         if bad is not None:
             self._done_reading()
             self._send(Reply(bad[0], _error(None, INVALID_REQUEST,
                                             f"Invalid Request: {bad[1]}"),
                              {"CADL-Run-Id": gw.run_id}))
             return
-        n = int(lengths[0])
+        n = int(lengths[0]) if lengths else 0
         try:
             body = self.rfile.read(n)
         except OSError:
@@ -1738,7 +1982,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         try:
-            reply = gw.handle_post(self.path, self.headers, body, self._closed)
+            reply = gw.handle_request(method, self.path, self.headers, body, self._closed,
+                                      self.peer)
         except Exception as e:      # noqa: BLE001
             _log(f"internal error on a request: {type(e).__name__}: {e}")
             reply = Reply(500, _error(None, INTERNAL_ERROR, "Internal error"),
@@ -1810,9 +2055,12 @@ class _Server(ThreadingHTTPServer):
     def __init__(self, address, gw, family, max_readers: int = MAX_READERS,
                  read_timeout: float = READ_TIMEOUT,
                  max_readers_per_address: int = MAX_READERS_PER_ADDRESS,
-                 max_readers_per_prefix: int = MAX_READERS_PER_PREFIX):
+                 max_readers_per_prefix: int = MAX_READERS_PER_PREFIX,
+                 mtls: bool = False, max_handshakes: int = MAX_HANDSHAKES):
         self.address_family = family
         self.gw = gw
+        self.mtls = mtls
+        self.handshakes = threading.BoundedSemaphore(max_handshakes)
         self.readers = threading.BoundedSemaphore(max_readers)
         self.read_timeout = read_timeout
         self.max_readers_per_address = max_readers_per_address
@@ -1862,6 +2110,28 @@ class _Server(ThreadingHTTPServer):
         _log(f"a connection failed: {sys.exc_info()[0].__name__}: {sys.exc_info()[1]}")
 
 
+def certificate_actor(cert: dict | None) -> str | None:
+    """The actor that a verified client certificate names: the one common
+    name of its subject, when it is a concrete actor; None otherwise."""
+    if not cert:
+        return None
+    try:
+        names = [value for rdn in cert.get("subject", ()) for key, value in rdn
+                 if key == "commonName"]
+    except (TypeError, ValueError):
+        return None
+    if len(names) != 1:
+        return None
+    who = G.parse_concrete_actor(names[0])
+    return who["text"] if who and who["text"] == names[0] else None
+
+
+def _tls_reason(e: ssl.SSLError) -> str:
+    """A short reason for a failed handshake, for the log."""
+    reason = getattr(e, "reason", None) or type(e).__name__
+    return str(reason)[:80].lower()
+
+
 def parse_listen(text: str) -> tuple[str, int]:
     m = re.fullmatch(r"\[([0-9A-Fa-f:.]+)\]:([0-9]{1,5})|([^:\[\]]+):([0-9]{1,5})", text)
     if m is None:
@@ -1887,7 +2157,8 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
           poll: float = 0.05, max_readers: int = MAX_READERS,
           read_timeout: float = READ_TIMEOUT,
           max_readers_per_address: int = MAX_READERS_PER_ADDRESS,
-          max_readers_per_prefix: int = MAX_READERS_PER_PREFIX) -> int:
+          max_readers_per_prefix: int = MAX_READERS_PER_PREFIX,
+          client_ca: Path | None = None, max_handshakes: int = MAX_HANDSHAKES) -> int:
     """Run the gateway until SIGTERM or SIGINT. Returns the exit status."""
     host, port = parse_listen(listen)
     if not _is_loopback(host) and tls_cert is None:
@@ -1895,6 +2166,8 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
                            f"and --tls-key (the bodies are not encrypted otherwise)")
     if (tls_cert is None) != (tls_key is None):
         raise GatewayError("--tls-cert and --tls-key go together")
+    if client_ca is not None and tls_cert is None:
+        raise GatewayError("--client-ca needs --tls-cert and --tls-key")
     context = None
     if tls_cert is not None:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1903,6 +2176,14 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
             context.load_cert_chain(tls_cert, tls_key)
         except (OSError, ssl.SSLError) as e:
             raise GatewayError(f"cannot load the TLS certificate: {e}") from None
+        if client_ca is not None:
+            # Mutual TLS: a client without a certificate of the CA fails the
+            # handshake, before it can take a reader slot.
+            context.verify_mode = ssl.CERT_REQUIRED
+            try:
+                context.load_verify_locations(cafile=str(client_ca))
+            except (OSError, ssl.SSLError) as e:
+                raise GatewayError(f"cannot load --client-ca: {e}") from None
     try:
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         socket.getaddrinfo(host, port, family)
@@ -1911,7 +2192,8 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
     gw = A2AGateway(**gw_args)
     try:
         server = _Server((host, port), gw, family, max_readers, read_timeout,
-                         max_readers_per_address, max_readers_per_prefix)
+                         max_readers_per_address, max_readers_per_prefix,
+                         mtls=client_ca is not None, max_handshakes=max_handshakes)
     except OSError as e:
         gw.stop()
         raise GatewayError(f"cannot listen on {listen}: {e}") from None
@@ -1989,7 +2271,7 @@ def cli_gateway(args) -> int:
             raise GatewayError("the trace and the audit log are the same file")
         if args.poll <= 0 or args.upstream_timeout <= 0 or args.read_timeout <= 0 \
                 or min(args.max_handlers, args.max_readers, args.max_readers_per_address,
-                       args.max_readers_per_prefix,
+                       args.max_readers_per_prefix, args.max_handshakes,
                        args.max_handlers_per_actor, args.max_holds_per_actor) < 1:
             raise GatewayError("--poll, --upstream-timeout, --read-timeout and the --max-* "
                                "options must be positive")
@@ -2001,12 +2283,14 @@ def cli_gateway(args) -> int:
                        upstream_timeout=args.upstream_timeout, agent_card=card,
                        max_handlers=args.max_handlers,
                        max_handlers_per_actor=args.max_handlers_per_actor,
-                       max_holds_per_actor=args.max_holds_per_actor)
+                       max_holds_per_actor=args.max_holds_per_actor,
+                       upstream_binding=args.upstream_binding)
         code = serve(gw_args, listen=args.listen, port_file=args.port_file,
                      tls_cert=args.tls_cert, tls_key=args.tls_key, poll=args.poll,
                      max_readers=args.max_readers, read_timeout=args.read_timeout,
                      max_readers_per_address=args.max_readers_per_address,
-                     max_readers_per_prefix=args.max_readers_per_prefix)
+                     max_readers_per_prefix=args.max_readers_per_prefix,
+                     client_ca=args.client_ca, max_handshakes=args.max_handshakes)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
