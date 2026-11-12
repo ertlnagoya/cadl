@@ -49,6 +49,9 @@ from cadl.norms_check import (
     trace_lines,
 )
 from cadl.norms_eval import evaluate, load_version, parse_trace
+from fractions import Fraction
+
+from cadl.norms_check import _is_dec
 from cadl.parser import parse
 from cadl.type_checker import type_check
 
@@ -1976,3 +1979,141 @@ norms:
     m = re.search(r"besides lists, (\d+) classes .*at least \d+\^4 = (\d+) combinations", text)
     assert m, text
     assert int(m.group(1)) >= 15 and int(m.group(2)) > 50000
+
+
+# === Finite decimal points of the faces (F.12) ==============================
+
+DEC_HEAD = """\
+sos:
+  name: T
+  extensions:
+    - norms: 0.1
+  actors:
+    - {id: D, role: d}
+    - {id: R, role: r}
+  contracts:
+    - id: C
+      parties: [D, R]
+      norms:
+"""
+
+
+def _dec_model(*contents):
+    body = "".join(f"        - id: p{i}\n          kind: prohibition\n          bearer: D\n"
+                   f"          content: \"{c}\"\n" for i, c in enumerate(contents))
+    sos = parse(DEC_HEAD + body)
+    assert type_check(sos).ok
+    return build_model(sos)
+
+
+@pytest.mark.parametrize("content, point", [
+    # large coefficients: the hull holds decimal points only on a coarse
+    # lattice (a = 0.12, b = -1.34, c = 4.6 violates it)
+    ("R.a * 67 + R.b * 6 == 0 AND R.b < 0 AND R.c * 3 + R.b * 3 > R.a",
+     {"R.a": Fraction("0.12"), "R.b": Fraction("-1.34"), "R.c": Fraction("4.6")}),
+    ("R.a * 4099 + R.c * 67 + R.b * 66 == 0 AND R.b > 140 AND R.b < 142",
+     {"R.a": Fraction("-1.65"), "R.b": Fraction(141), "R.c": Fraction("-37.95")}),
+], ids=["lin4", "lin3"])
+def test_faces_with_coarse_decimal_lattices(content, point):
+    """A face whose decimal points form a coarse lattice in its hull is
+    kept: the prohibition is violable (review reproducers lin3, lin4)."""
+    m = _dec_model(content)
+    tr = m.tr
+    (ids, vecs), = tr.components
+    assert any(v == ("T",) for v, _vals in vecs)
+    for v, vals in vecs:
+        if v == ("T",):
+            assert all(type(x) in (int, float) or hasattr(x, "text") for x in vals.values())
+    assert tuple(tr._oracle([tr.preds[0].expr], point)) == ("T",)
+
+
+def _check_face_point(forms, p, variables):
+    from cadl.norms_check import _decimal_in_face, _leval, _lnorm, _sign
+    forms = [_lnorm(f) for f in forms]
+    q = _decimal_in_face(forms, p, variables)
+    assert q is not None
+    assert all(_is_dec(q[v]) for v in variables)
+    assert [_sign(_leval(f, q)) for f in forms] == [_sign(_leval(f, p)) for f in forms]
+    return q
+
+
+def test_decimal_points_with_non_unit_pivots():
+    """Equalities whose coefficients are not units of the finite decimals
+    (3, 7, 67, ...): over two and three free variables of the hull, a
+    decimal point of the face is found from a point that is not one, and a
+    hull without decimal points gives none."""
+    from cadl.norms_check import _decimal_in_face, _lnorm
+    F_ = Fraction
+    # one equality in 3 variables: 2 free variables, a thin open slab
+    forms = [({"a": F_(6), "b": F_(21), "c": F_(35)}, F_(-1)),
+             ({"a": F_(1)}, F_(-1, 3)), ({"b": F_(1)}, F_(3, 7)),
+             ({"a": F_(1), "c": F_(-1)}, F_(1, 1000))]
+    p = {"a": F_(1, 2), "b": F_(-1, 3), "c": None}
+    p["c"] = (1 - 6 * p["a"] - 21 * p["b"]) / 35
+    q = _check_face_point(forms, p, ["a", "b", "c"])
+    assert 6 * q["a"] + 21 * q["b"] + 35 * q["c"] == 1
+    # one equality in 4 variables: 3 free variables
+    forms = [({"a": F_(67), "b": F_(6), "c": F_(9), "d": F_(15)}, F_(-1)),
+             ({"a": F_(1)}, F_(-1, 7)), ({"d": F_(1)}, F_(1, 3)),
+             ({"b": F_(1), "c": F_(1)}, F_(0))]
+    p = {"a": F_(1, 6), "b": F_(1, 3), "c": F_(-1, 3), "d": None}
+    p["d"] = (1 - 67 * p["a"]) / 15
+    _check_face_point(forms, p, ["a", "b", "c", "d"])
+    # two equalities: 3 a + 6 b = 1 has no decimal point
+    forms = [_lnorm(({"a": F_(3), "b": F_(6)}, F_(-1))), _lnorm(({"c": F_(7)}, F_(-1)))]
+    p = {"a": F_(1, 3), "b": F_(0), "c": F_(1, 7)}
+    assert _decimal_in_face(forms, p, ["a", "b", "c"]) is None
+    # a vertex: 7 a = 14, 3 b = 0.3
+    forms = [_lnorm(({"a": F_(7)}, F_(-14))), _lnorm(({"b": F_(3)}, F_(-3, 10)))]
+    assert _decimal_in_face(forms, {"a": F_(2), "b": F_(1, 10)}, ["a", "b"]) == {
+        "a": F_(2), "b": F_(1, 10)}
+
+
+def test_random_linear_faces_against_decimal_points():
+    """Random linear predicates with large and non-unit coefficients: every
+    decimal point found by brute force (random points and points solved
+    onto the equalities) gives the predicates the values of a choice of
+    the model. CADL_NORMS_CHECK_LONG=1 runs more trials."""
+    import random as _random
+    rng = _random.Random(5)
+    variables = ["a", "b", "c"]
+
+    def dec():
+        return Fraction(rng.randint(-300, 300), rng.choice([1, 10, 100]))
+
+    def text(x):
+        return str(x.numerator) if x.denominator == 1 else str(float(x))
+
+    trials = 0
+    for _ in range(150 if LONG else 30):
+        preds = []
+        for _k in range(rng.randint(1, 3)):
+            vs = rng.sample(variables, rng.randint(1, 3))
+            coefs = {v: rng.choice([1, 2, 3, 7, 67, 97, 4099, -1, -3]) for v in vs}
+            op = rng.choice(["==", "<", ">", "<=", "!="])
+            rhs = dec()
+            preds.append((coefs, op, rhs))
+        texts = [" + ".join(f"R.{v} * {c}" for v, c in co.items()) + f" {op} {text(rhs)}"
+                 for co, op, rhs in preds]
+        try:
+            m = _dec_model(*texts)
+        except NormsCheckError:
+            continue
+        tr = m.tr
+        trials += 1
+        for ids, vecs in tr.components:
+            have = {v for v, _vals in vecs}
+            keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+            for _n in range(150):
+                pt = {k: dec() for k in keys}
+                co, op, rhs = rng.choice(preds)
+                v = rng.choice(list(co))
+                if f"R.{v}" in pt:
+                    rest = sum(c * pt[f"R.{w}"] for w, c in co.items()
+                               if w != v and f"R.{w}" in pt)
+                    val = (rhs - rest) / co[v]
+                    if _is_dec(val):
+                        pt[f"R.{v}"] = val
+                vec = tuple(tr._oracle([tr.preds[i].expr for i in ids], pt))
+                assert vec in have, (texts, pt)
+    assert trials >= 20

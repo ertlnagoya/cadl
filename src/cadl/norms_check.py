@@ -2206,7 +2206,10 @@ class Environment:
 # by the roots in the last variable and a point below, between and above
 # them. A value of a trace is an integer or a float, that is a finite
 # decimal: a point of a face with other coordinates is moved to a decimal
-# point of the same face, or the face is left out when it holds none.
+# point of the same face, found exactly by a unimodular reduction of its
+# equalities and a rounding whose precision is computed from the margins
+# of its strict inequalities; a face is left out only when its affine hull
+# holds no finite decimal point (`_decimal_in_face`).
 
 def _lnorm(f: tuple) -> Any:
     """A form scaled so that its first coefficient is 1 (None: constant)."""
@@ -2280,81 +2283,142 @@ class _TooMany(Exception):
     pass
 
 
-def _coprime10(n: int) -> int:
-    for q in (2, 5):
-        while n % q == 0:
-            n //= q
-    return n
+def _is_dec(x: Fraction) -> bool:
+    return _is_decimal(Fraction(x))
+
+
+def _egcd(a: int, b: int) -> tuple:
+    """(g, u, v) with u a + v b = g = gcd(a, b) >= 0."""
+    x0, y0, x1, y1 = 1, 0, 0, 1
+    while b:
+        q, a, b = a // b, b, a % b
+        x0, x1 = x1, x0 - q * x1
+        y0, y1 = y1, y0 - q * y1
+    if a < 0:
+        a, x0, y0 = -a, -x0, -y0
+    return a, x0, y0
 
 
 def _decimal_in_face(forms: list, p: dict, variables: list) -> dict | None:
     """A point with finite decimal coordinates in the face of p (the points
-    where every form has the sign it has at p), or None when the face
-    holds none. The face is open in its affine hull (the forms that are 0
-    at p are 0); the decimal points of the hull, when there are any, are
-    dense in it, so they are found by a congruence modulo the part of the
-    denominators prime to 10 and approached to p."""
-    if all(_is_decimal(p[v]) for v in variables):
+    where every form has the sign it has at p), or None when the face holds
+    no such point. Exact, without a bound (F.12):
+
+    1. The affine hull H of the face is given by the forms that are 0 at p.
+       Their rows, scaled to integers, are brought by unimodular column
+       operations (extended Euclid) to a lower triangular matrix T = A V
+       with nonzero diagonal, for a maximal set of independent rows. With
+       x = V y, a point of H has y_1..y_r fixed by forward substitution and
+       y_{r+1}.. free. V and V^-1 are integer matrices, so x is a finite
+       decimal exactly when y is: H holds a finite decimal point exactly
+       when the fixed y_i are finite decimals (and the integer-scaled right
+       hand sides are, which the y_i then imply).
+    2. Then x0 + B t (B the free columns of V, integer; x0 finite decimal)
+       for decimal t are the finite decimal points of H. The face is open
+       in H and contains p = x0 + B t*. For a form f with f(p) != 0, f
+       changes by at most |t - t*|_inf * sum_j |(f B)_j| when t moves; with
+       t = t* rounded to k decimals (|t - t*|_inf <= 10^-k / 2), every
+       such form keeps its sign once 10^-k / 2 * sum_j |(f B)_j| < |f(p)|,
+       and the forms that are 0 at p stay 0 on H. The k is computed from
+       this bound, so the search always ends."""
+    if all(_is_dec(p[v]) for v in variables):
         return p
     sig = [_sign(_leval(f, p)) for f in forms]
-    # the hull: the forms that are 0 at p, in reduced row echelon form
-    rows = [dict(f[0]) | {None: f[1]} for f, s in zip(forms, sig) if s == 0]
-    pivots: list = []
-    for v in variables:
-        r = next((row for row in rows if row.get(v, 0) != 0 and row not in
-                  [pr for _pv, pr in pivots]), None)
-        if r is None:
+    d = len(variables)
+    col = {v: j for j, v in enumerate(variables)}
+    eqs = [f for f, s in zip(forms, sig) if s == 0]
+    # a maximal set of independent equalities (rational elimination)
+    rows, basis = [], []
+    for co, c in eqs:
+        vec = [Fraction(0)] * d
+        for k, v in co:
+            vec[col[k]] = Fraction(v)
+        red = list(vec)
+        for piv, b in basis:
+            if red[piv] != 0:
+                fac = red[piv] / b[piv]
+                red = [x - fac * y for x, y in zip(red, b)]
+        nz = next((j for j, x in enumerate(red) if x != 0), None)
+        if nz is None:
             continue
-        a = r[v]
-        for k in list(r):
-            r[k] = r[k] / a
-        for other in rows:
-            if other is not r and other.get(v, 0) != 0:
-                f = other[v]
-                for k, val in r.items():
-                    other[k] = other.get(k, Fraction(0)) - f * val
-        pivots.append((v, r))
-    piv = {v for v, _r in pivots}
-    free = [v for v in variables if v not in piv]
-    # x_pivot = -(const + sum of coef * free)
-    expr = {v: ({f: -r.get(f, Fraction(0)) for f in free}, -r.get(None, Fraction(0)))
-            for v, r in pivots}
-
-    def point(t: dict) -> dict:
-        out = dict(t)
-        for v, (co, c) in expr.items():
-            out[v] = c + sum((co[f] * t[f] for f in free), Fraction(0))
-        return out
-
-    def same_face(q: dict) -> bool:
-        return all(_sign(_leval(f, q)) == s for f, s in zip(forms, sig))
-
-    den = 1
-    for co, c in expr.values():
-        for x in list(co.values()) + [c]:
+        basis.append((nz, red))
+        # integer row, and the right hand side: sum a_j x_j = -c
+        den = 1
+        for x in vec + [Fraction(c)]:
             den = math.lcm(den, x.denominator)
-    m = _coprime10(den)
-    if not free:
-        q = point({})
-        return q if all(_is_decimal(q[v]) for v in variables) else None
-    if m ** len(free) > 4096:
-        return None
-    for n in range(0, 60):
-        scale = 10 ** n
-        # residues of t * 10^n modulo m that give decimal pivots
-        for res in itertools.product(range(m), repeat=len(free)):
-            t = {f: Fraction(r, scale) for f, r in zip(free, res)}
-            if not all(_is_decimal(x) for x in point(t).values()):
-                continue
-            # the decimal point of this class nearest to p
-            t = {f: Fraction(r + m * round((p[f] * scale - r) / m), scale)
-                 for f, r in zip(free, res)}
-            q = point(t)
-            if same_face(q) and all(_is_decimal(q[v]) for v in variables):
-                return q
-            break
-    return None
+        rows.append(([int(x * den) for x in vec], -Fraction(c) * den))
+    r = len(rows)
+    A = [list(row) for row, _rhs in rows]
+    V = [[int(i == j) for j in range(d)] for i in range(d)]
 
+    def colop(i: int, j: int, a: int, b: int, c_: int, e: int) -> None:
+        # (col i, col j) <- (a col i + b col j, c col i + e col j), det 1
+        for M in (A, V):
+            for row in M:
+                x, y = row[i], row[j]
+                row[i], row[j] = a * x + b * y, c_ * x + e * y
+
+    for i in range(r):
+        for j in range(i + 1, d):
+            if A[i][j] == 0:
+                continue
+            if A[i][i] == 0:
+                colop(i, j, 0, 1, 1, 0)       # swap (det -1, still unimodular)
+                continue
+            a, b = A[i][i], A[i][j]
+            g, u, v = _egcd(a, b)
+            colop(i, j, u, v, -b // g, a // g)
+        assert A[i][i] != 0
+    y: list = []
+    for i in range(r):
+        acc = rows[i][1] - sum((A[i][j] * y[j] for j in range(i)), Fraction(0))
+        yi = acc / A[i][i]
+        if not _is_dec(yi):
+            return None               # H holds no finite decimal point
+        y.append(yi)
+    x0 = [sum((V[i][j] * y[j] for j in range(r)), Fraction(0)) for i in range(d)]
+    free = list(range(r, d))
+    if not free:
+        q = dict(zip(variables, x0))
+        assert all(_sign(_leval(f, q)) == s for f, s in zip(forms, sig)), "decimal point"
+        return q
+    # t* with x0 + B t* = p: the free coordinates of V^-1 p
+    Vinv = _inverse([[Fraction(x) for x in row] for row in V])
+    pv = [p[v] for v in variables]
+    ts = [sum((Vinv[j][i] * pv[i] for i in range(d)), Fraction(0)) for j in free]
+    bound = Fraction(0)
+    for f, s in zip(forms, sig):
+        if s == 0:
+            continue
+        fb = Fraction(0)
+        for j in free:
+            fb += abs(sum((Fraction(v) * V[col[k]][j] for k, v in f[0]), Fraction(0)))
+        bound = max(bound, fb / abs(_leval(f, p)))
+    k = 0
+    while Fraction(1, 2 * 10 ** k) * bound >= 1:
+        k += 1
+    t = [Fraction(round(x * 10 ** k), 10 ** k) for x in ts]
+    xq = [x0[i] + sum((V[i][j] * tj for j, tj in zip(free, t)), Fraction(0)) for i in range(d)]
+    q = dict(zip(variables, xq))
+    assert all(_is_dec(x) for x in xq), "decimal point"
+    assert all(_sign(_leval(f, q)) == s for f, s in zip(forms, sig)), "same face"
+    return q
+
+
+def _inverse(M: list) -> list:
+    """The inverse of a square rational matrix (Gauss-Jordan)."""
+    n = len(M)
+    a = [list(row) + [Fraction(int(i == j)) for j in range(n)] for i, row in enumerate(M)]
+    for c in range(n):
+        piv = next(i for i in range(c, n) if a[i][c] != 0)
+        a[c], a[piv] = a[piv], a[c]
+        f = a[c][c]
+        a[c] = [x / f for x in a[c]]
+        for i in range(n):
+            if i != c and a[i][c] != 0:
+                g = a[i][c]
+                a[i] = [x - g * y for x, y in zip(a[i], a[c])]
+    return [row[n:] for row in a]
 
 
 # === The model =============================================================
