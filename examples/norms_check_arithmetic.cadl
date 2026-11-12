@@ -1,0 +1,56 @@
+# Norms Extension Demo: Arithmetic and Comparisons of Quantities in
+# Design-Time Checking (F.12)
+#
+# over_capacity sums the loads of the robots and compares the sum with the
+# capacity of the depot; balance compares the loads of two robots. A
+# comparison of two quantities needs no more than the classes of values of
+# F.12; arithmetic and sum need a finite domain, given with --domain, and
+# the answers then hold for traces whose numbers for these quantities are
+# integers in that domain:
+#
+#   cadl norms-check examples/norms_check_arithmetic.cadl --members ROBOT=2 \
+#       --domain "ROBOT[*].load=0..3" --domain DEPOT.capacity=2..4
+
+sos:
+  name: "DepotLoads"
+  type: Acknowledged
+  version: "0.1.0"
+  description: "Loads of delivery robots against the capacity of a depot."
+  extensions:
+    - norms: 0.1
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities: [monitor_fleet]
+      interface:
+        output: [rebalance]
+
+    - id: DEPOT
+      role: "storage"
+      autonomy: low
+      capabilities: [store]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities: [follow_path, deliver]
+      interface:
+        input: [rebalance]
+
+  contracts:
+    - id: DEPOT_LOADS
+      parties: [DISPATCHER, DEPOT, "ROBOT[*]"]
+
+      norms:
+        - id: over_capacity
+          kind: prohibition
+          bearer: DISPATCHER
+          content: "sum(r.load for r in ROBOT) > DEPOT.capacity"
+        - id: balance
+          kind: obligation
+          bearer: DISPATCHER
+          trigger: "DISPATCHER -> ROBOT[1] : rebalance"
+          content: "ROBOT[1].load == ROBOT[2].load"
+          deadline: 2s

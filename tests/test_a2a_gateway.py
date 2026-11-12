@@ -523,14 +523,19 @@ class TestScenarios:
         capsys.readouterr()
 
     def test_agent_down(self, tmp_path, capsys):
+        # Bound but never listening: connections are refused, and the port
+        # cannot be taken by another server while the test runs (closing
+        # it first was a race under load).
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-        sock.close()                                   # nothing listens there
-        r = Run(tmp_path, upstream=f"http://127.0.0.1:{port}/")
-        body = r.call("PLANNER", "SendMessage", params("summarize"))
-        assert body["error"]["code"] == -32603
-        r.stop()
+        try:
+            r = Run(tmp_path, upstream=f"http://127.0.0.1:{port}/")
+            body = r.call("PLANNER", "SendMessage", params("summarize"))
+            assert body["error"]["code"] == -32603
+            r.stop()
+        finally:
+            sock.close()
         assert [e for e, _ in host_events(r.audit)] == ["forward_failed"]
         result = r.replay_check()
         assert decisions(result) == [("PLANNER", "summarize", "allow", "permission")]
