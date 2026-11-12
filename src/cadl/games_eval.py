@@ -1245,17 +1245,39 @@ class CoupledPlays:
         self.table = table
         self.rho = game.rho(proc.player)
         self.local = {g: i for i, g in enumerate(proc.states)}
+        self._components: dict = {}
         self._options: dict = {}
         self._values: tuple = ({}, {})            # least, largest
 
-    def _moves(self, i: int, k: Any, c: int) -> tuple:
+    def _component(self, i: int, k: Any) -> tuple:
+        """The distinct distributions (over local states) of command k in
+        the local state i at the corners of the cell, and per corner the
+        position of its distribution among them and the bounds of the
+        step payoff there. A state in which the target holds stays where
+        it is and adds 0."""
+        key = (i, k)
+        if key in self._components:
+            return self._components[key]
         proc = self.proc
         if proc.target[i] or k is None:
-            return {i: ONE}, (ZERO, ZERO)
-        g = proc.states[i]
-        d = self.table.distribution(g, k, c)
-        return ({self.local[j]: p for j, p in d.items()},
-                self.table.reward(self.rho[g][k], c))
+            out = ([{i: ONE}], [(0, ZERO, ZERO)] * len(self.table.corners))
+        else:
+            g = proc.states[i]
+            dists: list = []
+            index: dict = {}
+            per_corner = []
+            for c in range(len(self.table.corners)):
+                d = self.table.distribution(g, k, c)
+                d = {self.local[j]: p for j, p in d.items()}
+                sig = tuple(d.items())
+                if sig not in index:
+                    index[sig] = len(dists)
+                    dists.append(d)
+                lo, hi = self.table.reward(self.rho[g][k], c)
+                per_corner.append((index[sig], lo, hi))
+            out = (dists, per_corner)
+        self._components[key] = out
+        return out
 
     def options(self, x: tuple) -> list:
         """The options of x, a pair of local states or `("start", i, k)`
@@ -1273,18 +1295,21 @@ class CoupledPlays:
             return []
         else:
             a, b = (x[0], proc.selected[x[0]]), (x[1], proc.selected[x[1]])
+        dists1, corners1 = self._component(*a)
+        dists2, corners2 = self._component(*b)
         groups: dict = {}
-        for c in range(len(self.table.corners)):
-            d1, r1 = self._moves(*a, c)
-            d2, r2 = self._moves(*b, c)
-            key = (tuple(d1.items()), tuple(d2.items()))
-            lo, hi = r1[0] - r2[1], r1[1] - r2[0]
-            if key in groups:
-                g = groups[key]
-                g[0], g[1] = min(g[0], lo), max(g[1], hi)
+        for (n1, lo1, hi1), (n2, lo2, hi2) in zip(corners1, corners2):
+            lo, hi = lo1 - hi2, hi1 - lo2
+            g = groups.get((n1, n2))
+            if g is None:
+                groups[(n1, n2)] = [lo, hi]
             else:
-                groups[key] = [lo, hi, d1, d2]
-        out = [(lo, hi, _coupling(d1, d2)) for lo, hi, d1, d2 in groups.values()]
+                if lo < g[0]:
+                    g[0] = lo
+                if hi > g[1]:
+                    g[1] = hi
+        out = [(lo, hi, _coupling(dists1[n1], dists2[n2]))
+               for (n1, n2), (lo, hi) in groups.items()]
         self._options[x] = out
         return out
 
@@ -1417,6 +1442,8 @@ class PlayerOnCell:
     # (index of the game) and the lower bound of the gain from s.
     state: Any = None
     state_gain_lower: Fraction = ZERO
+    # Whether PD+ or PD− decided the player with the coupled bounds.
+    coupled: bool = False
 
 
 def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Callable,
@@ -1485,16 +1512,22 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
     if adv is not None and game.multi_affine and \
             (USE_COUPLING if use_coupling is None else use_coupling):
         # PD+ and PD− again, with the bounds of the advantages narrowed by
-        # the coupled relaxation (I.9): the upper bounds that are positive,
-        # and the lower bounds of the commands of τ.
+        # the coupled relaxation (I.9): the upper bounds that are positive
+        # for PD+, and the lower bounds of the commands of τ for PD−. The
+        # bounds hold at the centre of the cell, so PD+ cannot hold when
+        # the player gains more than ε there, and PD− cannot hold when it
+        # does not; the condition that cannot hold is not tried.
         plays = CoupledPlays(game, proc, table or CornerTable(game, cell))
         adv = dict(adv)
-        for key, (a, b) in adv.items():
-            if b > 0:
-                adv[key] = (a, min(b, plays.bound(*key, maximize=True)))
-        if pd_plus(proc, out, adv, epsilon, every_state):
-            return out
-        if at.admissible and at.state_gain > 0:
+        gain_at_centre = at.state_gain if every_state else at.gain
+        if not at.admissible or gain_at_centre <= epsilon:
+            for key, (a, b) in adv.items():
+                if b > 0:
+                    adv[key] = (a, min(b, plays.bound(*key, maximize=True)))
+            if pd_plus(proc, out, adv, epsilon, every_state):
+                out.coupled = True
+                return out
+        elif at.deviation or every_state:
             tau = at.best_response if every_state else at.deviation
             local = {g: i for i, g in enumerate(proc.states)}
             for g, k in tau.items():
@@ -1503,6 +1536,7 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
                     a, b = adv[key]
                     adv[key] = (max(a, plays.bound(*key, maximize=False)), b)
             if at.deviation and pd_minus(proc, out, adv, at, epsilon, every_state):
+                out.coupled = True
                 return out
     if every_state and at.admissible and at.state_gain > epsilon:
         state_deviation(game, profile, proc, out, at, lo, upper, cell, epsilon, adv)
