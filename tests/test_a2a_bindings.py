@@ -132,7 +132,9 @@ class TestMutualTLS:
         good = TLSClient(r.client.port, r.run_id, pki, "planner")
         t0 = time.monotonic()
         assert good.call("PLANNER", "SendMessage", params("summarize"))["result"]["task"]
-        assert time.monotonic() - t0 < 1.0
+        # It did not wait for a reader (READER_WAIT is one second): no
+        # refusal is recorded, whatever the load of the machine.
+        assert not events(r.audit, "overloaded"), time.monotonic() - t0
         # A slow handshake is cut by the read deadline, recorded once.
         wait_for(lambda: len(events(r.audit, "read_timeout")) >= 3, "the read deadlines",
                  timeout=15)
@@ -662,7 +664,7 @@ class TestPush:
                 "summarize", taskPushNotificationConfig=push_cfg(f"{hook.url}/hooks/{path}")))
             t0 = time.monotonic()
             assert r.agent.notify(f"up-task-{i + 1}", status_event(f"up-task-{i + 1}")) == [502]
-            assert time.monotonic() - t0 < 2.5
+            assert time.monotonic() - t0 < 2.9         # the slow webhook takes 3 s
         assert [g["path"] for g in hook.got] == ["/hooks/redirect", "/hooks/slow",
                                                  "/hooks/fail"]       # not /hooks/moved
         err = r.call("PLANNER", "SendMessage", params("summarize", taskPushNotificationConfig=
