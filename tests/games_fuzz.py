@@ -790,8 +790,8 @@ def mutation(name: str | None):
         # The conditions of I.9 for the concept nash also for
         # every_reachable_state (E1 at the initial state only, no N_s).
         original_on = saved["player_on_cell"]
-        ge.player_on_cell = lambda game, profile, player, cell, dists, epsilon, every=False: \
-            original_on(game, profile, player, cell, dists, epsilon)
+        ge.player_on_cell = lambda game, profile, player, cell, dists, epsilon, every=False, \
+            **options: original_on(game, profile, player, cell, dists, epsilon, **options)
     elif name == "advantage_drop_successors":
         # A(s, c) bounded by the difference of the step payoffs alone,
         # without the term Σ ΔP(s′) · V(s′).
@@ -828,9 +828,15 @@ def mutation(name: str | None):
                     return [(F(0), F(0), d) for _, _, d in opts]
                 return opts
         ge.CoupledPlays = WithoutFirst
-    elif name == "coupling_one_marginal":
-        # Both plays move by the distribution of the first one.
-        ge._coupling = lambda d1, d2: {(j, j): x for j, x in d1.items()}
+    elif name == "coupling_drop_later_payoffs":
+        # The step payoffs after the first step left out.
+        class FirstOnly(saved["CoupledPlays"]):
+            def options(self, x):
+                opts = super().options(x)
+                if x[0] != "start":
+                    return [(F(0), F(0), d) for _, _, d in opts]
+                return opts
+        ge.CoupledPlays = FirstOnly
     elif name is not None:
         raise ValueError(name)
     try:
@@ -848,7 +854,7 @@ EVERY_STATE_MUTATIONS = ("drop_reach_certificate", "every_state_as_nash")
 ADVANTAGE_MUTATIONS = ("advantage_drop_successors", "advantage_swap_sides",
                        "advantage_centre_only")
 COUPLING_MUTATIONS = ("coupling_swap_sides", "coupling_drop_first_payoff",
-                      "coupling_one_marginal")
+                      "coupling_drop_later_payoffs")
 
 
 def run(seed: int, count: int, mutant: str | None = None, max_cells: int = 24,

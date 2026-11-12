@@ -1313,6 +1313,18 @@ class CoupledPlays:
         self._options[x] = out
         return out
 
+    def may_narrow(self, i: int, k: int, lower: list, upper: list) -> bool:
+        """False when every pair of different states that the first step
+        reaches has a state whose value is known exactly on the cell
+        (l_p = u_p) or in which the target holds: then the coupled bound
+        is not expected to be narrower than that of `advantage_bounds`,
+        and it is not computed (leaving it out is always sound)."""
+        for _, _, d in self.options(("start", i, k)):
+            for x, y in d:
+                if x != y and lower[x] != upper[x] and lower[y] != upper[y]:
+                    return True
+        return False
+
     def bound(self, i: int, k: int, maximize: bool) -> Fraction:
         """The largest (or least) value of the process on pairs from the
         first step of the commands k and σ(s) in the local state i: an
@@ -1522,7 +1534,7 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
         gain_at_centre = at.state_gain if every_state else at.gain
         if not at.admissible or gain_at_centre <= epsilon:
             for key, (a, b) in adv.items():
-                if b > 0:
+                if b > 0 and plays.may_narrow(*key, lower, upper):
                     adv[key] = (a, min(b, plays.bound(*key, maximize=True)))
             if pd_plus(proc, out, adv, epsilon, every_state):
                 out.coupled = True
@@ -1532,7 +1544,7 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
             local = {g: i for i, g in enumerate(proc.states)}
             for g, k in tau.items():
                 key = (local.get(g), k)
-                if key in adv:
+                if key in adv and plays.may_narrow(*key, lower, upper):
                     a, b = adv[key]
                     adv[key] = (max(a, plays.bound(*key, maximize=False)), b)
             if at.deviation and pd_minus(proc, out, adv, at, epsilon, every_state):

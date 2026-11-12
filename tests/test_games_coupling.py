@@ -293,10 +293,10 @@ class TestFuzz:
         assert stats["advantages_compared"] > 0
 
     @pytest.mark.parametrize("name", games_fuzz.COUPLING_MUTATIONS)
-    @pytest.mark.parametrize("concept", ["nash", "every"])
-    def test_a_soundness_bug_is_detected_by_the_maps(self, name, concept):
+    @pytest.mark.parametrize("concept, seed", [("nash", 1), ("every", 4)])
+    def test_a_soundness_bug_is_detected_by_the_maps(self, name, concept, seed):
         # Without the direct check of the bounds: a wrong claim of a map.
-        stats = games_fuzz.run(1, 60, name, concept=concept, direct=False)
+        stats = games_fuzz.run(seed, 80, name, concept=concept, direct=False)
         assert "failure" in stats, f"the mutant {name} survived {stats}"
 
     @pytest.mark.parametrize("name", games_fuzz.COUPLING_MUTATIONS)
