@@ -401,3 +401,39 @@ class TestFuzz:
     def test_a_deliberate_soundness_bug_is_detected(self, name, seed, count, options):
         stats = games_fuzz.run(seed, count, name, **options)
         assert "failure" in stats, f"the mutant {name} survived {stats}"
+
+    @pytest.mark.parametrize("name", games_fuzz.ADVANTAGE_MUTATIONS)
+    @pytest.mark.parametrize("concept", ["nash", "every"])
+    def test_a_soundness_bug_of_pd_is_detected(self, name, concept):
+        # PD+ and PD− of I.9: the advantages without the successors, the
+        # lower and upper bounds exchanged, or the differences taken at the
+        # centre of the cell only.
+        stats = games_fuzz.run(1, 40, name, concept=concept)
+        assert "failure" in stats, f"the mutant {name} survived {stats}"
+
+    def test_pd_decides_more_cells(self):
+        # On the same games, the maps with PD+ and PD− leave at most the
+        # undecided volume of the maps without them, at the same budget.
+        import random
+        from cadl.games_eval import equilibrium_map
+        from cadl.parser import parse
+        from cadl.stochastic import analyse
+        import cadl.games_eval as ge
+        rng = random.Random(5)
+        better = 0
+        for _ in range(12):
+            g = games_fuzz.generate(rng, mode="scale")
+            analysis = analyse(parse(games_fuzz.to_cadl(g)))
+            if not analysis.ok:
+                continue
+            with_pd = equilibrium_map(analysis.model, "on_region", max_cells=24)
+            saved = ge.USE_ADVANTAGES
+            ge.USE_ADVANTAGES = False
+            try:
+                without = equilibrium_map(analysis.model, "on_region", max_cells=24)
+            finally:
+                ge.USE_ADVANTAGES = saved
+            a = with_pd["designs"][0]["undecided_fraction"]
+            b = without["designs"][0]["undecided_fraction"]
+            better += a < b
+        assert better > 0

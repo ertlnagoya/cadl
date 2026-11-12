@@ -638,7 +638,13 @@ def mutation(name: str | None):
     saved = {k: getattr(ge, k) for k in
              ("deviation_lower", "improper_states", "one_step_upper", "cell_distributions",
               "reward_bounds", "endpoint_parameter_free_model", "endpoint_affine_weights",
-              "endpoint_monotone_states", "certified_reach", "player_on_cell")}
+              "endpoint_monotone_states", "certified_reach", "player_on_cell",
+              "USE_ADVANTAGES", "advantage_bounds", "advantage_reward", "poly_bounds")}
+    if name is not None and name not in ADVANTAGE_MUTATIONS:
+        # The other mutants concern N, E1, E2, N_s and the end points: the
+        # conditions PD+ and PD− are switched off, so that the cells reach
+        # the mutated condition as they did before PD+ and PD− existed.
+        ge.USE_ADVANTAGES = False
     if name == "swap_bound_direction":
         # d(τ): the best case over the cell instead of the worst case.
         ge.deviation_lower = lambda proc, tau, lo: ge.optimal_values(
@@ -693,6 +699,26 @@ def mutation(name: str | None):
         original_on = saved["player_on_cell"]
         ge.player_on_cell = lambda game, profile, player, cell, dists, epsilon, every=False: \
             original_on(game, profile, player, cell, dists, epsilon)
+    elif name == "advantage_drop_successors":
+        # A(s, c) bounded by the difference of the step payoffs alone,
+        # without the term Σ ΔP(s′) · V(s′).
+        original_ab = saved["advantage_bounds"]
+
+        def without_successors(game, proc, cell, lower, upper):
+            zero = [F(0)] * len(lower)
+            return original_ab(game, proc, cell, zero, zero)
+        ge.advantage_bounds = without_successors
+    elif name == "advantage_swap_sides":
+        # PD+ with the lower bounds of the advantages, PD− with the upper.
+        original_ar = saved["advantage_reward"]
+        ge.advantage_reward = lambda proc, bounds, side: original_ar(proc, bounds, 1 - side)
+    elif name == "advantage_centre_only":
+        # The differences of payoffs and probabilities at the centre of the
+        # cell only, not bounded on the cell.
+        def at_centre(poly, cell):
+            x = ge._p_eval(poly, tuple((a + b) / 2 for a, b in cell)) if poly else F(0)
+            return x, x
+        ge.poly_bounds = at_centre
     elif name is not None:
         raise ValueError(name)
     try:
@@ -707,6 +733,8 @@ MUTATIONS = ("swap_bound_direction", "drop_admissibility", "profile_command_for_
 ENDPOINT_MUTATIONS = ("endpoints_drop_probability", "endpoints_drop_affine",
                       "endpoints_drop_condition_b", "endpoints_b_from_initial")
 EVERY_STATE_MUTATIONS = ("drop_reach_certificate", "every_state_as_nash")
+ADVANTAGE_MUTATIONS = ("advantage_drop_successors", "advantage_swap_sides",
+                       "advantage_centre_only")
 
 
 def run(seed: int, count: int, mutant: str | None = None, max_cells: int = 24,
@@ -745,7 +773,8 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--max-cells", type=int, default=24)
     parser.add_argument("--extra", type=int, default=4)
     parser.add_argument("--mutation", default=None,
-                        choices=MUTATIONS + ENDPOINT_MUTATIONS + EVERY_STATE_MUTATIONS)
+                        choices=MUTATIONS + ENDPOINT_MUTATIONS + EVERY_STATE_MUTATIONS
+                        + ADVANTAGE_MUTATIONS)
     parser.add_argument("--j14", action="store_true",
                         help="one-parameter maps over lam in files that declare grounding "
                              "0.1 (the end-point certification of I.9, through J-14)")

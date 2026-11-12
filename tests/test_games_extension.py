@@ -897,9 +897,25 @@ class TestExport:
         for label in ("[monitor]", "[trust]", "[careful]", "[careless]", "[settle]"):
             assert f"  {label} " in text
 
-    def test_player_without_a_command_is_not_written(self):
+    def test_player_without_a_command_is_written_without_actions(self):
+        # Up to 0.3.26 such a player was not written; a design in which no
+        # player owns a command then gave an `smg` file without players,
+        # which PRISM-games 3.2.4 rejects ("SMG model has no player
+        # definitions").
         text = export_prism(checked_model(parse_file(ROBOT)))["RobotDeliveryGame_CENTRALIZED.prism"]
-        assert "player R_" in text and "player D" not in text
+        assert text.startswith("smg\n\nplayer R_\n  [careful], [careless]\nendplayer\n\n"
+                               "player D\nendplayer\n\nconst ")
+
+    def test_design_without_an_owned_command(self, tmp_path):
+        def mutate(model, sos):
+            for c in model["commands"]:
+                c.pop("owner", None)
+                if c["action"] == "careless":
+                    c["guard"] = "false"
+            model["profiles"] = {name: [] for name in model["profiles"]}
+        model = model_of(mutate, base=robot)
+        text = export_prism(model)["RobotDeliveryGame_CENTRALIZED.prism"]
+        assert text.startswith("smg\n\nplayer R_\nendplayer\n\nplayer D\nendplayer\n\nconst ")
 
     def test_parameter_open_in_a_regime_map_stays_open(self):
         model = model_of(TestModelUnderProfile().regime_map, base=robot)
