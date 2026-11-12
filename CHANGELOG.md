@@ -54,6 +54,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Findings of an independent review of the new bindings, each with a
+  regression test: a push configuration given with `SendMessage` is
+  bound to the task of the agent's answer (allow, release, first stream
+  event), notifications before that are dropped and never claim a task;
+  idle gRPC calls no longer hold the workers (header check before the
+  message is awaited, caps on calls not yet authenticated per address,
+  per prefix and in all, read deadline, HTTP/2 limits); gRPC mutual TLS
+  requires exactly one common name, read from the full certificate;
+  callback URLs with dot segments, backslashes or percent-encoded dots,
+  slashes or backslashes are refused; the cap on push configurations is
+  atomic and counts held ones; the help of `--push-allow` says what a
+  network entry allows.
 - `cadl a2a-gateway`: closing a stream of one event (a denial, or a
   submitted task of `returnImmediately`) raised an error that was only
   logged.
