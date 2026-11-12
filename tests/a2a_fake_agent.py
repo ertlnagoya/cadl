@@ -14,10 +14,16 @@ SendMessage answers with a completed task, or with what the text of the
 first part asks for: "reply-with-message" (a Message), "garbage" (not
 JSON), "foreign-task" (the task of another client), "slow" (after one
 second), "error" (a JSON-RPC error).
+
+Push notifications: the agent keeps the configurations it is given
+(CreateTaskPushNotificationConfig, or the configuration of a SendMessage)
+and `notify` POSTs a `StreamResponse` to them, with their token and
+credentials, as an agent does (A2A 1.0.0, 4.3.3).
 """
 
 from __future__ import annotations
 
+import http.client
 import itertools
 import json
 import threading
@@ -41,6 +47,15 @@ def rest_request(method: str, target: str, body: bytes) -> dict | None:
         return {"id": 0, "method": "SendStreamingMessage", "params": params}
     if path.startswith("/tasks/"):
         rest = path[len("/tasks/"):]
+        if "/pushNotificationConfigs" in rest:
+            tid, _, cid = rest.partition("/pushNotificationConfigs")
+            if method == "POST":
+                return {"id": 0, "method": "CreateTaskPushNotificationConfig",
+                        "params": dict(params, taskId=unquote(tid))}
+            if method == "DELETE":
+                return {"id": 0, "method": "DeleteTaskPushNotificationConfig",
+                        "params": {"taskId": unquote(tid), "id": unquote(cid[1:])}}
+            return None
         if rest.endswith(":cancel") and method == "POST":
             return {"id": 0, "method": "CancelTask",
                     "params": dict(params, id=unquote(rest[:-7]))}
@@ -64,6 +79,7 @@ class FakeAgent:
     def __init__(self):
         self.requests: list[dict] = []
         self.tasks: dict[str, dict] = {}
+        self.push: dict[tuple, dict] = {}       # (task id, config id) -> configuration
         self.release = threading.Event()
         self.lock = threading.Lock()
         self.ids = itertools.count(1)
@@ -187,6 +203,36 @@ class FakeAgent:
         self.server.shutdown()
         self.server.server_close()
 
+    def notify(self, task_id: str, payload: dict, config: dict | None = None,
+               headers: dict | None = None, context=None) -> list[int]:
+        """POST `payload` to every configuration of `task_id` (or to
+        `config`), as the agent's notification; the HTTP statuses. An https
+        URL is reached with the TLS client context `context`."""
+        with self.lock:
+            configs = [config] if config is not None else [
+                c for (t, _), c in self.push.items() if t == task_id]
+        out = []
+        for c in configs:
+            url = c["url"]
+            hostport, path = url.split("://", 1)[1].split("/", 1)
+            host, port = hostport.rsplit(":", 1)
+            if url.startswith("https:"):
+                conn = http.client.HTTPSConnection(host, int(port), timeout=30,
+                                                   context=context)
+            else:
+                conn = http.client.HTTPConnection(host, int(port), timeout=30)
+            h = {"Content-Type": "application/json"}
+            if c.get("token"):
+                h["X-A2A-Notification-Token"] = c["token"]
+            auth = c.get("authentication") or {}
+            if auth.get("credentials"):
+                h["Authorization"] = f"{auth['scheme']} {auth['credentials']}"
+            h.update(headers or {})
+            conn.request("POST", "/" + path, body=json.dumps(payload).encode(), headers=h)
+            out.append(conn.getresponse().status)
+            conn.close()
+        return out
+
     def sent(self, method: str = "SendMessage") -> list[str]:
         """The CADL names of the requests of `method` that reached the agent."""
         out = []
@@ -233,6 +279,7 @@ class FakeAgent:
         task = {"id": tid, "contextId": ctx, "status": {"state": "TASK_STATE_SUBMITTED"}}
         with self.lock:
             self.tasks[tid] = task
+            self._keep_push(params, tid)
         yield b": a comment\n\n"
         yield ev({"task": task})
         other = "other-task" if text == "stream-foreign" else tid
@@ -246,6 +293,11 @@ class FakeAgent:
             self.release.wait(30)
         yield ev({"statusUpdate": {"taskId": tid, "contextId": ctx,
                                    "status": {"state": "TASK_STATE_COMPLETED"}}})
+
+    def _keep_push(self, params: dict, task_id: str) -> None:
+        cfg = (params.get("configuration") or {}).get("taskPushNotificationConfig")
+        if cfg is not None:
+            self.push[(task_id, cfg["id"])] = dict(cfg, taskId=task_id)
 
     def answer(self, req: dict):
         id_ = req.get("id")
@@ -268,6 +320,7 @@ class FakeAgent:
                         "parts": [{"text": "done"}]}}}
                 n = next(self.ids)
                 task_id = "foreign-1" if text == "foreign-task" else f"up-task-{n}"
+                self._keep_push(params, task_id)
                 task = {"id": task_id, "contextId": msg.get("contextId", f"up-ctx-{n}"),
                         "status": {"state": "TASK_STATE_COMPLETED", "message": {
                             "messageId": f"s-{n}", "role": "ROLE_AGENT", "taskId": task_id,
@@ -275,6 +328,12 @@ class FakeAgent:
                         "history": [dict(msg, taskId=task_id)]}
                 self.tasks[task_id] = task
                 return {"jsonrpc": "2.0", "id": id_, "result": {"task": task}}
+            if method == "CreateTaskPushNotificationConfig":
+                self.push[(params["taskId"], params["id"])] = params
+                return {"jsonrpc": "2.0", "id": id_, "result": params}
+            if method == "DeleteTaskPushNotificationConfig":
+                self.push.pop((params["taskId"], params["id"]), None)
+                return {"jsonrpc": "2.0", "id": id_, "result": None}
             if method in ("GetTask", "CancelTask"):
                 task = self.tasks.get(params.get("id"))
                 if task is None:

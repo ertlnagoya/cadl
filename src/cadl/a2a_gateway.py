@@ -98,6 +98,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from . import a2a_rest as A2ARest
+from .a2a_push import PushError, PushPolicy, check_auth, deliver
 from . import agents as G
 from .audit_log import AuditKeyError, canonical, loads_unique, read_key
 from .gateway_core import (
@@ -160,6 +161,11 @@ MAX_HANDLERS_PER_ACTOR = 16    # authenticated requests of one actor at the same
 MAX_HOLDS_PER_ACTOR = 64       # holds of one actor, blocking or not
 READ_TIMEOUT = 10.0            # seconds to read the request line, headers and body
 MAX_HANDSHAKES = 256           # TLS handshakes at the same time, with --client-ca
+MAX_PUSH_CONFIGS = 64          # push notification configurations of one actor
+MAX_PUSH_RECEIPTS = 16         # notifications of the agent relayed at the same time
+PUSH_PATH = "/cadl-push/"      # where the agent sends the notifications of a configuration
+PUSH_METHODS = ("CreateTaskPushNotificationConfig", "GetTaskPushNotificationConfig",
+                "ListTaskPushNotificationConfigs", "DeleteTaskPushNotificationConfig")
 
 _AUTH_RE = re.compile(r'CADL-HMAC actor="([A-Za-z_][A-Za-z0-9_]*(?:\[[0-9]{1,9}\])?)", '
                       r'nonce="([0-9a-f]{32})", mac="([0-9a-f]{64})"')
@@ -249,7 +255,9 @@ class _Stream:
             return
         self.closed = True
         try:
-            self.gen.close()
+            close = getattr(self.gen, "close", None)     # a list iterator has none
+            if close is not None:
+                close()
         finally:
             if self.on_close is not None:
                 self.on_close()
@@ -264,7 +272,67 @@ class _NoResponse(Exception):
 
 
 @dataclass
+class _PushConfig:
+    """A push notification configuration of a client. The agent gets one of
+    the gateway, whose URL is the gateway's (`PUSH_PATH` + `gid`) and whose
+    token and credentials are secrets of the gateway; the gateway relays
+    what the agent sends there to the client's URL, with the client's token
+    and credentials, for the task of the configuration only."""
+    gid: str                            # the id at the agent, and the path
+    owner: str
+    client_id: str                      # the id that the client sees
+    url: str
+    token: str | None
+    auth: dict | None
+    secret_token: str = field(default_factory=lambda: secrets.token_hex(32))
+    secret_cred: str = field(default_factory=lambda: secrets.token_hex(32))
+    upstream_task: str | None = None    # the agent's task, once known
+    own_task: str | None = None         # the gateway's task that shows it
+    agent_id: str | None = None         # the id that the agent gave it
+    active: bool = False
+
+    def view_task(self) -> str | None:
+        return self.own_task or self.upstream_task
+
+    def public(self) -> dict:
+        out: dict[str, Any] = {"id": self.client_id, "url": self.url}
+        if self.view_task() is not None:
+            out["taskId"] = self.view_task()
+        if self.token:
+            out["token"] = self.token
+        if self.auth is not None:
+            out["authentication"] = dict(self.auth)
+        return out
+
+    def upstream(self, base: str) -> dict:
+        out: dict[str, Any] = {"id": self.gid, "url": f"{base}{PUSH_PATH}{self.gid}",
+                               "token": self.secret_token,
+                               "authentication": {"scheme": "Bearer",
+                                                  "credentials": self.secret_cred}}
+        if self.upstream_task is not None:
+            out["taskId"] = self.upstream_task
+        return out
+
+
+def _redacted(params: dict) -> dict:
+    """The params of a SendMessage as an approver sees them: the token and
+    the credentials of a push notification configuration are not shown."""
+    conf = params.get("configuration")
+    if not isinstance(conf, dict) or not isinstance(conf.get("taskPushNotificationConfig"),
+                                                    dict):
+        return params
+    push = dict(conf["taskPushNotificationConfig"])
+    if "token" in push:
+        push["token"] = "(not shown)"
+    if isinstance(push.get("authentication"), dict) \
+            and "credentials" in push["authentication"]:
+        push["authentication"] = dict(push["authentication"], credentials="(not shown)")
+    return dict(params, configuration=dict(conf, taskPushNotificationConfig=push))
+
+
+@dataclass
 class _A2AHeld(_Held):
+    push: _PushConfig | None = None
     actor: str = ""
     upstream_id: int = 0
     return_immediately: bool = False
@@ -338,7 +406,12 @@ class A2AGateway(EnforcementPoint):
                  max_handlers_per_actor: int = MAX_HANDLERS_PER_ACTOR,
                  max_holds_per_actor: int = MAX_HOLDS_PER_ACTOR,
                  hold_key: bytes | None = None,
-                 upstream_binding: str = "jsonrpc") -> None:
+                 upstream_binding: str = "jsonrpc",
+                 push_allow: list | None = None,
+                 push_url: str | None = None,
+                 push_timeout: float = 10.0,
+                 push_tls: ssl.SSLContext | None = None,
+                 resolve: Callable[..., list] | None = None) -> None:
         self._load(file)
         self.receiver = self._actor(agent_actor, "--agent-actor")
         decl = next((a for a in self.sos.actors if a.id.name == self.receiver["name"]), None)
@@ -395,6 +468,27 @@ class A2AGateway(EnforcementPoint):
             raise GatewayError(f"--upstream-binding {upstream_binding!r} is jsonrpc or rest")
         self.upstream_binding = upstream_binding
         self.rest_ids = itertools.count(1)
+        self.push_policy = None
+        if push_allow:
+            try:
+                self.push_policy = PushPolicy(list(push_allow),
+                                              **({"resolve": resolve} if resolve else {}))
+            except PushError as e:
+                raise GatewayError(str(e)) from None
+        if push_url is not None:
+            pu = urlsplit(push_url)
+            if pu.scheme not in ("http", "https") or not pu.hostname or pu.query \
+                    or pu.fragment or pu.username or not _TOKEN_RE.fullmatch(push_url):
+                raise GatewayError(f"--push-url {push_url!r} is an http or https URL "
+                                   f"without query, fragment or user")
+            if self.push_policy is None:
+                raise GatewayError("--push-url needs --push-allow")
+            push_url = push_url.rstrip("/")
+        self.push_url = push_url
+        self.push_timeout = push_timeout
+        self.push_tls = push_tls
+        self.push: dict[str, _PushConfig] = {}
+        self.push_slots = threading.BoundedSemaphore(MAX_PUSH_RECEIPTS)
         self.upstream_token = upstream_token
         self.upstream_timeout = upstream_timeout
         self.agent_card = agent_card
@@ -402,6 +496,7 @@ class A2AGateway(EnforcementPoint):
         self.client_nonces: dict[str, set] = {a: set() for a in client_keys}
         self.max_nonces = max_nonces
         self.slots = threading.BoundedSemaphore(max_handlers)
+        self.max_handlers = max_handlers
         self.max_handlers_per_actor = max_handlers_per_actor
         self.max_holds_per_actor = max_holds_per_actor
         self.actor_handlers: dict[str, int] = {}
@@ -427,8 +522,13 @@ class A2AGateway(EnforcementPoint):
 
     def cert_actors(self) -> set:
         """The actors whose client certificates the gateway accepts (with
-        --client-ca): the actors of --client-keys."""
-        return set(self.client_keys)
+        --client-ca): the actors of --client-keys, and with push
+        notifications the agent's actor, whose certificate may only deliver
+        notifications."""
+        out = set(self.client_keys)
+        if self.push_policy is not None:
+            out.add(self.receiver["text"])
+        return out
 
     # --- replies -----------------------------------------------------------------
 
@@ -547,6 +647,8 @@ class A2AGateway(EnforcementPoint):
             return self.handle_get(target)
         if method == "POST" and target == "/":
             return self.handle_post(target, headers, body, closed, peer)
+        if method == "POST" and target.startswith(PUSH_PATH) and self.push_policy is not None:
+            return self.receive_push(target[len(PUSH_PATH):], headers, body, peer)
         return self.handle_rest(method, target, headers, body, closed, peer)
 
     def _rest_error(self, code: int, message: str, status: int | None = None,
@@ -588,7 +690,9 @@ class A2AGateway(EnforcementPoint):
             return self._rest_error(VERSION_NOT_SUPPORTED,
                                     "VersionNotSupportedError: the gateway speaks A2A 1.0 "
                                     "only (header A2A-Version: 1.0)")
-        allowed = {"historyLength": "int"} if op == "GetTask" else {}
+        allowed = {"GetTask": {"historyLength": "int"},
+                   "ListTaskPushNotificationConfigs": {"pageSize": "int",
+                                                       "pageToken": "str"}}.get(op, {})
         q, why = A2ARest.query(target, allowed)
         if q is None:
             return self._rest_error(INVALID_PARAMS, f"Invalid params: {why}")
@@ -661,6 +765,8 @@ class A2AGateway(EnforcementPoint):
             return self._get_task(actor, id_, params)
         if method == "CancelTask":
             return self._cancel_task(actor, id_, params)
+        if method in PUSH_METHODS and self.push_policy is not None:
+            return self._push_method(actor, method, id_, params)
         with self.lock:
             self._host_event("method_refused", reason=method[:200])
         if method in REFUSED_METHODS:
@@ -876,13 +982,19 @@ class A2AGateway(EnforcementPoint):
         if params is None:
             return self._rpc_error(id_, INVALID_PARAMS, f"Invalid params: {why}")
         conf = params.get("configuration", {})
+        push = None
         if "taskPushNotificationConfig" in conf:
-            with self.lock:
-                self._host_event("method_refused",
-                                 reason=f"{method}: taskPushNotificationConfig")
-            return self._rpc_error(id_, PUSH_NOT_SUPPORTED,
-                                   "PushNotificationNotSupportedError: push notifications "
-                                   "are not supported by the CADL gateway")
+            if self.push_policy is None:
+                with self.lock:
+                    self._host_event("method_refused",
+                                     reason=f"{method}: taskPushNotificationConfig")
+                return self._rpc_error(id_, PUSH_NOT_SUPPORTED,
+                                       "PushNotificationNotSupportedError: push "
+                                       "notifications are not supported by the CADL gateway")
+            push, why = self._new_push(actor, conf["taskPushNotificationConfig"], method,
+                                       in_message=True)
+            if push is None:
+                return self._rpc_error(id_, INVALID_PARAMS, f"Invalid params: {why}")
         msg = params["message"]
         name, args, why = self._name(msg)
         if why is not None:
@@ -907,6 +1019,13 @@ class A2AGateway(EnforcementPoint):
             ctx = msg.get("contextId")
             if ctx is not None and self.context_owner.get(ctx) != actor:
                 return self._task_refused(method, id_, "contextId")
+            if push is not None:
+                if "taskId" in msg:
+                    push.upstream_task = fmsg["taskId"]
+                    if msg["taskId"] != fmsg["taskId"]:
+                        push.own_task = msg["taskId"]
+                forwarded["configuration"]["taskPushNotificationConfig"] = \
+                    push.upstream(self.push_url)
         m = {"from": actor, "to": self.receiver["text"], "name": name, "args": args}
         if name is None:
             with self.lock:
@@ -935,7 +1054,8 @@ class A2AGateway(EnforcementPoint):
             released_text = text if not (stream and immediate) else wire(
                 {"jsonrpc": "2.0", "id": upstream_id, "method": "SendMessage",
                  "params": forwarded})
-            params_sha256 = hashlib.sha256(canonical(params)).hexdigest()
+            shown = _redacted(params)
+            params_sha256 = hashlib.sha256(canonical(shown)).hexdigest()
         except (ValueError, TypeError) as e:
             return self._rpc_error(id_, INVALID_PARAMS, f"Invalid params: not "
                                                         f"representable in canonical JSON "
@@ -963,8 +1083,8 @@ class A2AGateway(EnforcementPoint):
             if decision == "escalate":
                 hold_id = step["hold_id"]
                 h = _A2AHeld(id_, {"jsonrpc": "2.0", "id": id_, "method": method,
-                                   "params": params}, m, released_text, params_sha256,
-                             actor=actor, upstream_id=upstream_id,
+                                   "params": shown}, m, released_text, params_sha256,
+                             push=push, actor=actor, upstream_id=upstream_id,
                              return_immediately=immediate)
                 self.held[hold_id] = h
                 self._publish_hold(hold_id)
@@ -978,9 +1098,12 @@ class A2AGateway(EnforcementPoint):
                                        _result_meta(dict(step["result"], hold_id=hold_id)),
                                        hold_id)
                     h.task_id = t.id
+                    if push is not None:
+                        push.own_task = t.id
                     return self._rpc({"jsonrpc": "2.0", "id": id_,
                                       "result": {"task": self._task_json(t)}})
         if decision == "allow":
+            self._push_activate(push, m)
             if stream:
                 return self._stream_reply(self._relay(actor, id_, text, upstream_id, m,
                                                       closed=closed))
@@ -1014,6 +1137,7 @@ class A2AGateway(EnforcementPoint):
                              f"{h.id!r} ({hold_id}); it is withdrawn")
         kind, rec = h.outcome
         if kind == "allow":
+            self._push_activate(h.push, h.message)
             yield from self._relay(h.actor, h.id, h.wire, h.upstream_id, h.message,
                                    closed=closed)
         elif kind == "stopped":
@@ -1364,6 +1488,7 @@ class A2AGateway(EnforcementPoint):
                         return None
         kind, rec = h.outcome
         if kind == "allow":
+            self._push_activate(h.push, h.message)
             return self._forward(h.actor, h.id, h.wire, h.upstream_id, h.message)
         if kind == "stopped":
             return self._rpc_error(h.id, INTERNAL_ERROR,
@@ -1424,6 +1549,7 @@ class A2AGateway(EnforcementPoint):
         """Pass on a released request whose client has the task of the
         gateway (returnImmediately), and keep what the agent answered."""
         try:
+            self._push_activate(h.push, h.message)
             reply = self._forward(h.actor, h.id, h.wire, h.upstream_id, h.message)
         except Exception as e:      # noqa: BLE001 - the task never stays submitted
             _log(f"the released request {h.id!r} failed: {type(e).__name__}: {e}")
@@ -1671,6 +1797,230 @@ class A2AGateway(EnforcementPoint):
             # Recorded before it is passed on: it changes the state of the agent.
             self._host_event("task_cancel", reason=f"agent task {upstream} ({actor})"[:200])
         return self._task_call(actor, id_, "CancelTask", params, upstream, tid)
+
+    # --- push notifications --------------------------------------------------------------
+
+    def _new_push(self, actor: str, cfg: Any, method: str, in_message: bool = False,
+                  task_id: str | None = None) -> tuple[_PushConfig | None, str | None]:
+        """A configuration of `actor` that the gateway accepts, not yet
+        active; or None and why, recorded as `push_refused`."""
+        def refuse(why: str):
+            with self.lock:
+                self._host_event("push_refused", reason=f"{method}: {why}"[:200])
+            return None, f"taskPushNotificationConfig: {why}" if in_message else why
+        keys = {"id", "url", "token", "authentication", "taskId"}
+        if not isinstance(cfg, dict):
+            return refuse("the configuration is an object")
+        if "tenant" in cfg:
+            return refuse("tenant is not supported")
+        if set(cfg) - keys:
+            return refuse("the configuration has the fields of TaskPushNotificationConfig")
+        if in_message and cfg.get("taskId"):
+            return refuse("taskId is empty in a SendMessage (A2A 3.2.2)")
+        cid = cfg.get("id")
+        if cid is not None and (not isinstance(cid, str)
+                                or (cid and not re.fullmatch(r"[\x21-\x7e]{1,128}", cid))):
+            return refuse("id is printable ASCII of at most 128 characters")
+        try:
+            check_auth(cfg.get("token"), cfg.get("authentication"))
+            # Checked now, so that the client learns of a refusal, and again
+            # at every notification, since a name can resolve differently.
+            self.push_policy.addresses(self.push_policy.check(cfg.get("url")))
+        except PushError as e:
+            return refuse(str(e))
+        with self.lock:
+            if sum(1 for c in self.push.values() if c.owner == actor and c.active) \
+                    >= MAX_PUSH_CONFIGS:
+                return None, f"at most {MAX_PUSH_CONFIGS} configurations of a client"
+            gid = f"cadl-push-{secrets.token_hex(16)}"
+        return _PushConfig(gid, actor, cid or gid, cfg["url"], cfg.get("token") or None,
+                           cfg.get("authentication")), None
+
+    def _push_activate(self, push: _PushConfig | None, m: dict | None) -> None:
+        """A configuration that goes to the agent now: recorded first, as it
+        changes what the agent does."""
+        if push is None:
+            return
+        u = urlsplit(push.url)
+        with self.lock:
+            push.active = True
+            self.push[push.gid] = push
+            self._host_event("push_config", reason=(
+                f"create {push.gid} {push.owner} {u.scheme}://{u.netloc}")[:200], message=m)
+
+    def _push_method(self, actor: str, method: str, id_: Any, params: Any) -> Reply:
+        """The methods of push notification configurations (A2A 3.1.7 to
+        3.1.10) for the client's own tasks. Create and Delete reach the
+        agent; Get and List are answered from the configurations of the
+        gateway, which shows the client its own URL, token and credentials."""
+        if isinstance(params, dict) and "tenant" in params:
+            return self._rpc_error(id_, INVALID_PARAMS, "Invalid params: tenant is not "
+                                                        "supported by the CADL gateway")
+        keys = {"CreateTaskPushNotificationConfig": {"taskId", "id", "url", "token",
+                                                     "authentication"},
+                "GetTaskPushNotificationConfig": {"taskId", "id"},
+                "ListTaskPushNotificationConfigs": {"taskId", "pageSize", "pageToken"},
+                "DeleteTaskPushNotificationConfig": {"taskId", "id"}}[method]
+        if not isinstance(params, dict) or not isinstance(params.get("taskId"), str) \
+                or set(params) - keys or (method in ("GetTaskPushNotificationConfig",
+                                                     "DeleteTaskPushNotificationConfig")
+                                          and not isinstance(params.get("id"), str)):
+            return self._rpc_error(id_, INVALID_PARAMS, f"Invalid params: {method} has "
+                                                        f"{', '.join(sorted(keys))}")
+        tid = params["taskId"]
+        with self.lock:
+            t = self.tasks.get(tid)
+            if t is not None and t.owner == actor:
+                upstream, own = t.upstream_id, tid
+            elif t is None and self.task_owner.get(tid) == actor:
+                upstream, own = tid, None
+            else:
+                return self._task_refused(method, id_, "not a task of the client")
+            mine = [c for c in self.push.values() if c.active and c.owner == actor
+                    and c.view_task() == tid]
+        if method == "ListTaskPushNotificationConfigs":
+            return self._rpc({"jsonrpc": "2.0", "id": id_, "result": {
+                "configs": [c.public() for c in mine], "nextPageToken": ""}})
+        if method in ("GetTaskPushNotificationConfig", "DeleteTaskPushNotificationConfig"):
+            found = next((c for c in mine if c.client_id == params["id"]), None)
+            if found is None:
+                return self._task_refused(method, id_, "no such configuration")
+            if method == "GetTaskPushNotificationConfig":
+                return self._rpc({"jsonrpc": "2.0", "id": id_, "result": found.public()})
+            with self.lock:
+                found.active = False
+                self.push.pop(found.gid, None)
+                self._host_event("push_config", reason=f"delete {found.gid} {actor}")
+            if found.upstream_task is None:
+                return self._rpc({"jsonrpc": "2.0", "id": id_, "result": {}})
+            return self._push_call(id_, method, {"taskId": found.upstream_task,
+                                                 "id": found.agent_id or found.gid},
+                                   lambda result: {})
+        # Create.
+        if upstream is None:
+            return self._rpc_error(id_, UNSUPPORTED_OPERATION,
+                                   "UnsupportedOperationError: the task has not reached "
+                                   "the agent; give the configuration with SendMessage")
+        if any(c.client_id == params.get("id") for c in mine):
+            return self._rpc_error(id_, INVALID_PARAMS, "Invalid params: the task has a "
+                                                        "configuration with this id")
+        push, why = self._new_push(actor, {k: v for k, v in params.items() if k != "taskId"},
+                                   method)
+        if push is None:
+            return self._rpc_error(id_, INVALID_PARAMS, f"Invalid params: {why}")
+        push.upstream_task, push.own_task = upstream, own
+        self._push_activate(push, None)
+
+        def created(result: Any) -> dict | None:
+            if not isinstance(result, dict):
+                return None
+            with self.lock:
+                push.agent_id = result.get("id") if isinstance(result.get("id"), str) \
+                    else push.gid
+            return push.public()
+        reply = self._push_call(id_, method, push.upstream(self.push_url), created)
+        if reply.body.get("error") is not None:
+            with self.lock:
+                push.active = False
+                self.push.pop(push.gid, None)
+        return reply
+
+    def _push_call(self, id_: Any, method: str, params: dict,
+                   answer: Callable[[Any], dict | None]) -> Reply:
+        """Pass a method of push configurations on to the agent; `answer`
+        turns its result into the client's, or None for a result that is
+        not one."""
+        with self.lock:
+            upstream_id = next(self.upstream_ids)
+        text = wire({"jsonrpc": "2.0", "id": upstream_id, "method": method,
+                     "params": params})
+        obj, failed = self._call_agent(upstream_id, text, None)
+        if failed is not None:
+            failed.body["id"] = id_
+            failed.headers = self._headers()
+            return failed
+        if "error" in obj:
+            return self._rpc({"jsonrpc": "2.0", "id": id_, "error": obj["error"]})
+        result = answer(obj["result"])
+        if result is None:
+            reply = self._invalid(f"{method}: the result is not a configuration", None)
+            reply.body["id"] = id_
+            reply.headers = self._headers()
+            return reply
+        return self._rpc({"jsonrpc": "2.0", "id": id_, "result": result})
+
+    def receive_push(self, gid: str, headers, body: bytes, peer: str | None) -> Reply:
+        """A notification of the agent for the configuration `gid` (A2A
+        4.3.3): authenticated by the token and the credentials that the
+        gateway gave the agent for it (and with mutual TLS by the agent's
+        certificate), a `StreamResponse` of the task of the configuration,
+        whose owner is the client of the configuration; relayed to the
+        client's URL, with the client's token and credentials, and recorded
+        as `push_sent` or `push_failed`. Anything else is `push_dropped`."""
+        def drop(status: int, why: str) -> Reply:
+            with self.lock:
+                if not self.stopped:
+                    self._refusal("push_dropped", why[:200])
+            return Reply(status, None, self._headers())
+        if self.stopped:
+            return Reply(503, None, self._headers())
+        with self.lock:
+            push = self.push.get(gid)
+        tokens = headers.get_all("X-A2A-Notification-Token") or []
+        auths = headers.get_all("Authorization") or []
+        if push is None or not push.active:
+            return drop(404, "unknown_config")
+        if peer is not None and peer != self.receiver["text"]:
+            return drop(401, f"certificate {gid}")
+        if len(tokens) != 1 or len(auths) != 1 \
+                or not hmac.compare_digest(tokens[0].strip().encode(),
+                                           push.secret_token.encode()) \
+                or not hmac.compare_digest(auths[0].strip().encode(),
+                                           f"Bearer {push.secret_cred}".encode()):
+            return drop(401, f"credentials {gid}")
+        if not self.push_slots.acquire(blocking=False):
+            return self.overloaded("push")
+        try:
+            ctype = headers.get_all("Content-Type") or []
+            if len(ctype) != 1 or ctype[0].split(";")[0].strip().lower() \
+                    not in A2ARest.MEDIA_TYPES:
+                return drop(415, f"content_type {gid}")
+            try:
+                obj, code, why = parse_json(body.decode("utf-8"))
+            except UnicodeDecodeError:
+                obj, code, why = None, PARSE_ERROR, "not UTF-8"
+            if code is not None or not isinstance(obj, dict) or len(obj) != 1 \
+                    or next(iter(obj)) not in STREAM_KEYS \
+                    or not isinstance(obj[next(iter(obj))], dict):
+                return drop(400, f"not a StreamResponse {gid}")
+            key = next(iter(obj))
+            event = obj[key]
+            tid = event.get("id") if key == "task" else event.get("taskId")
+            if not isinstance(tid, str):
+                return drop(400, f"no task {gid}")
+            with self.lock:
+                if not push.active:
+                    return drop(404, "unknown_config")
+                bound = push.upstream_task
+                if (bound is not None and tid != bound) \
+                        or not self._claim(push.owner, tid, event.get("contextId")):
+                    return drop(400, f"task {tid[:64]} of {gid}")
+                push.upstream_task = tid
+                own, url, token, auth = push.own_task, push.url, push.token, push.auth
+            if own is not None:
+                event = _rewrite(event, tid, own, top=(key == "task"))
+            payload = wire({key: event}).encode("ascii")
+            status, why = deliver(self.push_policy, url, payload, token, auth,
+                                  timeout=self.push_timeout, tls=self.push_tls)
+            ok = not why
+            with self.lock:
+                if not self.stopped:
+                    self._host_event("push_sent" if ok else "push_failed",
+                                     reason=(f"{gid} {key} {status}" if ok
+                                             else f"{gid} {key}: {why}")[:200])
+            return Reply(204 if ok else 502, None, self._headers())
+        finally:
+            self.push_slots.release()
 
     # --- end ----------------------------------------------------------------------------
 
@@ -2158,7 +2508,8 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
           read_timeout: float = READ_TIMEOUT,
           max_readers_per_address: int = MAX_READERS_PER_ADDRESS,
           max_readers_per_prefix: int = MAX_READERS_PER_PREFIX,
-          client_ca: Path | None = None, max_handshakes: int = MAX_HANDSHAKES) -> int:
+          client_ca: Path | None = None, max_handshakes: int = MAX_HANDSHAKES,
+          grpc_listen: str | None = None, grpc_port_file: Path | None = None) -> int:
     """Run the gateway until SIGTERM or SIGINT. Returns the exit status."""
     host, port = parse_listen(listen)
     if not _is_loopback(host) and tls_cert is None:
@@ -2168,6 +2519,14 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
         raise GatewayError("--tls-cert and --tls-key go together")
     if client_ca is not None and tls_cert is None:
         raise GatewayError("--client-ca needs --tls-cert and --tls-key")
+    grpc_address = None
+    if grpc_listen is not None:
+        grpc_address = parse_listen(grpc_listen)
+        if not _is_loopback(grpc_address[0]) and tls_cert is None:
+            raise GatewayError(f"--grpc-listen {grpc_listen} is not a loopback address; give "
+                               f"--tls-cert and --tls-key")
+        from .a2a_grpc import modules
+        modules()                       # the extra is installed
     context = None
     if tls_cert is not None:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -2205,6 +2564,28 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
     actual = server.server_address[1]
     scheme = "https" if context is not None else "http"
     shown = f"[{host}]" if ":" in host else host
+    if gw.push_policy is not None and gw.push_url is None:
+        if not _is_loopback(host):
+            gw.stop()
+            server.server_close()
+            raise GatewayError("--push-allow on an address other than loopback needs "
+                               "--push-url, the URL at which the agent reaches the gateway")
+        gw.push_url = f"{scheme}://{shown}:{actual}"
+    grpc_server = None
+    if grpc_address is not None:
+        from .a2a_grpc import start
+        try:
+            grpc_server, grpc_port = start(gw, grpc_address, tls_cert, tls_key, client_ca,
+                                           max_workers=gw.max_handlers + 16)
+        except GatewayError:
+            gw.stop()
+            server.server_close()
+            raise
+        _log(f"gRPC on {grpc_address[0]}:{grpc_port} (A2A 1.0.0, 10)")
+        if grpc_port_file is not None:
+            tmp = Path(str(grpc_port_file) + f".{secrets.token_hex(4)}.tmp")
+            tmp.write_text(f"{grpc_port}\n", encoding="utf-8")
+            os.replace(tmp, grpc_port_file)
     if port_file is not None:
         tmp = Path(str(port_file) + f".{secrets.token_hex(4)}.tmp")
         tmp.write_text(f"{actual}\n", encoding="utf-8")
@@ -2233,6 +2614,8 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
         pass
     done.set()
     gw.stop()
+    if grpc_server is not None:
+        grpc_server.stop(grace=1).wait(5)
     server.shutdown()
     server.server_close()
     return 1 if gw.failed is not None else 0
@@ -2275,6 +2658,13 @@ def cli_gateway(args) -> int:
                        args.max_handlers_per_actor, args.max_holds_per_actor) < 1:
             raise GatewayError("--poll, --upstream-timeout, --read-timeout and the --max-* "
                                "options must be positive")
+        push_tls = None
+        if args.push_ca is not None:
+            push_tls = ssl.create_default_context(cafile=str(args.push_ca))
+        if (args.push_url or args.push_ca) and not args.push_allow:
+            raise GatewayError("--push-url and --push-ca need --push-allow")
+        if args.push_timeout <= 0:
+            raise GatewayError("--push-timeout must be positive")
         gw_args = dict(file=args.file, agent_actor=args.agent_actor, upstream=args.upstream,
                        client_keys=clients, audit=args.audit, trace_out=trace_out, key=key,
                        inbox=args.approvals, init=init, approver_keys=ring,
@@ -2284,13 +2674,16 @@ def cli_gateway(args) -> int:
                        max_handlers=args.max_handlers,
                        max_handlers_per_actor=args.max_handlers_per_actor,
                        max_holds_per_actor=args.max_holds_per_actor,
-                       upstream_binding=args.upstream_binding)
+                       upstream_binding=args.upstream_binding,
+                       push_allow=args.push_allow, push_url=args.push_url,
+                       push_timeout=args.push_timeout, push_tls=push_tls)
         code = serve(gw_args, listen=args.listen, port_file=args.port_file,
                      tls_cert=args.tls_cert, tls_key=args.tls_key, poll=args.poll,
                      max_readers=args.max_readers, read_timeout=args.read_timeout,
                      max_readers_per_address=args.max_readers_per_address,
                      max_readers_per_prefix=args.max_readers_per_prefix,
-                     client_ca=args.client_ca, max_handshakes=args.max_handshakes)
+                     client_ca=args.client_ca, max_handshakes=args.max_handshakes,
+                     grpc_listen=args.grpc_listen, grpc_port_file=args.grpc_port_file)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

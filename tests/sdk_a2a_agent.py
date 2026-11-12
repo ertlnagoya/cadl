@@ -25,7 +25,12 @@ from a2a.server.routes import (
     create_jsonrpc_routes,
     create_rest_routes,
 )
-from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.server.tasks import (
+    BasePushNotificationSender,
+    InMemoryPushNotificationConfigStore,
+    InMemoryTaskStore,
+    TaskUpdater,
+)
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
@@ -87,12 +92,21 @@ def free_port() -> int:
 class Agent:
     """The agent on a free port of 127.0.0.1."""
 
-    def __init__(self, extension_uri: str) -> None:
+    def __init__(self, extension_uri: str, push: bool = False) -> None:
         port = free_port()
         self.url = f"http://127.0.0.1:{port}/"
         self.executor = Recorder()
-        card = agent_card(self.url, extension_uri)
-        handler = DefaultRequestHandler(self.executor, InMemoryTaskStore(), card)
+        card = agent_card(self.url, extension_uri, push=push)
+        kw = {}
+        if push:
+            # Push notifications with the sender of the SDK, which POSTs to
+            # the URL of each configuration (here the gateway's).
+            import httpx
+            store = InMemoryPushNotificationConfigStore()
+            kw = {"push_config_store": store,
+                  "push_sender": BasePushNotificationSender(httpx.AsyncClient(timeout=30),
+                                                            store)}
+        handler = DefaultRequestHandler(self.executor, InMemoryTaskStore(), card, **kw)
         # The JSON-RPC binding at / and the HTTP+JSON binding at its routes.
         app = Starlette(routes=create_jsonrpc_routes(handler, "/")
                         + create_agent_card_routes(card) + create_rest_routes(handler))

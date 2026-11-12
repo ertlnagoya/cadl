@@ -257,6 +257,32 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--max-handshakes", type=int, default=256, metavar="N",
                          help="TLS handshakes at the same time with --client-ca "
                               "(default 256); beyond that the connection is closed")
+    a2a_cmd.add_argument("--grpc-listen", default=None, metavar="HOST:PORT",
+                         help="Also serve the gRPC binding of A2A 1.0.0 on HOST:PORT (port "
+                              "0 picks a free port), with the TLS options of --listen. Needs "
+                              "the extra: pip install 'cadl-lang[grpc]'")
+    a2a_cmd.add_argument("--grpc-port-file", type=Path, default=None, metavar="FILE",
+                         help="Write the port of --grpc-listen to FILE")
+    a2a_cmd.add_argument("--push-allow", action="append", default=None,
+                         metavar="ENTRY",
+                         help="Allow push notifications to callback URLs that match "
+                              "ENTRY: a URL (a path ending in / is a prefix), HOST[:PORT], "
+                              "or an IP address or network (which also allows a host that "
+                              "resolves into it). Repeatable. Callbacks are https unless "
+                              "the host is loopback, every resolved address is global "
+                              "unicast unless an address entry contains it, and redirects "
+                              "are not followed. Without it, push notifications are "
+                              "refused")
+    a2a_cmd.add_argument("--push-url", default=None, metavar="URL",
+                         help="The URL at which the agent reaches the gateway to deliver "
+                              "notifications (default: the --listen address, which then "
+                              "has to be loopback)")
+    a2a_cmd.add_argument("--push-timeout", type=float, default=10.0, metavar="SECONDS",
+                         help="Time for one notification to a client, from connect to "
+                              "answer (default 10)")
+    a2a_cmd.add_argument("--push-ca", type=Path, default=None, metavar="FILE",
+                         help="CA certificates (PEM) for https callbacks, in place of "
+                              "those of the system")
     a2a_cmd.add_argument("--agent-card", type=Path, default=None, metavar="FILE.json",
                          help="Agent card served at /.well-known/agent-card.json")
     a2a_cmd.add_argument("--upstream-token", type=Path, default=None, metavar="FILE",

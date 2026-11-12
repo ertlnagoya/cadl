@@ -45,6 +45,11 @@ dependencies = [
 ai = [
     "anthropic>=0.40",
 ]
+# The gRPC binding of `cadl a2a-gateway` (--grpc-listen): the official A2A
+# SDK, whose a2a.types.a2a_pb2 is generated from the normative a2a.proto.
+grpc = [
+    "a2a-sdk[grpc]>=1.3,<2; python_version >= '3.10'",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov",

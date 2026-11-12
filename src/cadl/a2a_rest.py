@@ -160,7 +160,8 @@ def route(method: str, target: str) -> tuple[str, dict] | None:
 
 def query(target: str, allowed: dict[str, str]) -> tuple[dict | None, str | None]:
     """The query parameters of a request: each at most once, only the names
-    of `allowed` (name -> "int"), decimal integers of at most nine digits.
+    of `allowed` (name -> "int" or "str"); an "int" is a decimal integer of
+    at most nine digits, a "str" printable ASCII of at most 256 characters.
     Returns (parameters, None) or (None, the error text)."""
     text = urlsplit(target).query
     if not text:
@@ -176,6 +177,11 @@ def query(target: str, allowed: dict[str, str]) -> tuple[dict | None, str | None
             return None, f"the query parameter {k[:40]!r} is not supported"
         if k in out:
             return None, f"the query parameter {k} is given twice"
+        if allowed[k] == "str":
+            if not re.fullmatch(r"[\x20-\x7e]{0,256}", v):
+                return None, f"{k} is printable ASCII"
+            out[k] = v
+            continue
         if not re.fullmatch(r"[0-9]{1,9}", v):
             return None, f"{k} is a non-negative decimal integer"
         out[k] = int(v)

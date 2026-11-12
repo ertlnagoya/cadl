@@ -43,7 +43,8 @@ def events(path, *names) -> list[tuple]:
 def pki(tmp_path_factory):
     return PKI(tmp_path_factory.mktemp("pki"),
                clients={"planner": "PLANNER", "operator": "OPERATOR",
-                        "intruder": "INTRUDER", "two": "PLANNER/CN=OPERATOR"},
+                        "summarizer": "SUMMARIZER", "intruder": "INTRUDER",
+                        "two": "PLANNER/CN=OPERATOR"},
                foreign={"forged": "PLANNER"})
 
 
@@ -173,12 +174,11 @@ class TestMutualTLS:
         r.replay_check()
         capsys.readouterr()
 
-    def test_client_ca_needs_tls(self, tmp_path, pki, capsys):
-        from cadl.cli import main
-        assert main(["a2a-gateway", "x.cadl", "--agent-actor", "SUMMARIZER", "--upstream",
-                     "http://127.0.0.1:1/", "--client-keys", "k.json", "--audit",
-                     str(tmp_path / "a.jsonl"), "--client-ca", str(pki.ca)]) == 2
-        capsys.readouterr()
+    def test_client_ca_needs_tls(self, pki):
+        from cadl.a2a_gateway import serve
+        from cadl.gateway_core import GatewayError
+        with pytest.raises(GatewayError, match="--client-ca needs --tls-cert"):
+            serve({}, listen="127.0.0.1:0", client_ca=pki.ca)
 
 
 def test_certificate_actor():
@@ -493,3 +493,497 @@ def test_rest_routes_and_errors():
     assert R.to_jsonrpc(3, 502, "<html>") is None
     assert json.loads(R.to_jsonrpc(3, 200, '{"task": {}}')) == {
         "jsonrpc": "2.0", "id": 3, "result": {"task": {}}}
+
+
+# === 3. Push notifications =========================================================
+
+class Hook:
+    """A webhook of a client on 127.0.0.1: records every POST; the path
+    chooses the answer: /slow (after `slow` seconds), /redirect (302 to
+    /moved), /fail (500), anything else 200."""
+
+    def __init__(self, slow: float = 3.0):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.got: list[dict] = []
+        hook = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):      # noqa: N802
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                hook.got.append({"path": self.path, "headers": dict(self.headers),
+                                 "body": json.loads(body)})
+                if self.path.endswith("/slow"):
+                    time.sleep(slow)
+                status = {"redirect": 302, "fail": 500}.get(self.path.rsplit("/", 1)[-1], 200)
+                self.send_response(status)
+                if status == 302:
+                    self.send_header("Location", "/hooks/moved")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def push_cfg(url: str, **kw) -> dict:
+    return dict({"url": url, "token": "client-token",
+                 "authentication": {"scheme": "Bearer", "credentials": "client-cred"}}, **kw)
+
+
+def status_event(task: str, state="TASK_STATE_WORKING", ctx=None) -> dict:
+    ev = {"taskId": task, "status": {"state": state}}
+    if ctx:
+        ev["contextId"] = ctx
+    return {"statusUpdate": ev}
+
+
+class TestPush:
+
+    def test_push_end_to_end(self, tmp_path, capsys):
+        hook = Hook()
+        r = Run(tmp_path, key=True, extra=("--push-allow", f"{hook.url}/hooks/"))
+        # A configuration with a SendMessage: the agent gets the gateway's.
+        body = r.call("PLANNER", "SendMessage", params(
+            "summarize", taskPushNotificationConfig=push_cfg(f"{hook.url}/hooks/a")))
+        assert body["result"]["task"]["id"] == "up-task-1"
+        (key, cfg), = r.agent.push.items()
+        assert key[0] == "up-task-1" and cfg["url"].startswith(
+            f"http://127.0.0.1:{r.client.port}/cadl-push/cadl-push-")
+        assert cfg["token"] != "client-token" and "client-cred" not in json.dumps(cfg)
+        assert r.agent.notify("up-task-1", status_event("up-task-1", ctx="up-ctx-1")) == [204]
+        got = hook.got[-1]
+        assert got["path"] == "/hooks/a" and got["body"] == status_event("up-task-1",
+                                                                         ctx="up-ctx-1")
+        assert got["headers"]["X-A2A-Notification-Token"] == "client-token"
+        assert got["headers"]["Authorization"] == "Bearer client-cred"
+        # Create, Get, List for the client's own task; another client sees none.
+        made = r.call("PLANNER", "CreateTaskPushNotificationConfig",
+                      dict(push_cfg(f"{hook.url}/hooks/b"), taskId="up-task-1", id="mine"))
+        assert made["result"] == dict(push_cfg(f"{hook.url}/hooks/b"), taskId="up-task-1",
+                                      id="mine")
+        assert r.call("PLANNER", "GetTaskPushNotificationConfig",
+                      {"taskId": "up-task-1", "id": "mine"})["result"]["url"].endswith("/b")
+        listed = r.call("PLANNER", "ListTaskPushNotificationConfigs", {"taskId": "up-task-1"})
+        assert sorted(c["url"][-1] for c in listed["result"]["configs"]) == ["a", "b"]
+        assert r.call("OPERATOR", "ListTaskPushNotificationConfigs",
+                      {"taskId": "up-task-1"})["error"]["code"] == -32001
+        assert r.call("OPERATOR", "CreateTaskPushNotificationConfig",
+                      dict(push_cfg(f"{hook.url}/hooks/c"), taskId="up-task-1"))[
+            "error"]["code"] == -32001
+        # A notification for a task of another client is not relayed.
+        r.call("OPERATOR", "SendMessage", params("translate"))         # allowed: up-task-2
+        n = len(hook.got)
+        assert r.agent.notify("", status_event("up-task-2"), config=cfg) == [400]
+        assert r.agent.notify("", status_event("up-task-1"), config=cfg,
+                              headers={"X-A2A-Notification-Token": "forged"}) == [401]
+        assert r.agent.notify("", status_event("up-task-1"),
+                              config=dict(cfg, url=cfg["url"][:-4] + "0000")) == [404]
+        assert r.agent.notify("", {"statusUpdate": {}}, config=cfg) == [400]
+        assert len(hook.got) == n
+        # Delete: the agent's configuration goes, and nothing more is relayed.
+        assert r.call("PLANNER", "DeleteTaskPushNotificationConfig",
+                      {"taskId": "up-task-1", "id": "mine"})["result"] == {}
+        assert len(r.agent.push) == 1
+        # URLs that the gateway does not call.
+        for url, why in ((f"{hook.url}/other", "no entry"),
+                         ("http://example.com/hooks/", "https"),
+                         (f"{hook.url}/hooks/x#f", "fragment"),
+                         (f"http://user@127.0.0.1:{hook.port}/hooks/", "user")):
+            err = r.call("PLANNER", "SendMessage", params(
+                "summarize", taskPushNotificationConfig=push_cfg(url)))["error"]
+            assert err["code"] == -32602 and why in err["message"], (url, err)
+        err = r.call("PLANNER", "SendMessage", params("summarize", taskPushNotificationConfig=
+                     push_cfg(f"{hook.url}/hooks/a", token="a\r\nX: y")))["error"]
+        assert err["code"] == -32602
+        # A denied message's configuration never reaches the agent.
+        r.call("PLANNER", "SendMessage", params(
+            "translate", taskPushNotificationConfig=push_cfg(f"{hook.url}/hooks/d")))
+        # A held request with returnImmediately: the client's task is the
+        # gateway's, also in the notifications.
+        body = r.call("PLANNER", "SendMessage", params(
+            "publish", returnImmediately=True,
+            taskPushNotificationConfig=push_cfg(f"{hook.url}/hooks/e")))
+        own = body["result"]["task"]["id"]
+        hold = json.loads(r.wait_hold("h-1").read_text())
+        assert hold["params"]["configuration"]["taskPushNotificationConfig"]["token"] == \
+            "(not shown)"
+        r.approve("h-1")
+        wait_for(lambda: r.call("PLANNER", "GetTask", {"id": own})["result"]["status"][
+            "state"] == "TASK_STATE_COMPLETED", "the released task")
+        up = [k[0] for k in r.agent.push if k[0] not in ("up-task-1",)][0]
+        assert r.agent.notify(up, status_event(up, "TASK_STATE_COMPLETED")) == [204]
+        assert hook.got[-1]["path"] == "/hooks/e"
+        assert hook.got[-1]["body"]["statusUpdate"]["taskId"] == own
+        assert r.call("PLANNER", "ListTaskPushNotificationConfigs", {"taskId": own})[
+            "result"]["configs"][0]["taskId"] == own
+        r.stop()
+        hook.close()
+        assert r.agent.sent() == ["summarize", "translate", "publish"]
+        assert [x["params"]["configuration"]["taskPushNotificationConfig"]["url"].rsplit(
+                    "/", 1)[0] + "/"
+                for x in r.agent.requests if x["method"] == "SendMessage"
+                and "configuration" in x["params"]][:1] == [
+            f"http://127.0.0.1:{r.client.port}/cadl-push/"]
+        evs = [e for e, _ in events(r.audit, "push_config", "push_sent", "push_dropped",
+                                    "push_refused", "push_failed")]
+        assert evs == ["push_config", "push_sent", "push_config", "push_dropped",
+                       "push_dropped", "push_dropped", "push_dropped", "push_config",
+                       "push_refused", "push_refused", "push_refused", "push_refused",
+                       "push_refused", "push_config", "push_sent"], evs
+        result = r.replay_check()
+        assert decisions(result)[:3] == [("PLANNER", "summarize", "allow", "permission"),
+                                         ("OPERATOR", "translate", "allow", "permission"),
+                                         ("PLANNER", "translate", "deny", "default")]
+        assert "client-cred" not in r.trace.read_text() + r.audit.read_text()
+        capsys.readouterr()
+
+    def test_push_delivery_limits(self, tmp_path, capsys):
+        """No redirects, a deadline for the whole exchange, failures
+        recorded; and a host name that resolves to loopback only with an
+        address of the allowlist."""
+        hook = Hook(slow=3.0)
+        r = Run(tmp_path, extra=("--push-allow", f"{hook.url}/hooks/",
+                                 "--push-allow", "localhost", "--push-timeout", "1"))
+        for i, path in enumerate(("redirect", "slow", "fail")):
+            r.call("PLANNER", "SendMessage", params(
+                "summarize", taskPushNotificationConfig=push_cfg(f"{hook.url}/hooks/{path}")))
+            t0 = time.monotonic()
+            assert r.agent.notify(f"up-task-{i + 1}", status_event(f"up-task-{i + 1}")) == [502]
+            assert time.monotonic() - t0 < 2.5
+        assert [g["path"] for g in hook.got] == ["/hooks/redirect", "/hooks/slow",
+                                                 "/hooks/fail"]       # not /hooks/moved
+        err = r.call("PLANNER", "SendMessage", params("summarize", taskPushNotificationConfig=
+                     push_cfg(f"http://localhost:{hook.port}/hooks/x")))["error"]
+        assert "loopback" in err["message"]
+        r.stop()
+        failed = [why for _, why in events(r.audit, "push_failed")]
+        assert "redirect 302 is not followed" in failed[0]
+        assert failed[1].endswith("timeout") and failed[2].endswith("HTTP status 500")
+        r.replay_check()
+        r = Run(tmp_path, name="lo", extra=("--push-allow", "localhost",
+                                            "--push-allow", "127.0.0.0/8",
+                                            "--push-allow", "::1"))
+        r.call("PLANNER", "SendMessage", params("summarize", taskPushNotificationConfig=
+               push_cfg(f"http://localhost:{hook.port}/hooks/y")))
+        assert r.agent.notify("up-task-1", status_event("up-task-1")) == [204]
+        assert hook.got[-1]["path"] == "/hooks/y"
+        r.stop()
+        hook.close()
+        r.replay_check()
+        capsys.readouterr()
+
+    def test_push_over_rest_and_mutual_tls(self, tmp_path, pki, capsys):
+        """The routes of 11.3.3, and with --client-ca the agent's certificate,
+        which delivers notifications and is no client's."""
+        hook = Hook()
+        r = Run(tmp_path, extra=(*pki.gateway_args(), "--push-allow", f"{hook.url}/hooks/"))
+        c = TLSClient(r.client.port, r.run_id, pki, "planner")
+        _, _, body = rest(r, "PLANNER", "POST", "/message:send", params("summarize"), client=c)
+        tid = body["task"]["id"]
+        status, _, made = rest(r, "PLANNER", "POST", f"/tasks/{tid}/pushNotificationConfigs",
+                               push_cfg(f"{hook.url}/hooks/r", id="r1"), client=c)
+        assert status == 200 and made["id"] == "r1" and made["taskId"] == tid
+        assert rest(r, "PLANNER", "GET", f"/tasks/{tid}/pushNotificationConfigs/r1",
+                    client=c)[2]["url"].endswith("/hooks/r")
+        assert len(rest(r, "PLANNER", "GET", f"/tasks/{tid}/pushNotificationConfigs?pageSize=5",
+                        client=c)[2]["configs"]) == 1
+        (_, cfg), = r.agent.push.items()
+        assert cfg["url"].startswith(f"https://127.0.0.1:{r.client.port}/cadl-push/")
+        # The agent delivers with its certificate (common name SUMMARIZER).
+        agent = TLSClient(r.client.port, r.run_id, pki, "summarizer")
+        note = json.dumps(status_event(tid)).encode()
+        status = agent.raw(note, {
+            "Content-Type": "application/json", "Content-Length": str(len(note)),
+            "X-A2A-Notification-Token": cfg["token"],
+            "Authorization": f"Bearer {cfg['authentication']['credentials']}"},
+            path=cfg["url"].split(str(r.client.port), 1)[1])[0]
+        assert status == 204
+        assert hook.got[-1]["path"] == "/hooks/r"
+        # A client's certificate cannot deliver; the agent's cannot send.
+        assert c.raw(note, {"Content-Type": "application/json",
+                            "Content-Length": str(len(note)),
+                            "X-A2A-Notification-Token": cfg["token"],
+                             "Authorization": "Bearer x"},
+                     path=cfg["url"].split(str(r.client.port), 1)[1])[0] == 401
+        assert agent.post("PLANNER", rpc("SendMessage", params("summarize")))[0] == 401
+        status, _, _ = rest(r, "PLANNER", "DELETE", f"/tasks/{tid}/pushNotificationConfigs/r1",
+                            client=c)
+        assert status == 200 and r.agent.push == {}
+        r.stop()
+        hook.close()
+        assert [x["target"] if "target" in x else x["method"] for x in r.agent.requests] == [
+            "SendMessage", "CreateTaskPushNotificationConfig",
+            "DeleteTaskPushNotificationConfig"]
+        assert [why for _, why in events(r.audit, "unauthenticated_request")] == [
+            "certificate_mismatch"]
+        r.replay_check()
+        capsys.readouterr()
+
+
+def test_push_policy():
+    """The SSRF checks of `cadl.a2a_push`, with a resolver of the test."""
+    import socket as S
+
+    from cadl.a2a_push import PushError, PushPolicy, blocked, check_auth
+    import ipaddress as I
+    names = {"hooks.example.com": ["93.184.216.34"], "inner.example.com": ["10.1.2.3"],
+             "meta.example.com": ["169.254.169.254"], "mixed.example.com":
+             ["93.184.216.34", "192.168.1.1"], "mapped.example.com": ["::ffff:10.0.0.1"],
+             "nat64.example.com": ["64:ff9b::a00:1"], "v6.example.com": ["2606:4700::1"]}
+
+    def resolve(host, port, type=None):
+        try:
+            names.setdefault(host, [str(I.ip_address(host))])
+        except ValueError:
+            pass
+        if host not in names:
+            raise S.gaierror("unknown")
+        return [(S.AF_INET6 if ":" in a else S.AF_INET, S.SOCK_STREAM, 6, "", (a, port))
+                for a in names[host]]
+    p = PushPolicy(["https://hooks.example.com/a2a/", "inner.example.com:8443",
+                    "meta.example.com", "mixed.example.com", "mapped.example.com",
+                    "nat64.example.com", "v6.example.com", "10.1.0.0/16",
+                    "169.254.0.0/16", "http://127.0.0.1:9/x"], resolve=resolve)
+
+    def ok(url):
+        return p.addresses(p.check(url))
+
+    def refused(url, why):
+        with pytest.raises(PushError, match=why):
+            ok(url)
+    assert ok("https://hooks.example.com/a2a/x?y=1") == ["93.184.216.34"]
+    refused("https://hooks.example.com/a2ax", "no entry")
+    refused("https://hooks.example.com:444/a2a/", "no entry")
+    refused("http://hooks.example.com/a2a/", "https")
+    assert ok("https://inner.example.com:8443/") == ["10.1.2.3"]     # in 10.1.0.0/16
+    refused("https://inner.example.com/", "no entry")
+    refused("https://meta.example.com/", "metadata")     # a network does not unlock it
+    refused("https://mixed.example.com/", "private")
+    refused("https://mapped.example.com/", "private")
+    refused("https://nat64.example.com/", "private")
+    assert ok("https://v6.example.com/") == ["2606:4700::1"]
+    assert ok("http://127.0.0.1:9/x") == ["127.0.0.1"]
+    refused("http://127.0.0.1:9/x/y", "no entry")
+    refused("https://unknown.example.com/", "no entry")
+    refused("ftp://hooks.example.com/a2a/", "http or https")
+    refused("https://u:p@hooks.example.com/a2a/", "user")
+    refused("https://hooks.example.com/a2a/é", "printable ASCII")
+    assert PushPolicy(["169.254.169.254"], resolve=resolve).addresses(
+        PushPolicy(["169.254.169.254"]).check("https://169.254.169.254/")) == [
+        "169.254.169.254"]                               # named itself: allowed
+    for addr, why in (("10.0.0.1", "private"), ("127.0.0.2", "loopback"),
+                      ("169.254.1.1", "link-local"), ("100.64.0.1", "not global"),
+                      ("fe80::1", "link-local"), ("fd00:ec2::254", "metadata"),
+                      ("2002:0a00:0001::1", "private"), ("0.0.0.0", "private"),
+                      ("224.0.0.1", "not global"), ("8.8.8.8", None)):
+        got = blocked(I.ip_address(addr))
+        assert (got is None) if why is None else (why in got), (addr, got)
+    for bad in ([], ["ftp://x/"], ["https://x/?q"], ["bad host!"], ["h:99999"]):
+        with pytest.raises(PushError):
+            PushPolicy(bad)
+    check_auth("t", {"scheme": "Bearer", "credentials": "c"})
+    for token, auth in (("a\nb", None), (None, {"scheme": "Bearer x"}),
+                        (None, {"scheme": "Bearer", "credentials": "a\r\n"}),
+                        (None, {"scheme": "B", "other": 1}), (5, None)):
+        with pytest.raises(PushError):
+            check_auth(token, auth)
+
+
+# === 4. gRPC (the extra cadl-lang[grpc]) ===========================================
+
+@pytest.fixture
+def grpc_extra():
+    grpc = pytest.importorskip("grpc")
+    pb = pytest.importorskip("a2a.types.a2a_pb2")
+    return grpc, pb
+
+
+class GrpcClient:
+    """A gRPC client of the gateway that signs the serialized request."""
+
+    def __init__(self, r, grpc, pb, port: int, pki: PKI | None = None, cert: str | None = None):
+        self.r, self.grpc, self.pb = r, grpc, pb
+        if pki is None:
+            self.channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+        else:
+            key = (pki.dir / f"{cert}.key").read_bytes() if cert else None
+            chain = (pki.dir / f"{cert}.pem").read_bytes() if cert else None
+            creds = grpc.ssl_channel_credentials(pki.ca.read_bytes(), key, chain)
+            self.channel = grpc.secure_channel(f"127.0.0.1:{port}", creds)
+
+    def _md(self, actor, name, data, version="1.0", sign=None):
+        md = []
+        if version is not None:
+            md.append(("a2a-version", version))
+        if actor is not None:
+            md.append(("authorization", authorization(
+                CLIENT_KEYS[actor], actor, self.r.run_id, data,
+                path=sign or f"/lf.a2a.v1.A2AService/{name}")))
+        return md
+
+    def call(self, actor, name, req, resp_cls, raw=None, **kw):
+        data = raw if raw is not None else req.SerializeToString()
+        fn = self.channel.unary_unary(f"/lf.a2a.v1.A2AService/{name}")
+        return resp_cls.FromString(fn(data, metadata=self._md(actor, name, data, **kw),
+                                      timeout=30))
+
+    def stream(self, actor, name, req, **kw):
+        data = req.SerializeToString()
+        fn = self.channel.unary_stream(f"/lf.a2a.v1.A2AService/{name}")
+        return [self.pb.StreamResponse.FromString(x)
+                for x in fn(data, metadata=self._md(actor, name, data, **kw), timeout=30)]
+
+    def error(self, fn, *args, **kw):
+        """(status code name, ErrorInfo reason or None) of a failed RPC."""
+        from google.rpc import error_details_pb2, status_pb2
+        with pytest.raises(self.grpc.RpcError) as e:
+            fn(*args, **kw)
+        reason = None
+        for k, v in e.value.trailing_metadata() or ():
+            if k == "grpc-status-details-bin":
+                st = status_pb2.Status.FromString(v)
+                info = error_details_pb2.ErrorInfo()
+                st.details[0].Unpack(info)
+                assert info.domain == "a2a-protocol.org"
+                reason = info.reason
+        return e.value.code().name, reason
+
+
+def grpc_message(pb, name, text="hello", **conf):
+    from google.protobuf import json_format
+    return json_format.ParseDict(params(name, text, **conf), pb.SendMessageRequest())
+
+
+class TestGrpc:
+
+    def test_grpc_scenarios(self, tmp_path, grpc_extra, capsys):
+        grpc, pb = grpc_extra
+        port_file = tmp_path / "grpc-port"
+        r = Run(tmp_path, key=True, extra=("--grpc-listen", "127.0.0.1:0", "--grpc-port-file",
+                                           str(tmp_path / "grpc-port")))
+        wait_for(lambda: port_file.exists() and port_file.read_text().strip(), "the port")
+        g = GrpcClient(r, grpc, pb, int(port_file.read_text()))
+        got = g.call("PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                     pb.SendMessageResponse)
+        assert got.task.id == "up-task-1" and got.task.status.state == pb.TASK_STATE_COMPLETED
+        got = g.call("PLANNER", "SendMessage", grpc_message(pb, "translate"),
+                     pb.SendMessageResponse)
+        assert got.task.status.state == pb.TASK_STATE_REJECTED
+        # A hold, approved.
+        fut = r.pool.submit(g.call, "PLANNER", "SendMessage", grpc_message(pb, "publish"),
+                            pb.SendMessageResponse)
+        r.approve("h-1")
+        assert fut.result(timeout=30).task.status.state == pb.TASK_STATE_COMPLETED
+        assert g.call("PLANNER", "GetTask", pb.GetTaskRequest(id="up-task-1"), pb.Task).id == \
+            "up-task-1"
+        assert g.error(g.call, "OPERATOR", "GetTask", pb.GetTaskRequest(id="up-task-1"),
+                       pb.Task) == ("NOT_FOUND", "TASK_NOT_FOUND")
+        assert g.call("PLANNER", "CancelTask", pb.CancelTaskRequest(id="up-task-1"),
+                      pb.Task).status.state == pb.TASK_STATE_CANCELED
+        # Streams and a subscription.
+        evs = g.stream("PLANNER", "SendStreamingMessage", grpc_message(pb, "summarize"))
+        assert [e.WhichOneof("payload") for e in evs] == [
+            "task", "status_update", "artifact_update", "status_update"]
+        evs = g.stream("PLANNER", "SendStreamingMessage", grpc_message(pb, "translate"))
+        assert [e.task.status.state for e in evs] == [pb.TASK_STATE_REJECTED]
+        assert g.stream("PLANNER", "SubscribeToTask",
+                        pb.SubscribeToTaskRequest(id="up-task-1"))[0].task.id == "up-task-1"
+        assert g.error(g.stream, "PLANNER", "SendStreamingMessage",
+                       grpc_message(pb, "summarize", "stream-foreign")) == (
+            "INTERNAL", "INVALID_AGENT_RESPONSE")
+        # Refused methods, versions, authentication, and unknown fields.
+        assert g.error(g.call, "PLANNER", "ListTasks", pb.ListTasksRequest(),
+                       pb.ListTasksResponse) == ("FAILED_PRECONDITION", "UNSUPPORTED_OPERATION")
+        assert g.error(g.call, "PLANNER", "CreateTaskPushNotificationConfig",
+                       pb.TaskPushNotificationConfig(task_id="up-task-1", url="https://x/"),
+                       pb.TaskPushNotificationConfig) == (
+            "FAILED_PRECONDITION", "PUSH_NOTIFICATION_NOT_SUPPORTED")
+        assert g.error(g.call, "PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                       pb.SendMessageResponse, version=None) == (
+            "FAILED_PRECONDITION", "VERSION_NOT_SUPPORTED")
+        assert g.error(g.call, None, "SendMessage", grpc_message(pb, "summarize"),
+                       pb.SendMessageResponse) == ("UNAUTHENTICATED", None)
+        assert g.error(g.call, "PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                       pb.SendMessageResponse, sign="/lf.a2a.v1.A2AService/GetTask") == (
+            "UNAUTHENTICATED", None)
+        data = grpc_message(pb, "summarize").SerializeToString() + b"\xf8\x07\x01"  # field 127
+        assert g.error(g.call, "PLANNER", "SendMessage", None, pb.SendMessageResponse,
+                       raw=data) == ("INVALID_ARGUMENT", "INVALID_PARAMS")
+        assert g.error(g.call, "PLANNER", "SendMessage", None, pb.SendMessageResponse,
+                       raw=b"\xff\xff") == ("INVALID_ARGUMENT", "INVALID_PARAMS")
+        g.channel.close()
+        r.stop()
+        assert r.agent.sent() == ["summarize", "publish"]
+        assert r.agent.sent("SendStreamingMessage") == ["summarize", "summarize"]
+        assert decisions(r.replay_check()) == [
+            ("PLANNER", "summarize", "allow", "permission"),
+            ("PLANNER", "translate", "deny", "default"),
+            ("PLANNER", "publish", "escalate", "prohibition"),
+            ("OPERATOR", "approve", "allow", "permission"),
+            ("PLANNER", "summarize", "allow", "permission"),
+            ("PLANNER", "translate", "deny", "default"),
+            ("PLANNER", "summarize", "allow", "permission")]
+        assert [why for _, why in events(r.audit, "unauthenticated_request")] == [
+            "missing", "bad_mac"]
+        capsys.readouterr()
+
+    def test_grpc_mutual_tls_and_push(self, tmp_path, grpc_extra, pki, capsys):
+        grpc, pb = grpc_extra
+        hook = Hook()
+        port_file = tmp_path / "grpc-port"
+        r = Run(tmp_path, extra=(*pki.gateway_args(), "--grpc-listen", "127.0.0.1:0",
+                                 "--grpc-port-file", str(port_file),
+                                 "--push-allow", f"{hook.url}/hooks/"))
+        wait_for(lambda: port_file.exists() and port_file.read_text().strip(), "the port")
+        port = int(port_file.read_text())
+        g = GrpcClient(r, grpc, pb, port, pki, "planner")
+        req = grpc_message(pb, "summarize")
+        req.configuration.task_push_notification_config.url = f"{hook.url}/hooks/g"
+        req.configuration.task_push_notification_config.token = "tok"
+        got = g.call("PLANNER", "SendMessage", req, pb.SendMessageResponse)
+        assert got.task.id == "up-task-1"
+        assert r.agent.notify("up-task-1", status_event("up-task-1"),
+                              context=pki.context("summarizer")) == [204]
+        assert hook.got[-1]["headers"]["X-A2A-Notification-Token"] == "tok"
+        cfgs = g.call("PLANNER", "ListTaskPushNotificationConfigs",
+                      pb.ListTaskPushNotificationConfigsRequest(task_id="up-task-1"),
+                      pb.ListTaskPushNotificationConfigsResponse)
+        assert [c.url for c in cfgs.configs] == [f"{hook.url}/hooks/g"]
+        # A certificate of another actor than the header's, and none.
+        other = GrpcClient(r, grpc, pb, port, pki, "operator")
+        assert other.error(other.call, "PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                           pb.SendMessageResponse) == ("UNAUTHENTICATED", None)
+        nocert = GrpcClient(r, grpc, pb, port, pki, None)
+        assert nocert.error(nocert.call, "PLANNER", "SendMessage",
+                            grpc_message(pb, "summarize"),
+                            pb.SendMessageResponse)[0] == "UNAVAILABLE"
+        for c in (g, other, nocert):
+            c.channel.close()
+        r.stop()
+        hook.close()
+        assert r.agent.sent() == ["summarize"]
+        assert [why for _, why in events(r.audit, "unauthenticated_request")] == [
+            "certificate_mismatch"]
+        assert [e for e, _ in events(r.audit, "push_config", "push_sent")] == [
+            "push_config", "push_sent"]
+        r.replay_check()
+        capsys.readouterr()
+
+    def test_grpc_needs_tls_off_loopback(self, tmp_path):
+        from cadl.a2a_gateway import serve
+        from cadl.gateway_core import GatewayError
+        with pytest.raises(GatewayError, match="loopback"):
+            serve({}, listen="127.0.0.1:0", grpc_listen="0.0.0.0:0")

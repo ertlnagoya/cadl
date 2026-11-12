@@ -201,20 +201,27 @@ class A2AGateway:
     CADL-HMAC header."""
 
     def __init__(self, tmp_path: Path, extra=(), pki=None, cert: str | None = "planner",
-                 binding: str = "JSONRPC"):
+                 binding: str = "JSONRPC", push: bool = False, grpc: bool = False):
         from google.protobuf import json_format
 
         from cadl.a2a_gateway import EXTENSION_URI
         from tests.sdk_a2a_agent import Agent, agent_card, free_port
         self.dir = tmp_path
         self.ext = EXTENSION_URI
-        self.agent = Agent(EXTENSION_URI)
+        self.agent = Agent(EXTENSION_URI, push=push)
         port = free_port()
         self.pki, self.cert = pki, cert
         self.url = f"{'https' if pki else 'http'}://127.0.0.1:{port}/"
         card = tmp_path / "card.json"
-        card.write_text(json_format.MessageToJson(agent_card(self.url, EXTENSION_URI,
-                                                             binding=binding)))
+        if grpc:
+            # The card names the gRPC listener of the gateway (A2A 1.0.0, 8.3.1).
+            self.grpc_port = free_port()
+            extra = (*extra, "--grpc-listen", f"127.0.0.1:{self.grpc_port}")
+            card.write_text(json_format.MessageToJson(agent_card(
+                f"127.0.0.1:{self.grpc_port}", EXTENSION_URI, binding="GRPC", push=push)))
+        else:
+            card.write_text(json_format.MessageToJson(agent_card(self.url, EXTENSION_URI,
+                                                                 binding=binding, push=push)))
         if pki is not None:
             extra = (*pki.gateway_args(), *extra)
         clients = keyring(tmp_path, "PLANNER", CLIENT_KEY, "client")
@@ -543,3 +550,179 @@ def test_a2a_sdk_rest_binding(tmp_path, a2a_sdk, upstream):
         ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
         ("publish", "allow", "approved")]
 
+
+
+@pytest.mark.parametrize("binding", ["JSONRPC", "HTTP+JSON"])
+def test_a2a_sdk_push_notifications(tmp_path, a2a_sdk, binding):
+    """Push notifications (--push-allow) with the push sender of the SDK
+    agent and the `a2a-sdk` client: a configuration given with SendMessage
+    and one created for a running task; the agent sends its notifications
+    to the gateway, which relays them to the client's webhook with the
+    client's token and credentials, and records them."""
+    import asyncio
+
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.types import (
+        AuthenticationInfo,
+        ListTaskPushNotificationConfigsRequest,
+        SendMessageConfiguration,
+        SendMessageRequest,
+        TaskPushNotificationConfig,
+    )
+
+    from tests.test_a2a_bindings import Hook
+    hook = Hook()
+    gw = A2AGateway(tmp_path, extra=("--push-allow", f"{hook.url}/hooks/"), binding=binding,
+                    push=True)
+    out: dict = {}
+
+    def config(path: str, **kw) -> TaskPushNotificationConfig:
+        return TaskPushNotificationConfig(
+            url=f"{hook.url}/hooks/{path}", token=f"token-{path}",
+            authentication=AuthenticationInfo(scheme="Bearer", credentials=f"cred-{path}"),
+            **kw)
+
+    async def run():
+        async with gw.httpx_client() as hc:
+            client = await ClientFactory(ClientConfig(
+                httpx_client=hc, streaming=False,
+                supported_protocol_bindings=[binding])).create_from_url(gw.url)
+            req = SendMessageRequest(message=gw.message("summarize", "one"))
+            req.configuration.CopyFrom(SendMessageConfiguration(
+                task_push_notification_config=config("a")))
+            out["one"] = [_dict(ev) async for ev in client.send_message(req)]
+            req = SendMessageRequest(message=gw.message("summarize", "wait"))
+            req.configuration.CopyFrom(SendMessageConfiguration(return_immediately=True))
+            sent = [_dict(ev) async for ev in client.send_message(req)]
+            tid = out["tid"] = sent[0]["task"]["id"]
+            out["made"] = _dict(await client.create_task_push_notification_config(
+                config("b", task_id=tid, id="b1")))
+            out["list"] = _dict(await client.list_task_push_notification_configs(
+                ListTaskPushNotificationConfigsRequest(task_id=tid)))
+            gw.agent.executor.release.set()
+            await asyncio.to_thread(wait_for, lambda: any(
+                g["path"] == "/hooks/b" and g["body"].get("statusUpdate", {}).get(
+                    "status", {}).get("state") == "TASK_STATE_COMPLETED" for g in hook.got),
+                "the notification of completion")
+
+    asyncio.run(run())
+    err = gw.stop()
+    hook.close()
+    first = out["one"][0]["task"]["id"]
+    a = [g for g in hook.got if g["path"] == "/hooks/a"]
+    b = [g for g in hook.got if g["path"] == "/hooks/b"]
+    assert a and b, (hook.got, err)
+    assert all(g["headers"]["X-A2A-Notification-Token"] == "token-a"
+               and g["headers"]["Authorization"] == "Bearer cred-a" for g in a)
+    assert all(g["headers"]["Authorization"] == "Bearer cred-b" for g in b)
+    tasks = {g["body"].get("task", {}).get("id") or next(iter(g["body"].values())).get("taskId")
+             for g in a}
+    assert tasks == {first}
+    assert out["made"]["id"] == "b1" and out["made"]["url"].endswith("/hooks/b")
+    assert [c["id"] for c in out["list"]["configs"]] == ["b1"]
+    events = [r.get("event") for r in read_records(gw.audit)]
+    assert events.count("push_config") == 2
+    assert events.count("push_sent") == len(hook.got)
+    assert "push_dropped" not in events and "push_failed" not in events
+    assert replay_equal(A2A_FILE, gw.trace, gw.audit) == [
+        ("summarize", "allow", "permission"), ("summarize", "allow", "permission")]
+
+
+def test_a2a_sdk_grpc_binding(tmp_path, a2a_sdk):
+    """The `a2a-sdk` client over the gRPC binding (A2A 1.0.0, 10) of the
+    gateway (--grpc-listen, the extra cadl-lang[grpc]), with an interceptor
+    of grpc.aio that adds the CADL-HMAC metadata over the serialized
+    request: allow, deny, a hold approved, GetTask, a stream, and a
+    subscription to a held task; the agent behind it speaks JSON-RPC."""
+    import asyncio
+
+    grpc = pytest.importorskip("grpc")
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.types import (
+        GetTaskRequest,
+        SendMessageConfiguration,
+        SendMessageRequest,
+        SubscribeToTaskRequest,
+    )
+
+    from cadl.a2a_gateway import authorization
+    gw = A2AGateway(tmp_path, grpc=True)
+    out: dict = {}
+
+    class Sign:
+        def _details(self, details, request):
+            method = details.method.decode() if isinstance(details.method, bytes) \
+                else details.method
+            md = grpc.aio.Metadata(*list(details.metadata or ()))
+            md.add("authorization", authorization(CLIENT_KEY, "PLANNER", gw.run_id,
+                                                  request.SerializeToString(), path=method))
+            return grpc.aio.ClientCallDetails(details.method, details.timeout, md,
+                                              details.credentials, details.wait_for_ready)
+
+    # grpc.aio takes an interceptor as one kind only, so one of each.
+    class SignUnary(Sign, grpc.aio.UnaryUnaryClientInterceptor):
+        async def intercept_unary_unary(self, continuation, details, request):
+            return await continuation(self._details(details, request), request)
+
+    class SignStream(Sign, grpc.aio.UnaryStreamClientInterceptor):
+        async def intercept_unary_stream(self, continuation, details, request):
+            return await continuation(self._details(details, request), request)
+
+    async def send(client, msg, **conf):
+        req = SendMessageRequest(message=msg)
+        if conf:
+            req.configuration.CopyFrom(SendMessageConfiguration(**conf))
+        return [_dict(ev) async for ev in client.send_message(req)]
+
+    async def run():
+        async with gw.httpx_client() as hc:
+            def channel(url):
+                return grpc.aio.insecure_channel(url, interceptors=[SignUnary(), SignStream()])
+            client = await ClientFactory(ClientConfig(
+                httpx_client=hc, streaming=False, grpc_channel_factory=channel,
+                supported_protocol_bindings=["GRPC"])).create_from_url(gw.url)
+            out["allow"] = await send(client, gw.message("summarize", "one"))
+            out["deny"] = await send(client, gw.message("translate"))
+            held = asyncio.create_task(send(client, gw.message("publish", "two")))
+            await asyncio.to_thread(approve_when_published, gw.inbox, "h-1", "approve",
+                                    tmp_path / "approver.key")
+            out["approved"] = await held
+            up_id = out["allow"][0]["task"]["id"]
+            out["get"] = _dict(await client.get_task(GetTaskRequest(id=up_id)))
+            streaming = await ClientFactory(ClientConfig(
+                httpx_client=hc, streaming=True, grpc_channel_factory=channel,
+                supported_protocol_bindings=["GRPC"])).create_from_url(gw.url)
+            out["stream"] = await send(streaming, gw.message("summarize", "three"))
+            sub = await send(streaming, gw.message("publish", "wait"), return_immediately=True)
+            gw_id = out["sub_id"] = sub[0]["task"]["id"]
+
+            async def follow():
+                events = []
+                async for ev in streaming.subscribe(SubscribeToTaskRequest(id=gw_id)):
+                    events.append(_dict(ev))
+                    gw.agent.executor.release.set()
+                return events
+            following = asyncio.create_task(follow())
+            await asyncio.to_thread(approve_when_published, gw.inbox, "h-2", "approve",
+                                    tmp_path / "approver.key")
+            out["subscribed"] = await following
+
+    asyncio.run(run())
+    err = gw.stop()
+    assert out["allow"][0]["task"]["status"]["state"] == "TASK_STATE_COMPLETED", err
+    assert out["deny"][0]["task"]["status"]["state"] == "TASK_STATE_REJECTED"
+    assert out["approved"][0]["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert out["get"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    kinds = [next(iter(ev)) for ev in out["stream"]]
+    assert kinds[0] == "task" and "artifactUpdate" in kinds, kinds
+    ids = {ev.get("task", {}).get("id") or ev.get("statusUpdate", ev.get("artifactUpdate",
+                                                                        {})).get("taskId")
+           for ev in out["subscribed"]}
+    assert ids == {out["sub_id"]}
+    assert gw.agent.executor.seen == ["one", "two", "three", "wait"]
+    assert replay_equal(A2A_FILE, gw.trace, gw.audit) == [
+        ("summarize", "allow", "permission"), ("translate", "deny", "default"),
+        ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
+        ("publish", "allow", "approved"), ("summarize", "allow", "permission"),
+        ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
+        ("publish", "allow", "approved")]
