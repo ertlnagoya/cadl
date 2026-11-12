@@ -1,0 +1,66 @@
+# Norms Extension Demo: Contract Instances That Start at Different Observations (F.12)
+#
+# One access contract per robot (index i). When an instance starts, the
+# gate must grant its robot access within 1 s. The robot must report
+# within 2 s; when it does not, the reparation lockout forbids the gate to
+# grant access to any robot for 3 s.
+#
+# When the instances start together, every grant_on_start is decided
+# before a lockout can begin, and the norms are not in conflict. When the
+# environment chooses the start of each instance, a robot whose instance
+# starts while the lockout of another instance is in force cannot be
+# granted access without violating that lockout:
+#
+#   cadl norms-check examples/norms_check_starts.cadl --members ROBOT=2 --instances 2
+#   cadl norms-check examples/norms_check_starts.cadl --members ROBOT=2 --instances 2 \
+#       --starts together
+
+sos:
+  name: "SharedGate"
+  type: Acknowledged
+  version: "0.1.0"
+  description: "One gate shared by the robots of a fleet."
+  extensions:
+    - norms: 0.1
+
+  actors:
+    - id: GATE
+      role: "access_control"
+      autonomy: low
+      capabilities: [grant_access]
+      interface:
+        input:  [report]
+        output: [grant]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities: [deliver]
+      interface:
+        input:  [grant]
+        output: [report]
+
+  contracts:
+    - id: ACCESS
+      parties: [GATE, "ROBOT[*]"]
+
+      norms:
+        - id: grant_on_start
+          kind: obligation
+          bearer: GATE
+          counterparty: "ROBOT[i]"
+          content: "GATE -> ROBOT[i] : grant"
+          deadline: 1s
+        - id: report
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: GATE
+          content: "ROBOT[i] -> GATE : report"
+          deadline: 2s
+          on_violation:
+            reparation: lockout
+        - id: lockout
+          kind: prohibition
+          bearer: GATE
+          content: "GATE -> ROBOT[*] : grant"
+          deadline: 3s

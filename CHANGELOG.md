@@ -6,6 +6,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `cadl norms-check` with several instances lets the environment choose
+  the observation at which each instance starts, in any order
+  (`--starts any`, the default); the trace of an instance runs from its
+  start to its end, and the norms active at the start, the rising edges
+  of its predicates and the intervals of its assumptions count from its
+  start (F.12). `--starts together` keeps the earlier model, in which all
+  instances start at the first observation. Conflicts that need
+  instances with different starts are found, such as the one of the new
+  example `examples/norms_check_starts.cadl`.
+
 ## [0.3.27] — 2026-11-12
 
 Resolves the remaining verification items. The strategic export is run

@@ -398,6 +398,10 @@ def main(argv: list[str] | None = None) -> int:
     nchk_cmd.add_argument("--instances", type=int, default=None, metavar="N",
                           help="Check N instances together, which bind the one open index to "
                                "the first N members of its set")
+    nchk_cmd.add_argument("--starts", choices=["any", "together"], default="any",
+                          help="With several instances: each starts at an observation the "
+                               "environment chooses, in any order (any, the default), or all "
+                               "start at the first observation (together, fewer commands)")
     nchk_cmd.add_argument("--version", dest="versions", action="append", default=[],
                           type=Path, metavar="FILE",
                           help="A later version of the file: the environment may amend the "
@@ -1242,7 +1246,7 @@ def _norms_check_run(args: argparse.Namespace) -> int:
                             args.step, args.horizon, args.export, timeout=args.timeout,
                             domains=args.domain,
                             instances=args.instance or args.instances,
-                            versions=args.versions)
+                            versions=args.versions, starts=args.starts)
     except NormsEvalError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

@@ -1936,34 +1936,57 @@ class Var:
 class NormsModel:
     """The finite model of one contract instance (F.12)."""
 
-    def __init__(self, tr, versions: list | None = None) -> None:
+    def __init__(self, tr, versions: list | None = None, starts: str = "any") -> None:
         trs = tr if isinstance(tr, list) else [tr]
         self.trs = trs
         self.tr = trs[0]
         self.multi = len(trs) > 1
-        # the versions of the contract (F.6): a translator per version of
-        # the one instance; the environment amends to the next one
-        self.vtrs = [self.tr] + list(versions or [])
+        # the versions of the contract (F.6): per instance, a translator per
+        # version; the environment amends every running instance to the
+        # next version at the same observation. `versions` is a list of
+        # later-version translators (one instance) or, per instance, such
+        # a list.
+        versions = list(versions or [])
+        if versions and not isinstance(versions[0], list):
+            versions = [versions]
+        self.vt = [[t] + (list(versions[k]) if versions else []) for k, t in enumerate(trs)]
+        self.vtrs = self.vt[0]
         self.versioned = len(self.vtrs) > 1
+        # several instances: each starts at an observation the environment
+        # chooses ("any") or all at the first one ("together")
+        if starts not in ("any", "together"):
+            raise NormsCheckError("--starts takes 'any' or 'together'")
+        self.staggered = self.multi and starts == "any"
         self.H = self.tr.horizon
         self.vars: list[Var] = []
         self._add("step", 0, self.H, 0, "index of the next observation")
+        if self.versioned:
+            self._add("ver", 0, len(self.vtrs) - 1, 0, "the version of the contract in force")
         self.norms = []
         self.items = []
         self.excuse_known = True
-        for k, t in enumerate(trs):
-            t.px = f"k{k + 1}_" if self.multi else ""
-            t.inst = k
-            for n in t.norms:
-                n.px, n.inst = t.px, k
-        if self.versioned:
-            self._init_versions()
-            return
+        for k, vts in enumerate(self.vt):
+            for v, t in enumerate(vts):
+                t.px = f"k{k + 1}_" if self.multi else ""
+                t.inst = k
+                t.version = v
+                t.staggered = self.staggered
+                t.n_instances = len(trs)
+                for n in t.norms:
+                    n.px, n.inst = t.px, k
         for t in trs:
             px = t.px
             self._add(f"{px}ended", None, None, False,
                       f"instance {t.inst + 1} has ended (settled)" if self.multi
                       else "the instance has ended (settled)")
+            if self.staggered:
+                self._add(f"{px}started", None, None, False,
+                          f"instance {t.inst + 1} has started")
+        if self.versioned:
+            self._init_versions()
+            return
+        for t in trs:
+            px = t.px
             t.model_items = [it for it in t.items if it["status"] == "model"]
             self.items += t.model_items
             self.excuse_known = self.excuse_known and all(
@@ -1971,11 +1994,20 @@ class NormsModel:
             if t.model_items:
                 self._add(f"{px}af", None, None, False,
                           "an assumption has failed (verdicts are excused)")
+            windows = []
             for k, it in enumerate(t.items):
                 if it["status"] == "model" and it["term"].kind == "temporal":
                     it["var"] = f"{px}as_{k}"
+                    windows.append(it["term"].window)
                     self._add(it["var"], 0, max(_codes(it["term"].op)), 1,
                               f"assumption {k + 1} (0: decided)")
+            t.ob_cap = None
+            if self.staggered and windows:
+                # the index of the observation within the instance, for the
+                # intervals of its assumptions (saturated past the longest)
+                t.ob_cap = max(windows) + 2
+                self._add(f"{px}ob", 0, t.ob_cap, 0,
+                          f"observations of instance {t.inst + 1} so far (saturated)")
         self.edge_preds = sorted(set().union(*(t.edge_preds for t in trs)))
         for pid in self.edge_preds:
             self._add(f"pe_{pid}", None, None, False,
@@ -1997,91 +2029,97 @@ class NormsModel:
         self.commands = self._commands()
 
     def _init_versions(self) -> None:
-        """Variables of a model with amendments: one set per norm id of any
-        version (its slot), sized for every version; assumptions by text,
-        with their age; the version in force."""
+        """Variables of a model with amendments: per instance, one set per
+        norm id of any version (its slot), sized for every version;
+        assumptions by text, with their age; the version in force is
+        shared by the instances."""
         vt = self.vtrs
-        self._add("ended", None, None, False, "the instance has ended (settled)")
-        self._add("ver", 0, len(vt) - 1, 0, "the version of the contract in force")
         self.slot_ids: list = []
         self.slot_defs: dict = {}               # id -> [NormInfo or None per version]
         for v, t in enumerate(vt):
-            t.px, t.inst = "", 0
             for n in t.model_norms():
                 if n.id not in self.slot_defs:
                     self.slot_ids.append(n.id)
                     self.slot_defs[n.id] = [None] * len(vt)
                 self.slot_defs[n.id][v] = n
-        for k, nid in enumerate(self.slot_ids):
-            for n in self.slot_defs[nid]:
-                if n is not None:
-                    n.slot = k
+        for vts in self.vt:
+            for t in vts:
+                for n in t.model_norms():
+                    n.slot = self.slot_ids.index(n.id)
         self.items = []
         self.item_slots: dict = {}              # text -> {"var", "age", "window", "op"}
-        for v, t in enumerate(vt):
-            t.model_items = [it for it in t.items if it["status"] == "model"]
-            for it in t.model_items:
-                term = it["term"]
-                slot = self.item_slots.get(it["text"])
-                if slot is None:
-                    j = len(self.item_slots)
-                    slot = self.item_slots[it["text"]] = {
-                        "temporal": term.kind == "temporal", "var": f"as_{j}",
-                        "age": f"ag_{j}", "window": 0, "op": term.op, "in": [False] * len(vt)}
-                slot["in"][v] = True
-                if term.kind == "temporal":
-                    slot["window"] = max(slot["window"], term.window)
-                    if slot["op"] != term.op:
-                        raise NormsCheckError(f"the assumption {it['text']!r} changes its "
-                                              f"operator between versions")
-                it["var"] = slot["var"]
-        if any(t.model_items for t in vt):
-            self._add("af", None, None, False, "an assumption has failed (verdicts are excused)")
-        for text, slot in self.item_slots.items():
-            if slot["temporal"]:
-                self._add(slot["var"], 0, max(_codes(slot["op"])), 1 if slot["in"][0] else 0,
-                          f"assumption {text!r} (0: decided or not in force)")
-                self._add(slot["age"], 0, slot["window"] + 1, 0,
-                          f"observations since assumption {text!r} began")
-        self.edge_preds = sorted(set().union(*(t.edge_preds for t in vt)))
+        for vts in self.vt:
+            for v, t in enumerate(vts):
+                t.model_items = [it for it in t.items if it["status"] == "model"]
+                for it in t.model_items:
+                    term = it["term"]
+                    slot = self.item_slots.get(it["text"])
+                    if slot is None:
+                        j = len(self.item_slots)
+                        slot = self.item_slots[it["text"]] = {
+                            "temporal": term.kind == "temporal", "var": f"as_{j}",
+                            "age": f"ag_{j}", "window": 0, "op": term.op,
+                            "in": [False] * len(vt)}
+                    slot["in"][v] = True
+                    if term.kind == "temporal":
+                        slot["window"] = max(slot["window"], term.window)
+                        if slot["op"] != term.op:
+                            raise NormsCheckError(f"the assumption {it['text']!r} changes its "
+                                                  f"operator between versions")
+                    it["var"] = t.px + slot["var"]
+        for t in self.trs:
+            px = t.px
+            if any(vv.model_items for vv in self.vt[t.inst]):
+                self._add(f"{px}af", None, None, False,
+                          "an assumption has failed (verdicts are excused)")
+            for text, slot in self.item_slots.items():
+                if slot["temporal"]:
+                    self._add(px + slot["var"], 0, max(_codes(slot["op"])),
+                              1 if slot["in"][0] else 0,
+                              f"assumption {text!r} (0: decided or not in force)")
+                    self._add(px + slot["age"], 0, slot["window"] + 1, 0,
+                              f"observations since assumption {text!r} began")
+        self.edge_preds = sorted(set().union(*(t.edge_preds for vts in self.vt for t in vts)))
         for pid in self.edge_preds:
             self._add(f"pe_{pid}", None, None, False,
                       f"predicate {pid} held at the previous observation")
         self.el_cap: dict = {}
-        for nid in self.slot_ids:
-            defs = [n for n in self.slot_defs[nid] if n is not None]
-            n0 = defs[0]
-            self.norms.append(n0)
-            judged = n0.judged
-            init = INACTIVE if self.slot_defs[nid][0] is not None else ABSENT
-            self._add(f"st_{n0.stem}", 0, ABSENT, init, f"state of {nid}")
-            if judged:
-                self._add(f"jn_{n0.stem}", None, None, False,
-                          f"{nid} was activated at the last observation")
-            dls = [n.deadline for n in defs if n.deadline is not None]
-            if judged and dls:
-                self.el_cap[nid] = max(dls)
-                self._add(f"el_{n0.stem}", 0, max(dls) + 1, 0,
-                          f"active steps of {nid} (saturated)")
-            temps = [n.content for n in defs if n.content is not None
-                     and n.content.kind == "temporal"]
-            if judged and temps:
-                top = max(max(_codes(c.op)) for c in temps)
-                for a in range(max(c.window for c in temps) + 1):
-                    self._add(f"sl_{n0.stem}_{a}", 0, top, 0,
-                              f"pending candidate of {nid} of age {a}")
-                self._add(f"ht_{n0.stem}", None, None, False,
-                          f"a candidate of {nid} decided true, not yet judged")
-                self._add(f"sf_{n0.stem}", None, None, False,
-                          f"a candidate of {nid} decided not true, not yet judged")
-            if n0.kind == "power":
-                self._add(f"ex_{n0.stem}", None, None, False, f"{nid} has been exercised")
-            if any(n.judged and n.reparation and t.by_id.get(n.reparation) is not None
-                   and t.by_id[n.reparation].status == "model"
-                   for t in vt for n in t.model_norms() if n.id == nid):
-                self._add(f"rp_{n0.stem}", None, None, False,
-                          f"the reparation of {nid} has been activated")
-        self.excuse_known = all(it["status"] != "untranslated" for t in vt for it in t.items)
+        for vts in self.vt:
+            for nid in self.slot_ids:
+                defs = [n for t in vts for n in t.model_norms() if n.id == nid]
+                n0 = defs[0]
+                self.norms.append(n0)
+                judged = n0.judged
+                init = INACTIVE if self.slot_defs[nid][0] is not None else ABSENT
+                self._add(f"st_{n0.stem}", 0, ABSENT, init, f"state of {n0.uid}")
+                if judged:
+                    self._add(f"jn_{n0.stem}", None, None, False,
+                              f"{n0.uid} was activated at the last observation")
+                dls = [n.deadline for n in defs if n.deadline is not None]
+                if judged and dls:
+                    self.el_cap[nid] = max(dls)
+                    self._add(f"el_{n0.stem}", 0, max(dls) + 1, 0,
+                              f"active steps of {n0.uid} (saturated)")
+                temps = [n.content for n in defs if n.content is not None
+                         and n.content.kind == "temporal"]
+                if judged and temps:
+                    top = max(max(_codes(c.op)) for c in temps)
+                    for a in range(max(c.window for c in temps) + 1):
+                        self._add(f"sl_{n0.stem}_{a}", 0, top, 0,
+                                  f"pending candidate of {n0.uid} of age {a}")
+                    self._add(f"ht_{n0.stem}", None, None, False,
+                              f"a candidate of {n0.uid} decided true, not yet judged")
+                    self._add(f"sf_{n0.stem}", None, None, False,
+                              f"a candidate of {n0.uid} decided not true, not yet judged")
+                if n0.kind == "power":
+                    self._add(f"ex_{n0.stem}", None, None, False, f"{n0.uid} has been exercised")
+                if any(n.judged and n.reparation and t.by_id.get(n.reparation) is not None
+                       and t.by_id[n.reparation].status == "model"
+                       for t in vts for n in t.model_norms() if n.id == nid):
+                    self._add(f"rp_{n0.stem}", None, None, False,
+                              f"the reparation of {n0.uid} has been activated")
+        self.excuse_known = all(it["status"] != "untranslated"
+                                for vts in self.vt for t in vts for it in t.items)
         self._finish_init()
 
     def _add_norm(self, tr: Translator, n: NormInfo) -> None:
@@ -2134,43 +2172,64 @@ class NormsModel:
     def _vals(self, term: Term, ch: Choice) -> tuple:
         return tuple(ch.vector[p] for p in term.preds)
 
-    def step(self, ch: Choice, end: Any, first: bool = False, cur: Any = None,
-             old: Any = None) -> dict:
-        """The updates of the command for choice `ch` and the instances that
-        end at this observation (`end`: a boolean for one instance, a mask
-        of instances for several): the steps of F.5 in their order within
-        one observation, for every instance. `first`: the command of the
-        first observation, from the initial state (its updates are
-        constants)."""
+    def step(self, ch: Choice, end: Any, first: bool = False, w: int = 0,
+             amend: bool = False) -> dict:
+        """The updates of the command for choice `ch`: the steps of F.5 in
+        their order within one observation, for every instance. `end` is a
+        boolean for one instance; for several, a mask whose bit k says that
+        instance k ends at this observation and, when the instances start
+        at observations of their own, bit n + k that it starts there. `w`:
+        the version in force before the observation; `amend`: the
+        observation amends every running instance to version w + 1.
+        `first`: the command of the first observation, from the initial
+        state (its updates are constants)."""
         _generation_time()
         ir = self.ir
         step = ir.V("step")
         out: dict = {}
-        if self.versioned:
-            out.update(self._inst_step(cur, ch, bool(end), old))
-        for t in ([] if self.versioned else self.trs):
-            ends = bool(int(end) >> t.inst & 1)
-            part = self._inst_step(t, ch, ends)
-            if self.multi:
-                # an ended instance does not change
-                done = ir.V(f"{t.px}ended")
-                part = {k: ir.ITE(done, ir.V(k), v) for k, v in part.items()}
+        n = len(self.trs)
+        mask = int(end)
+        for t in self.trs:
+            k = t.inst
+            ends = bool(mask >> k & 1)
+            starting = bool(mask >> (n + k) & 1) if self.staggered else first
+            pre = self.vt[k][w]
+            cur = self.vt[k][w + 1] if amend else pre
+            part = self._inst_step(cur, ch, ends, pre if amend else None, starting)
+            if self.multi and not starting and not ends:
+                # an instance that has not started or has ended does not change
+                running = ir.NOT(ir.V(f"{t.px}ended"))
+                if self.staggered:
+                    running = ir.AND(ir.V(f"{t.px}started"), running)
+                part = {x: ir.ITE(running, v, ir.V(x)) for x, v in part.items()}
+            if self.staggered and starting:
+                part[f"{t.px}started"] = ir.TRUE
             out.update(part)
         for pid in self.edge_preds:
-            out[f"pe_{pid}"] = ir.C(ch.vector[pid] == "T")
+            val = ir.C(ch.vector[pid] == "T")
+            if self.staggered:
+                owner = self.tr.preds[pid].owner
+                if not mask >> (n + owner.inst) & 1:
+                    # no previous observation before the start of the instance
+                    val = ir.ITE(ir.V(f"{owner.px}started"), val, ir.V(f"pe_{pid}"))
+            out[f"pe_{pid}"] = val
+        if amend:
+            out["ver"] = ir.C(w + 1)
         if self.multi:
-            # the observations go on while an instance runs
-            after = [ir.OR(ir.V(f"{t.px}ended"), ir.C(bool(int(end) >> t.inst & 1)))
+            # the observations go on while an instance runs or waits to start
+            after = [ir.OR(ir.V(f"{t.px}ended"), ir.C(bool(mask >> t.inst & 1)))
                      for t in self.trs]
             out["step"] = ir.ITE(ir.AND(*after), step, ir.ADD(step, 1))
         else:
             out["step"] = step if end else ir.ADD(step, 1)
         return self._simplify(out, first)
 
-    def _inst_step(self, tr: Translator, ch: Choice, end: bool, old: Any = None) -> dict:
+    def _inst_step(self, tr: Translator, ch: Choice, end: bool, old: Any = None,
+                   start: bool = False) -> dict:
         """The updates of one instance (F.5, one observation). With
         versions, `tr` is the version in force after this observation's
-        amendment and `old` the version before it (None: no amendment)."""
+        amendment and `old` the version before it (None: no amendment).
+        `start`: this is the first observation of the instance."""
         ir = self.ir
         px = tr.px
         msgs = set(ch.messages)
@@ -2179,10 +2238,15 @@ class NormsModel:
         if self.versioned:
             norms = tr.model_norms()
             pre_norms = pre.model_norms()
-            slot_norms = self.norms       # one per norm id of any version
+            # one per norm id of any version
+            slot_norms = [n for n in self.norms if n.inst == tr.inst]
         else:
             norms = pre_norms = slot_norms = [n for n in self.norms if n.inst == tr.inst]
         S = {n.id: ir.V(f"st_{n.stem}") for n in slot_norms}
+        if start and self.versioned:
+            # an instance that starts under a later version has its norms
+            have = {n.id for n in pre.model_norms()}
+            S = {n.id: ir.C(INACTIVE if n.id in have else ABSENT) for n in slot_norms}
         stems = {n.id: n.stem for n in slot_norms}
         out: dict = {}
         # active time up to this observation (the state between the previous
@@ -2216,15 +2280,20 @@ class NormsModel:
         # start of the instance (F.5, item 1)
         for n in pre_norms:
             if n.starts:
-                S[n.id] = ir.ITE(ir.EQ(step, 0), ir.C(ACTIVE), S[n.id])
+                S[n.id] = ir.C(ACTIVE) if start else S[n.id]
         amend_viol: dict = {}
         if old is not None:
             amend_viol = self._amend_ir(old, tr, S, el, slots, ht, sf, stems)
         # assume: items
         if self.versioned:
-            af = self._items_versioned(old, tr, ch, out)
+            af = self._items_versioned(old, tr, ch, out, start)
         else:
             af = ir.V(f"{px}af") if tr.model_items else ir.FALSE
+        index = step
+        if not self.versioned and getattr(tr, "ob_cap", None):
+            ob = ir.V(f"{px}ob")
+            index = ob
+            out[f"{px}ob"] = ir.ITE(ir.LE(ob, tr.ob_cap - 1), ir.ADD(ob, 1), ob)
         for k, it in enumerate([] if self.versioned else tr.items):
             if it["status"] != "model":
                 continue
@@ -2234,7 +2303,7 @@ class NormsModel:
                     af = ir.TRUE
             else:
                 code = ir.V(it["var"])
-                p, dt, df, du = self._tstep_ir(code, t.op, ir.EQ(step, t.window + 1),
+                p, dt, df, du = self._tstep_ir(code, t.op, ir.EQ(index, t.window + 1),
                                                self._vals(t, ch))
                 out[it["var"]] = p
                 af = ir.OR(af, df)
@@ -2407,7 +2476,7 @@ class NormsModel:
         S, el, slots, ht, sf in place; returns the conditions under which a
         norm is violated by the amendment (its reparation applies)."""
         ir = self.ir
-        af = ir.V("af") if self.has("af") else ir.FALSE
+        af = ir.V(f"{new.px}af") if self.has(f"{new.px}af") else ir.FALSE
         viol_code = ir.ITE(af, ir.C(EXCUSED), ir.C(VIOLATED))
         before = dict(S)
         amend_viol: dict = {}
@@ -2473,14 +2542,16 @@ class NormsModel:
                                  ir.C(ACTIVE), S[x.id])
         return amend_viol
 
-    def _items_versioned(self, old: Any, tr: Translator, ch: Choice, out: dict) -> tuple:
+    def _items_versioned(self, old: Any, tr: Translator, ch: Choice, out: dict,
+                         start: bool = False) -> tuple:
         """assume: items by text across versions (F.6): an item of the same
         text continues, a new one is evaluated from the amendment on, an old
         one is closed. Returns whether an assumption has failed."""
         ir = self.ir
-        af = ir.V("af") if self.has("af") else ir.FALSE
-        v_new = self.vtrs.index(tr)
-        v_old = self.vtrs.index(old) if old is not None else v_new
+        px = tr.px
+        af = ir.V(f"{px}af") if self.has(f"{px}af") else ir.FALSE
+        v_new = tr.version
+        v_old = old.version if old is not None else v_new
         terms = {it["text"]: it["term"] for it in tr.model_items}
         for text, slot in self.item_slots.items():
             in_old, in_new = slot["in"][v_old], slot["in"][v_new]
@@ -2488,7 +2559,10 @@ class NormsModel:
                 if in_new and ch.vector[terms[text].pred] == "F":
                     af = ir.TRUE
                 continue
-            code, age = ir.V(slot["var"]), ir.V(slot["age"])
+            code, age = ir.V(px + slot["var"]), ir.V(px + slot["age"])
+            if start:
+                # an instance that starts under a later version
+                code, age = ir.C(1 if slot["in"][v_old] else 0), ir.C(0)
             if old is not None and in_new and not in_old:
                 code, age = ir.C(1), ir.C(0)
             elif old is not None and in_old and not in_new:
@@ -2497,11 +2571,11 @@ class NormsModel:
                 t = terms[text]
                 p, dt, df, du = self._tstep_ir(code, t.op, ir.EQ(age, t.window + 1),
                                                self._vals(t, ch))
-                out[slot["var"]] = p
-                out[slot["age"]] = ir.ITE(ir.LE(age, slot["window"]), ir.ADD(age, 1), age)
+                out[px + slot["var"]] = p
+                out[px + slot["age"]] = ir.ITE(ir.LE(age, slot["window"]), ir.ADD(age, 1), age)
                 af = ir.OR(af, df)
             else:
-                out[slot["var"]] = code
+                out[px + slot["var"]] = code
         return af
 
     def _simplify(self, out: dict, first: bool) -> dict:
@@ -2535,12 +2609,67 @@ class NormsModel:
         m = _ACTOR_RE.match(performer)
         return bool(m) and m.group(1) == what
 
+    def patterns(self, first: bool) -> list:
+        """The starts and ends of the instances at one observation: a
+        boolean (the instance ends) for one instance, a mask for several
+        (bit k: instance k ends; bit n + k: it starts, when the instances
+        start at observations of their own)."""
+        if not self.multi:
+            return [False, True]
+        n = len(self.trs)
+        full = 2 ** n - 1
+        if not self.staggered:
+            return list(range(full + 1))
+        out = []
+        for starts in range(full + 1):
+            if first and not starts:
+                continue                  # some instance starts at the first observation
+            for ends in range(full + 1):
+                if first and ends & ~starts:
+                    continue              # nothing has started before
+                out.append(ends | starts << n)
+        return out
+
+    def _versions_at(self, first: bool) -> list:
+        """(version in force before the observation, amend) of the commands."""
+        V = len(self.vtrs)
+        return [(w, amend) for w in (range(1) if first else range(V))
+                for amend in (False, True) if not (amend and w == V - 1)]
+
     def command_count(self) -> int:
         """The number of commands before they are built (F.12 limits)."""
         a = len(self.tr.choices)
+        return sum(a * len(self.patterns(first)) * len(self._versions_at(first))
+                   for first in (True, False))
+
+    def _guard(self, first: bool, w: int, pat: Any) -> str:
+        parts = ["step=0" if first else "step>0"]
         if self.versioned:
-            return 2 * a * 2 * (2 * len(self.vtrs) - 1)
-        return 2 * a * (2 ** len(self.trs) if self.multi else 2)
+            parts.append(f"ver={w}")
+        if not self.multi:
+            parts.insert(0, "!ended")
+            parts.append("(early_end | step=H)" if pat else "step<H")
+            return " & ".join(parts)
+        n = len(self.trs)
+        ending = [t for t in self.trs if pat >> t.inst & 1]
+        others = [t for t in self.trs if not pat >> t.inst & 1]
+        if not self.staggered:
+            parts.insert(1, "(" + " | ".join(f"!{t.px}ended" for t in self.trs) + ")")
+            parts += [f"!{t.px}ended" for t in ending]
+        else:
+            starting = [t for t in self.trs if pat >> (n + t.inst) & 1]
+            parts += [f"!{t.px}started" for t in starting]
+            parts += [f"{t.px}started & !{t.px}ended" for t in ending if t not in starting]
+            if not starting:
+                # some instance runs at this observation
+                parts.append("(" + " | ".join(f"({t.px}started & !{t.px}ended)"
+                                              for t in self.trs) + ")")
+        if ending:
+            parts.append("(early_end | step=H)")
+        # at the horizon every instance that has not ended ends
+        if others:
+            parts.append("(step<H | " + " & ".join(f"{t.px}ended" for t in others) + ")")
+        return " & ".join(parts)
 
     def _commands(self) -> list:
         """(label, choice, end, guard, updates) for every command."""
@@ -2548,59 +2677,20 @@ class NormsModel:
         if count > MAX_COMMANDS:
             raise NormsCheckError(
                 f"the model would have {count} commands ({len(self.tr.choices)} choices per "
-                f"observation, times the ends of the instances and the versions); norms-check "
-                f"refuses more than {MAX_COMMANDS}")
+                f"observation, times the starts and ends of the instances and the versions); "
+                f"norms-check refuses more than {MAX_COMMANDS}"
+                + ("; --starts together lets the instances start together, with fewer commands"
+                   if self.staggered else ""))
         out = []
-        if self.versioned:
-            A = len(self.tr.choices)
-            V = len(self.vtrs)
-            for first in (True, False):
-                for w in range(V):
-                    if first and w > 0:
-                        continue
-                    for amend in (False, True):
-                        if amend and w == V - 1:
-                            continue
-                        cur = self.vtrs[w + 1] if amend else self.vtrs[w]
-                        old = self.vtrs[w] if amend else None
-                        for ch in self.tr.choices:
-                            for end in (False, True):
-                                guard = "!ended & step=0" if first else "!ended & step>0"
-                                guard += f" & ver={w}"
-                                guard += " & step<H" if not end else " & (early_end | step=H)"
-                                j = ch.index + (A if amend else 0)
-                                label = f"{'e' if end else 'o'}{j}"
-                                upd = self.step(ch, end, first, cur, old)
-                                if amend:
-                                    upd = dict(upd, ver=self.ir.C(w + 1))
-                                out.append((label, ch, end, guard, upd))
-            return out
-        if not self.multi:
-            for first in (True, False):
-                for ch in self.tr.choices:
-                    for end in (False, True):
-                        guard = "!ended & step=0" if first else "!ended & step>0"
-                        guard += " & step<H" if not end else " & (early_end | step=H)"
-                        label = f"{'e' if end else 'o'}{ch.index}"
-                        out.append((label, ch, end, guard, self.step(ch, end, first)))
-            return out
-        n = len(self.trs)
-        alive = " | ".join(f"!{t.px}ended" for t in self.trs)
+        A = len(self.tr.choices)
         for first in (True, False):
-            for ch in self.tr.choices:
-                for mask in range(2 ** n):
-                    ending = [t for t in self.trs if mask >> t.inst & 1]
-                    others = [t for t in self.trs if not mask >> t.inst & 1]
-                    parts = ["step=0" if first else "step>0", f"({alive})"]
-                    parts += [f"!{t.px}ended" for t in ending]
-                    if ending:
-                        parts.append("(early_end | step=H)")
-                    # at the horizon every running instance ends
-                    if others:
-                        parts.append("(step<H | " + " & ".join(f"{t.px}ended" for t in others)
-                                     + ")")
-                    out.append((f"c{ch.index}_{mask}", ch, mask, " & ".join(parts),
-                                self.step(ch, mask, first)))
+            for w, amend in self._versions_at(first):
+                for ch in self.tr.choices:
+                    for pat in self.patterns(first):
+                        j = ch.index + (A if amend else 0)
+                        upd = self.step(ch, pat, first, w, amend)
+                        out.append((make_label(j, pat), ch, pat, self._guard(first, w, pat),
+                                    upd))
         return out
 
     def all_ended(self, s: dict) -> bool:
@@ -2702,7 +2792,15 @@ class NormsModel:
         msgs = ", ".join(self.tr.atoms[i].text() for i in ch.messages) or "no message"
         vals = ", ".join(f"{k}={json_text(v)}" for k, v in sorted(ch.values.items())
                          if v is not None)
-        return f"{msgs}{'; ' + vals if vals else ''}{'; end' if end else ''}"
+        if isinstance(end, bool) or not self.multi:
+            tail = "; end" if end else ""
+        else:
+            n = len(self.trs)
+            starts = [str(k + 1) for k in range(n) if int(end) >> (n + k) & 1]
+            ends = [str(k + 1) for k in range(n) if int(end) >> k & 1]
+            tail = ((f"; instance {', '.join(starts)} starts" if starts else "")
+                    + (f"; instance {', '.join(ends)} ends" if ends else ""))
+        return f"{msgs}{'; ' + vals if vals else ''}{tail}"
 
 
 
@@ -2937,28 +3035,70 @@ def _ends(tr: Any, end: Any) -> bool:
     return bool(int(end) >> getattr(tr, "inst", 0) & 1)
 
 
+def _starts(tr: Any, end: Any, n: int) -> bool:
+    """Whether the instance of `tr` starts at observation n of a path (the
+    instances start at observations of their own, or all at the first)."""
+    if getattr(tr, "staggered", False):
+        return bool(int(end) >> (tr.n_instances + tr.inst) & 1)
+    return n == 0
+
+
+def instance_span(tr: Any, path: list) -> tuple:
+    """(first, last): the observations of a path that belong to the
+    instance of `tr`, from the one at which it starts to the one at which
+    it ends (inclusive)."""
+    first = None
+    for n, (_j, end) in enumerate(path):
+        if first is None and _starts(tr, end, n):
+            first = n
+        if first is not None and _ends(tr, end):
+            return first, n
+    if first is None:
+        return len(path), len(path) - 1
+    return first, len(path) - 1
+
+
 def instance_path(tr: Any, path: list) -> list:
-    """The observations of a path that belong to the instance of `tr`: up
-    to the one at which it ends."""
-    out = []
-    for j, end in path:
-        out.append((j, end))
-        if _ends(tr, end):
-            break
-    return out
+    """The observations of a path that belong to the instance of `tr`."""
+    first, last = instance_span(tr, path)
+    return path[first:last + 1]
+
+
+def _amends_before(tr: Any, path: list, n: int) -> int:
+    """The number of amendments of a path before observation n."""
+    a = len(tr.choices)
+    return sum(1 for j, _e in path[:n] if j >= a)
+
+
+def base_version(tr: Any, path: list) -> int:
+    """The version of the contract under which the instance of `tr` starts
+    (an instance that starts after an amendment is one of the new version)."""
+    if not getattr(tr, "version_names", None):
+        return 0
+    return _amends_before(tr, path, instance_span(tr, path)[0])
+
+
+def base_file(tr: Any, path: list) -> str | None:
+    """The version file of which the instance is an instance, when it starts
+    after an amendment (None: the file of the model)."""
+    v = base_version(tr, path)
+    return tr.version_names[v - 1] if v else None
 
 
 def trace_lines(tr: Translator, path: list) -> list[str]:
     """The trace of a path of choices [(choice index, end), ...] as JSON
     Lines for `cadl norms-eval`, for the instance of `tr`: one observation
-    per step, at multiples of the step, with the messages and the values
-    of the choice, up to the end of the instance."""
+    per step, at multiples of the step (the time of the observation in the
+    path), with the messages and the values of the choice, from the start
+    of the instance to its end."""
     lines = []
-    amended = 0
-    for n, (j, end) in enumerate(instance_path(tr, path)):
+    first, last = instance_span(tr, path)
+    amended = _amends_before(tr, path, first)
+    for n in range(first, last + 1):
+        j, end = path[n]
         ch, amend = split_choice(tr, j)
         obs: dict = {"t": _t(tr.step_ms, n)}
-        if n == 0:
+        if n == first:
             obs["bindings"] = dict(sorted(tr.bindings.items()))
         if amend:
             obs["amend"] = tr.version_names[amended]
@@ -2982,7 +3122,8 @@ def split_choice(tr: Any, j: int) -> tuple:
 
 def parse_label(label: str) -> tuple:
     """(choice, end): end is a boolean for one instance (labels o<j>, e<j>)
-    and a mask of the instances that end for several (c<j>_<mask>)."""
+    and a mask of the instances that end (and start) for several
+    (c<j>_<mask>)."""
     if label[0] == "c":
         j, mask = label[1:].split("_")
         return int(j), int(mask)
@@ -3005,17 +3146,27 @@ def run_path(pm: PrismModel, path: list) -> list[dict]:
     return out
 
 
+def _base_contract(tr: Any, path: list) -> ContractDef:
+    name = base_file(tr, path)
+    if name is None:
+        return tr.contract
+    return next(c for c in tr.version_sos[name].contracts if c.id == tr.contract.id)
+
+
 def evaluate_path(tr: Translator, path: list) -> dict:
     trace = parse_trace(trace_lines(tr, path))
     versions = getattr(tr, "version_sos", {})
-    return run_trace(tr.contract, trace, versions.get if versions else None, tr.actors)
+    return run_trace(_base_contract(tr, path), trace, versions.get if versions else None,
+                     tr.actors)
 
 
 def compare_path(model: NormsModel, pm: PrismModel, path: list) -> list[str]:
     """The differences between the model and norms_eval on one path: the
-    state of every translated norm after every observation, the final
-    verdicts (when the assumptions are translated), the first exercise of
-    every power and the first activation of every reparation."""
+    state of every translated norm after every observation of its
+    instance, the final verdicts (when the assumptions are translated), the
+    first exercise of every power and the first activation of every
+    reparation; and that the model does not change an instance before its
+    start or after its end."""
     all_states = run_path(pm, path)
     times = {_t(model.tr.step_ms, n): n for n in range(len(path))}
     diffs = []
@@ -3025,8 +3176,17 @@ def compare_path(model: NormsModel, pm: PrismModel, path: list) -> list[str]:
     for n in model.norms:
         tr = model.trs[n.inst]
         result = results[n.inst]
-        length = len(instance_path(tr, path))
-        states = all_states[:length]
+        first, last = instance_span(tr, path)
+        states = all_states[first:last + 1]
+        length = len(states)
+        # before its start and after its end the instance does not change
+        init = pm.initial()
+        for k in list(range(first)) + list(range(last + 1, len(path))):
+            ref = init if k < first else all_states[last]
+            if all_states[k][f"st_{n.stem}"] != ref[f"st_{n.stem}"]:
+                diffs.append(f"{n.uid} changes at observation {k}, outside its instance "
+                             f"(observations {first}..{last})")
+                break
         by_id = {r["id"]: r for r in result["norms"]}
         if n.id not in by_id:
             # not a norm of the instance (removed by an amendment, or of a
@@ -3038,51 +3198,52 @@ def compare_path(model: NormsModel, pm: PrismModel, path: list) -> list[str]:
         r = by_id[n.id]
         seq = ["inactive"] * length
         for h in r["history"]:
-            k = times[h["t"]]
+            k = times[h["t"]] - first
             for m in range(k, length):
                 seq[m] = h["state"]
         # a norm added by an amendment: absent in the model before it, and
         # present from it on (norms-eval keeps no state for it before)
         added = []
-        if n.id not in {d.id for d in tr.contract.norms}:
+        if n.id not in {d.id for d in _base_contract(tr, path).norms}:
             vs = getattr(tr, "version_sos", {})
             for a in result.get("amendments", []):
                 c = next((c for c in vs[a["file"]].contracts if c.id == tr.contract.id), None)
                 if c is not None and n.id in {d.id for d in c.norms}:
-                    added.append(times[a["t"]])
+                    added.append(times[a["t"]] - first)
                     break
         for k, s in enumerate(states):
             got = STATE_NAMES[s[f"st_{n.stem}"]]
             if added and (got == "absent") != (k < added[0]):
-                diffs.append(f"{n.uid} at observation {k}: model {got}, added by the "
-                             f"amendment at observation {added[0]}")
+                diffs.append(f"{n.uid} at observation {first + k}: model {got}, added by the "
+                             f"amendment at observation {first + added[0]}")
                 break
             if got == "absent" and added:
                 got = "inactive"
             if got != seq[k]:
-                diffs.append(f"{n.uid} at observation {k}: model {got}, norms-eval {seq[k]}")
+                diffs.append(f"{n.uid} at observation {first + k}: model {got}, norms-eval "
+                             f"{seq[k]}")
                 break
         code = states[-1][f"st_{n.stem}"]
         verdict = ("violated" if code == VIOLATED else "excused" if code == EXCUSED
                    else "fulfilled" if code in (FULFILLED, DISCHARGED, UNUSED) else "pending")
         if model.excuse_known and verdict != r["verdict"]:
-            diffs.append(f"{n.id}: verdict model {verdict}, norms-eval {r['verdict']}")
+            diffs.append(f"{n.uid}: verdict model {verdict}, norms-eval {r['verdict']}")
         elif not model.excuse_known and (verdict in ("violated", "excused")) != (
                 r["verdict"] in ("violated", "excused")):
-            diffs.append(f"{n.id}: verdict model {verdict}, norms-eval {r['verdict']}")
+            diffs.append(f"{n.uid}: verdict model {verdict}, norms-eval {r['verdict']}")
         if n.kind == "power":
-            first = next((k for k, s in enumerate(states) if s[f"ex_{n.stem}"]), None)
-            ev = [times[e["t"]] for e in result["timeline"]
+            first_ex = next((k for k, s in enumerate(states) if s[f"ex_{n.stem}"]), None)
+            ev = [times[e["t"]] - first for e in result["timeline"]
                   if e["kind"] == "power" and e.get("norm") == n.id]
-            if first != (min(ev) if ev else None):
-                diffs.append(f"{n.id}: first exercised model {first}, norms-eval "
+            if first_ex != (min(ev) if ev else None):
+                diffs.append(f"{n.uid}: first exercised model {first_ex}, norms-eval "
                              f"{min(ev) if ev else None}")
         if model.has(f"rp_{n.stem}"):
-            first = next((k for k, s in enumerate(states) if s[f"rp_{n.stem}"]), None)
-            ev = [times[v["t"]] for v in result["violations"]
+            first_rp = next((k for k, s in enumerate(states) if s[f"rp_{n.stem}"]), None)
+            ev = [times[v["t"]] - first for v in result["violations"]
                   if v["norm"] == n.id and v["reparation_activated"]]
-            if first != (min(ev) if ev else None):
-                diffs.append(f"{n.id}: reparation activated model {first}, norms-eval "
+            if first_rp != (min(ev) if ev else None):
+                diffs.append(f"{n.uid}: reparation activated model {first_rp}, norms-eval "
                              f"{min(ev) if ev else None}")
     return diffs
 
@@ -3090,21 +3251,28 @@ def compare_path(model: NormsModel, pm: PrismModel, path: list) -> list[str]:
 def random_paths(tr: Translator, count: int, seed: int = 0, p_message: float = 0.3,
                  p_end: float = 0.12, full_length: bool = False,
                  p_keep: float = 0.0, instances: int = 1,
-                 p_amend: float = 0.0) -> list[list]:
+                 p_amend: float = 0.0, p_start: float = 0.35) -> list[list]:
     """Random paths of environment choices: each message of a choice with
     probability p_message, the classes of values of the previous
     observation kept with probability p_keep and otherwise drawn
     uniformly, and the end of the instance with probability p_end at each
-    observation (only at the horizon when full_length)."""
+    observation (only at the horizon when full_length). With several
+    instances that start at observations of their own, each one that has
+    not started starts with probability p_start (one at the first
+    observation, and every one at the horizon at the latest)."""
     rng = random.Random(seed)
     index: dict = {}
     by_values: dict = {}
     for ch in tr.choices:
         index.setdefault(ch.messages, []).append(ch.index)
         by_values[(ch.messages, json_text(dict(sorted(ch.values.items()))))] = ch.index
+    staggered = getattr(tr, "staggered", False) and instances > 1
+    full = 2 ** instances - 1
     paths = []
     for _ in range(count):
         path: list = []
+        started = 0 if staggered else full
+        done = 0
         for n in range(tr.horizon + 1):
             msgs = tuple(i for i in range(len(tr.atoms)) if rng.random() < p_message)
             j = rng.choice(index[msgs])
@@ -3120,54 +3288,82 @@ def random_paths(tr: Translator, count: int, seed: int = 0, p_message: float = 0
                 if end:
                     break
                 continue
-            # several instances: each running one ends on its own
-            done = 0
-            for _j, m in path:
-                done |= m
+            starting = 0
+            if staggered:
+                for k in range(instances):
+                    if not started >> k & 1 and (n == tr.horizon or rng.random() < p_start):
+                        starting |= 1 << k
+                running = started & ~done
+                if not starting and not running:
+                    # some instance runs at every observation
+                    waiting = [k for k in range(instances) if not started >> k & 1]
+                    starting = 1 << rng.choice(waiting)
+                started |= starting
+            # each running instance ends on its own
             mask = 0
             for k in range(instances):
-                if not done >> k & 1 and (n == tr.horizon or (
+                if started >> k & 1 and not done >> k & 1 and (n == tr.horizon or (
                         not full_length and rng.random() < p_end)):
                     mask |= 1 << k
-            path.append((j, mask))
-            if (done | mask) == 2 ** instances - 1:
+            path.append((j, mask | (starting << instances if staggered else 0)))
+            done |= mask
+            if done == full:
                 break
         paths.append(path)
     return paths
 
 
-def all_paths(tr: Translator, length: int, instances: int = 1) -> list[list]:
+def all_paths(tr: Translator, length: int, instances: int = 1,
+              choices: list | None = None) -> list[list]:
     """Every path of at most `length` observations (the last one ends the
-    instance); with several instances, every order in which they end."""
+    instance); with several instances, every order in which they start and
+    end; with versions, every choice also with an amendment. `choices`:
+    only these choice indices (an amendment adds the number of choices)."""
     out = []
+    names = getattr(tr, "version_names", None) or []
+    n_choice = len(tr.choices) * (2 if names else 1)
+    if choices is not None:
+        allowed = set(choices)
+        allowed |= {j + len(tr.choices) for j in choices} if names else set()
+    else:
+        allowed = set(range(n_choice))
     if instances == 1:
         # with versions, every choice also with an amendment (at most one
         # amendment per version)
-        n = len(tr.choices) * (2 if getattr(tr, "version_names", None) else 1)
         for k in range(1, length + 1):
-            for combo in itertools.product(range(n), repeat=k):
-                if sum(j >= len(tr.choices) for j in combo) > len(
-                        getattr(tr, "version_names", [])):
+            for combo in itertools.product(sorted(allowed), repeat=k):
+                if sum(j >= len(tr.choices) for j in combo) > len(names):
                     continue
                 out.append([(j, i == k - 1) for i, j in enumerate(combo)])
         return out
     full = 2 ** instances - 1
+    staggered = getattr(tr, "staggered", False)
 
-    def extend(path: list, done: int) -> None:
+    def extend(path: list, started: int, done: int, amended: int) -> None:
         if done == full:
             out.append(path)
             return
         if len(path) == length:
             return
-        for j in range(len(tr.choices)):
-            for mask in range(full + 1):
-                if mask & done:
+        for j in sorted(allowed):
+            am = amended + (j >= len(tr.choices))
+            if am > len(names):
+                continue
+            for starts in (range(full + 1) if staggered else [0]):
+                if starts & started:
                     continue
-                if len(path) + 1 == length and (done | mask) != full:
+                now = started | starts
+                if staggered and not (starts or now & ~done):
                     continue
-                extend(path + [(j, mask)], done | mask)
+                for mask in range(full + 1):
+                    if mask & done or mask & ~now:
+                        continue
+                    if len(path) + 1 == length and (done | mask) != full:
+                        continue
+                    extend(path + [(j, mask | (starts << instances if staggered else 0))],
+                           now, done | mask, am)
 
-    extend([], 0)
+    extend([], 0 if staggered else full, 0, 0)
     return out
 
 
@@ -3191,7 +3387,7 @@ def _parse_domains(items) -> dict:
 def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=None,
                 members=None, step: str | int | None = None,
                 horizon: int | None = None, domains=None, instances=None,
-                versions=None) -> NormsModel:
+                versions=None, starts: str = "any") -> NormsModel:
     """Translate one contract instance (F.12). `bindings` and `members`
     map names to integers (or are lists of "name=n" texts), `step` is a
     duration text or milliseconds."""
@@ -3218,7 +3414,7 @@ def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=Non
         trs = [Translator(sos, contract, {**bindings, **b}, members, step_ms, horizon, domains)
                for b in sets]
         Environment(trs, step_ms, horizon)
-        return NormsModel(trs)
+        return NormsModel(trs, starts=starts)
     tr = Translator(sos, contract, bindings, members, step_ms, horizon, domains)
     if versions:
         vtrs = _version_translators(tr, sos, contract, versions, bindings, members, step_ms,
@@ -3490,7 +3686,13 @@ def finish(model: NormsModel, pm: PrismModel, s: dict) -> tuple:
     while not model.all_ended(s):
         if model.multi:
             alive = sum(1 << t.inst for t in model.trs if not s[f"{t.px}ended"])
-            labels = [make_label(j, alive), make_label(j, 0)]
+            if model.staggered:
+                # an instance that has not started starts now
+                n = len(model.trs)
+                wait = sum(1 << t.inst for t in model.trs if not s[f"{t.px}started"])
+                labels = [make_label(j, alive | wait << n), make_label(j, wait << n)]
+            else:
+                labels = [make_label(j, alive), make_label(j, 0)]
         else:
             labels = [f"e{j}", f"o{j}"]
         for label in labels:
@@ -3549,6 +3751,13 @@ def _witness(model: NormsModel, path: list, claim: tuple, explain: str) -> dict:
         # the trace of every instance over the same observations
         w["instance"] = norm.inst + 1
         w["traces"] = {str(t.inst + 1): trace_lines(t, path) for t in model.trs}
+    if model.versioned:
+        # an instance that starts after an amendment is an instance of the
+        # version then in force: its trace is evaluated with that file
+        bases = {str(t.inst + 1): base_file(t, path) for t in model.trs}
+        bases = {k: v for k, v in bases.items() if v is not None}
+        if bases:
+            w["files"] = bases
     return w
 
 
@@ -3754,8 +3963,11 @@ def _report_head(model: NormsModel) -> dict:
     if model.versioned:
         for n in model.norms:
             versions = [k + 1 for k, d in enumerate(model.slot_defs[n.id]) if d is not None]
-            norms.append({"id": n.id, "kind": n.kind, "status": n.status, "reason": n.reason,
-                          "versions": versions})
+            entry = {"id": n.uid, "kind": n.kind, "status": n.status, "reason": n.reason,
+                     "versions": versions}
+            if model.multi:
+                entry["instance"] = n.inst + 1
+            norms.append(entry)
     for t in ([] if model.versioned else model.trs):
         for n in t.norms:
             entry = {"id": n.uid, "kind": n.kind, "status": n.status, "reason": n.reason}
@@ -3769,6 +3981,7 @@ def _report_head(model: NormsModel) -> dict:
             "bindings": dict(sorted(tr.bindings.items())),
             "instances": [dict(sorted(t.bindings.items())) for t in model.trs],
             "versions": [tr.contract.id] and getattr(tr, "version_names", []),
+            "starts": ("any" if model.staggered else "together") if model.multi else None,
             "members": {k: [v[0], v[-1]] for k, v in sorted(tr.members.items())},
             "step_ms": tr.step_ms,
             "horizon": model.H,
@@ -3788,10 +4001,15 @@ def _report_head(model: NormsModel) -> dict:
         "excuse_known": model.excuse_known,
         "notes": list(dict.fromkeys(
             [x for t in model.trs for x in t.notes]
-            + ([f"the {len(model.trs)} instances start together at the first observation and "
-                f"share the observations, the message events and the quantities; each ends at "
-                f"an observation of its own (traces whose instances start at different "
-                f"observations are not covered)"] if model.multi else []))),
+            + ([f"the {len(model.trs)} instances start at observations that the environment "
+                f"chooses, in any order, and share the observations, the message events and "
+                f"the quantities; each ends at an observation of its own"]
+               if model.staggered else
+               [f"the {len(model.trs)} instances start together at the first observation "
+                f"(--starts together) and share the observations, the message events and the "
+                f"quantities; each ends at an observation of its own (traces whose instances "
+                f"start at different observations are not covered)"]
+               if model.multi else []))),
         "conflicts": [],
         "checked": True,
     }
@@ -4026,7 +4244,7 @@ def format_text(report: dict) -> str:
 
 def check_file(path, contract_id=None, bindings=None, members=None, step=None,
                horizon=None, export_dir=None, prism=None, timeout: float = 600,
-               domains=None, instances=None, versions=None) -> dict:
+               domains=None, instances=None, versions=None, starts: str = "any") -> dict:
     """`cadl norms-check`: build the model of a file, check it, export."""
     import time
     from .norms_eval import load_version
@@ -4035,7 +4253,7 @@ def check_file(path, contract_id=None, bindings=None, members=None, step=None,
     _DEADLINE[0] = start + timeout
     try:
         model = build_model(sos, contract_id, bindings, members, step, horizon, domains,
-                            instances, versions)
+                            instances, versions, starts)
     finally:
         _DEADLINE[0] = None
     built = time.monotonic() - start

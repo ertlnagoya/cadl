@@ -36,6 +36,7 @@ from cadl.norms_check import (
     build_model,
     check,
     compare_path,
+    instance_span,
     format_text,
     prism_expr,
     questions,
@@ -320,7 +321,36 @@ norms:
     trigger: "R[i] -> D : docked"
     content: "D -> R[*] : dock"
 """
-MULTI_KW = {"members": ["R=2"], "instances": [{"i": 1}, {"i": 2}]}
+MULTI_KW = {"members": ["R=2"], "instances": [{"i": 1}, {"i": 2}], "starts": "together"}
+MULTI_ANY = {"members": ["R=2"], "instances": [{"i": 1}, {"i": 2}]}
+
+# instances that start at observations of their own (F.12): a norm active
+# at the start of each instance, a rising edge of a predicate of the
+# instance, and a temporal assumption whose interval begins at the start
+# of the instance
+STAGGER = """\
+assume:
+  - "within(2s, R[i].ok == true)"
+norms:
+  - id: greet
+    kind: obligation
+    bearer: D
+    content: "D -> R[i] : dock"
+    deadline: 1s
+  - id: on_fault
+    kind: obligation
+    bearer: D
+    trigger: "R[i].ok == false"
+    content: "D -> R[i] : dock"
+    deadline: 1s
+  - id: one_at_a_time
+    kind: prohibition
+    bearer: D
+    trigger: "R[i] -> D : docked"
+    content: "D -> R[*] : dock"
+    deadline: 2s
+"""
+STARTS = EXAMPLES / "norms_check_starts.cadl"
 
 
 # two versions of a contract (F.6): carry_over with a shorter deadline
@@ -410,7 +440,6 @@ norms:
     deadline: 1s
 """
 
-
 def make_sos(body: str):
     sos = parse(HEAD + textwrap.indent(body, "      "))
     result = type_check(sos)
@@ -429,7 +458,7 @@ def model_of(name: str, **kw):
         texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS,
                  "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES, "QUANT": QUANT,
                  "ARITH": ARITH, "MIXED": MIXED, "LISTS": LISTS,
-                 "MULTI": MULTI}
+                 "MULTI": MULTI, "STAGGER": STAGGER}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
         _MODELS[key] = (sos, m, PrismModel(m.prism_text(), {"early_end": True}))
@@ -742,6 +771,79 @@ def test_several_instances_differential():
     assert len({s["st_k1_0_dock_when_low"] for s in states}) == 1
 
 
+def test_instances_start_at_observations_of_their_own():
+    """--starts any (the default): the environment chooses the observation
+    at which each instance starts; before it and after its end the
+    instance does not change, its trace begins at its start, and the norms
+    active at the start, rising edges and the intervals of assumptions
+    count from there."""
+    _sos, m, pm = model_of("STAGGER", **MULTI_ANY)
+    tr = m.tr
+    assert m.staggered and m.has("k1_started") and m.has("k2_ob")
+    paths = (random_paths(tr, PATHS * 2, seed=41, instances=2)
+             + random_paths(tr, PATHS, seed=42, p_message=0.15, p_end=0.05, p_start=0.2,
+                            instances=2)
+             + random_paths(tr, PATHS, seed=43, full_length=True, p_keep=0.7, instances=2)
+             + all_paths(tr, 1, instances=2))
+    late = 0
+    for p in paths:
+        assert not compare_path(m, pm, p), p
+        late += any(instance_span(t, p)[0] > 0 for t in m.trs)
+    assert late > PATHS
+    # every order of starts and ends over four observations, with the
+    # choice without messages and values and one with a fault of R[2]
+    fault = next(c.index for c in tr.choices if not c.messages
+                 and c.values.get("R[2].ok") is False and c.values.get("R[1].ok") is None)
+    short = all_paths(tr, 4, instances=2, choices=[0, fault])
+    assert len(short) > 600
+    for p in short:
+        assert not compare_path(m, pm, p), p
+    # instance 2 starts at observation 2: its trace begins there, at t=2
+    p = [(0, 1 << 2), (0, 0), (fault, 2 << 2), (0, 3)]
+    lines = trace_lines(m.trs[1], p)
+    assert [json.loads(x)["t"] for x in lines] == [2, 3]
+    assert not compare_path(m, pm, p)
+    states = run_path(pm, p)
+    assert states[1]["st_k2_0_greet"] == INACTIVE and states[2]["st_k2_0_greet"] == ACTIVE
+
+
+def test_starts_together_or_any():
+    """--starts together keeps the instances starting at the first
+    observation; the model has fewer commands."""
+    _sos, any_, _pm = model_of("MULTI", **MULTI_ANY)
+    _sos, tog, _pm = model_of("MULTI", **MULTI_KW)
+    assert any_.staggered and not tog.staggered
+    assert len(tog.commands) < len(any_.commands)
+    assert len(any_.commands) == len(any_.tr.choices) * (8 + 16)
+    with pytest.raises(NormsCheckError, match="--starts"):
+        build_model(make_sos(MULTI), members=["R=2"], instances=[{"i": 1}, {"i": 2}],
+                    starts="later")
+
+
+@needs_prism
+def test_conflict_that_needs_staggered_starts():
+    """A reparation of one instance in force while another instance
+    starts: a conflict that only instances with starts of their own have."""
+    sos = load_version(str(STARTS))
+    report = check(build_model(sos, members=["ROBOT=2"], instances=2), PRISM)
+    pairs = {tuple(c["norms"]) for c in report["conflicts"]}
+    assert pairs == {("grant_on_start@1", "lockout@2"), ("lockout@1", "grant_on_start@2")}
+    assert report["unconfirmed"] == []
+    for c in report["conflicts"]:
+        for w in c["witnesses"]:
+            starts = {k: json.loads(lines[0])["t"] for k, lines in w["traces"].items()}
+            assert len(set(starts.values())) == 2           # different starts
+            for k, lines in w["traces"].items():
+                r = evaluate(sos, parse_trace(lines))
+                states = {n["id"]: n["state"] for n in r["norms"]}
+                keep_id, keep_k = w["keeps"].split("@")
+                if keep_k == k:
+                    assert states[keep_id] != "violated"
+    together = check(build_model(sos, members=["ROBOT=2"], instances=2, starts="together"),
+                     PRISM)
+    assert together["conflicts"] == []
+
+
 @needs_prism
 def test_conflict_across_instances():
     sos, m, _pm = model_of("MULTI", **MULTI_KW)
@@ -802,6 +904,7 @@ def test_amendment_refusals():
     with pytest.raises(NormsCheckError, match="not translated together"):
         build_model(v1, members=["R=2"], instances=[{"i": 1}, {"i": 2}],
                     versions=[("v2.cadl", make_sos(AM_V2))])
+
 
 
 AM_SMALL_V1 = """\
