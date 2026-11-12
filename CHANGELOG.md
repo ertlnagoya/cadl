@@ -6,6 +6,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.27] — 2026-11-12
+
+Resolves the remaining verification items. The strategic export is run
+through PRISM-games 3.2.4 and agrees with `cadl game-check` on the
+bundled examples and 200 fuzz models (I.11); equilibrium maps use new
+sound conditions from the performance-difference identity, so that
+maps with three open parameters reach their resolution far more often
+(I.9). The Cedar agent policies are compared with `agents-decide` on
+the same input space as the Rego policies, and amendments are checked
+differentially against `cadl norms-diff`; this found and fixed how a
+norm whose new deadline has passed is settled at an amendment (F.6).
+Each part was reviewed independently before the release.
+
+Known limits: the second three-parameter example still exhausts the
+default cell budget (0.200 undecided); PRISM-games is run in CI on
+Python 3.12 only.
+
 ### Added
 
 - Equilibrium maps (`cadl game-check --certify`) use the conditions PD+
