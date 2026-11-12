@@ -443,8 +443,8 @@ def sol_run(lines: list, quantities: list) -> dict:
 
 def run_evm(compiled: dict, monitor: str, runs: list, tmp: Path) -> list:
     libs = ["Monitor.sol:CadlNormsValues", "Monitor.sol:CadlNormsEval",
-            "Monitor.sol:CadlNormsWindows", "Monitor.sol:CadlNormsItems",
-            "Monitor.sol:CadlNormsActs"]
+            "Monitor.sol:CadlNormsWindows", "Monitor.sol:CadlNormsMulti",
+            "Monitor.sol:CadlNormsItems", "Monitor.sol:CadlNormsActs"]
     job = {"contracts": compiled, "libraries": libs, "monitor": monitor, "runs": runs}
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / "job.json").write_text(json.dumps(job), encoding="utf-8")

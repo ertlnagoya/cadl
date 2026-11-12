@@ -850,6 +850,260 @@ library CadlNormsWindows {
     }
 }
 
+// A content with two temporal operators (F.4, F.5). Each operator has its
+// own record of what the observations say about its operands, and the
+// candidates of the norm are the leaves of a segment tree in storage. A
+// leaf holds, for its candidate, the values of the content for every
+// combination of operator values that the candidate can still reach: the
+// rest of the content is decided at the observation of the candidate, so
+// these values are computed there once (CadlNormsEval.table). An operator
+// is decided for a range of candidates at a time (a window that is over,
+// an operand that decides every open window), so an observation changes a
+// few ranges of the tree, each in a number of steps that grows with the
+// logarithm of the number of candidates; the root then says whether some
+// candidate holds and whether some candidate is still undecided.
+//
+// A node word: bits 0..63 say which (state, future) pairs have a candidate
+// whose content is true in that future, bits 64..127 the same for an
+// undecided content; a pair is 16 * d + f, where d says which operators are
+// still undecided for the candidate (bit 0: the first, bit 1: the second)
+// and f = va + 4 * vb gives the values of the two operators in the future
+// (X_D, X_T, X_F or X_U). Bits 128..133 hold the tags of the lazy
+// propagation: an operator decided to a value for the candidates below.
+struct MOp {
+    uint8 mode; uint256 tp; uint256 tq; int256 td; uint256 node;
+    bool uSet; uint256 u;        // the candidates at or before u have seen an undefined operand
+    bool puSet; uint256 pu;      // until: the last observation with p undefined
+}
+
+struct Multi {
+    uint256 root;                // the root of the content
+    MOp a;
+    MOp b;
+    uint256 gen;                 // the tree of the current activation
+    uint256 tail;                // the number of candidates
+    uint256 h;                   // the tree covers the candidates [0, 2^h)
+    bool pend;                   // a candidate was undecided at the last judgement
+    uint256 noted;               // n + 1 once observation n has been applied
+    uint8 sa; uint8 sb;          // the operators for a candidate at that observation
+    mapping(uint256 => uint256) k;       // the observation of a candidate
+    mapping(uint256 => int256) t;        // its time
+    mapping(uint256 => uint256) nodes;
+}
+
+library CadlNormsMulti {
+    uint256 internal constant BITS = (1 << 128) - 1;
+    uint256 internal constant CUR_T = 0x1000e1110eee0;
+    uint256 internal constant CUR_D = 0x1000e1110eee00000000000000000;
+
+    /// An observation, for the candidates there are (also while the norm
+    /// is suspended).
+    function note(Multi storage mu, EvalData storage data, uint256 n, int256 t) public {
+        if (mu.tail > 0) observe(mu, data, n, t);
+    }
+
+    /// The judgement of observation n when the norm is active: whether a
+    /// candidate holds, and whether none is undecided. `open`: the deadline
+    /// has not passed, so n is a candidate.
+    function judge(Multi storage mu, EvalData storage data, uint256 n, int256 t, bool open)
+            public returns (bool hit, bool empty) {
+        if (mu.noted != n + 1) observe(mu, data, n, t);
+        if (open) add(mu, data, n, t);
+        uint256 w = mu.tail == 0 ? 0 : mu.nodes[key(mu, mu.h, 0)];
+        hit = w & CUR_T != 0;
+        mu.pend = !hit && w & CUR_D != 0;
+        empty = !mu.pend;
+    }
+
+    /// A new activation starts without candidates.
+    function clear(Multi storage mu) internal {
+        mu.gen++;
+        mu.tail = 0;
+        mu.h = 0;
+        mu.pend = false;
+    }
+
+    function observe(Multi storage mu, EvalData storage data, uint256 n, int256 t) internal {
+        mu.noted = n + 1;
+        mu.sa = decide(mu, mu.a, 0, data, n, t);
+        mu.sb = decide(mu, mu.b, 1, data, n, t);
+    }
+
+    /// What observation n decides about operator i, for the candidates
+    /// before n; returns its value for a candidate at n.
+    function decide(Multi storage mu, MOp storage op, uint256 i, EvalData storage data, uint256 n, int256 t)
+            internal returns (uint8 now_) {
+        uint8 pv = code(CadlNormsEval.evaluate(data, op.tp, n, n));
+        uint8 qv = op.mode == W_UNTIL ? code(CadlNormsEval.evaluate(data, op.tq, n, n)) : X_F;
+        // the candidates whose window is over without a decisive value:
+        // undefined when an operand was undefined in it
+        uint256 x = firstFrom(mu, t - op.td);
+        if (x > 0) {
+            uint256 a = firstAfter(mu, op.uSet, op.u);
+            assign(mu, i, X_U, a < x ? a : x);
+            assign(mu, i, op.mode == W_THROUGHOUT ? X_T : X_F, x);
+        }
+        if (op.mode == W_WITHIN) {
+            if (pv == X_T) assign(mu, i, X_T, mu.tail);
+            if (pv == X_U) { op.uSet = true; op.u = n; }
+            return pv == X_T ? X_T : X_D;
+        }
+        if (op.mode == W_THROUGHOUT) {
+            if (pv == X_F) assign(mu, i, X_F, mu.tail);
+            if (pv == X_U) { op.uSet = true; op.u = n; }
+            return pv == X_F ? X_F : X_D;
+        }
+        // until(p, q): q true decides the candidates with p true since them,
+        // and makes the others uncertain; p false ends every window
+        if (qv == X_T) {
+            assignFrom(mu, i, firstAfter(mu, op.puSet, op.pu));
+            if (op.puSet && (!op.uSet || op.u < op.pu)) { op.uSet = true; op.u = op.pu; }
+        } else if (qv == X_U) {
+            op.uSet = true;
+            op.u = n;
+        }
+        if (pv == X_F) {
+            uint256 a = firstAfter(mu, op.uSet, op.u);
+            assign(mu, i, X_U, a);
+            assign(mu, i, X_F, mu.tail);
+        } else if (pv == X_U) {
+            op.puSet = true;
+            op.pu = n;
+        }
+        if (qv == X_T) return X_T;
+        if (pv == X_F) return qv == X_U ? X_U : X_F;
+        return X_D;
+    }
+
+    /// Candidate n, with the values of the content computed at n.
+    function add(Multi storage mu, EvalData storage data, uint256 n, int256 t) internal {
+        (uint256 ts, uint256 ds) = CadlNormsEval.table(data, mu.root, n, mu.a.node, mu.b.node);
+        uint256 sa = mu.sa;
+        uint256 sb = mu.sb;
+        if ((ts | ds) >> (sa + 4 * sb) & 1 == 0) return;     // decided, and not true
+        insert(mu, n, t, leaf(ts, ds, sa, sb));
+    }
+
+    /// The leaf of a candidate whose operators are sa and sb now.
+    function leaf(uint256 ts, uint256 ds, uint256 sa, uint256 sb) internal pure returns (uint256 bits) {
+        uint256 d = (sa == X_D ? 1 : 0) | (sb == X_D ? 2 : 0);
+        for (uint256 e = 0; e < 16; e++) {
+            if ((sa != X_D && e & 3 != sa) || (sb != X_D && e >> 2 != sb)) continue;
+            if (ts >> e & 1 != 0) bits |= 1 << (16 * d + e);
+            if (ds >> e & 1 != 0) bits |= 1 << (64 + 16 * d + e);
+        }
+    }
+
+    function insert(Multi storage mu, uint256 n, int256 t, uint256 bits) internal {
+        uint256 c = mu.tail;
+        // a new root above the old one when the tree is full (the loop
+        // below writes it)
+        if (c > 0 && c == 1 << mu.h) mu.h++;
+        mu.k[key(mu, 255, c)] = n;
+        mu.t[key(mu, 255, c)] = t;
+        mu.tail = c + 1;
+        mu.nodes[key(mu, 0, c)] = bits;
+        for (uint256 lvl = 1; lvl <= mu.h; lvl++) {
+            uint256 idx = c >> lvl;
+            mu.nodes[key(mu, lvl, idx)] = (mu.nodes[key(mu, lvl - 1, 2 * idx)]
+                                           | mu.nodes[key(mu, lvl - 1, 2 * idx + 1)]) & BITS;
+        }
+    }
+
+    // --- the tree ----------------------------------------------------------------------
+
+    function key(Multi storage mu, uint256 lvl, uint256 idx) internal view returns (uint256) {
+        return mu.gen << 128 | lvl << 64 | idx;
+    }
+
+    /// Operator i is v for the undecided candidates among [0, x).
+    function assign(Multi storage mu, uint256 i, uint8 v, uint256 x) internal {
+        if (x > 0) rec(mu, i, v, mu.h, 0, 0, x);
+    }
+
+    /// Operator i is true for the undecided candidates from y on.
+    function assignFrom(Multi storage mu, uint256 i, uint256 y) internal {
+        if (y < mu.tail) rec(mu, i, X_T, mu.h, 0, y, mu.tail);
+    }
+
+    function rec(Multi storage mu, uint256 i, uint8 v, uint256 lvl, uint256 idx, uint256 lo, uint256 hi) internal {
+        uint256 l = idx << lvl;
+        uint256 r = l + (1 << lvl);
+        if (r <= lo || l >= hi) return;
+        uint256 kk = key(mu, lvl, idx);
+        uint256 w = mu.nodes[kk];
+        if (w & undecided(i) == 0) return;               // nothing to decide below
+        if (lo <= l && r <= hi) {
+            mu.nodes[kk] = tagged(w, i, v);
+            return;
+        }
+        uint256 kl = key(mu, lvl - 1, 2 * idx);
+        uint256 kr = key(mu, lvl - 1, 2 * idx + 1);
+        // push the tags of the node to its children
+        for (uint256 j = 0; j < 2; j++) {
+            if (w >> (128 + 3 * j) & 1 == 0) continue;
+            uint8 vj = uint8(w >> (129 + 3 * j) & 3);
+            mu.nodes[kl] = tagged(mu.nodes[kl], j, vj);
+            mu.nodes[kr] = tagged(mu.nodes[kr], j, vj);
+        }
+        rec(mu, i, v, lvl - 1, 2 * idx, lo, hi);
+        rec(mu, i, v, lvl - 1, 2 * idx + 1, lo, hi);
+        mu.nodes[kk] = (mu.nodes[kl] | mu.nodes[kr]) & BITS;
+    }
+
+    function undecided(uint256 i) internal pure returns (uint256) {
+        return i == 0 ? 0xffff0000ffff0000ffff0000ffff0000 : 0xffffffff00000000ffffffff00000000;
+    }
+
+    /// The node with operator i decided to v for its undecided candidates.
+    function tagged(uint256 w, uint256 i, uint8 v) internal pure returns (uint256) {
+        if (w & undecided(i) == 0) return w;
+        uint256 x = w & BITS;
+        uint256 f;
+        uint256 vv = v;
+        if (i == 0) {
+            f = (1 << vv) | (1 << (vv + 4)) | (1 << (vv + 8)) | (1 << (vv + 12));
+            f = f | f << 32 | f << 64 | f << 96;
+            x = (x & 0xffff0000ffff0000ffff0000ffff) | (x >> 16 & f);
+        } else {
+            f = 0xf << (4 * vv);
+            f = f | f << 16 | f << 64 | f << 80;
+            x = (x & 0xffffffff00000000ffffffff) | (x >> 32 & f);
+        }
+        return x | (w & ~BITS) | (1 | vv << 1) << (128 + 3 * i);
+    }
+
+    // --- the candidates ----------------------------------------------------------------
+
+    /// The first candidate with a time at or after x, or tail.
+    function firstFrom(Multi storage mu, int256 x) internal view returns (uint256) {
+        uint256 lo = 0;
+        uint256 hi = mu.tail;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (mu.t[key(mu, 255, mid)] < x) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+
+    /// The first candidate at an observation after u (all when !set).
+    function firstAfter(Multi storage mu, bool set, uint256 u) internal view returns (uint256) {
+        if (!set) return 0;
+        uint256 lo = 0;
+        uint256 hi = mu.tail;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (mu.k[key(mu, 255, mid)] <= u) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+
+    function code(Val memory v) internal pure returns (uint8) {
+        if (v.k == K_B || v.k == K_N) return v.n != 0 ? X_T : X_F;
+        return X_U;
+    }
+}
+
 // The assume: and guarantee: items (value: 0 not decided, 1 true, 2 false,
 // 3 undefined), in a library of their own.
 struct Item { string text; bool temporal; bool broken; bool unsupported; uint256 root; }
@@ -942,7 +1196,8 @@ struct NormDef {
     string severity; bool hasSanction; string sanction; int256 reparation;
     bool hasReparationId; string reparationId; bool hasTransition; string transition;
     uint256[] activate; uint256[] suspend; uint256[] resume; uint256[] discharge;
-    // a content with a temporal operator (1, see `temporals`), or none (0)
+    // a content with one temporal operator (1, see `temporals`), two (2,
+    // see `multis`), or none (0)
     uint8 tmode;
 }
 struct Rule { string creates; bool broken; int256 when; int256 cond; }
@@ -975,6 +1230,8 @@ struct Monitor {
     // the candidates that are true with it and those that are never true
     mapping(uint256 => Temporal) temporals;
     mapping(uint256 => Windows) windows;
+    // by norm, for a content with two temporal operators
+    mapping(uint256 => Multi) multis;
     // --- the state of the contract instance
     uint256 observations;      // observations of the instance so far
     int256 lastT;
@@ -1005,6 +1262,7 @@ function setSt(Monitor storage m, uint256 i, uint8 st, uint256 n, int256 t) {
     else if (st == FULFILLED || st == DISCHARGED) r.verdict = V_FULFILLED;
     if (st >= FULFILLED) {
         CadlNormsWindows.clear(m.windows[i]);
+        CadlNormsMulti.clear(m.multis[i]);
     }
 }
 
@@ -1457,7 +1715,8 @@ abstract contract CadlNormsMonitorBase {
         for (uint256 i = 0; i < m.normDefs.length; i++) {
             NormDef storage d = m.normDefs[i];
             if (d.tmode == 0 || d.frozen) continue;
-            CadlNormsWindows.note(m.windows[i], m.data, m.temporals[i], n, t);
+            if (d.tmode == 1) CadlNormsWindows.note(m.windows[i], m.data, m.temporals[i], n, t);
+            else CadlNormsMulti.note(m.multis[i], m.data, n, t);
         }
         uint256[] memory violated = judge(n, t, msgs, created);
         for (uint256 v = 0; v < violated.length; v++) onViolation(violated[v], n, t, true);
@@ -1515,7 +1774,8 @@ abstract contract CadlNormsMonitorBase {
 
     function judgeWindow(uint256 i, uint256 n, int256 t, bool open) internal returns (bool hit, bool closed) {
         bool empty;
-        (hit, empty) = CadlNormsWindows.judge(m.windows[i], m.data, m.temporals[i], n, t, open);
+        if (m.normDefs[i].tmode == 1) (hit, empty) = CadlNormsWindows.judge(m.windows[i], m.data, m.temporals[i], n, t, open);
+        else (hit, empty) = CadlNormsMulti.judge(m.multis[i], m.data, n, t, open);
         closed = !hit && !open && empty;
     }
 
@@ -1559,7 +1819,7 @@ abstract contract CadlNormsMonitorBase {
             bool inForce = r.state == ACTIVE || r.state == SUSPENDED;
             if (inForce && r.act == int256(n)) { setSt(m, i, DISCHARGED, n, t); continue; }
             if (inForce && (d.kind == OBLIGATION || d.kind == PROHIBITION)
-                && CadlNormsWindows.pending(m.windows[i])) continue;
+                && (CadlNormsWindows.pending(m.windows[i]) || m.multis[i].pend)) continue;
             if (inForce && d.kind == OBLIGATION) {
                 if (!d.hasDeadline) { setSt(m, i, VIOLATED, n, t); late[c++] = i; }
                 else if (elapsed(m, i, t) <= d.deadline) setSt(m, i, DISCHARGED, n, t);
@@ -1645,6 +1905,16 @@ abstract contract CadlNormsMonitorBase {
         uint256 i = m.normDefs.length - 1;
         m.normDefs[i].tmode = 1;
         m.temporals[i] = Temporal(mode, tp, tq, td, node, root);
+    }
+
+    function _multi(uint256 root, uint8 ma, uint256 pa, uint256 qa, int256 da, uint256 na,
+                    uint8 mb, uint256 pb, uint256 qb, int256 db, uint256 nb) internal {
+        uint256 i = m.normDefs.length - 1;
+        m.normDefs[i].tmode = 2;
+        Multi storage mu = m.multis[i];
+        mu.root = root;
+        mu.a.mode = ma; mu.a.tp = pa; mu.a.tq = qa; mu.a.td = da; mu.a.node = na;
+        mu.b.mode = mb; mu.b.tp = pb; mu.b.tq = qb; mu.b.td = db; mu.b.node = nb;
     }
 
     function _actor(string memory name, bool isIndexed_, bool hasLo, int256 lo, bool hasHi, int256 hi) internal {

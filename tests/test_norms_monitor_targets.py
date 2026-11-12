@@ -233,14 +233,14 @@ class TestGeneration:
         assert temporal_names(solidity_ir(sos, sos.contracts[0])) == ["flag"]
         assert "temporalName[keccak256" in generate_norms_monitor_sol(sos, sos.contracts[0])
 
-    def test_solidity_refuses_two_temporal_operators_in_a_content(self):
-        """The Solidity monitor decides the candidates of a content from one
-        temporal operator; OPA monitors such a content too."""
-        content = "within(3s, A.x > 1) OR throughout(2s, A.y == 1)"
+    def test_solidity_refuses_three_temporal_operators_in_a_content(self):
+        """The Solidity monitor decides the candidates of a content from at
+        most two temporal operators; OPA monitors such a content too."""
+        content = "within(3s, A.x > 1) OR throughout(2s, A.y == 1) OR within(1s, A.z == 1)"
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
                      f"content: \"{content}\"}}\n")
         generate_norms_monitor_rego(sos, sos.contracts[0])
-        with pytest.raises(NormsTargetUnsupported, match="2 temporal operators"):
+        with pytest.raises(NormsTargetUnsupported, match="3 temporal operators"):
             generate_norms_monitor_sol(sos, sos.contracts[0])
 
     @pytest.mark.parametrize("content,call", [
@@ -250,10 +250,13 @@ class TestGeneration:
         ("NOT until(A.x > 1, A.y == 1, 3s)", "_temporal(3, "),
         ("within(3s, A.x > 1) == true", "_temporal(1, "),
         ("until(A.x > 1, A.y == 1, 3s) <= A.z", "_temporal(3, "),
+        ("within(3s, A.x > 1) OR throughout(2s, A.y == 1)", "_multi("),
+        ("within(3s, A.x > 1) == throughout(2s, A.y == 1)", "_multi("),
     ])
     def test_solidity_temporal_contents_it_decides(self, content, call):
         """One temporal operator anywhere in a content (under NOT, in a
-        comparison) goes to the queues of CadlNormsWindows."""
+        comparison) goes to the queues of CadlNormsWindows, two to the
+        segment tree of CadlNormsMulti."""
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
                      f"content: \"{content}\"}}\n")
         assert call in generate_norms_monitor_sol(sos, sos.contracts[0])
@@ -916,7 +919,8 @@ def test_evm_gas_of_a_temporal_content_is_bounded(tmp_path):
 # === NOT until, comparisons and two temporal operators (Solidity) ====================
 
 # NOT until(...) is the release on the dual queue; an operator inside a
-# comparison gives each candidate its own queue. Reparations, suspension,
+# comparison gives each candidate its own queue; two operators in one
+# content share a segment tree of candidates. Reparations, suspension,
 # undefined values and epoch timestamps.
 RELEASE = """\
       norms:
@@ -952,6 +956,27 @@ COMPARE = """\
         - {id: re, kind: power, bearer: B, content: "B -> A : resume",
            effects: {resume: [ce, cn, cl, ci, cr]}}
 """
+
+TWO = """\
+      norms:
+        - {id: wa, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(3s, A.x > 5) AND throughout(2s, A.ok == true)", deadline: 5s,
+           on_violation: {severity: Major, reparation: tr}}
+        - {id: wo, kind: prohibition, bearer: A,
+           content: "within(1s, A.x == 0) OR NOT until(A.ok == true, A.done == true, 2s)"}
+        - {id: ua, kind: obligation, bearer: A, trigger: "B -> A : start",
+           content: "until(A.ok == true, A.done == true, 3s) AND NOT within(2s, A.x > 8) OR A.z == 1",
+           deadline: 6s}
+        - {id: eq, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(2s, A.x > 5) == throughout(1s, A.y == 1)", deadline: 4s}
+        - {id: tr, kind: obligation, bearer: A,
+           content: "throughout(1s, A.y == 1) OR within(2s, A.done == true)", deadline: 3s}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [wa, wo, ua, eq, tr]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [wa, wo, ua, eq, tr]}}
+"""
+
 
 def _epoch_trace(rng: random.Random, length: int | None = None) -> list:
     """Like _window_trace, with values that are often undefined (null),
@@ -1032,7 +1057,8 @@ EDGES = [
 ]
 
 
-TEMPORAL_SETS = [("release", RELEASE, 20261301), ("compare", COMPARE, 20261302)]
+TEMPORAL_SETS = [("release", RELEASE, 20261301), ("compare", COMPARE, 20261302),
+                 ("two", TWO, 20261303)]
 
 
 @needs_evm
@@ -1066,7 +1092,9 @@ def test_opa_more_temporal_contents(name, blocks, seed, tmp_path, monkeypatch):
     assert {"fulfilled", "violated", "suspended"} <= seen["states"]
 
 
-GAS_CONTENTS = ["NOT until(A.x >= 0, A.x < 0, 1000s)", "throughout(1000s, A.x >= 0) == true"]
+GAS_CONTENTS = ["NOT until(A.x >= 0, A.x < 0, 1000s)", "throughout(1000s, A.x >= 0) == true",
+                "within(1000s, A.x < 0) OR throughout(1000s, A.x >= 0)",
+                "within(1000s, A.x >= 0) AND throughout(1000s, A.x >= 0)"]
 
 
 @needs_evm
@@ -1074,8 +1102,10 @@ GAS_CONTENTS = ["NOT until(A.x >= 0, A.x < 0, 1000s)", "throughout(1000s, A.x >=
 def test_evm_gas_of_more_temporal_contents_is_bounded(content, tmp_path):
     """NOT until, a comparison and two temporal operators (from the
     second set on): 320 observations at one per second into windows of
-    1000 s, each a candidate that stays undecided. The cost of an
-    observation stays within 10 % from the 20th observation on."""
+    1000 s, each a candidate that stays undecided. The mean cost of the
+    last 50 observations stays within 15 % of that of observations 20 to
+    70; with two operators the cost grows with the depth of the tree, a
+    step at each power of two of the candidates."""
     sos = _small("      norms:\n        - {id: p, kind: prohibition, bearer: A, "
                  f"content: \"{content}\"}}\n")
     contract = sos.contracts[0]
@@ -1086,7 +1116,8 @@ def test_evm_gas_of_more_temporal_contents_is_bounded(content, tmp_path):
     run["steps"] = [s for s in run["steps"] if "finish" not in s]
     [raw] = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", [run], tmp_path)
     gas = [r["gas"] for r in raw]
-    assert max(gas[20:]) < 1.1 * min(gas[20:]) and max(gas) < 1_000_000, (min(gas), max(gas))
+    early, late = sum(gas[20:70]) / 50, sum(gas[-50:]) / 50
+    assert late < 1.15 * early and max(gas) < 1_000_000, (early, late, max(gas))
 
 
 # === The range of exact numbers, exact deadlines, runtime size =======================
