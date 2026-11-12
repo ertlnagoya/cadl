@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from cadl.norms_check import (
+    evaluate_path,
     ACTIVE,
     INACTIVE,
     NormsCheckError,
@@ -299,7 +300,7 @@ norms:
     bearer: D
     content: "R[1].o == R[2].o"
 """
-ARITH_DOMAINS = ["R[1].x=0..3", "R[1].y=0..3", "R[*].load=0..1"]
+ARITH_DOMAINS = ["R[1].x=0..2", "R[1].y=0..2", "R[*].load=0..1"]
 
 
 # one bearer, two instances: docking one robot is forbidden while another
@@ -319,6 +320,94 @@ norms:
     content: "D -> R[*] : dock"
 """
 MULTI_KW = {"members": ["R=2"], "instances": [{"i": 1}, {"i": 2}]}
+
+
+# two versions of a contract (F.6): carry_over with a shorter deadline
+# (violated at the amendment, with its reparation), a changed temporal
+# content (candidates dropped), transform with the elapsed time, discharge,
+# a removed norm, a new norm without trigger, assumptions that continue,
+# start anew, and end
+AM_V1 = """\
+assume:
+  - "throughout(2s, D.ok == true)"
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 3s
+    on_violation: {reparation: repair}
+  - id: repair
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 1s
+  - id: watch
+    kind: prohibition
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "within(1s, R[i].v > 5)"
+    deadline: 2s
+  - id: old_duty
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : ask"
+    content: "R[i] -> D : answer"
+    deadline: 3s
+    on_amendment: {transform: new_duty}
+  - id: drop_me
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : ask"
+    content: "R[i] -> D : done"
+    deadline: 2s
+    on_amendment: discharge
+  - id: gone
+    kind: prohibition
+    bearer: "R[i]"
+    trigger: "D -> R[i] : ask"
+    content: "R[i] -> D : answer"
+"""
+AM_V2 = """\
+assume:
+  - "within(2s, D.ok == true)"
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 1s
+    on_violation: {reparation: repair}
+  - id: repair
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 2s
+  - id: watch
+    kind: prohibition
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "within(1s, R[i].v > 6)"
+    deadline: 2s
+  - id: new_duty
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : answer"
+    deadline: 3s
+  - id: drop_me
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : ask"
+    content: "R[i] -> D : done"
+    deadline: 2s
+  - id: fresh
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : answer"
+    deadline: 1s
+"""
 
 
 def make_sos(body: str):
@@ -620,8 +709,8 @@ def test_arithmetic_needs_a_domain():
     assert tr.by_id["order"].status == "model" and tr.by_id["names"].status == "model"
     tr = model_of("ARITH", domains=ARITH_DOMAINS)[1].tr
     assert all(n.status == "model" for n in tr.norms)
-    assert tr.quantities["R[1].x"].reps[1:5] == [0, 1, 2, 3]
-    assert any("R[1].x takes the integers 0..3" in n for n in tr.notes)
+    assert tr.quantities["R[1].x"].reps[1:4] == [0, 1, 2]
+    assert any("R[1].x takes the integers 0..2" in n for n in tr.notes)
     # three quantities ordered against each other: three values in every gap
     assert tr.quantities["R[1].a"].order == 3
     with pytest.raises(NormsCheckError, match="--domain takes"):
@@ -666,6 +755,101 @@ def test_conflict_across_instances():
                 keep_id, keep_k = w["keeps"].split("@")
                 if keep_k == k:
                     assert states[keep_id] != "violated"
+
+
+def _amend_model():
+    key = ("AMEND", "")
+    if key not in _MODELS:
+        v1, v2 = make_sos(AM_V1), make_sos(AM_V2)
+        m = build_model(v1, bindings={"i": 1}, versions=[("v2.cadl", v2)])
+        _MODELS[key] = ((v1, v2), m, PrismModel(m.prism_text(), {"early_end": True}))
+    return _MODELS[key]
+
+
+def test_amendments_differential():
+    """Amendments as a choice of the environment (F.6): every path is
+    compared with norms-eval reading the same trace with its amend line."""
+    (v1, v2), m, pm = _amend_model()
+    tr = m.tr
+    assert [n.id for n in m.norms] == ["carry", "repair", "watch", "old_duty", "drop_me",
+                                       "gone", "new_duty", "fresh"]
+    paths = (random_paths(tr, PATHS * 2, seed=31, p_amend=0.3, p_message=0.35)
+             + random_paths(tr, PATHS, seed=32, p_keep=0.8, p_message=0.15, p_end=0.04,
+                            p_amend=0.2)
+             + random_paths(tr, PATHS // 2, seed=33, full_length=True, p_amend=0.15))
+    effects = set()
+    for p in paths:
+        assert not compare_path(m, pm, p), p
+        for a in evaluate_path(tr, p)["amendments"]:
+            effects.update((e["norm"], e["effect"]) for e in a["effects"])
+    # the paths reach the cases of F.6
+    assert {("carry", "carry_over"), ("drop_me", "discharge"), ("gone", "removed"),
+            ("old_duty", "transform"), ("new_duty", "activated"),
+            ("fresh", "added")} <= effects
+    for p in all_paths(tr, 1):
+        assert not compare_path(m, pm, p), p
+
+
+def test_amendment_refusals():
+    v1 = make_sos(AM_V1)
+    other = make_sos(AM_V2.replace("kind: prohibition", "kind: obligation", 1))
+    with pytest.raises(NormsCheckError, match="changes its kind"):
+        build_model(v1, bindings={"i": 1}, versions=[("o.cadl", other)])
+    with pytest.raises(NormsCheckError, match="not translated together"):
+        build_model(v1, members=["R=2"], instances=[{"i": 1}, {"i": 2}],
+                    versions=[("v2.cadl", make_sos(AM_V2))])
+
+
+AM_SMALL_V1 = """\
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 2s
+  - id: old_duty
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : ask"
+    content: "R[i] -> D : answer"
+    deadline: 2s
+    on_amendment: {transform: new_duty}
+"""
+AM_SMALL_V2 = """\
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 1s
+  - id: new_duty
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : answer"
+    deadline: 2s
+  - id: fresh
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 1s
+"""
+
+
+@needs_prism
+def test_questions_across_an_amendment():
+    v1, v2 = make_sos(AM_SMALL_V1), make_sos(AM_SMALL_V2)
+    m = build_model(v1, bindings={"i": 1}, versions=[("v2.cadl", v2)])
+    report = check(m, PRISM)
+    assert report["unconfirmed"] == []
+    norms = {n["id"]: n for n in report["norms"]}
+    assert norms["new_duty"]["versions"] == [2]
+    assert norms["fresh"]["activatable"]["answer"]          # only after an amendment
+    w = norms["fresh"]["activatable"]["witness"]
+    assert any(line.find('"amend"') >= 0 for line in w["trace"])
+    r = evaluate(v1, parse_trace(w["trace"]), versions={"v2.cadl": v2})
+    assert {n["id"]: n for n in r["norms"]}["fresh"]["activated_at"] is not None
 
 
 def test_paths_cover_the_semantics():

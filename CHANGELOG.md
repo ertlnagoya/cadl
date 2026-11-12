@@ -51,6 +51,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   bindings of that instance. At most 4 instances.
   `examples/norms_check_instances.cadl` finds a conflict across two
   robots' instances.
+- `cadl norms-check --version FILE` (repeatable) models amendments
+  (F.6): at any observation the environment may amend the contract to the
+  next version, which applies `on_amendment:` (`carry_over` with the
+  elapsed time and, for an unchanged content, the pending candidates;
+  `discharge`; `transform:` with the elapsed time), removes and adds norms,
+  continues, starts and closes assumptions, and switches the counts-as
+  rules, as `cadl norms-eval` does. The norms of every version share one
+  set of variables per id; the questions are asked across the amendment,
+  and witnesses carry the `amend` line. Versions with other actors or
+  another lifecycle, a norm whose kind changes, an untranslated norm or
+  rule in some version, and amendments with several instances are
+  refused. PRISM now runs with `-javamaxmem 4g` (`CADL_PRISM_JAVAMAXMEM`).
 
 ### Fixed
 

@@ -378,6 +378,11 @@ def main(argv: list[str] | None = None) -> int:
     nchk_cmd.add_argument("--instances", type=int, default=None, metavar="N",
                           help="Check N instances together, which bind the one open index to "
                                "the first N members of its set")
+    nchk_cmd.add_argument("--version", dest="versions", action="append", default=[],
+                          type=Path, metavar="FILE",
+                          help="A later version of the file: the environment may amend the "
+                               "contract to it at any observation (F.6); repeat for a sequence "
+                               "of amendments")
     nchk_cmd.add_argument("--domain", action="append", default=[], metavar="Q=lo..hi",
                           help="Integer domain of a quantity used in arithmetic, sum or avg "
                                "(ROBOT[*].load=0..5); the answers then hold for traces whose "
@@ -1209,7 +1214,8 @@ def _cmd_norms_check(args: argparse.Namespace) -> int:
         report = check_file(args.file, args.contract, args.bindings, args.members,
                             args.step, args.horizon, args.export, timeout=args.timeout,
                             domains=args.domain,
-                            instances=args.instance or args.instances)
+                            instances=args.instance or args.instances,
+                            versions=args.versions)
     except NormsEvalError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
