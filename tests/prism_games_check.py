@@ -132,6 +132,11 @@ def _parse_state(model, text: str) -> tuple:
     return tuple(out)
 
 
+class NotConverged(RuntimeError):
+    """PRISM-games did not converge (value iteration up to -maxiters); the
+    model is not compared."""
+
+
 def run_prism(prism: str, text: str, props: list, consts: str = "",
               options: tuple = PRISM_OPTIONS) -> str:
     with tempfile.TemporaryDirectory() as d:
@@ -146,6 +151,8 @@ def run_prism(prism: str, text: str, props: list, consts: str = "",
         if consts:
             cmd += ["-const", consts]
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=900).stdout
+    if re.search(r"^Error: Iterative method did not converge", out, re.M):
+        raise NotConverged(re.search(r"^Error: (.*)$", out, re.M).group(1))
     if re.search(r"^Error", out, re.M):
         raise RuntimeError(f"PRISM-games reports an error:\n{out[-4000:]}")
     return out
@@ -310,7 +317,7 @@ class DesignRun:
             # the shifted one. On all of Reach_p (the player is free): V_p
             # from the pinned structure, V*_p from the shifted one.
             v_terms: dict = {}
-            v_shift, v, v_star = {}, {}, {}
+            v_shift, v, v_star, scale = {}, {}, {}, {}
             for (free, k), (player, kind, w, per_state) in values.items():
                 if player != p.id:
                     continue
@@ -321,19 +328,26 @@ class DesignRun:
                             v_terms[g] = v_terms.get(g, 0.0) + float(w) * per_state[g]
                         elif kind == "shifted":
                             v_shift[g] = per_state[g] - float(h_of[g])
+                            scale[g] = max(scale.get(g, 1.0), abs(per_state[g]))
                 elif free == i + 1:
                     for g in proc.states:
                         if kind == "shifted":
                             v_star[g] = per_state[g] - float(h_of[g])
+                            scale[g] = max(scale.get(g, 1.0), abs(per_state[g]))
                         elif kind == "pinned":
                             v[g] = per_state[g] - float(h_of[g])
+                            scale[g] = max(scale.get(g, 1.0), abs(per_state[g]))
             result[p.id] = {"terms": v_terms, "shifted": v_shift, "pinned": v,
-                            "star": v_star}
+                            "star": v_star, "scale": scale}
         return result
 
 
-def _close(a: float, b: float) -> bool:
-    return abs(a - b) <= TOL * max(1.0, abs(a), abs(b))
+def _close(a: float, b: float, scale: float = 1.0) -> bool:
+    """Equal up to the relative tolerance. `scale` is the size of the
+    operands a value was computed from: V_p and V*_p − V_p come from the
+    shifted values V_p + h and V*_p + h, whose rounding error is relative
+    to their size, not to the size of the difference."""
+    return abs(a - b) <= TOL * max(1.0, abs(a), abs(b), scale)
 
 
 def compare_model(model, prism: str, stats: dict | None = None) -> list:
@@ -354,27 +368,40 @@ def compare_model(model, prism: str, stats: dict | None = None) -> list:
             key = (d["design"], q.profile)
             if key not in runs:
                 run = DesignRun(model, design, q.profile, prism)
+                try:
+                    solved_run = run.solve()
+                except NotConverged as e:
+                    # Value iteration of PRISM-games stopped at -maxiters: its
+                    # values are not answers, and this design is not compared.
+                    count("not compared: PRISM-games did not converge")
+                    stats.setdefault("not converged", []).append(
+                        f"{q.id} {d['design']}: {e}")
+                    runs[key] = None
+                    continue
                 n = run.states_of_export()
                 count("designs")
                 if n != len(run.game.states):
                     problems.append(f"{key}: PRISM-games builds {n} states, cadl "
                                     f"{len(run.game.states)}")
-                runs[key] = (run, run.solve())
+                runs[key] = (run, solved_run)
+            if runs[key] is None:
+                continue
             run, solved = runs[key]
             game = run.game
-            gains, sgains = {}, {}
+            gains, sgains, scales = {}, {}, {}
             for e in d["players"]:
                 p = e["player"]
                 got = solved[p]
                 at = player_at_point(game, q.profile, p, ())
-                v, v_star = got["pinned"], got["star"]
+                v, v_star, scale = got["pinned"], got["star"], got["scale"]
+                scales[p] = max(scale.values(), default=1.0)
                 checks = [("payoff", e["payoff"], got["terms"][0]),
                           ("payoff (shifted)", e["payoff"], got["shifted"][0]),
                           ("payoff (pinned)", e["payoff"], v[0]),
                           ("best-response value", e["best_response_value"], v_star[0])]
                 for name, mine, theirs in checks:
                     count("values")
-                    if not _close(float(mine), theirs):
+                    if not _close(float(mine), theirs, scale.get(0, 1.0)):
                         problems.append(f"{q.id} {d['design']} {p}: {name} cadl "
                                         f"{float(mine)!r}, PRISM-games {theirs!r}")
                 proc = build_process(game, p, q.profile, point_distributions(game, ()))
@@ -383,15 +410,17 @@ def compare_model(model, prism: str, stats: dict | None = None) -> list:
                 mine_v = {g: profile_values[i] for i, g in enumerate(proc.states)}
                 for g, x in got["terms"].items():
                     count("state values")
-                    if not (_close(float(mine_v[g]), x) and _close(x, got["shifted"][g])):
+                    if not (_close(float(mine_v[g]), x, scale.get(g, 1.0))
+                            and _close(x, got["shifted"][g], scale.get(g, 1.0))):
                         problems.append(f"{q.id} {d['design']} {p}: V_p at {game.states[g]} "
                                         f"cadl {float(mine_v[g])!r}, PRISM-games {x!r} "
                                         f"(shifted {got['shifted'][g]!r})")
                 state_gain = 0.0
                 for g in v:
                     count("state values", 2)
-                    if not (_close(float(mine_v[g]), v[g])
-                            and _close(float(at.state_gains[g]), v_star[g] - v[g])):
+                    if not (_close(float(mine_v[g]), v[g], scale.get(g, 1.0))
+                            and _close(float(at.state_gains[g]), v_star[g] - v[g],
+                                       scale.get(g, 1.0))):
                         problems.append(f"{q.id} {d['design']} {p}: at {game.states[g]} "
                                         f"V_p cadl {float(mine_v[g])!r}, PRISM-games {v[g]!r}; "
                                         f"V*-V cadl {float(at.state_gains[g])!r}, "
@@ -403,7 +432,8 @@ def compare_model(model, prism: str, stats: dict | None = None) -> list:
             measure = sgains if q.concept == "every_reachable_state" else gains
             exact = {e["player"]: (e["state_gain"] if q.concept == "every_reachable_state"
                                    else e["gain"]) for e in d["players"]}
-            near = [p for p, x in measure.items() if abs(x - eps) <= TOL * max(1.0, eps)]
+            near = [p for p, x in measure.items()
+                    if abs(x - eps) <= TOL * max(1.0, eps, scales[p])]
             if near:
                 # A floating-point gain within the tolerance of ε does not
                 # decide the verdict; the exact gain of cadl must then be ε.
@@ -422,7 +452,7 @@ def compare_model(model, prism: str, stats: dict | None = None) -> list:
                     problems.append(f"{q.id} {d['design']}: deviators cadl {d['deviators']}, "
                                     f"PRISM-games {deviators}")
             if d.get("from_every_state") is not None:
-                pg_every = all(x <= TOL for x in sgains.values())
+                pg_every = all(x <= TOL * max(1.0, scales[p]) for p, x in sgains.items())
                 count("from_every_state")
                 if pg_every != d["from_every_state"]:
                     problems.append(f"{q.id} {d['design']}: from_every_state cadl "

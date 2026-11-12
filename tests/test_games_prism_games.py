@@ -83,6 +83,26 @@ class TestPrismGames:
             out = run_prism(PRISM_GAMES, text, ['<<R_>> R{"effort"}max=? [ F "delivered" ]'])
             assert re.search(r"^Result: ", out, re.M)
 
+    def test_tolerance_follows_the_shifted_values(self):
+        # p = 0.999: the expected number of steps is about 1000, so the
+        # shifted values V + h are large, and V* − V = 0 comes out of
+        # PRISM-games as a difference of about 1e-6 in absolute terms; the
+        # tolerance is relative to the shifted values (a review finding).
+        model = _model(Path(__file__).parent / "data" / "games_slow_0999.cadl")
+        stats: dict = {}
+        assert compare_model(model, PRISM_GAMES, stats) == []
+        assert stats["designs"] == 1 and "not converged" not in stats
+
+    def test_no_comparison_when_prism_games_does_not_converge(self):
+        # p = 0.9995: value iteration of PRISM-games stops at -maxiters.
+        # The design is reported as not compared, not as a difference.
+        model = _model(Path(__file__).parent / "data" / "games_slow_09995.cadl")
+        stats: dict = {}
+        assert compare_model(model, PRISM_GAMES, stats) == []
+        assert stats["not compared: PRISM-games did not converge"] == 1
+        assert "did not converge" in stats["not converged"][0]
+        assert "designs" not in stats
+
     @pytest.mark.parametrize("name", ["loc", "goal", "a", "p", "steps", "main"])
     def test_player_named_like_another_identifier(self, name):
         # I.11 leaves open whether PRISM-games accepts such a player;

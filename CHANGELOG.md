@@ -36,7 +36,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `tests/games_fuzz.py`. The exported file is used unchanged, followed by
   a module that fixes the players other than one to the profile and by a
   reward structure that is not negative (PRISM-games rejects negative
-  rewards; the shift telescopes along every play). The tests are skipped
+  rewards; the shift telescopes along every play). Values are compared
+  with a tolerance relative to the shifted values they come from, and a
+  design on which the value iteration of PRISM-games does not converge
+  is reported as not compared. The tests are skipped
   without PRISM-games (`CADL_PRISM_GAMES`, or `prism-games` on PATH). The
   CI installs PRISM-games 3.2.4 (Linux x86-64 release, pinned by its
   SHA-256) for Python 3.12.

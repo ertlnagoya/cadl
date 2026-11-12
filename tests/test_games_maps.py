@@ -318,14 +318,62 @@ class TestMapOverLambdaAndFailure:
         game = prepare_map(ROBOT_MODEL, query, design, None)
         cells = design_map_cells(game, query)
         assert cells
+        e2 = 0
         for cell in cells:
-            on = player_on_cell(game, "comply", "R", cell, cell_distributions(game, cell), F(0))
-            assert on.e2 and not on.e1 and not on.n
+            # E2 alone, without PD+ and PD− (I.9); E1 fails on every cell.
+            on = player_on_cell(game, "comply", "R", cell, cell_distributions(game, cell), F(0),
+                                use_advantages=False)
+            assert not on.e1 and not on.n
+            e2 += on.e2
             proc = build_process(game, "R", "comply", cell_distributions(game, cell))
             lo, hi = reward_bounds(game, proc, cell)
             b = optimal_values(proc, _all(proc), hi)[0]
             l = optimal_values(proc, _profile(proc), lo, maximize=False)[0]
             assert not condition_e1(b, l, F(0))
+        # The map of 0.3.26 (without PD+ and PD−): E2 decides every cell.
+        import cadl.games_eval as ge
+        saved = ge.USE_ADVANTAGES
+        ge.USE_ADVANTAGES = False
+        try:
+            old_cells = design_map_cells(game, query)
+        finally:
+            ge.USE_ADVANTAGES = saved
+        for cell in old_cells:
+            on = player_on_cell(game, "comply", "R", cell, cell_distributions(game, cell), F(0),
+                                use_advantages=False)
+            assert on.e2 and not on.e1 and not on.n
+        assert e2 > 0
+
+    def test_pd_plus_reaches_the_same_conclusion(self):
+        """PD+ of I.9 alone establishes V*_R = V_R on the equilibrium cells
+        that E2 decides, and on those it decides where E2 fails."""
+        from cadl.games_eval import (
+            advantage_bounds,
+            advantage_reward,
+            reward_bounds,
+        )
+        design = ROBOT_MODEL.design("DISTRIBUTED")
+        query = ROBOT_MODEL.equilibria[3]
+        game = prepare_map(ROBOT_MODEL, query, design, None)
+        cells = design_map_cells(game, query)
+        assert cells
+        only_pd = 0
+        for cell in cells:
+            proc = build_process(game, "R", "comply", cell_distributions(game, cell))
+            lo, hi = reward_bounds(game, proc, cell)
+            lower = optimal_values(proc, _profile(proc), lo, maximize=False)
+            upper = optimal_values(proc, _profile(proc), hi, maximize=True)
+            adv = advantage_bounds(game, proc, cell, lower, upper)
+            g_up = optimal_values(proc, _all(proc), advantage_reward(proc, adv, 1))
+            # g⁺_R(s) ≤ 0 in every state of R_C(R) without the target: the
+            # conclusion of E2, V*_R = V_R on Reach_R at every valuation.
+            assert all(g_up[i] <= 0 for i in range(len(proc.states)) if not proc.target[i])
+            on = player_on_cell(game, "comply", "R", cell, cell_distributions(game, cell), F(0))
+            assert on.e2 and not on.n
+            only_pd += not player_on_cell(game, "comply", "R", cell,
+                                          cell_distributions(game, cell), F(0),
+                                          use_advantages=False).e2
+        assert only_pd > 0
 
 
 TABLE = """
