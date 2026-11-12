@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -99,11 +100,20 @@ def _unknown(msg, unknown_fields) -> bool:
 class GrpcBinding:
     """The gRPC service of a gateway (`A2AGateway`)."""
 
-    def __init__(self, gw, mtls: bool) -> None:
+    def __init__(self, gw, mtls: bool, read_timeout: float = 10.0, max_readers: int = 64,
+                 max_readers_per_address: int = 4, max_readers_per_prefix: int = 16) -> None:
         (self.grpc, self.pb, self.json_format, self.empty, self.status_pb,
          self.details_pb, self.unknown_fields) = modules()
         self.gw, self.mtls = gw, mtls
         self.ids = itertools.count(1)
+        self.read_timeout = read_timeout
+        self.max_readers = max_readers
+        self.max_readers_per_address = max_readers_per_address
+        self.max_readers_per_prefix = max_readers_per_prefix
+        self.lock = threading.Lock()
+        self.readers = 0
+        self.address_count: dict = {}
+        self.prefix_count: dict = {}
 
     def _class(self, name: str):
         return self.empty.Empty if name == "Empty" else getattr(self.pb, name)
@@ -111,13 +121,17 @@ class GrpcBinding:
     def handler(self):
         grpc = self.grpc
         handlers = {}
+        # The handlers take the requests as a stream (on the wire a unary
+        # request is a stream of one message), so that the gateway, not
+        # gRPC, waits for the request message: under the read deadline and
+        # within the caps on calls not yet authenticated (`_receive`).
         for name, (_, _, streaming) in METHODS.items():
             if streaming:
-                handlers[name] = grpc.unary_stream_rpc_method_handler(
+                handlers[name] = grpc.stream_stream_rpc_method_handler(
                     self._streaming(name), request_deserializer=None,
                     response_serializer=None)
             else:
-                handlers[name] = grpc.unary_unary_rpc_method_handler(
+                handlers[name] = grpc.stream_unary_rpc_method_handler(
                     self._unary(name), request_deserializer=None, response_serializer=None)
         return grpc.method_handlers_generic_handler(SERVICE, handlers)
 
@@ -159,22 +173,87 @@ class GrpcBinding:
         return out
 
     def _peer(self, context) -> str | None:
+        """With mutual TLS, the actor of the client certificate, read from
+        its full subject (`x509_pem_cert`): exactly one common name, which is
+        an actor of the gateway; "" for anything else."""
         if not self.mtls:
             return None
         from .a2a_gateway import certificate_actor
-        names = (context.auth_context() or {}).get("x509_common_name") or []
-        if len(names) != 1:
+        pems = (context.auth_context() or {}).get("x509_pem_cert") or []
+        if len(pems) != 1:
             return ""
-        try:
-            cn = names[0].decode("utf-8")
-        except UnicodeDecodeError:
+        names = common_names(pems[0])
+        if names is None or len(names) != 1:
             return ""
-        actor = certificate_actor({"subject": ((("commonName", cn),),)})
+        actor = certificate_actor({"subject": ((("commonName", names[0]),),)})
         return actor if actor is not None and actor in self.gw.cert_actors() else ""
 
-    def _call(self, name: str, raw: bytes, context):
-        """Authenticate, parse and dispatch one RPC: the Reply of the
-        gateway."""
+    def _receive(self, requests, context) -> bytes:
+        """The one request message of a call, received within the read
+        deadline, while the call takes one of the places of calls not yet
+        authenticated: at most `max_readers_per_address` of one peer
+        address (from the peer string of gRPC, counted as at the HTTP
+        listener), `max_readers_per_prefix` of one IPv4 /24 or IPv6 /48, and
+        `max_readers` in all. Beyond them the call is refused at once
+        (`overloaded`); a call whose message has not arrived at the deadline
+        is cancelled (`read_timeout`)."""
+        from .a2a_gateway import _Server
+        gw = self.gw
+        host = peer_host(context.peer())
+        key, prefix = _Server.peer_key((host,)), _Server.prefix_key((host,))
+        with self.lock:
+            if self.address_count.get(key, 0) >= self.max_readers_per_address:
+                full = "grpc address"
+            elif self.prefix_count.get(prefix, 0) >= self.max_readers_per_prefix:
+                full = "grpc prefix"
+            elif self.readers >= self.max_readers:
+                full = "grpc readers"
+            else:
+                full = None
+                self.readers += 1
+                self.address_count[key] = self.address_count.get(key, 0) + 1
+                self.prefix_count[prefix] = self.prefix_count.get(prefix, 0) + 1
+        if full is not None:
+            gw.refused("overloaded", full)
+            self._abort(context, None, "the gateway is busy", "RESOURCE_EXHAUSTED")
+        expired = threading.Event()
+
+        def expire() -> None:
+            expired.set()
+            gw.refused("read_timeout", "grpc deadline")
+            context.cancel()
+        timer = threading.Timer(self.read_timeout, expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            try:
+                raw = next(requests)
+                more = next(requests, None)
+            except StopIteration:
+                raw, more = None, None
+            except Exception:       # noqa: BLE001 - the call was cancelled
+                raw, more = None, None
+        finally:
+            timer.cancel()
+            with self.lock:
+                self.readers -= 1
+                for table, k in ((self.address_count, key), (self.prefix_count, prefix)):
+                    n = table.get(k, 1) - 1
+                    if n > 0:
+                        table[k] = n
+                    else:
+                        table.pop(k, None)
+        if expired.is_set():
+            self._abort(context, None, "the request did not arrive in time",
+                        "DEADLINE_EXCEEDED")
+        if not isinstance(raw, bytes) or more is not None:
+            self._abort(context, INVALID_PARAMS, "Invalid params: a call has exactly one "
+                                                 "request message")
+        return raw
+
+    def _call(self, name: str, requests, context):
+        """Receive, authenticate, parse and dispatch one RPC: the Reply of
+        the gateway."""
         gw = self.gw
         if gw.stopped:
             self._abort(context, None, "the gateway has stopped", "UNAVAILABLE")
@@ -182,6 +261,16 @@ class GrpcBinding:
         if peer == "":
             gw.refused("handshake_failed", "unknown_certificate")
             self._abort(context, None, "Unauthorized", "UNAUTHENTICATED")
+        # Before the message is awaited: the header has to be one that could
+        # authenticate (its form, an actor with a key, the certificate's
+        # actor), so that a call without one takes no place at all.
+        values = self._metadata(context, "authorization")
+        why = gw.header_refusal(values, peer)
+        if why is not None:
+            with gw.lock:
+                gw._unauthenticated(why)
+            self._abort(context, None, "Unauthorized", "UNAUTHENTICATED")
+        raw = self._receive(requests, context)
         actor, why = gw._authenticate(self._metadata(context, "authorization"),
                                       f"/{SERVICE}/{name}", raw, peer, "POST")
         if actor is None:
@@ -219,8 +308,8 @@ class GrpcBinding:
             return None
 
     def _unary(self, name: str):
-        def rpc(raw: bytes, context) -> bytes:
-            reply = self._call(name, raw, context)
+        def rpc(requests, context) -> bytes:
+            reply = self._call(name, requests, context)
             if reply is None:
                 self._abort(context, None, "cancelled", "CANCELLED")
             body = reply.body
@@ -239,8 +328,8 @@ class GrpcBinding:
                                      "response")
 
     def _streaming(self, name: str):
-        def rpc(raw: bytes, context):
-            reply = self._call(name, raw, context)
+        def rpc(requests, context):
+            reply = self._call(name, requests, context)
             if reply is None:
                 self._abort(context, None, "cancelled", "CANCELLED")
             if reply.stream is None:
@@ -277,16 +366,71 @@ class GrpcBinding:
         return rpc
 
 
+def peer_host(peer: str) -> str:
+    """The address of a gRPC peer string (`ipv4:1.2.3.4:5`, `ipv6:[::1]:5`)."""
+    peer = peer or ""
+    if peer.startswith("ipv4:"):
+        return peer[5:].rsplit(":", 1)[0]
+    if peer.startswith("ipv6:"):
+        return peer[5:].rsplit(":", 1)[0].strip("[]")
+    return peer
+
+
+def common_names(pem: bytes) -> list[str] | None:
+    """The common names of the subject of a PEM certificate, in order; None
+    when it cannot be read. With `cryptography` when it is installed (it
+    comes with the gRPC extra), else with the decoder of the standard
+    library."""
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        x509 = None
+    try:
+        if x509 is not None:
+            cert = x509.load_pem_x509_certificate(pem)
+            return [str(a.value) for a in
+                    cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)]
+        import os
+        import ssl
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".pem")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(pem)
+            decoded = ssl._ssl._test_decode_cert(path)       # noqa: SLF001
+        finally:
+            os.unlink(path)
+        return [v for rdn in decoded.get("subject", ()) for k, v in rdn
+                if k == "commonName"]
+    except Exception:       # noqa: BLE001 - unreadable: refused by the caller
+        return None
+
+
 def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | None,
-          client_ca: Path | None, max_workers: int):
-    """Start the gRPC service of `gw` on `listen`: (server, port)."""
+          client_ca: Path | None, max_handlers: int, read_timeout: float = 10.0,
+          max_readers: int = 64, max_readers_per_address: int = 4,
+          max_readers_per_prefix: int = 16):
+    """Start the gRPC service of `gw` on `listen`: (server, port). Its
+    workers are enough for `max_readers` calls not yet authenticated next
+    to `max_handlers` + 16 authenticated ones, so that the former cannot
+    take the places of the latter."""
     grpc = modules()[0]
-    binding = GrpcBinding(gw, mtls=client_ca is not None)
+    binding = GrpcBinding(gw, mtls=client_ca is not None, read_timeout=read_timeout,
+                          max_readers=max_readers,
+                          max_readers_per_address=max_readers_per_address,
+                          max_readers_per_prefix=max_readers_per_prefix)
+    workers = max_handlers + 16 + max_readers
     server = grpc.server(
-        ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cadl-grpc"),
-        handlers=[binding.handler()], maximum_concurrent_rpcs=max_workers,
+        ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cadl-grpc"),
+        handlers=[binding.handler()], maximum_concurrent_rpcs=workers,
         options=[("grpc.max_receive_message_length", MAX_MESSAGE),
                  ("grpc.max_send_message_length", 16 << 20),
+                 ("grpc.max_concurrent_streams", 16),
+                 ("grpc.max_metadata_size", 16 << 10),
+                 ("grpc.http2.min_ping_interval_without_data_ms", 10_000),
+                 ("grpc.http2.max_ping_strikes", 2),
+                 ("grpc.max_connection_idle_ms", 120_000),
                  ("grpc.so_reuseport", 0)])
     host, port = listen
     address = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"

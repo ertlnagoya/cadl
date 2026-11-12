@@ -555,10 +555,12 @@ def test_a2a_sdk_rest_binding(tmp_path, a2a_sdk, upstream):
 @pytest.mark.parametrize("binding", ["JSONRPC", "HTTP+JSON"])
 def test_a2a_sdk_push_notifications(tmp_path, a2a_sdk, binding):
     """Push notifications (--push-allow) with the push sender of the SDK
-    agent and the `a2a-sdk` client: a configuration given with SendMessage
-    and one created for a running task; the agent sends its notifications
-    to the gateway, which relays them to the client's webhook with the
-    client's token and credentials, and records them."""
+    agent and the `a2a-sdk` client: a configuration given with a SendMessage
+    with returnImmediately, and one created for the running task. A
+    configuration is bound to the task that the agent's answer names; the
+    gateway drops the notifications that come before that answer (the SDK
+    agent sends some while it creates the task) and relays the later ones
+    to the client's webhook, with the client's token and credentials."""
     import asyncio
 
     from a2a.client import ClientConfig, ClientFactory
@@ -582,17 +584,18 @@ def test_a2a_sdk_push_notifications(tmp_path, a2a_sdk, binding):
             authentication=AuthenticationInfo(scheme="Bearer", credentials=f"cred-{path}"),
             **kw)
 
+    def completed(path: str) -> bool:
+        return any(g["path"] == path and g["body"].get("statusUpdate", {}).get(
+            "status", {}).get("state") == "TASK_STATE_COMPLETED" for g in hook.got)
+
     async def run():
         async with gw.httpx_client() as hc:
             client = await ClientFactory(ClientConfig(
                 httpx_client=hc, streaming=False,
                 supported_protocol_bindings=[binding])).create_from_url(gw.url)
-            req = SendMessageRequest(message=gw.message("summarize", "one"))
-            req.configuration.CopyFrom(SendMessageConfiguration(
-                task_push_notification_config=config("a")))
-            out["one"] = [_dict(ev) async for ev in client.send_message(req)]
             req = SendMessageRequest(message=gw.message("summarize", "wait"))
-            req.configuration.CopyFrom(SendMessageConfiguration(return_immediately=True))
+            req.configuration.CopyFrom(SendMessageConfiguration(
+                return_immediately=True, task_push_notification_config=config("a", id="a1")))
             sent = [_dict(ev) async for ev in client.send_message(req)]
             tid = out["tid"] = sent[0]["task"]["id"]
             out["made"] = _dict(await client.create_task_push_notification_config(
@@ -600,15 +603,12 @@ def test_a2a_sdk_push_notifications(tmp_path, a2a_sdk, binding):
             out["list"] = _dict(await client.list_task_push_notification_configs(
                 ListTaskPushNotificationConfigsRequest(task_id=tid)))
             gw.agent.executor.release.set()
-            await asyncio.to_thread(wait_for, lambda: any(
-                g["path"] == "/hooks/b" and g["body"].get("statusUpdate", {}).get(
-                    "status", {}).get("state") == "TASK_STATE_COMPLETED" for g in hook.got),
-                "the notification of completion")
+            await asyncio.to_thread(wait_for, lambda: completed("/hooks/a")
+                                    and completed("/hooks/b"), "the notifications of completion")
 
     asyncio.run(run())
     err = gw.stop()
     hook.close()
-    first = out["one"][0]["task"]["id"]
     a = [g for g in hook.got if g["path"] == "/hooks/a"]
     b = [g for g in hook.got if g["path"] == "/hooks/b"]
     assert a and b, (hook.got, err)
@@ -616,16 +616,19 @@ def test_a2a_sdk_push_notifications(tmp_path, a2a_sdk, binding):
                and g["headers"]["Authorization"] == "Bearer cred-a" for g in a)
     assert all(g["headers"]["Authorization"] == "Bearer cred-b" for g in b)
     tasks = {g["body"].get("task", {}).get("id") or next(iter(g["body"].values())).get("taskId")
-             for g in a}
-    assert tasks == {first}
+             for g in hook.got}
+    assert tasks == {out["tid"]}
     assert out["made"]["id"] == "b1" and out["made"]["url"].endswith("/hooks/b")
-    assert [c["id"] for c in out["list"]["configs"]] == ["b1"]
-    events = [r.get("event") for r in read_records(gw.audit)]
+    assert sorted(c["id"] for c in out["list"]["configs"]) == ["a1", "b1"]
+    records = read_records(gw.audit)
+    events = [r.get("event") for r in records]
     assert events.count("push_config") == 2
     assert events.count("push_sent") == len(hook.got)
-    assert "push_dropped" not in events and "push_failed" not in events
-    assert replay_equal(A2A_FILE, gw.trace, gw.audit) == [
-        ("summarize", "allow", "permission"), ("summarize", "allow", "permission")]
+    assert "push_failed" not in events
+    assert all((r["reason"] or "").startswith("unbound ") for r in records
+               if r.get("event") == "push_dropped")
+    assert replay_equal(A2A_FILE, gw.trace, gw.audit) == [("summarize", "allow", "permission")]
+
 
 
 def test_a2a_sdk_grpc_binding(tmp_path, a2a_sdk):

@@ -266,9 +266,12 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--push-allow", action="append", default=None,
                          metavar="ENTRY",
                          help="Allow push notifications to callback URLs that match "
-                              "ENTRY: a URL (a path ending in / is a prefix), HOST[:PORT], "
-                              "or an IP address or network (which also allows a host that "
-                              "resolves into it). Repeatable. Callbacks are https unless "
+                              "ENTRY: a URL (a path ending in / is a prefix), HOST[:PORT] "
+                              "(without a port: every port and path of the host), or an IP "
+                              "address or network. A callback URL has to match a URL or "
+                              "HOST entry (an IP address entry is also a HOST entry); "
+                              "a network entry alone allows no host name, it only allows "
+                              "the addresses that a matching host resolves to. Repeatable. Callbacks are https unless "
                               "the host is loopback, every resolved address is global "
                               "unicast unless an address entry contains it, and redirects "
                               "are not followed. Without it, push notifications are "

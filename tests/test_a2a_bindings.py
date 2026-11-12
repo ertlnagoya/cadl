@@ -44,7 +44,7 @@ def pki(tmp_path_factory):
     return PKI(tmp_path_factory.mktemp("pki"),
                clients={"planner": "PLANNER", "operator": "OPERATOR",
                         "summarizer": "SUMMARIZER", "intruder": "INTRUDER",
-                        "two": "PLANNER/CN=OPERATOR"},
+                        "two": "PLANNER/CN=OPERATOR", "two_rev": "OPERATOR/CN=PLANNER"},
                foreign={"forged": "PLANNER"})
 
 
@@ -989,3 +989,228 @@ class TestGrpc:
         from cadl.gateway_core import GatewayError
         with pytest.raises(GatewayError, match="loopback"):
             serve({}, listen="127.0.0.1:0", grpc_listen="0.0.0.0:0")
+
+
+# === Findings of the review of the bindings (each test failed before its fix) =====
+
+def test_push_url_cannot_leave_a_path_prefix():
+    """M4: a URL entry that ends with / is a prefix of the path as it is
+    sent; dot segments, percent-encoded dots, slashes and backslashes, and
+    backslashes could make a server read another path."""
+    import socket as S
+
+    from cadl.a2a_push import PushError, PushPolicy
+
+    def resolve(host, port, type=0):
+        return [(S.AF_INET, S.SOCK_STREAM, 6, "", ("203.0.113.7", port))]
+    p = PushPolicy(["https://hooks.example/tenant-a/"], resolve=resolve)
+    assert p.check("https://hooks.example/tenant-a/hook?x=..").path == "/tenant-a/hook?x=.."
+    for url in ("https://hooks.example/tenant-a/../admin",
+                "https://hooks.example/tenant-a/./x",
+                "https://hooks.example/tenant-a/%2e%2e/tenant-b/hook",
+                "https://hooks.example/tenant-a/%2E./x",
+                "https://hooks.example/tenant-a/..%2Fadmin",
+                "https://hooks.example/tenant-a/x%2fy",
+                "https://hooks.example/tenant-a/x%5cy",
+                "https://hooks.example/tenant-a/x\\..\\y",
+                "https://hooks.example/tenant-a/.."):
+        with pytest.raises(PushError, match="dot segment"):
+            p.check(url)
+    with pytest.raises(PushError):
+        PushPolicy(["https://hooks.example/a/../"])
+
+
+def test_network_entry_allows_no_host_name(capsys):
+    """L1: an IP network allows the addresses of a host that an entry
+    names, never a host name by itself; the help says so."""
+    import socket as S
+
+    from cadl.a2a_push import PushError, PushPolicy
+    from cadl.cli import main
+
+    def resolve(host, port, type=0):
+        return [(S.AF_INET, S.SOCK_STREAM, 6, "", ("203.0.113.7", port))]
+    with pytest.raises(PushError, match="matches no entry"):
+        PushPolicy(["203.0.113.0/24"], resolve=resolve).check("https://hooks.example/x")
+    with pytest.raises(SystemExit):
+        main(["a2a-gateway", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "a network entry alone allows no host name" in text
+    assert "without a port: every port and path of the host" in text
+
+
+def test_push_config_of_a_send_message_is_bound_to_its_task(tmp_path, capsys):
+    """M1: a configuration given with SendMessage is bound to the task that
+    the agent's answer names: the client can list and delete it before any
+    notification, a notification of another task is dropped and claims
+    nothing, and one that comes before the answer is dropped."""
+    hook = Hook()
+    r = Run(tmp_path, extra=("--push-allow", f"{hook.url}/hooks/"))
+    body = r.call("PLANNER", "SendMessage", params(
+        "summarize", taskPushNotificationConfig=push_cfg(f"{hook.url}/hooks/a", id="cfgA")))
+    task = body["result"]["task"]["id"]
+    listed = r.call("PLANNER", "ListTaskPushNotificationConfigs", {"taskId": task})
+    assert [c["id"] for c in listed["result"]["configs"]] == ["cfgA"]
+    assert listed["result"]["configs"][0]["taskId"] == task
+    (_, cfg), = r.agent.push.items()
+    assert r.agent.notify("", status_event("never-given-task"), config=cfg) == [400]
+    assert r.call("PLANNER", "GetTask", {"id": "never-given-task"})["error"]["code"] == -32001
+    assert r.agent.notify("", status_event(task, ctx="other-ctx"), config=cfg) == [400]
+    assert r.agent.notify("", status_event(task), config=cfg) == [204]
+    assert r.call("PLANNER", "DeleteTaskPushNotificationConfig",
+                  {"taskId": task, "id": "cfgA"})["result"] == {}
+    assert r.agent.push == {}
+    assert r.agent.notify("", status_event(task), config=cfg) == [404]
+    # A streamed request binds its configuration with its first event.
+    _, _, (_, evs) = rest(r, "PLANNER", "POST", "/message:stream", params(
+        "summarize", taskPushNotificationConfig=push_cfg(f"{hook.url}/hooks/s", id="s1")))
+    stask = evs[0][1]["task"]["id"]
+    assert [c["id"] for c in r.call("PLANNER", "ListTaskPushNotificationConfigs",
+                                    {"taskId": stask})["result"]["configs"]] == ["s1"]
+    r.stop()
+    hook.close()
+    assert [g["path"] for g in hook.got] == ["/hooks/a"]
+    assert [why.split()[0] for _, why in events(r.audit, "push_dropped")] == [
+        "task", "task", "unknown_config"]
+    r.replay_check()
+    capsys.readouterr()
+
+
+def test_push_cap_counts_held_configurations(tmp_path, monkeypatch):
+    """The cap on configurations of a client is checked and taken in one
+    step, and counts the configurations that wait with held requests."""
+    import cadl.a2a_gateway as A
+    from .test_a2a_gateway import Local
+    monkeypatch.setattr(A, "MAX_PUSH_CONFIGS", 2)
+    loc = Local(tmp_path, push_allow=["http://127.0.0.1:9/hooks/"],
+                push_url="http://127.0.0.1:1")
+    gw = loc.gw
+    for i in range(2):
+        body = loc.post(rpc("SendMessage", params(
+            "publish", returnImmediately=True,
+            taskPushNotificationConfig=push_cfg(f"http://127.0.0.1:9/hooks/{i}")), i)).body
+        assert body["result"]["task"]["status"]["state"] == "TASK_STATE_SUBMITTED"
+    err = loc.post(rpc("SendMessage", params(
+        "publish", returnImmediately=True,
+        taskPushNotificationConfig=push_cfg("http://127.0.0.1:9/hooks/x")), 3)).body["error"]
+    assert "at most 2 configurations" in err["message"]
+    # A denied request gives its place back.
+    loc.post(rpc("SendMessage", params(
+        "translate", taskPushNotificationConfig=push_cfg("http://127.0.0.1:9/hooks/y")), 4))
+    assert sum(1 for c in gw.push.values() if c.owner == "PLANNER") == 2
+    gw.stop()
+
+
+class TestGrpcReview:
+
+    def _run(self, tmp_path, *extra):
+        pf = tmp_path / "grpc-port"
+        r = Run(tmp_path, extra=("--grpc-listen", "127.0.0.1:0", "--grpc-port-file", str(pf),
+                                 *extra))
+        wait_for(lambda: pf.exists() and pf.read_text().strip(), "the port")
+        return r, int(pf.read_text())
+
+    def test_grpc_two_common_names(self, tmp_path, grpc_extra, pki, capsys):
+        """M3: a client certificate with two common names is refused over
+        gRPC as over HTTPS, whichever order they have."""
+        grpc, pb = grpc_extra
+        r, port = self._run(tmp_path, *pki.gateway_args())
+        for cert in ("two", "two_rev"):
+            g = GrpcClient(r, grpc, pb, port, pki, cert)
+            for actor in ("PLANNER", "OPERATOR"):
+                assert g.error(g.call, actor, "SendMessage", grpc_message(pb, "summarize"),
+                               pb.SendMessageResponse) == ("UNAUTHENTICATED", None)
+            g.channel.close()
+        g = GrpcClient(r, grpc, pb, port, pki, "planner")
+        assert g.call("PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                      pb.SendMessageResponse).task.id == "up-task-1"
+        g.channel.close()
+        r.stop()
+        assert r.agent.sent() == ["summarize"]
+        assert [why for _, why in events(r.audit, "handshake_failed")] == [
+            "unknown_certificate"] * 4
+        r.replay_check()
+        capsys.readouterr()
+
+    def test_grpc_idle_calls_take_no_worker(self, tmp_path, grpc_extra, capsys):
+        """M2: calls whose request message never comes do not hold the
+        workers. Without a header that could authenticate they are refused
+        before the message is awaited; with a forged one they take at most
+        the places per address, and are cancelled at the read deadline."""
+        import threading
+        grpc, pb = grpc_extra
+        r, port = self._run(tmp_path, "--max-handlers", "4", "--read-timeout", "2")
+        gate = threading.Event()
+
+        def never():
+            gate.wait(60)
+            return
+            yield b""
+        ch = grpc.insecure_channel(f"127.0.0.1:{port}",
+                                   options=[("grpc.use_local_subchannel_pool", 1)])
+        ch2 = grpc.insecure_channel(f"127.0.0.1:{port}",
+                                    options=[("grpc.use_local_subchannel_pool", 1)])
+        bare = [ch.stream_unary("/lf.a2a.v1.A2AService/SendMessage").future(
+            never(), timeout=60) for _ in range(40)]
+        forged = [ch2.stream_unary("/lf.a2a.v1.A2AService/SendMessage").future(
+            never(), timeout=60, metadata=[
+                ("authorization",
+                 f'CADL-HMAC actor="PLANNER", nonce="{i:032x}", mac="{"0" * 64}"'),
+                ("a2a-version", "1.0")]) for i in range(10)]
+        wait_for(lambda: sum(f.done() for f in forged) >= 6, "the refusals beyond the cap")
+        g = GrpcClient(r, grpc, pb, port)
+        # The forged calls hold the 4 places of 127.0.0.1 until the deadline.
+        assert g.error(g.call, "PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                       pb.SendMessageResponse)[0] == "RESOURCE_EXHAUSTED"
+        codes = []
+        for f in forged:
+            e = f.exception(timeout=30)
+            codes.append(e.code().name if e is not None else "OK")
+        assert sorted(codes) == ["CANCELLED"] * 4 + ["RESOURCE_EXHAUSTED"] * 6, codes
+        got = g.call("PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                     pb.SendMessageResponse)
+        assert got.task.id == "up-task-1"
+        gate.set()
+        # Refused at once; gRPC may close the connection of so many refused
+        # calls (UNAVAILABLE for the rest), which is the peer's loss.
+        codes = [f.exception(timeout=30).code().name for f in bare]
+        assert set(codes) <= {"UNAUTHENTICATED", "UNAVAILABLE"}, codes
+        assert "UNAUTHENTICATED" in codes
+        ch.close()
+        ch2.close()
+        g.channel.close()
+        r.stop()
+        assert [why for _, why in events(r.audit, "read_timeout")] == ["grpc deadline"] * 4
+        assert r.agent.sent() == ["summarize"]
+        r.replay_check()
+        capsys.readouterr()
+
+    def test_grpc_call_served_beside_idle_unauthenticated_calls(self, tmp_path, grpc_extra,
+                                                                capsys):
+        """M2: an authenticated call is served while 40 idle calls without
+        a header are open on the same connection."""
+        import threading
+        grpc, pb = grpc_extra
+        r, port = self._run(tmp_path, "--max-handlers", "4")
+        gate = threading.Event()
+
+        def never():
+            gate.wait(60)
+            return
+            yield b""
+        ch = grpc.insecure_channel(f"127.0.0.1:{port}")
+        hang = ch.stream_unary("/lf.a2a.v1.A2AService/SendMessage")
+        futs = [hang.future(never(), timeout=60) for _ in range(40)]
+        time.sleep(1.0)
+        g = GrpcClient(r, grpc, pb, port)
+        got = g.call("PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                     pb.SendMessageResponse)
+        assert got.task.id == "up-task-1"
+        gate.set()
+        for f in futs:
+            f.exception(timeout=30)
+        ch.close()
+        g.channel.close()
+        r.stop()
+        r.replay_check()
+        capsys.readouterr()
