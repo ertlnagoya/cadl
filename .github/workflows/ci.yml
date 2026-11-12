@@ -82,6 +82,29 @@ jobs:
           java -version
           "$HOME/.local/prism/bin/prism" -version
 
+      # tests/test_games_prism_games.py runs the export of Appendix I (I.11)
+      # through PRISM-games and compares its values with `cadl game-check`.
+      # The archive is the release of the PRISM-games project, pinned by its
+      # SHA-256; its `prism` script goes into CADL_PRISM_GAMES, not on PATH,
+      # where it would hide PRISM. One Python version is enough.
+      - name: Install PRISM-games
+        if: ${{ matrix.python-version == '3.12' }}
+        env:
+          PRISM_GAMES_VERSION: "3.2.4"
+          PRISM_GAMES_SHA256: "11fb5c67d9897493588e0198d3c3fa3bbb28b4eee9b128b8d15f86b87fffec6b"
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/prism-games.tar.gz" \
+            "https://github.com/prismmodelchecker/prism-games/releases/download/v${PRISM_GAMES_VERSION}/prism-games-${PRISM_GAMES_VERSION}-linux64-x86.tar.gz"
+          echo "${PRISM_GAMES_SHA256}  $RUNNER_TEMP/prism-games.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/prism-games"
+          tar -xzf "$RUNNER_TEMP/prism-games.tar.gz" -C "$HOME/.local/prism-games" --strip-components=1
+          (cd "$HOME/.local/prism-games" && ./install.sh silent)
+          "$HOME/.local/prism-games/bin/prism" -version
+          {
+            echo "CADL_PRISM_GAMES=$HOME/.local/prism-games/bin/prism"
+            echo "CADL_REQUIRE_PRISM_GAMES=1"
+          } >> "$GITHUB_ENV"
+
       # The norms monitor of the Solidity target runs on an EVM from PyPI in
       # tests/test_norms_monitor_targets.py. The EVM goes into a venv of its
       # own (CADL_EVM_PYTHON), with the versions of tests/evm-constraints.txt,

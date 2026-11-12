@@ -286,17 +286,29 @@ class TestMapOverLambdaAndFailure:
         share = check_against_closed_form(d)
         assert share["equilibrium"] > F(1, 3) and share["not_equilibrium"] > F(1, 20)
 
-    @pytest.mark.skipif(not os.environ.get("CADL_GAMES_SLOW"),
-                        reason="about 6 s; set CADL_GAMES_SLOW=1")
     def test_centralized_reaches_the_resolution(self):
         result = equilibrium_map(ROBOT_MODEL, "comply_by_lambda_and_failure", "CENTRALIZED")
         d = result["designs"][0]
         assert d["resolution_reached"]
         share = check_against_closed_form(d)
-        # I.14: 0.8088 of the region certified equilibrium, 0.1412
-        # not_equilibrium, 0.0499 undecided.
+        # I.14: 0.8118 of the region certified equilibrium, 0.1387
+        # not_equilibrium, 0.0496 undecided (203/4096), 567 cells analysed.
+        assert [round(share[k], 4) for k in ("equilibrium", "not_equilibrium", "undecided")] \
+            == [F("0.8118"), F("0.1387"), F("0.0496")]
+        assert d["undecided_fraction"] == F(203, 4096) and d["cells_analysed"] == 567
+
+    @pytest.mark.skipif(not os.environ.get("CADL_GAMES_SLOW"),
+                        reason="about 6 s; set CADL_GAMES_SLOW=1")
+    def test_centralized_without_the_advantages(self, monkeypatch):
+        # The map of cadl 0.3.26, without PD+ and PD−.
+        import cadl.games_eval as ge
+        monkeypatch.setattr(ge, "USE_ADVANTAGES", False)
+        result = equilibrium_map(ROBOT_MODEL, "comply_by_lambda_and_failure", "CENTRALIZED")
+        d = result["designs"][0]
+        share = check_against_closed_form(d)
         assert [round(share[k], 4) for k in ("equilibrium", "not_equilibrium", "undecided")] \
             == [F("0.8088"), F("0.1412"), F("0.0499")]
+        assert d["undecided_fraction"] == F(409, 8192) and d["cells_analysed"] == 3849
 
     def test_e1_decides_no_equilibrium_cell_here(self):
         """U_R varies with p_fail: E1 fails and E2 holds (I.12)."""

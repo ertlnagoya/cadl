@@ -10,9 +10,10 @@ an equilibrium map left open (`build_game`). From it this module derives
   I.8 (`equilibrium_check`);
 - on a cell of an equilibrium map: the relaxation of I.9 of the game of
   one player against the profile (parameter lifting, on top of
-  `stochastic_regions`), the bounds l, u, b, d(τ) and q, and the
-  sufficient conditions N, E1 and E2 (`cell_verdict`); and the map
-  itself by bisection (`equilibrium_map`).
+  `stochastic_regions`), the bounds l, u, b, d(τ) and q, bounds of the
+  one-step advantages, and the sufficient conditions N, E1, E2, PD+ and
+  PD− (`cell_verdict`); and the map itself by bisection
+  (`equilibrium_map`).
 
 `equilibrium` and `not_equilibrium` are claims about every valuation of a
 cell. A cell gets one of them only when the relaxed process of every
@@ -72,7 +73,11 @@ NOTE = ("equilibrium checks of cadl (explicit enumeration, exact rational arithm
         "policy iteration)")
 METHOD = ("parameter lifting of the game of each player against the profile (I.9): on a "
           "cell, every state chooses a corner distribution for each allowed command; "
-          "conditions N, E1 and E2 from the exact optimal values of the relaxed processes")
+          "conditions N, E1 and E2 from the exact optimal values of the relaxed processes, "
+          "and PD+ and PD- from bounds of the one-step advantages (performance difference)")
+# Whether the conditions PD+ and PD− of I.9 are used (the default; False
+# gives the maps of cadl 0.3.26).
+USE_ADVANTAGES = True
 MAP_NOTE = ("certified equilibrium map: 'equilibrium' and 'not_equilibrium' hold at every "
             "valuation of the cell")
 
@@ -1036,6 +1041,93 @@ def deviation_lower(proc: Process, tau: dict, lo: Callable) -> Fraction:
     return optimal_values(proc, _strategy(proc, tau), lo, maximize=False)[0]
 
 
+def poly_bounds(poly: tuple, cell: tuple) -> tuple:
+    """Exact bounds of a polynomial on a cell: its extreme values at the
+    corners when it is multi-affine in the open parameters (its value at a
+    valuation of the box is a convex combination of its values at the
+    corners), and an exact interval enclosure otherwise."""
+    if not poly:
+        return ZERO, ZERO
+    if _multi_affine(poly):
+        occurring = [d for d in range(len(cell)) if any(e[d] for e, _ in poly)]
+        values = []
+        for corner in itertools.product((0, 1), repeat=len(occurring)):
+            point = [b[0] for b in cell]
+            for d, side in zip(occurring, corner):
+                point[d] = cell[d][side]
+            values.append(_p_eval(poly, point))
+        return min(values), max(values)
+    return _p_interval(poly, cell)
+
+
+def _interval_product(a: tuple, b: tuple) -> tuple:
+    products = (a[0] * b[0], a[0] * b[1], a[1] * b[0], a[1] * b[1])
+    return min(products), max(products)
+
+
+def advantage_bounds(game: Game, proc: Process, cell: tuple, lower: list,
+                     upper: list) -> dict | None:
+    """Bounds of the one-step advantage A_p(s, c, v) = Q_p(s, c, v) − V_p(s, v)
+    of I.9 on a cell, for every state s of p in R_C(p) in which the target
+    does not hold and every command c other than the one the profile
+    selects: `{(i, k): (lower, upper)}` over local states i and command
+    positions k. With σ(s) the command of the profile, V_p(s, v) =
+    Q_p(s, σ(s), v), so
+
+        A_p(s, c, v) = ρ_p(s, c, v) − ρ_p(s, σ(s), v)
+                       + Σ_s′ (P(s, c, s′, v) − P(s, σ(s), s′, v)) · (V_p(s′, v) − m)
+
+    for any number m, since both distributions sum to 1. The differences
+    of step payoffs and of probabilities are polynomials in the open
+    parameters and are bounded exactly on the cell (`poly_bounds`), V_p(s′)
+    by the bounds l_p(s′) and u_p(s′) of the relaxation, and the products
+    by interval arithmetic; m is the middle of the hull of these bounds.
+    A successor with a probability that is not zero at some valuation of
+    the cell is in R_C(p); the result is None if one is not."""
+    rho = game.rho(proc.player)
+    local = {g: i for i, g in enumerate(proc.states)}
+    out: dict = {}
+    for i, g in enumerate(proc.states):
+        if proc.target[i] or not proc.mine[i]:
+            continue
+        sel = proc.selected[i]
+        mine = game.commands[g][sel]
+        for k, _ in proc.options[i]:
+            if k is None or k == sel:
+                continue
+            c = game.commands[g][k]
+            d_rho = _canonical(_p_add(dict(rho[g][k]), dict(rho[g][sel]), -1))
+            lo, hi = poly_bounds(d_rho, cell)
+            diff: dict = {}
+            for j, poly in zip(c.targets, c.row.polys):
+                diff[j] = _p_add(diff.get(j, {}), dict(poly))
+            for j, poly in zip(mine.targets, mine.row.polys):
+                diff[j] = _p_add(diff.get(j, {}), dict(poly), -1)
+            terms = []
+            for j, poly in diff.items():
+                bounds = poly_bounds(_canonical(poly), cell)
+                if bounds == (ZERO, ZERO):
+                    continue
+                if j not in local:
+                    return None
+                terms.append((bounds, lower[local[j]], upper[local[j]]))
+            if terms:
+                m = (min(t[1] for t in terms) + max(t[2] for t in terms)) / 2
+                for bounds, l, u in terms:
+                    a, b = _interval_product(bounds, (l - m, u - m))
+                    lo += a
+                    hi += b
+            out[(i, k)] = (lo, hi)
+    return out
+
+
+def advantage_reward(proc: Process, bounds: dict, side: int) -> Callable:
+    """`(i, k) -> number`: the lower (side 0) or upper (side 1) bound of the
+    advantage of command k in the local state i, and 0 for the command of
+    the profile and in a state that is not the player's."""
+    return lambda i, k: bounds[(i, k)][side] if (i, k) in bounds else ZERO
+
+
 def positive_on_cell(poly: tuple, cell: tuple) -> bool:
     """Whether a probability is positive at every valuation of the cell:
     at every corner of the cell when it is multi-affine (its value at any
@@ -1095,13 +1187,16 @@ class PlayerOnCell:
 
 
 def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Callable,
-                   epsilon: Fraction, every_state: bool = False) -> PlayerOnCell | None:
+                   epsilon: Fraction, every_state: bool = False,
+                   use_advantages: bool | None = None) -> PlayerOnCell | None:
     """The conditions of I.9 for one player on a cell, or None when the
     relaxed process of the player has a policy that misses the target
     (then nothing is established for the cell). With `every_state`, the
     conditions for the concept every_reachable_state: E2, E1 at every
     state of R_C(p), and N at the initial state or N_s at a state that is
-    in Reach_p at every valuation of the cell."""
+    in Reach_p at every valuation of the cell. Where E1 and E2 fail, PD+
+    is tried before N and PD− after it (`advantage_bounds`), unless
+    `use_advantages` (default: `USE_ADVANTAGES`) is False."""
     proc = build_process(game, player, profile, dists)
     if improper_states(proc):
         return None
@@ -1134,6 +1229,23 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
         out.e1 = condition_e1(b, lower[0], epsilon)
     if out.e1:
         return out
+    if use_advantages is None:
+        use_advantages = USE_ADVANTAGES
+    adv = advantage_bounds(game, proc, cell, lower, upper) if use_advantages else None
+    if adv is not None:
+        # PD+: the largest sum of the upper bounds of the advantages along a
+        # play of the relaxed process bounds V*_p(s) − V_p(s) (I.9).
+        gain_up = optimal_values(proc, _all(proc), advantage_reward(proc, adv, 1),
+                                 maximize=True)
+        out.gain_upper = min(out.gain_upper, max(ZERO, gain_up[0]))
+        free = [i for i in range(len(proc.states)) if not proc.target[i]]
+        if all(gain_up[i] <= 0 for i in free):
+            out.e2 = True          # V*_p = V_p on Reach_p
+            out.gain_upper = ZERO
+            return out
+        if all(gain_up[i] <= epsilon for i in (free if every_state else [0])):
+            out.e1 = True
+            return out
     # N, with the canonical best response at the centre of the cell as τ.
     centre = tuple((a + b_) / 2 for a, b_ in cell)
     at = player_at_point(game, profile, player, centre)
@@ -1146,14 +1258,25 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
             if every_state:
                 out.state, out.state_gain_lower = 0, d_tau - upper[0]
             return out
+        # PD−: the least sum of the lower bounds of the advantages of τ.
+        if adv is not None:
+            d_adv = optimal_values(proc, _strategy(proc, at.deviation),
+                                   advantage_reward(proc, adv, 0), maximize=False)[0]
+            out.gain_lower = max(out.gain_lower, d_adv)
+            if d_adv > epsilon:
+                out.n = True
+                out.deviation = at.deviation
+                if every_state:
+                    out.state, out.state_gain_lower = 0, d_adv
+                return out
     if every_state and at.admissible and at.state_gain > epsilon:
-        state_deviation(game, profile, proc, out, at, lo, upper, cell, epsilon)
+        state_deviation(game, profile, proc, out, at, lo, upper, cell, epsilon, adv)
     return out
 
 
 def state_deviation(game: Game, profile: str, proc: Process, out: PlayerOnCell,
                     at: PlayerAtPoint, lo: Callable, upper: list, cell: tuple,
-                    epsilon: Fraction) -> None:
+                    epsilon: Fraction, adv: dict | None = None) -> None:
     """Condition N_s of I.9 (concept every_reachable_state): a state s
     that is in Reach_p at every valuation of the cell (`certified_reach`)
     and a strategy τ of p with d_p(τ, s) − u_p(s) > ε, where d_p(τ, s) is
@@ -1162,17 +1285,23 @@ def state_deviation(game: Game, profile: str, proc: Process, out: PlayerOnCell,
     of the cell, restricted to the states that the relaxed process reaches
     from s under it; s is the first such state in the order of S."""
     d = optimal_values(proc, _strategy(proc, at.best_response), lo, maximize=False)
+    gain = [x - y for x, y in zip(d, upper)]
+    if adv is not None:
+        # PD− from s: the least sum of the lower bounds of the advantages
+        # of τ along a play of the relaxed process from s.
+        d_adv = optimal_values(proc, _strategy(proc, at.best_response),
+                               advantage_reward(proc, adv, 0), maximize=False)
+        gain = [max(x, y) for x, y in zip(gain, d_adv)]
     reach = certified_reach(game, profile, out.player, cell)
     model = game.model
     candidates = sorted((i for i, g in enumerate(proc.states)
-                         if g in reach and not proc.target[i]
-                         and condition_n(d[i], upper[i], epsilon)),
+                         if g in reach and not proc.target[i] and gain[i] > epsilon),
                         key=lambda i: _state_key(model, game.states[proc.states[i]]))
     if not candidates:
         return
     i = candidates[0]
     out.n = True
-    out.state, out.state_gain_lower = proc.states[i], d[i] - upper[i]
+    out.state, out.state_gain_lower = proc.states[i], gain[i]
     out.deviation = reachable_deviation(proc, at.best_response, i)
 
 
