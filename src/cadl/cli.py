@@ -369,7 +369,11 @@ def main(argv: list[str] | None = None) -> int:
     # norms-check command
     nchk_cmd = subparsers.add_parser("norms-check",
         help="Check the norms of one contract instance over all behaviours with a model "
-             "checker (Appendix F, F.12)")
+             "checker (Appendix F, F.12)",
+        epilog="PRISM runs with a Java heap of 4g, or half the physical memory when that is "
+               "smaller; set CADL_PRISM_JAVAMAXMEM (such as 8g) to change it. Exit status: 0 "
+               "no finding, 1 a finding, 2 a usage error, refusal or timeout, 3 a witness not "
+               "confirmed by norms-eval, 4 an internal error.")
     nchk_cmd.add_argument("file", type=Path, help="CADL file that declares norms: 0.1")
     nchk_cmd.add_argument("--contract", default=None, metavar="ID",
                           help="Contract to check (default: the only one with norms)")
@@ -388,6 +392,21 @@ def main(argv: list[str] | None = None) -> int:
     nchk_cmd.add_argument("--export", type=Path, default=None, metavar="DIR",
                           help="Write the PRISM model, the properties and the witness traces "
                                "to DIR")
+    nchk_cmd.add_argument("--instance", action="append", default=[], metavar="i=n,...",
+                          help="Bindings of one contract instance; repeat to check several "
+                               "instances together over the same observations (F.12)")
+    nchk_cmd.add_argument("--instances", type=int, default=None, metavar="N",
+                          help="Check N instances together, which bind the one open index to "
+                               "the first N members of its set")
+    nchk_cmd.add_argument("--version", dest="versions", action="append", default=[],
+                          type=Path, metavar="FILE",
+                          help="A later version of the file: the environment may amend the "
+                               "contract to it at any observation (F.6); repeat for a sequence "
+                               "of amendments")
+    nchk_cmd.add_argument("--domain", action="append", default=[], metavar="Q=lo..hi",
+                          help="Integer domain of a quantity used in arithmetic, sum or avg "
+                               "(ROBOT[*].load=0..5); the answers then hold for traces whose "
+                               "numbers for it are such integers; may be repeated")
     nchk_cmd.add_argument("--timeout", type=float, default=600, metavar="SECONDS",
                           help="Time for all runs of the model checker together; exit status 2 "
                                "when it is exceeded (default: 600)")
@@ -1193,6 +1212,19 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
 
 
 def _cmd_norms_check(args: argparse.Namespace) -> int:
+    """Exit status 4 for an internal error of norms-check (never 1, which
+    means a finding); see _norms_check_run for the others."""
+    try:
+        return _norms_check_run(args)
+    except Exception as e:      # an error of norms-check itself
+        import traceback
+        print(f"Internal error of norms-check ({type(e).__name__}: {e}); please report it "
+              f"with the file and the options.", file=sys.stderr)
+        traceback.print_exc(limit=3, file=sys.stderr)
+        return 4
+
+
+def _norms_check_run(args: argparse.Namespace) -> int:
     """Exit status: 0 when the questions were answered without a finding,
     or when no model checker is on PATH (the model is still exported with
     --export) unless --require-checker is given; 1 on a finding (a
@@ -1213,7 +1245,10 @@ def _cmd_norms_check(args: argparse.Namespace) -> int:
         return 2
     try:
         report = check_file(args.file, args.contract, args.bindings, args.members,
-                            args.step, args.horizon, args.export, timeout=args.timeout)
+                            args.step, args.horizon, args.export, timeout=args.timeout,
+                            domains=args.domain,
+                            instances=args.instance or args.instances,
+                            versions=args.versions)
     except NormsEvalError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

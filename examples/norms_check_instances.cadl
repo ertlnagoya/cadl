@@ -1,0 +1,55 @@
+# Norms Extension Demo: Several Contract Instances in Design-Time Checking (F.12)
+#
+# One charging contract per robot (index i). The dispatcher bears the
+# norms of every instance: while one robot is docked, one_at_a_time of its
+# instance forbids the dispatcher to dock any robot, while dock_when_low of
+# another robot's instance obliges it to dock that robot. Checking two
+# instances together over the same observations finds this conflict
+# across the instances (and, within one instance, the conflict of a robot
+# that reports low and docked at once):
+#
+#   cadl norms-check examples/norms_check_instances.cadl --members ROBOT=2 --instances 2
+
+sos:
+  name: "ChargingDock"
+  type: Acknowledged
+  version: "0.1.0"
+  description: "One charging dock shared by the robots of a fleet."
+  extensions:
+    - norms: 0.1
+
+  actors:
+    - id: DISPATCHER
+      role: "central_coordinator"
+      autonomy: low
+      capabilities: [assign_dock]
+      interface:
+        input:  [low, docked, undocked]
+        output: [dock]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities: [charge]
+      interface:
+        input:  [dock]
+        output: [low, docked, undocked]
+
+  contracts:
+    - id: CHARGING
+      parties: [DISPATCHER, "ROBOT[*]"]
+
+      norms:
+        - id: dock_when_low
+          kind: obligation
+          bearer: DISPATCHER
+          counterparty: "ROBOT[i]"
+          trigger: "ROBOT[i] -> DISPATCHER : low"
+          content: "DISPATCHER -> ROBOT[i] : dock"
+          deadline: 1s
+        - id: one_at_a_time
+          kind: prohibition
+          bearer: DISPATCHER
+          trigger: "ROBOT[i] -> DISPATCHER : docked"
+          until: "ROBOT[i] -> DISPATCHER : undocked"
+          content: "DISPATCHER -> ROBOT[*] : dock"

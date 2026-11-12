@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from cadl.norms_check import (
+    evaluate_path,
     ACTIVE,
     INACTIVE,
     NormsCheckError,
@@ -230,6 +232,185 @@ norms:
 """
 
 
+# quantifiers over a set and over its members, a wildcard, an index
+# expression j+1, count compared with a literal and with a quantity, max
+QUANT = """\
+assume:
+  - "for all r in R: r.ok != false"
+counts_as:
+  - when: "exists j in R: R[j].alarm == true"
+    creates: alarm
+norms:
+  - id: stop_all
+    kind: obligation
+    bearer: D
+    trigger: alarm
+    content: "count(R[*].moving == false) >= 2"
+    deadline: 2s
+  - id: no_overload
+    kind: prohibition
+    bearer: D
+    content: "max(R[*].load) > 5"
+  - id: capacity
+    kind: prohibition
+    bearer: D
+    content: "R[1].cap < count(r.moving == true for r in R)"
+  - id: keep_one
+    kind: obligation
+    bearer: D
+    content: "within(2s, exists j in R: R[j].load == 0 AND R[j+1].load == 0)"
+"""
+
+
+# arithmetic and sum (with --domain), orders and equalities between
+# quantities, an order against a text literal
+ARITH = """\
+norms:
+  - id: sum_ok
+    kind: obligation
+    bearer: D
+    trigger: "D -> R[1] : go"
+    content: "R[1].x + R[1].y > 3"
+    deadline: 1s
+  - id: order
+    kind: prohibition
+    bearer: D
+    content: "R[1].a < R[1].b AND R[1].b != R[2].b"
+  - id: load
+    kind: prohibition
+    bearer: D
+    content: "sum(R[*].load) > 2"
+  - id: names
+    kind: prohibition
+    bearer: D
+    content: "R[1].s < \\"m\\" OR R[1].s >= R[2].s"
+  - id: names2
+    kind: prohibition
+    bearer: D
+    content: "R[1].s < R[2].s"
+  - id: names3
+    kind: prohibition
+    bearer: D
+    content: "R[1].s == R[2].s"
+  - id: objects
+    kind: prohibition
+    bearer: D
+    content: "R[1].o < R[2].o"
+  - id: objects2
+    kind: prohibition
+    bearer: D
+    content: "R[1].o == R[2].o"
+"""
+ARITH_DOMAINS = ["R[1].x=0..2", "R[1].y=0..2", "R[*].load=0..1"]
+
+
+# one bearer, two instances: docking one robot is forbidden while another
+# is docked
+MULTI = """\
+norms:
+  - id: dock_when_low
+    kind: obligation
+    bearer: D
+    trigger: "R[i] -> D : low"
+    content: "D -> R[i] : dock"
+    deadline: 1s
+  - id: one_at_a_time
+    kind: prohibition
+    bearer: D
+    trigger: "R[i] -> D : docked"
+    content: "D -> R[*] : dock"
+"""
+MULTI_KW = {"members": ["R=2"], "instances": [{"i": 1}, {"i": 2}]}
+
+
+# two versions of a contract (F.6): carry_over with a shorter deadline
+# (violated at the amendment, with its reparation), a changed temporal
+# content (candidates dropped), transform with the elapsed time, discharge,
+# a removed norm, a new norm without trigger, assumptions that continue,
+# start anew, and end
+AM_V1 = """\
+assume:
+  - "throughout(2s, D.ok == true)"
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 3s
+    on_violation: {reparation: repair}
+  - id: repair
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 1s
+  - id: watch
+    kind: prohibition
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "within(1s, R[i].v > 5)"
+    deadline: 2s
+  - id: old_duty
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : ask"
+    content: "R[i] -> D : answer"
+    deadline: 3s
+    on_amendment: {transform: new_duty}
+  - id: drop_me
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : ask"
+    content: "R[i] -> D : done"
+    deadline: 2s
+    on_amendment: discharge
+  - id: gone
+    kind: prohibition
+    bearer: "R[i]"
+    trigger: "D -> R[i] : ask"
+    content: "R[i] -> D : answer"
+"""
+AM_V2 = """\
+assume:
+  - "within(2s, D.ok == true)"
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 1s
+    on_violation: {reparation: repair}
+  - id: repair
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 2s
+  - id: watch
+    kind: prohibition
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "within(1s, R[i].v > 6)"
+    deadline: 2s
+  - id: new_duty
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : answer"
+    deadline: 3s
+  - id: drop_me
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : ask"
+    content: "R[i] -> D : done"
+    deadline: 2s
+  - id: fresh
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : answer"
+    deadline: 1s
+"""
+
+
 def make_sos(body: str):
     sos = parse(HEAD + textwrap.indent(body, "      "))
     result = type_check(sos)
@@ -243,10 +424,12 @@ _MODELS: dict = {}
 def model_of(name: str, **kw):
     """The model of an example file or of one of the contracts above,
     built once per test session."""
-    key = (name, json.dumps(kw, sort_keys=True))
+    key = (name, json.dumps(kw, sort_keys=True, default=str))
     if key not in _MODELS:
         texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS,
-                 "DEADLINE_ZERO": DEADLINE_ZERO}
+                 "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES, "QUANT": QUANT,
+                 "ARITH": ARITH, "MIXED": MIXED, "LISTS": LISTS,
+                 "MULTI": MULTI}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
         _MODELS[key] = (sos, m, PrismModel(m.prism_text(), {"early_end": True}))
@@ -261,6 +444,15 @@ CASES = [
     ("UNTIL", {"bindings": ["i=1"]}),
     ("CONFLICTS", {"bindings": ["i=1"]}),
     ("EVENTS", {"bindings": ["i=1"], "members": ["R=2"]}),
+    ("TYPES", {"bindings": ["i=1"]}),
+    ("MIXED", {"members": ["R=2"]}),
+    ("LISTS", {}),
+    (str(EXAMPLES / "norms_check_value_types.cadl"), {"bindings": ["i=1"]}),
+    ("QUANT", {"members": ["R=2"]}),
+    ("ARITH", {"domains": ARITH_DOMAINS}),
+    (str(EXAMPLES / "norms_check_arithmetic.cadl"),
+     {"members": ["ROBOT=2"], "domains": ["ROBOT[*].load=0..3", "DEPOT.capacity=2..4"]}),
+    (str(EXAMPLES / "norms_check_quantifiers.cadl"), {"members": ["ROBOT=2"]}),
 ]
 
 
@@ -281,9 +473,11 @@ class TestTranslation:
             "DISPATCHER -> ROBOT[2] : replan_command",
         ]
         reps = {q.key: q.reps for q in tr.quantities.values()}
-        assert reps == {"ROBOT[2].battery": [None, 9, 10, 11],
+        # one value per class: a class holds the values of every JSON type
+        # on which each comparison with a literal has the same value
+        assert reps == {"ROBOT[2].battery": [None, 0, 10],
                         "ROBOT[2].status": [None, "InTransit", "OTHER"],
-                        "DISPATCHER.is_operational": [None, True, False]}
+                        "DISPATCHER.is_operational": [None, 0, True]}
         # 2**4 message sets, 3 classes of the prohibition's content (true,
         # false, undefined) and 3 of the assumption
         assert len(tr.choices) == 16 * 3 * 3
@@ -291,7 +485,9 @@ class TestTranslation:
         assert m.H == 2 + (5 + 2) + (2 + 2) + 2
         assert all(n.status == "model" for n in tr.norms)
         assert tr.members["ROBOT"] == [1, 2]
-        assert [n for n in tr.notes if "type of the literals" not in n] == []
+        assert tr.bindings == {"i": 2, "N": 2, "M": 1}      # N, M: the members
+        # the sets with a symbolic bound and no --members: one note each
+        assert len(tr.notes) == 2 and all("give --members" in n for n in tr.notes)
 
     def test_default_binding_is_reported(self):
         _sos, m, _pm = model_of(str(ROBOT))
@@ -302,7 +498,7 @@ class TestTranslation:
         _sos, m, _pm = model_of(str(DOUBLE), bindings=["i=1"])
         n = m.tr.by_id["no_double_assignment"]
         assert n.status == "untranslated"
-        assert "a quantifier in a predicate is not translated" in n.reason
+        assert "request fields are not translated" in n.reason
         assert m.tr.by_id["acknowledge"].status == "model"
 
     def test_dependants_of_untranslated_norms(self):
@@ -311,7 +507,7 @@ norms:
   - id: a
     kind: obligation
     bearer: "R[i]"
-    content: "R[i].x == R[i].y"
+    content: "R[i].x + 1 == R[i].y"
     on_violation: {reparation: b}
   - id: b
     kind: obligation
@@ -320,7 +516,7 @@ norms:
 """)
         tr = build_model(sos, bindings={"i": 1}).tr
         assert tr.by_id["a"].status == "untranslated"
-        assert "two quantities" in tr.by_id["a"].reason
+        assert "--domain" in tr.by_id["a"].reason
         assert tr.by_id["b"].status == "untranslated"
         assert "reparation of a" in tr.by_id["b"].reason
 
@@ -343,14 +539,19 @@ norms:
         with pytest.raises(NormsCheckError, match="distinguishable choices"):
             build_model(sos, bindings={"i": 1})
 
-    def test_three_valued_predicates(self):
-        p = ("and", ("cmp", "<", "R[1].b", 10), ("cmp", "==", "R[1].s", "InTransit"))
-        ev = Translator.evaluate
-        assert ev(p, {"R[1].b": 9, "R[1].s": "InTransit"}) == "T"
-        assert ev(p, {"R[1].b": 11, "R[1].s": None}) == "F"
-        assert ev(p, {"R[1].b": 9, "R[1].s": None}) == "U"
-        assert ev(("not", p), {"R[1].b": 9, "R[1].s": None}) == "U"
-        assert ev(("cmp", "==", "q", True), {"q": 1}) == "F"      # a boolean is not 1
+    def test_predicates_are_evaluated_by_norms_eval(self):
+        _sos, m, _pm = model_of(str(ROBOT), bindings=["i=2"])
+        tr = m.tr
+        p = next(x.expr for x in tr.preds if "battery" in x.text)
+        ev = tr._oracle
+        assert ev([p], {"ROBOT[2].battery": 9, "ROBOT[2].status": "InTransit"}) == ["T"]
+        assert ev([p], {"ROBOT[2].battery": 11, "ROBOT[2].status": None}) == ["F"]
+        assert ev([p], {"ROBOT[2].battery": 9, "ROBOT[2].status": None}) == ["U"]
+        # values of another type: a text is not ordered against 10, a
+        # boolean is (as 0 or 1), a list is neither
+        assert ev([p], {"ROBOT[2].battery": "low", "ROBOT[2].status": "InTransit"}) == ["U"]
+        assert ev([p], {"ROBOT[2].battery": True, "ROBOT[2].status": "InTransit"}) == ["T"]
+        assert ev([p], {"ROBOT[2].battery": 5, "ROBOT[2].status": 3}) == ["U"]
 
     def test_temporal_steps(self):
         # within: decided true at once, false only after the interval
@@ -459,16 +660,200 @@ def test_until_predicate_is_a_rising_edge():
     tr = m.tr
     go = next(i for i, a in enumerate(tr.atoms) if a.name == "go")
 
-    def choice(msgs, level):
+    def choice(msgs, test):
         return next(c.index for c in tr.choices
-                    if c.messages == msgs and c.values.get("R[1].level") == level)
+                    if c.messages == msgs and test(c.values.get("R[1].level")))
 
-    none, low = choice((), None), choice((), 2)
-    path = ([(choice((go,), None), False)] + [(none, False)] * 5
+    def low_number(v):
+        return v is True or (type(v) in (int, float) and v < 3)     # true < 3 as well
+
+    none, low = choice((), lambda v: v is None), choice((), low_number)
+    path = ([(choice((go,), lambda v: v is None), False)] + [(none, False)] * 5
             + [(low, False), (low, False), (none, True)])
     assert not compare_path(m, pm, path)
     states = run_path(pm, path)
     assert states[7]["st_1_o_rep"] == ACTIVE
+
+
+def test_quantifiers_over_the_members():
+    """Quantifiers, aggregates and wildcards range over the members of the
+    instance; a member beyond --members of a set with integer bounds is in
+    the domain without a value, and the report says so."""
+    _sos, m, pm = model_of("QUANT", members=["R=2"])
+    tr = m.tr
+    assert {k for k in tr.quantities} == {f"R[{j}].{q}" for j in (1, 2)
+                                          for q in ("ok", "alarm", "moving", "load")} | {"R[1].cap"}
+    assert any("R[3..3] belong to the domain" in n for n in tr.notes)
+    assert not any("index j" in n for n in tr.notes)      # a quantifier variable
+    for p in all_paths(tr, 1):
+        assert not compare_path(m, pm, p), p
+
+
+@needs_prism
+def test_conflict_through_quantifiers():
+    sos, m, _pm = model_of(str(EXAMPLES / "norms_check_quantifiers.cadl"), members=["ROBOT=2"])
+    report = check(m, PRISM)
+    assert [c["norms"] for c in report["conflicts"]] == [["halt_fleet", "keep_patrol"]]
+    assert all(w["confirmed"] for c in report["conflicts"] for w in c["witnesses"])
+    for c in report["conflicts"]:
+        for w in c["witnesses"]:
+            r = evaluate(sos, parse_trace(w["trace"]))
+            states = {n["id"]: n["state"] for n in r["norms"]}
+            assert states[w["keeps"]] != "violated"
+
+
+def test_arithmetic_needs_a_domain():
+    """Arithmetic, sum and avg need --domain; orders and equalities between
+    quantities and orders against texts do not. The report says for which
+    traces the answers hold."""
+    tr = build_model(make_sos(ARITH), bindings={"i": 1}).tr
+    assert tr.by_id["sum_ok"].status == "untranslated"
+    assert "--domain R[1].x=0..10" in tr.by_id["sum_ok"].reason
+    assert tr.by_id["load"].status == "untranslated"
+    assert tr.by_id["order"].status == "model" and tr.by_id["names"].status == "model"
+    tr = model_of("ARITH", domains=ARITH_DOMAINS)[1].tr
+    assert all(n.status == "model" for n in tr.norms)
+    assert tr.quantities["R[1].x"].reps[1:4] == [0, 1, 2]
+    assert any("R[1].x takes the integers 0..2" in n for n in tr.notes)
+    # three quantities ordered against each other: three values in every gap
+    assert tr.quantities["R[1].a"].order == 3
+    with pytest.raises(NormsCheckError, match="--domain takes"):
+        build_model(make_sos(ARITH), domains=["R[1].x=3..1"])
+
+
+def test_several_instances_differential():
+    """Two instances over the same observations: each instance's trace, up
+    to its own end, is evaluated by norms-eval with its bindings and
+    compared with the model at every observation."""
+    _sos, m, pm = model_of("MULTI", **MULTI_KW)
+    tr = m.tr
+    assert [n.uid for n in m.norms] == ["dock_when_low@1", "one_at_a_time@1",
+                                        "dock_when_low@2", "one_at_a_time@2"]
+    paths = (random_paths(tr, PATHS * 2, seed=21, instances=2)
+             + random_paths(tr, PATHS, seed=22, p_message=0.15, p_end=0.05, instances=2)
+             + random_paths(tr, PATHS, seed=23, full_length=True, instances=2)
+             + all_paths(tr, 1, instances=2))
+    for p in paths:
+        assert not compare_path(m, pm, p), p
+    # an instance that ends first does not change afterwards
+    p = [(0, 1)] + [(0, 0)] * 2 + [(0, 2)]
+    states = run_path(pm, p)
+    assert states[0]["k1_ended"] and not states[0]["k2_ended"]
+    assert len({s["st_k1_0_dock_when_low"] for s in states}) == 1
+
+
+@needs_prism
+def test_conflict_across_instances():
+    sos, m, _pm = model_of("MULTI", **MULTI_KW)
+    report = check(m, PRISM)
+    pairs = {tuple(c["norms"]) for c in report["conflicts"]}
+    assert ("dock_when_low@1", "one_at_a_time@2") in pairs
+    assert ("one_at_a_time@1", "dock_when_low@2") in pairs
+    for c in report["conflicts"]:
+        for w in c["witnesses"]:
+            assert w["confirmed"] and set(w["traces"]) == {"1", "2"}
+            for k, lines in w["traces"].items():
+                r = evaluate(sos, parse_trace(lines))
+                assert r["instance"]["bindings"]["i"] == int(k)
+                states = {n["id"]: n["state"] for n in r["norms"]}
+                keep_id, keep_k = w["keeps"].split("@")
+                if keep_k == k:
+                    assert states[keep_id] != "violated"
+
+
+def _amend_model():
+    key = ("AMEND", "")
+    if key not in _MODELS:
+        v1, v2 = make_sos(AM_V1), make_sos(AM_V2)
+        m = build_model(v1, bindings={"i": 1}, versions=[("v2.cadl", v2)])
+        _MODELS[key] = ((v1, v2), m, PrismModel(m.prism_text(), {"early_end": True}))
+    return _MODELS[key]
+
+
+def test_amendments_differential():
+    """Amendments as a choice of the environment (F.6): every path is
+    compared with norms-eval reading the same trace with its amend line."""
+    (v1, v2), m, pm = _amend_model()
+    tr = m.tr
+    assert [n.id for n in m.norms] == ["carry", "repair", "watch", "old_duty", "drop_me",
+                                       "gone", "new_duty", "fresh"]
+    paths = (random_paths(tr, PATHS * 2, seed=31, p_amend=0.3, p_message=0.35)
+             + random_paths(tr, PATHS, seed=32, p_keep=0.8, p_message=0.15, p_end=0.04,
+                            p_amend=0.2)
+             + random_paths(tr, PATHS // 2, seed=33, full_length=True, p_amend=0.15))
+    effects = set()
+    for p in paths:
+        assert not compare_path(m, pm, p), p
+        for a in evaluate_path(tr, p)["amendments"]:
+            effects.update((e["norm"], e["effect"]) for e in a["effects"])
+    # the paths reach the cases of F.6
+    assert {("carry", "carry_over"), ("drop_me", "discharge"), ("gone", "removed"),
+            ("old_duty", "transform"), ("new_duty", "activated"),
+            ("fresh", "added")} <= effects
+    for p in all_paths(tr, 1):
+        assert not compare_path(m, pm, p), p
+
+
+def test_amendment_refusals():
+    v1 = make_sos(AM_V1)
+    other = make_sos(AM_V2.replace("kind: prohibition", "kind: obligation", 1))
+    with pytest.raises(NormsCheckError, match="changes its kind"):
+        build_model(v1, bindings={"i": 1}, versions=[("o.cadl", other)])
+    with pytest.raises(NormsCheckError, match="not translated together"):
+        build_model(v1, members=["R=2"], instances=[{"i": 1}, {"i": 2}],
+                    versions=[("v2.cadl", make_sos(AM_V2))])
+
+
+AM_SMALL_V1 = """\
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 2s
+  - id: old_duty
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : ask"
+    content: "R[i] -> D : answer"
+    deadline: 2s
+    on_amendment: {transform: new_duty}
+"""
+AM_SMALL_V2 = """\
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 1s
+  - id: new_duty
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : answer"
+    deadline: 2s
+  - id: fresh
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 1s
+"""
+
+
+@needs_prism
+def test_questions_across_an_amendment():
+    v1, v2 = make_sos(AM_SMALL_V1), make_sos(AM_SMALL_V2)
+    m = build_model(v1, bindings={"i": 1}, versions=[("v2.cadl", v2)])
+    report = check(m, PRISM)
+    assert report["unconfirmed"] == []
+    norms = {n["id"]: n for n in report["norms"]}
+    assert norms["new_duty"]["versions"] == [2]
+    assert norms["fresh"]["activatable"]["answer"]          # only after an amendment
+    w = norms["fresh"]["activatable"]["witness"]
+    assert any(line.find('"amend"') >= 0 for line in w["trace"])
+    r = evaluate(v1, parse_trace(w["trace"]), versions={"v2.cadl": v2})
+    assert {n["id"]: n for n in r["norms"]}["fresh"]["activated_at"] is not None
 
 
 def test_paths_cover_the_semantics():
@@ -791,7 +1176,7 @@ def test_nothing_or_only_powers_translated(body):
 def test_notes_on_bindings_and_value_types():
     _sos, m, _pm = model_of(str(ROBOT), bindings=["i=2", "k=1"])
     assert any("--bindings k" in n for n in m.tr.notes)
-    assert any("type of the literals" in n for n in m.tr.notes)
+    assert not any("type of the literals" in n for n in m.tr.notes)
 
 
 def test_temporal_operator_positions_have_exact_reasons():
@@ -830,13 +1215,233 @@ def test_cli_require_checker_and_timeout(tmp_path):
     if PRISM is not None:
         p = cli(str(CONFLICT), "--bindings", "i=1", "--timeout", "0.01",
                 "--export", str(tmp_path))
-        assert p.returncode == 2 and "--timeout" in p.stderr
-        assert (tmp_path / "STATUS_REPORTING.prism").exists()
+        assert p.returncode == 2 and "--timeout" in p.stderr      # building or checking
 
     for bad in ("0", "-5", "nan", "inf"):
         p = cli(str(CONFLICT), "--bindings", "i=1", "--timeout", bad)
         assert p.returncode == 2 and "--timeout" in p.stderr, bad
         assert "Traceback" not in p.stderr
+
+
+def _random_json(rng, consts, domain=None):
+    pool = [None, True, False, [], {}, [1], [0, 2], {"a": 1}, {"b": 2}, "", "x", "OTHER",
+            [1, "a"], [1, 2], ["a"], [None], [[0]], [{"x": 1}], [0, [1, "b"]], [True, 0.5],
+            rng.choice(["a", "b", "zz", "m", "ma", "l\uffff"]),
+            rng.randint(-30, 30), rng.uniform(-30, 30), rng.choice([0, 0.0, 1, 1.0, -0.0])]
+    if domain is not None:
+        pool = [v for v in pool if type(v) not in (int, float)]
+        return rng.choice(pool + [rng.randint(*domain)] * len(pool))
+    for c in consts:
+        pool.append(c)
+        if isinstance(c, (int, float)) and not isinstance(c, bool):
+            pool += [c - 0.5, c + 0.5, c - 1, c + 1, float(c)]
+        if isinstance(c, str):
+            pool.append(c + "x")
+    return rng.choice(pool)
+
+
+@pytest.mark.parametrize("case", CASES, ids=case_id)
+def test_value_classes_cover_every_json_value(case):
+    """Exactness of the classes of values (F.12): for random JSON values of
+    every type (not only the representatives), the values that norms-eval
+    gives the predicates of a group are those of one of the choices."""
+    import random as _random
+    name, kw = case
+    _sos, m, _pm = model_of(name, **kw)
+    tr = m.tr
+    rng = _random.Random(3)
+    for ids, vecs in tr.components:
+        keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+        exprs = [tr.preds[i].expr for i in ids]
+        known = {v for v, _vals in vecs}
+        # the literals of the whole group, so that a value of one quantity
+        # can equal a literal compared with another one
+        lits = set().union(*(tr.quantities[k].consts for k in keys))
+        for _ in range(80):
+            vals = {k: _random_json(rng, lits, tr.quantities[k].domain) for k in keys}
+            assert tuple(tr._oracle(exprs, vals)) in known, vals
+
+
+MIXED = """\
+norms:
+  - id: same_above
+    kind: prohibition
+    bearer: D
+    content: "R[1].v == R[2].v AND R[2].v > 3"
+  - id: order_above
+    kind: prohibition
+    bearer: D
+    content: "R[1].w < R[2].w AND R[1].w > 5"
+  - id: texts
+    kind: prohibition
+    bearer: D
+    content: "R[1].s == R[2].s AND R[2].s == \\"zz\\""
+  - id: floats
+    kind: prohibition
+    bearer: D
+    content: "R[1].f < 0.5 AND R[1].f > -1e-3 AND R[1].f != 0.25"
+"""
+
+
+# lists are not always comparable: [1, "a"] < [1, 2] is undefined
+LISTS = """\
+norms:
+  - id: o
+    kind: obligation
+    bearer: D
+    trigger: "D -> R[1] : go"
+    content: "R[1].v < R[2].v AND R[1].v < R[3].v"
+    deadline: 1s
+  - id: p
+    kind: prohibition
+    bearer: D
+    content: "R[2].v < R[3].v OR R[2].v >= R[3].v"
+"""
+
+
+TYPES = """\
+norms:
+  - id: p
+    kind: prohibition
+    bearer: "R[1]"
+    content: "R[1].v >= 1 AND R[1].v <= 1 AND R[1].v != 1"
+  - id: o
+    kind: obligation
+    bearer: "R[1]"
+    trigger: "D -> R[1] : go"
+    content: "R[1].w != 3"
+    deadline: 1s
+  - id: q
+    kind: prohibition
+    bearer: "R[1]"
+    content: "R[1].w >= 3 OR R[1].w < 3"
+  - id: r
+    kind: prohibition
+    bearer: "R[1]"
+    content: "R[1].u < true AND R[1].u > 0"
+"""
+
+
+@needs_prism
+def test_values_of_another_type():
+    """A boolean is ordered as 0 or 1 but is not equal to 1, so p can be
+    violated (by true); a text is neither ordered nor equal to 3, so o and q
+    are not in conflict: a text fulfils o and leaves q undefined. Both
+    answers were wrong while the classes assumed the type of the literals."""
+    sos = make_sos(TYPES)
+    m = build_model(sos, bindings={"i": 1})
+    report = check(m, PRISM)
+    norms = {n["id"]: n for n in report["norms"]}
+    w = norms["p"]["violable"]["witness"]
+    assert w["confirmed"] and "R[1].v=true" in " ".join(w["choices"])
+    assert report["conflicts"] == []
+    assert norms["o"]["fulfillable"]["answer"] and norms["q"]["violable"]["answer"]
+
+
+@needs_prism
+def test_mixed_comparisons_are_violable():
+    """A quantity compared with another one also takes the literals that the
+    other is compared with: both values 4 violate same_above, and so on.
+    norms-check 0.3.25+ reported these as never violated."""
+    sos, m, _pm = model_of("MIXED", members=["R=2"])
+    assert 0.25 in m.tr.quantities["R[1].f"].reps or any(
+        type(v) is float and -1e-3 < v < 0.5 for v in m.tr.quantities["R[1].f"].reps)
+    report = check(m, PRISM)
+    for nid in ("same_above", "order_above", "texts", "floats"):
+        entry = {n["id"]: n for n in report["norms"]}[nid]["violable"]
+        assert entry["answer"] and entry["witness"]["confirmed"], nid
+
+
+def test_list_orders_realise_every_pattern():
+    """The list values of the model realise every pattern of pairwise
+    outcomes (equal, less, greater, not comparable) that random lists with
+    mixed and nested elements have, for two and three lists."""
+    import random as _random
+    from cadl.norms_check import _LIST_VALUES
+
+    def outcome(a, b):
+        if a == b:
+            return "eq"
+        try:
+            return "lt" if a < b else "gt"
+        except TypeError:
+            return "inc"
+
+    def sig(vs):
+        return tuple(outcome(vs[i], vs[j]) for i in range(len(vs))
+                     for j in range(i + 1, len(vs)))
+
+    rng = _random.Random(7)
+
+    def rand_list(depth=0):
+        out = []
+        for _ in range(rng.randint(0, 3)):
+            c = rng.random()
+            if c < 0.35:
+                out.append(rng.choice([0, 1, 2, 0.5, True, False]))
+            elif c < 0.6:
+                out.append(rng.choice(["a", "b", "c", ""]))
+            elif c < 0.7:
+                out.append(None)
+            elif c < 0.8:
+                out.append(rng.choice([{}, {"x": 1}]))
+            elif depth < 2:
+                out.append(rand_list(depth + 1))
+        return out
+
+    for n, values in _LIST_VALUES.items():
+        import itertools
+        have = {sig(c) for c in itertools.product(values, repeat=n)}
+        assert len(have) == {2: 4, 3: 29}[n]
+        for _ in range(5000):
+            assert sig([rand_list() for _ in range(n)]) in have
+
+
+@needs_prism
+def test_lists_that_are_not_comparable():
+    """A trace may give R[2].v = [1, "a"] and R[3].v = [1, 2], which
+    norms-eval cannot order: p stays undefined, so o and p are not in
+    conflict (norms-check 0.3.26 before this fix reported a conflict)."""
+    sos, m, _pm = model_of("LISTS")
+    report = check(m, PRISM)
+    assert report["conflicts"] == []
+    assert report["unconfirmed"] == []
+
+
+def test_internal_errors_exit_4(monkeypatch, capsys):
+    import argparse
+    import cadl.norms_check as nc
+    from cadl import cli as cli_module
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(nc, "check_file", boom)
+    args = argparse.Namespace(file=ROBOT, contract=None, bindings=[], members=[], step=None,
+                              horizon=None, export=None, format="text", timeout=600,
+                              require_checker=False, domain=[], instance=[], instances=None,
+                              versions=[])
+    assert cli_module._cmd_norms_check(args) == 4
+    assert "Internal error of norms-check" in capsys.readouterr().err
+
+
+def test_command_limit_and_java_memory():
+    from cadl.norms_check import MAX_COMMANDS, _java_memory
+    _sos, m, _pm = model_of(str(ROBOT), bindings=["i=2"])
+    assert m.command_count() == len(m.commands) <= MAX_COMMANDS
+    assert re.fullmatch(r"[1-4]g", _java_memory())
+
+
+def test_witness_amend_lines_are_relative(tmp_path):
+    v1, v2 = tmp_path / "v1.cadl", tmp_path / "v2.cadl"
+    v1.write_text(HEAD + textwrap.indent(AM_SMALL_V1, "      "))
+    v2.write_text(HEAD + textwrap.indent(AM_SMALL_V2, "      "))
+    m = build_model(load_version(v1), bindings={"i": 1}, versions=[str(v2)])
+    assert m.tr.version_names == ["v2.cadl"]
+    from cadl.norms_check import random_paths as rp, trace_lines as tl
+    p = next(p for p in rp(m.tr, 50, seed=1, p_amend=0.5) if any(j >= len(m.tr.choices)
+                                                                for j, _e in p))
+    assert '"amend": "v2.cadl"' in "\n".join(tl(m.tr, p))
 
 
 def test_cli_refusal():

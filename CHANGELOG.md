@@ -7,6 +7,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+
 - `cadl a2a-gateway` streams: `SendStreamingMessage` and `SubscribeToTask`
   over Server-Sent Events (JSON-RPC binding of A2A 1.0.0). A streamed
   request is decided once, as `SendMessage`, before anything is passed
@@ -31,6 +32,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   are not dependencies of cadl.
 
 ### Changed
+
 - `cadl mcp-approve` refuses a published hold whose shown arguments do
   not have the SHA-256 it names, and, without `--hold-key`, a hold that
   the gateway signed. With `--require-signed-hold`, or when `run.json` of
@@ -43,6 +45,85 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - `cadl a2a-gateway` answers a connection beyond the cap of its address
   with HTTP 503 (it was closed without an answer), and keeps the read
   deadlines of all connections in one thread.
+
+- `cadl norms-check` (F.12) covers values of every type. Each quantity
+  has classes for no value, true, false, numbers (around the numeric
+  literals, 0, and 1 next to a boolean literal), texts (each literal and
+  one other) and lists and objects, and every predicate is evaluated on
+  the representatives by the evaluator of `cadl norms-eval`. A comparison
+  of values of different types now has the value it has in a trace (a
+  boolean is ordered as 0 or 1 but is not equal to 1; a text is not
+  ordered against a number), and the note that the answers assume the
+  type of the literals is gone. Up to 0.3.25 such traces were not
+  covered: a prohibition violated only by `true` was reported as never
+  violated, and a conflict that a text value avoids was reported.
+- `cadl norms-check` translates quantifiers (`exists`, `for all`),
+  `count`, and `min` / `max` compared with a literal, of comprehensions,
+  and wildcard and range references in predicates (F.5), over the
+  members of the instance: a symbolic bound (`ROBOT[1..N]`) is bound to
+  the last member given by `--members`, so the domain is closed, and the
+  witness traces bind it too. A quantity used only in comparisons with
+  literals keeps one value per class of these comparisons, which keeps
+  the combinations of the members' quantities small; the report notes
+  members of a set with integer bounds that are outside the instance.
+  `examples/norms_check_quantifiers.cadl` shows a conflict between a
+  quantified obligation and a prohibition with `count`.
+- `cadl norms-check` translates comparisons of two quantities: the
+  quantities compared with each other form groups, and for a group of k
+  quantities the classes hold k numbers, texts, lists and objects below,
+  between and above the literals, enough for every order and pattern of
+  equalities (exact). Arithmetic, `sum` and `avg` are translated for
+  quantities with a domain given by the new option `--domain
+  Q=lo..hi` (`Q` a quantity or a pattern such as `ROBOT[*].load`); such a
+  quantity takes the integers of its domain and the values that are not
+  numbers, and the report states that the answers hold for traces whose
+  numbers for it are such integers. Without a domain such a norm is not
+  translated, and the reason names the option.
+  `examples/norms_check_arithmetic.cadl` sums loads against a capacity.
+- `cadl norms-check --instance i=1 --instance i=2` (or `--instances N`)
+  checks several instances of a contract together: one model whose
+  instances share the observations, the message events and the
+  quantities, start together and end each on its own; norms are named
+  `id@k`, conflicts are asked across instances, and every witness holds
+  the trace of each instance, which `cadl norms-eval` evaluates with the
+  bindings of that instance. At most 4 instances.
+  `examples/norms_check_instances.cadl` finds a conflict across two
+  robots' instances.
+- `cadl norms-check --version FILE` (repeatable) models amendments
+  (F.6): at any observation the environment may amend the contract to the
+  next version, which applies `on_amendment:` (`carry_over` with the
+  elapsed time and, for an unchanged content, the pending candidates;
+  `discharge`; `transform:` with the elapsed time), removes and adds norms,
+  continues, starts and closes assumptions, and switches the counts-as
+  rules, as `cadl norms-eval` does. The norms of every version share one
+  set of variables per id; the questions are asked across the amendment,
+  and witnesses carry the `amend` line. Versions with other actors or
+  another lifecycle, a norm whose kind changes, an untranslated norm or
+  rule in some version, and amendments with several instances are
+  refused. PRISM now runs with a Java heap of 4g, or half the physical
+  memory when that is smaller (`CADL_PRISM_JAVAMAXMEM` overrides it).
+  Witness traces name a version by its file name, and exported ones by a
+  path relative to the export directory.
+- `cadl norms-check`: every quantity of a group of quantities compared with
+  each other takes the literals of the whole group, so
+  `R[1].v == R[2].v AND R[2].v > 3` is violable again; the grid of numbers
+  is computed exactly, which fixes a crash on any float literal. An
+  internal error exits with status 4 (never 1, a finding); `--timeout`
+  bounds building the model too; the limit is checked on the commands
+  (after the ends of instances and the versions, at most 32768); a
+  refusal for too many classes names the predicates, the quantities and
+  the sets; notes say when a set has one member by default, when
+  `--members` is below the declared size, and that instances start
+  together.
+- `cadl norms-check`: lists of a trace are not always comparable
+  (`[1, "a"] < [1, 2]` is undefined), so quantities ordered against each
+  other get lists that realise every pattern of pairwise outcomes (equal,
+  less, greater, not comparable): 3 lists for two quantities (4
+  patterns), 8 for three (29 patterns); four or more such quantities are
+  refused. A false conflict between two norms over such quantities is no
+  longer reported. The limit on combinations of classes in one group is
+  raised from 20000 to 50000.
+
 
 ### Fixed
 
