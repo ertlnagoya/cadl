@@ -1794,3 +1794,21 @@ def test_cli_refusal():
     assert p.returncode == 2
     assert "does not divide" in p.stderr
 
+
+def test_four_ordered_quantities_are_refused_with_the_reason():
+    """Four quantities ordered against each other: even without lists,
+    each has at least 15 classes, so the group exceeds the limit of
+    50 000 combinations (F.12); the refusal gives the numbers."""
+    body = """\
+norms:
+  - id: chain
+    kind: prohibition
+    bearer: D
+    content: "R[1].a < R[1].b AND R[1].b < R[1].c AND R[1].c < R[1].d"
+"""
+    with pytest.raises(NormsCheckError) as e:
+        build_model(make_sos(body))
+    text = str(e.value)
+    m = re.search(r"besides lists, (\d+) classes .*at least \d+\^4 = (\d+) combinations", text)
+    assert m, text
+    assert int(m.group(1)) >= 15 and int(m.group(2)) > 50000

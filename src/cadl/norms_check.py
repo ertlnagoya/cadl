@@ -1520,6 +1520,19 @@ class Translator:
                 while other in texts:
                     other += "_"
                 others.append(other)
+        if q.list_order > len(_LIST_VALUES) + 1:
+            # F.12: even without lists, every quantity of such a group has
+            # this many classes, and the group exceeds the limit on the
+            # combinations of classes
+            other = 1 + len(numbers) + len(texts) + len(others) + 2 + k
+            raise NormsCheckError(
+                f"{q.key} is ordered (<, <=, >, >=) against {q.list_order - 1} other quantities; "
+                f"norms-check translates such orders of at most 3 quantities. Each quantity of "
+                f"this group has, besides lists, {other} classes (no value, {len(numbers)} "
+                f"numbers, {len(texts) + len(others)} texts, true, false and {k} objects), so "
+                f"the {q.list_order} quantities have at least {other}^{q.list_order} = "
+                f"{other ** q.list_order} combinations of classes, more than the limit of "
+                f"{MAX_VALUATIONS}")
         # lists are ordered among themselves, objects only equal or not
         objects = (_list_values(q) if q.list_order > 1
                    else [[]] if k == 1 else [[j] for j in range(k)])

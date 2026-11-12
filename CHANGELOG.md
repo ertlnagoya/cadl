@@ -25,6 +25,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   version, and its witness names that file (`files`). Example:
   `examples/norms_check_amend_v1.cadl` and `norms_check_amend_v2.cadl`.
 
+### Changed
+
+- The refusal of four or more quantities ordered against each other
+  states why it is kept: even without lists, each quantity of such a
+  group has at least 15 classes, so the group exceeds the limit of
+  50,000 combinations (F.12).
+
 ## [0.3.27] — 2026-11-12
 
 Resolves the remaining verification items. The strategic export is run
