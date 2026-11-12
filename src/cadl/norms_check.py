@@ -87,6 +87,21 @@ MAX_CHOICES = 8192
 MAX_VALUATIONS = 20000
 MAX_ATOMS = 16
 MAX_INSTANCES = 4
+MAX_COMMANDS = 32768
+
+# The time by which the model must be built (--timeout covers the
+# generation too); None: no bound.
+_DEADLINE: list = [None]
+
+
+def _generation_time() -> None:
+    import time
+    d = _DEADLINE[0]
+    if d is not None and time.monotonic() > d:
+        raise NormsCheckTimeout(
+            "building the model did not finish within --timeout; the time grows with the "
+            "choices of the environment, the instances and the versions: use fewer --members, "
+            "a smaller --domain, a smaller --horizon or a coarser --step")
 
 _UNIT_MS = {"ms": 1, "s": 1000, "min": 60000, "h": 3600000}
 
@@ -560,6 +575,32 @@ class Pred:
     owner: Any = None          # the Translator of its instance
 
 
+def _exact_number(v: Fraction) -> Any:
+    return int(v) if v.denominator == 1 else float(v)
+
+
+def _numbers_between(a: Fraction, b: Fraction, k: int) -> list:
+    """k numbers (integers first, else floats) strictly between a and b, or
+    every float between them when there are fewer."""
+    out: list = []
+    if b - a >= k + 1 and a.denominator == 1:
+        return [int(a) + j for j in range(1, k + 1)]
+    for j in range(1, k + 1):
+        v = _exact_number(a + (b - a) * Fraction(j, k + 1))
+        if a < Fraction(v) < b and v not in out:
+            out.append(v)
+    x = float(a)
+    while len(out) < k:
+        x = math.nextafter(x, math.inf)
+        if Fraction(x) <= a:
+            continue
+        if Fraction(x) >= b:
+            break
+        if x not in out:
+            out.append(x)
+    return sorted(out)
+
+
 def _expr_text(expr: Any) -> str:
     from .norms import item_text
     try:
@@ -677,12 +718,19 @@ class Translator:
                     raise NormsCheckError(f"--members {name}={want}: {name} has only "
                                           f"{hi - lo + 1} member(s)")
                 top = lo + want - 1
+                if hi is not None and top < hi:
+                    self._note(f"--members {name}={want}: {name} is declared with "
+                               f"{hi - lo + 1} members; the answers (\"violable: no\" among "
+                               f"them) hold for instances with {want} of them only")
             elif hi is not None:
                 top = hi
             else:
                 used = [v for (s, var), v in ((k, self.bindings.get(k[1])) for k in refs)
                         if s == name and isinstance(v, int)]
                 top = max([lo] + used)
+                self._note(f"{name}[{lo}..{symbolic}] has {top - lo + 1} member(s) in the "
+                           f"instance because --members does not give its size; the answers "
+                           f"hold for that size only: give --members {name}=n to check more")
             self.members[name] = list(range(lo, top + 1))
         for name in members:
             if name not in self.members:
@@ -1334,21 +1382,15 @@ class Translator:
         else:
             # k values below, between and above the literals, so that k
             # quantities compared with each other can take every order
-            numbers = [cs[0] - j for j in range(k, 0, -1)]
+            # (computed exactly; a value of a trace is an integer or a float,
+            # so the values are k integers or floats strictly inside each gap,
+            # or all of them when the gap holds fewer)
+            numbers = [_exact_number(Fraction(cs[0]) - j) for j in range(k, 0, -1)]
             for i, c in enumerate(cs):
                 numbers.append(c)
                 if i + 1 < len(cs):
-                    nxt = cs[i + 1]
-                    for j in range(1, k + 1):
-                        if k == 1 and isinstance(c, int) and isinstance(nxt, int) \
-                                and nxt - c >= 2:
-                            v = c + 1
-                        else:
-                            v = c + (nxt - c) * Fraction(j, k + 1)
-                            v = int(v) if v.denominator == 1 else float(v)
-                        if v not in numbers:
-                            numbers.append(v)
-            numbers += [cs[-1] + j for j in range(1, k + 1)]
+                    numbers += _numbers_between(Fraction(c), Fraction(cs[i + 1]), k)
+            numbers += [_exact_number(Fraction(cs[-1]) + j) for j in range(1, k + 1)]
         lits = sorted({str(c) for c in q.consts if isinstance(c, str)})
         ordered = k > 1 or any(a[0] in ("<", "<=", ">", ">=") and isinstance(a[1], str)
                                for a in q.atoms)
@@ -1605,9 +1647,16 @@ class Environment:
         for k in parent:
             groups.setdefault(root(k), []).append(k)
         for keys in groups.values():
+            # every quantity of the group gets the literals of all of them, so
+            # that its values cover every literal comparison of the others
+            # (F.12: an order of the group with the literals is realised)
+            union: set = set()
+            for k in keys:
+                union |= self.quantities[k].consts
             for k in keys:
                 q = self.quantities[k]
                 q.order = len(keys)
+                q.consts |= union
                 q.consts.update((0, 1))         # an ordering compares true as 1
                 for other in keys:
                     dom = self.quantities[other].domain
@@ -1651,11 +1700,20 @@ class Environment:
             for k in keys:
                 size *= len(self.quantities[k].reps)
             if size > MAX_VALUATIONS:
+                sizes = ", ".join(f"{k} ({len(self.quantities[k].reps)} classes)" for k in keys)
+                sets = sorted({m.group(1) for k in keys
+                               for m in [re.match(r"([A-Za-z_]\w*)\[\d+\]", k)] if m})
                 raise NormsCheckError(
-                    f"the quantities {', '.join(keys)} have {size} classes of values together; "
-                    f"norms-check 0.1 refuses more than {MAX_VALUATIONS}")
+                    f"the predicates {', '.join(repr(self.preds[i].text) for i in ids)} read "
+                    f"{sizes}: {size} combinations together, and norms-check refuses more than "
+                    f"{MAX_VALUATIONS}. Use fewer --members"
+                    + (f" ({', '.join(sets)})" if sets else "")
+                    + " or, for quantities used in arithmetic, a smaller --domain")
             seen: dict = {}
-            for combo in itertools.product(*(self.quantities[k].reps for k in keys)):
+            for count_, combo in enumerate(
+                    itertools.product(*(self.quantities[k].reps for k in keys))):
+                if count_ % 512 == 0:
+                    _generation_time()
                 vals = dict(zip(keys, combo))
                 vec = tuple(self._value(i, vals) for i in ids)
                 if vec not in seen:
@@ -1943,6 +2001,7 @@ class NormsModel:
         one observation, for every instance. `first`: the command of the
         first observation, from the initial state (its updates are
         constants)."""
+        _generation_time()
         ir = self.ir
         step = ir.V("step")
         out: dict = {}
@@ -2321,8 +2380,21 @@ class NormsModel:
         m = _ACTOR_RE.match(performer)
         return bool(m) and m.group(1) == what
 
+    def command_count(self) -> int:
+        """The number of commands before they are built (F.12 limits)."""
+        a = len(self.tr.choices)
+        if self.versioned:
+            return 2 * a * 2 * (2 * len(self.vtrs) - 1)
+        return 2 * a * (2 ** len(self.trs) if self.multi else 2)
+
     def _commands(self) -> list:
         """(label, choice, end, guard, updates) for every command."""
+        count = self.command_count()
+        if count > MAX_COMMANDS:
+            raise NormsCheckError(
+                f"the model would have {count} commands ({len(self.tr.choices)} choices per "
+                f"observation, times the ends of the instances and the versions); norms-check "
+                f"refuses more than {MAX_COMMANDS}")
         out = []
         if self.versioned:
             A = len(self.tr.choices)
@@ -3010,11 +3082,13 @@ def _version_translators(tr: Translator, sos: SoSDefinition, contract: ContractD
     does not translate exactly."""
     from .norms_eval import load_version
     names, soses = [], []
+    paths_of: dict = {}
     for v in versions:
         if isinstance(v, tuple):
             name, vs = v
         else:
-            name, vs = str(Path(v).resolve()), load_version(v)
+            name, vs = Path(v).name, load_version(v)
+            paths_of[name] = str(Path(v).resolve())
         names.append(name)
         soses.append(vs)
     out = []
@@ -3051,8 +3125,11 @@ def _version_translators(tr: Translator, sos: SoSDefinition, contract: ContractD
                 raise NormsCheckError(
                     f"the norm {n.id} changes its kind between versions, which norms-check "
                     f"does not translate (F.6 discharges it)")
+    if len(set(names)) != len(names):
+        raise NormsCheckError("--version: two versions have the same file name")
     tr.version_names = names
     tr.version_sos = dict(zip(names, soses))
+    tr.version_paths = paths_of
     return out
 
 
@@ -3175,6 +3252,17 @@ def _parse_prism_output(out: str, count: int) -> list[dict]:
     return results
 
 
+def _java_memory() -> str:
+    """The Java heap for PRISM: 4g, or half the physical memory when that
+    is smaller (at least 1g)."""
+    try:
+        phys = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        return "1g"
+    gib = phys // 2 // (1 << 30)
+    return f"{max(1, min(4, gib))}g"
+
+
 def run_prism(prism: str, model_text: str, props: list[str], early_end: bool,
               timeout: float = 600, workdir: str | None = None) -> list[dict]:
     """Check `props` on the model with PRISM (explicit engine, with the
@@ -3186,7 +3274,7 @@ def run_prism(prism: str, model_text: str, props: list[str], early_end: bool,
         pp.write_text("\n".join(props) + "\n", encoding="utf-8")
         cmd = [prism, str(mp), str(pp), "-const", f"early_end={'true' if early_end else 'false'}",
                "-explicit", "-exportstrat", "stdout",
-               "-javamaxmem", os.environ.get("CADL_PRISM_JAVAMAXMEM", "4g")]
+               "-javamaxmem", os.environ.get("CADL_PRISM_JAVAMAXMEM") or _java_memory()]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)
         try:
@@ -3542,7 +3630,12 @@ def _report_head(model: NormsModel) -> dict:
         "rules": [{"creates": r.creates, "status": r.status, "reason": r.reason}
                   for r in tr.rules],
         "excuse_known": model.excuse_known,
-        "notes": list(dict.fromkeys(x for t in model.trs for x in t.notes)),
+        "notes": list(dict.fromkeys(
+            [x for t in model.trs for x in t.notes]
+            + ([f"the {len(model.trs)} instances start together at the first observation and "
+                f"share the observations, the message events and the quantities; each ends at "
+                f"an observation of its own (traces whose instances start at different "
+                f"observations are not covered)"] if model.multi else []))),
         "conflicts": [],
         "checked": True,
     }
@@ -3604,6 +3697,20 @@ def export(model: NormsModel, report: dict | None, directory) -> list[str]:
     d = Path(directory)
     d.mkdir(parents=True, exist_ok=True)
     stem = _file_stem(model.tr.contract.id)
+    paths = getattr(model.tr, "version_paths", {})
+
+    def _lines(lines: list) -> str:
+        # the amend line names the version file relative to the trace file
+        out = []
+        for line in lines:
+            if '"amend"' in line:
+                obs = json.loads(line)
+                if obs.get("amend") in paths:
+                    obs["amend"] = os.path.relpath(paths[obs["amend"]], d.resolve())
+                line = json.dumps(obs)
+            out.append(line)
+        return "\n".join(out)
+
     files = {f"{stem}.prism": model.prism_text(),
              f"{stem}_any.props": props_text(model, "any"),
              f"{stem}_full.props": props_text(model, "full")}
@@ -3613,19 +3720,18 @@ def export(model: NormsModel, report: dict | None, directory) -> list[str]:
                 w = entry.get("witness") if isinstance(entry, dict) else None
                 if w and "trace" in w:
                     name = f"witness_{_file_stem(n['id'])}_{key}.jsonl"
-                    files[name] = "\n".join(w["trace"]) + "\n"
+                    files[name] = _lines(w["trace"]) + "\n"
                     w["file"] = str(d / name)
                     for k, lines in w.get("traces", {}).items():
-                        files[name.replace(".jsonl", f"_instance{k}.jsonl")] = \
-                            "\n".join(lines) + "\n"
+                        files[name.replace(".jsonl", f"_instance{k}.jsonl")] = _lines(lines) + "\n"
         for c in report["conflicts"]:
             for w in c.get("witnesses", []):
                 name = (f"witness_conflict_{_file_stem(c['norms'][0])}_"
                         f"{_file_stem(c['norms'][1])}_keep_{_file_stem(w['keeps'])}.jsonl")
-                files[name] = "\n".join(w["trace"]) + "\n"
+                files[name] = _lines(w["trace"]) + "\n"
                 w["file"] = str(d / name)
                 for k, lines in w.get("traces", {}).items():
-                    files[name.replace(".jsonl", f"_instance{k}.jsonl")] = "\n".join(lines) + "\n"
+                    files[name.replace(".jsonl", f"_instance{k}.jsonl")] = _lines(lines) + "\n"
     for name, text in files.items():
         (d / name).write_text(text, encoding="utf-8")
     if report is not None:
@@ -3765,13 +3871,24 @@ def check_file(path, contract_id=None, bindings=None, members=None, step=None,
                horizon=None, export_dir=None, prism=None, timeout: float = 600,
                domains=None, instances=None, versions=None) -> dict:
     """`cadl norms-check`: build the model of a file, check it, export."""
+    import time
     from .norms_eval import load_version
+    start = time.monotonic()
     sos = load_version(path)
-    model = build_model(sos, contract_id, bindings, members, step, horizon, domains, instances,
-                        versions)
+    _DEADLINE[0] = start + timeout
+    try:
+        model = build_model(sos, contract_id, bindings, members, step, horizon, domains,
+                            instances, versions)
+    finally:
+        _DEADLINE[0] = None
+    built = time.monotonic() - start
     if export_dir is not None:
         export(model, None, export_dir)       # the model, also when the check fails
-    report = check(model, prism, timeout)
+    left = timeout - (time.monotonic() - start)
+    if left <= 0:
+        raise NormsCheckTimeout("building the model used up --timeout")
+    report = check(model, prism, left)
+    report["model"]["generation_s"] = round(built, 1)
     report["file"] = str(path)
     if export_dir is not None:
         export(model, report, export_dir)

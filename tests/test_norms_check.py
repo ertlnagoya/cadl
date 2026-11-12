@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -427,7 +428,7 @@ def model_of(name: str, **kw):
     if key not in _MODELS:
         texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS,
                  "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES, "QUANT": QUANT,
-                 "ARITH": ARITH,
+                 "ARITH": ARITH, "MIXED": MIXED,
                  "MULTI": MULTI}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
@@ -444,6 +445,7 @@ CASES = [
     ("CONFLICTS", {"bindings": ["i=1"]}),
     ("EVENTS", {"bindings": ["i=1"], "members": ["R=2"]}),
     ("TYPES", {"bindings": ["i=1"]}),
+    ("MIXED", {"members": ["R=2"]}),
     (str(EXAMPLES / "norms_check_value_types.cadl"), {"bindings": ["i=1"]}),
     ("QUANT", {"members": ["R=2"]}),
     ("ARITH", {"domains": ARITH_DOMAINS}),
@@ -483,7 +485,8 @@ class TestTranslation:
         assert all(n.status == "model" for n in tr.norms)
         assert tr.members["ROBOT"] == [1, 2]
         assert tr.bindings == {"i": 2, "N": 2, "M": 1}      # N, M: the members
-        assert tr.notes == []
+        # the sets with a symbolic bound and no --members: one note each
+        assert len(tr.notes) == 2 and all("give --members" in n for n in tr.notes)
 
     def test_default_binding_is_reported(self):
         _sos, m, _pm = model_of(str(ROBOT))
@@ -1211,8 +1214,7 @@ def test_cli_require_checker_and_timeout(tmp_path):
     if PRISM is not None:
         p = cli(str(CONFLICT), "--bindings", "i=1", "--timeout", "0.01",
                 "--export", str(tmp_path))
-        assert p.returncode == 2 and "--timeout" in p.stderr
-        assert (tmp_path / "STATUS_REPORTING.prism").exists()
+        assert p.returncode == 2 and "--timeout" in p.stderr      # building or checking
 
     for bad in ("0", "-5", "nan", "inf"):
         p = cli(str(CONFLICT), "--bindings", "i=1", "--timeout", bad)
@@ -1250,10 +1252,33 @@ def test_value_classes_cover_every_json_value(case):
         keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
         exprs = [tr.preds[i].expr for i in ids]
         known = {v for v, _vals in vecs}
+        # the literals of the whole group, so that a value of one quantity
+        # can equal a literal compared with another one
+        lits = set().union(*(tr.quantities[k].consts for k in keys))
         for _ in range(150):
-            vals = {k: _random_json(rng, tr.quantities[k].consts, tr.quantities[k].domain)
-                    for k in keys}
+            vals = {k: _random_json(rng, lits, tr.quantities[k].domain) for k in keys}
             assert tuple(tr._oracle(exprs, vals)) in known, vals
+
+
+MIXED = """\
+norms:
+  - id: same_above
+    kind: prohibition
+    bearer: D
+    content: "R[1].v == R[2].v AND R[2].v > 3"
+  - id: order_above
+    kind: prohibition
+    bearer: D
+    content: "R[1].w < R[2].w AND R[1].w > 5"
+  - id: texts
+    kind: prohibition
+    bearer: D
+    content: "R[1].s == R[2].s AND R[2].s == \\"zz\\""
+  - id: floats
+    kind: prohibition
+    bearer: D
+    content: "R[1].f < 0.5 AND R[1].f > -1e-3 AND R[1].f != 0.25"
+"""
 
 
 TYPES = """\
@@ -1293,6 +1318,56 @@ def test_values_of_another_type():
     assert w["confirmed"] and "R[1].v=true" in " ".join(w["choices"])
     assert report["conflicts"] == []
     assert norms["o"]["fulfillable"]["answer"] and norms["q"]["violable"]["answer"]
+
+
+@needs_prism
+def test_mixed_comparisons_are_violable():
+    """A quantity compared with another one also takes the literals that the
+    other is compared with: both values 4 violate same_above, and so on.
+    norms-check 0.3.25+ reported these as never violated."""
+    sos, m, _pm = model_of("MIXED", members=["R=2"])
+    assert 0.25 in m.tr.quantities["R[1].f"].reps or any(
+        type(v) is float and -1e-3 < v < 0.5 for v in m.tr.quantities["R[1].f"].reps)
+    report = check(m, PRISM)
+    for nid in ("same_above", "order_above", "texts", "floats"):
+        entry = {n["id"]: n for n in report["norms"]}[nid]["violable"]
+        assert entry["answer"] and entry["witness"]["confirmed"], nid
+
+
+def test_internal_errors_exit_4(monkeypatch, capsys):
+    import argparse
+    import cadl.norms_check as nc
+    from cadl import cli as cli_module
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(nc, "check_file", boom)
+    args = argparse.Namespace(file=ROBOT, contract=None, bindings=[], members=[], step=None,
+                              horizon=None, export=None, format="text", timeout=600,
+                              require_checker=False, domain=[], instance=[], instances=None,
+                              versions=[])
+    assert cli_module._cmd_norms_check(args) == 4
+    assert "Internal error of norms-check" in capsys.readouterr().err
+
+
+def test_command_limit_and_java_memory():
+    from cadl.norms_check import MAX_COMMANDS, _java_memory
+    _sos, m, _pm = model_of(str(ROBOT), bindings=["i=2"])
+    assert m.command_count() == len(m.commands) <= MAX_COMMANDS
+    assert re.fullmatch(r"[1-4]g", _java_memory())
+
+
+def test_witness_amend_lines_are_relative(tmp_path):
+    v1, v2 = tmp_path / "v1.cadl", tmp_path / "v2.cadl"
+    v1.write_text(HEAD + textwrap.indent(AM_SMALL_V1, "      "))
+    v2.write_text(HEAD + textwrap.indent(AM_SMALL_V2, "      "))
+    m = build_model(load_version(v1), bindings={"i": 1}, versions=[str(v2)])
+    assert m.tr.version_names == ["v2.cadl"]
+    from cadl.norms_check import random_paths as rp, trace_lines as tl
+    p = next(p for p in rp(m.tr, 50, seed=1, p_amend=0.5) if any(j >= len(m.tr.choices)
+                                                                for j, _e in p))
+    assert '"amend": "v2.cadl"' in "\n".join(tl(m.tr, p))
 
 
 def test_cli_refusal():

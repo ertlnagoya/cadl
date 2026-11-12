@@ -353,7 +353,11 @@ def main(argv: list[str] | None = None) -> int:
     # norms-check command
     nchk_cmd = subparsers.add_parser("norms-check",
         help="Check the norms of one contract instance over all behaviours with a model "
-             "checker (Appendix F, F.12)")
+             "checker (Appendix F, F.12)",
+        epilog="PRISM runs with a Java heap of 4g, or half the physical memory when that is "
+               "smaller; set CADL_PRISM_JAVAMAXMEM (such as 8g) to change it. Exit status: 0 "
+               "no finding, 1 a finding, 2 a usage error, refusal or timeout, 3 a witness not "
+               "confirmed by norms-eval, 4 an internal error.")
     nchk_cmd.add_argument("file", type=Path, help="CADL file that declares norms: 0.1")
     nchk_cmd.add_argument("--contract", default=None, metavar="ID",
                           help="Contract to check (default: the only one with norms)")
@@ -1192,6 +1196,19 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
 
 
 def _cmd_norms_check(args: argparse.Namespace) -> int:
+    """Exit status 4 for an internal error of norms-check (never 1, which
+    means a finding); see _norms_check_run for the others."""
+    try:
+        return _norms_check_run(args)
+    except Exception as e:      # an error of norms-check itself
+        import traceback
+        print(f"Internal error of norms-check ({type(e).__name__}: {e}); please report it "
+              f"with the file and the options.", file=sys.stderr)
+        traceback.print_exc(limit=3, file=sys.stderr)
+        return 4
+
+
+def _norms_check_run(args: argparse.Namespace) -> int:
     """Exit status: 0 when the questions were answered without a finding,
     or when no model checker is on PATH (the model is still exported with
     --export) unless --require-checker is given; 1 on a finding (a

@@ -62,7 +62,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   and witnesses carry the `amend` line. Versions with other actors or
   another lifecycle, a norm whose kind changes, an untranslated norm or
   rule in some version, and amendments with several instances are
-  refused. PRISM now runs with `-javamaxmem 4g` (`CADL_PRISM_JAVAMAXMEM`).
+  refused. PRISM now runs with a Java heap of 4g, or half the physical
+  memory when that is smaller (`CADL_PRISM_JAVAMAXMEM` overrides it).
+  Witness traces name a version by its file name, and exported ones by a
+  path relative to the export directory.
+- `cadl norms-check`: every quantity of a group of quantities compared with
+  each other takes the literals of the whole group, so
+  `R[1].v == R[2].v AND R[2].v > 3` is violable again; the grid of numbers
+  is computed exactly, which fixes a crash on any float literal. An
+  internal error exits with status 4 (never 1, a finding); `--timeout`
+  bounds building the model too; the limit is checked on the commands
+  (after the ends of instances and the versions, at most 32768); a
+  refusal for too many classes names the predicates, the quantities and
+  the sets; notes say when a set has one member by default, when
+  `--members` is below the declared size, and that instances start
+  together.
 
 ### Fixed
 
