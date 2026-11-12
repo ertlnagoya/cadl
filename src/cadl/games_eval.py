@@ -1315,15 +1315,17 @@ class CoupledPlays:
 
     def may_narrow(self, i: int, k: int, lower: list, upper: list) -> bool:
         """False when every pair of different states that the first step
-        reaches has a state whose value is known exactly on the cell
-        (l_p = u_p) or in which the target holds: then the coupled bound
+        can reach (a successor of c and one of σ(s) in the relaxed
+        process) has a state whose value is known exactly on the cell
+        (l_p = u_p, also where the target holds): then the coupled bound
         is not expected to be narrower than that of `advantage_bounds`,
         and it is not computed (leaving it out is always sound)."""
-        for _, _, d in self.options(("start", i, k)):
-            for x, y in d:
-                if x != y and lower[x] != upper[x] and lower[y] != upper[y]:
-                    return True
-        return False
+        proc = self.proc
+        def open_successors(command: Any) -> set:
+            return {j for k2, ds in proc.options[i] if k2 == command for d in ds for j in d
+                    if lower[j] != upper[j]}
+        first, second = open_successors(k), open_successors(proc.selected[i])
+        return any(x != y for x in first for y in second)
 
     def bound(self, i: int, k: int, maximize: bool) -> Fraction:
         """The largest (or least) value of the process on pairs from the
@@ -1533,21 +1535,30 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
         adv = dict(adv)
         gain_at_centre = at.state_gain if every_state else at.gain
         if not at.admissible or gain_at_centre <= epsilon:
+            narrowed = False
             for key, (a, b) in adv.items():
                 if b > 0 and plays.may_narrow(*key, lower, upper):
-                    adv[key] = (a, min(b, plays.bound(*key, maximize=True)))
-            if pd_plus(proc, out, adv, epsilon, every_state):
+                    c = plays.bound(*key, maximize=True)
+                    if c < b:
+                        adv[key] = (a, c)
+                        narrowed = True
+            if narrowed and pd_plus(proc, out, adv, epsilon, every_state):
                 out.coupled = True
                 return out
         elif at.deviation or every_state:
+            narrowed = False
             tau = at.best_response if every_state else at.deviation
             local = {g: i for i, g in enumerate(proc.states)}
             for g, k in tau.items():
                 key = (local.get(g), k)
                 if key in adv and plays.may_narrow(*key, lower, upper):
                     a, b = adv[key]
-                    adv[key] = (max(a, plays.bound(*key, maximize=False)), b)
-            if at.deviation and pd_minus(proc, out, adv, at, epsilon, every_state):
+                    c = plays.bound(*key, maximize=False)
+                    if c > a:
+                        adv[key] = (c, b)
+                        narrowed = True
+            if narrowed and at.deviation and \
+                    pd_minus(proc, out, adv, at, epsilon, every_state):
                 out.coupled = True
                 return out
     if every_state and at.admissible and at.state_gain > epsilon:
