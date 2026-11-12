@@ -20,7 +20,14 @@ _D := {"$": "undecided"}
 
 _MAX_T := {"$q": [9007199254740992, 0]}
 
-_ZEROS := "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+# The range of the exact numbers, as in cadl norms-eval (F.5): at most 400
+# significant digits, at most 400 decimals, an absolute value below 10^308.
+# The scales of the model are below 4096 (cadl codegen refuses a product
+# that could exceed it), so that pow10 and the operations below are
+# defined for every number the monitor computes with.
+_LIMIT := 400
+
+_MAX_SCALE := 4095
 
 _NUM_RE := `^(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$`
 
@@ -51,21 +58,77 @@ _MSG_KEYS := {"from", "to", "name", "args"}
 
 # --- exact decimal numbers ------------------------------------------------------
 
-pow10(k) := to_number(concat("", ["1", substring(_ZEROS, 0, k)]))
+# 10^k for 0 <= k <= _MAX_SCALE, by repeated squaring (integers only)
+_p0 := 10
 
-# A number of the input as the decimal it is written as (its JSON text);
-# undefined for a number with more decimals or digits than _ZEROS holds.
-dec(v) := {"$q": [to_number(concat("", [m[1], m[2], m[3]])), sc]} if {
-	m := regex.find_all_string_submatch_n(_NUM_RE, json.marshal(v), 1)[0]
-	sc := count(m[3]) - exp_of(m[4])
-	sc >= 0
-	sc <= count(_ZEROS)
-} else := {"$q": [to_number(concat("", [m[1], m[2], m[3], substring(_ZEROS, 0, sh)])), 0]} if {
-	m := regex.find_all_string_submatch_n(_NUM_RE, json.marshal(v), 1)[0]
-	sh := exp_of(m[4]) - count(m[3])
-	sh > 0
-	sh <= count(_ZEROS)
+_p1 := _p0 * _p0
+
+_p2 := _p1 * _p1
+
+_p3 := _p2 * _p2
+
+_p4 := _p3 * _p3
+
+_p5 := _p4 * _p4
+
+_p6 := _p5 * _p5
+
+_p7 := _p6 * _p6
+
+_p8 := _p7 * _p7
+
+_p9 := _p8 * _p8
+
+_p10 := _p9 * _p9
+
+_p11 := _p10 * _p10
+
+_POWERS := [_p0, _p1, _p2, _p3, _p4, _p5, _p6, _p7, _p8, _p9, _p10, _p11]
+
+pow10(k) := product([_POWERS[i] | some i in numbers.range(0, 11); bits.and(k, bits.lsh(1, i)) != 0]) if {
+	k >= 0
+	k <= _MAX_SCALE
 }
+
+# a string of decimal digits as an integer, in chunks that to_number reads exactly
+digits_int(s) := sum([digit_chunk(s, i) | some i in numbers.range(0, floor((count(s) - 1) / 18))])
+
+digit_chunk(s, i) := to_number(substring(s, i * 18, 18)) * pow10(rest) if {
+	rest := count(s) - (i * 18 + count(substring(s, i * 18, 18)))
+}
+
+# A number of the input as the decimal it is written as (its JSON text):
+# n / 10^k with mantissa digits m and exponent e of its last digit.
+# Undefined outside the range of the exact numbers.
+dec(v) := {"$q": [0, 0]} if {
+	m := regex.find_all_string_submatch_n(_NUM_RE, json.marshal(v), 1)[0]
+	trim_left(concat("", [m[2], m[3]]), "0") == ""
+	exp_of(m[4]) - count(m[3]) >= 0 - _LIMIT
+} else := {"$q": [sgn(m[1]) * digits_int(mant) * pow10(e), 0]} if {
+	m := regex.find_all_string_submatch_n(_NUM_RE, json.marshal(v), 1)[0]
+	mant := concat("", [m[2], m[3]])
+	e := exp_of(m[4]) - count(m[3])
+	in_range(mant, e)
+	e >= 0
+} else := {"$q": [sgn(m[1]) * digits_int(mant), 0 - e]} if {
+	m := regex.find_all_string_submatch_n(_NUM_RE, json.marshal(v), 1)[0]
+	mant := concat("", [m[2], m[3]])
+	e := exp_of(m[4]) - count(m[3])
+	in_range(mant, e)
+	e < 0
+}
+
+sgn(s) := -1 if {
+	s == "-"
+} else := 1
+
+in_range(mant, e) if {
+	nd := count(trim_left(mant, "0"))
+	nd <= _LIMIT
+	e >= 0 - _LIMIT
+	nd + e <= 308
+}
+
 
 exp_of(e) := 0 if {
 	e == ""
@@ -93,7 +156,10 @@ qcmp(a, b) := -1 if {
 } else := 1 if {
 	x := qal(a, b)
 	x[0] > x[1]
-} else := 0
+} else := 0 if {
+	x := qal(a, b)
+	x[0] == x[1]
+}
 
 qle(a, b) if qcmp(a, b) <= 0
 
@@ -1311,8 +1377,7 @@ errs[6] := sprintf("time %v is before the previous observation (%v)", [obs.t, qf
 	qcmp(tq, S.t) < 0
 }
 
-# a number with more digits than the monitor writes exactly (_ZEROS)
-errs[16] := "a number of the observation has too many digits" if {
+errs[16] := "a number of the observation is outside the range of exact numbers (at most 400 significant digits, at most 400 decimals, an absolute value below 10^308)" if {
 	not finishing
 	is_object(obs)
 	walk(obs, [_, x])

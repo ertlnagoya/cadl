@@ -784,6 +784,9 @@ def _build_norm(data: dict) -> NormDef:
         until=_opt_text(_get(data, 'until')),
         content=_opt_text(_get(data, 'content')) or '',
         deadline_ms=deadline_ms,
+        deadline_text=(repr(raw_deadline) if deadline_ms is not None
+                       and isinstance(raw_deadline, (int, float))
+                       and not isinstance(raw_deadline, bool) else None),
         invalid_deadline=(
             _value_as_text(raw_deadline)
             if raw_deadline is not None and deadline_ms is None

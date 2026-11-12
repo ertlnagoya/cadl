@@ -54,9 +54,19 @@ NO_DOUBLE = EXAMPLES / "norms_no_double_assignment.cadl"
 
 needs_opa = pytest.mark.skipif(S.opa_binary() is None, reason="the opa binary is not on PATH")
 needs_solc = pytest.mark.skipif(S.solc_binary() is None, reason="no solc (CADL_SOLC, PATH, ~/.solcx)")
-needs_evm = pytest.mark.skipif(S.solc_binary() is None or S.evm_python() is None,
-                               reason="no solc, or no EVM (CADL_EVM_PYTHON: a Python with "
-                                      "eth-tester[py-evm])")
+# CADL_REQUIRE_EVM=1 (CI): the EVM tests run, and fail when there is no EVM
+REQUIRE_EVM = os.environ.get("CADL_REQUIRE_EVM") == "1"
+needs_evm = pytest.mark.skipif(
+    not REQUIRE_EVM and (S.solc_binary() is None or S.evm_python() is None),
+    reason="no solc, or no EVM (CADL_EVM_PYTHON: a Python with eth-tester[py-evm])")
+
+
+def test_evm_is_there_when_required():
+    """With CADL_REQUIRE_EVM=1 a missing EVM or solc is a failure, not a skip."""
+    if not REQUIRE_EVM:
+        pytest.skip("CADL_REQUIRE_EVM is not set")
+    assert S.solc_binary() is not None, "no solc (CADL_SOLC, PATH or ~/.solcx)"
+    assert S.evm_python() is not None, "no EVM (CADL_EVM_PYTHON: eth-tester[py-evm])"
 
 
 def _count(default: int) -> int:
@@ -223,17 +233,28 @@ class TestGeneration:
         assert temporal_names(solidity_ir(sos, sos.contracts[0])) == ["flag"]
         assert "temporalName[keccak256" in generate_norms_monitor_sol(sos, sos.contracts[0])
 
-    @pytest.mark.parametrize("content", ["within(3s, A.x > 1) OR A.y == 1",
-                                         "NOT throughout(2s, A.x > 1)"])
-    def test_solidity_wants_a_temporal_content_to_be_one_operator(self, content):
-        """The Solidity monitor decides the candidates of a temporal
-        content together, from the operator and its operands, so the
-        operator is the whole content; OPA monitors the rest too."""
+    @pytest.mark.parametrize("content,match", [
+        ("within(3s, A.x > 1) OR throughout(2s, A.y == 1)", "two temporal operators"),
+        ("NOT until(A.x > 1, A.y == 1, 3s)", "NOT until"),
+        ("within(3s, A.x > 1) == true", "inside a comparison"),
+    ])
+    def test_solidity_temporal_content_limits(self, content, match):
+        """The Solidity monitor decides the candidates of a content from its
+        one temporal operator (NOT turns within and throughout into their
+        duals); OPA monitors these contents too."""
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
                      f"content: \"{content}\"}}\n")
         generate_norms_monitor_rego(sos, sos.contracts[0])
-        with pytest.raises(NormsTargetUnsupported, match="not the whole content"):
+        with pytest.raises(NormsTargetUnsupported, match=match):
             generate_norms_monitor_sol(sos, sos.contracts[0])
+
+    @pytest.mark.parametrize("content", ["within(3s, A.x > 1) OR A.y == 1",
+                                         "NOT throughout(2s, A.x > 1) AND A.ok == true",
+                                         "NOT (within(2s, A.x == 0) OR A.z == 1)"])
+    def test_solidity_reduces_a_content_to_its_operator(self, content):
+        sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
+                     f"content: \"{content}\"}}\n")
+        assert "_temporal(" in generate_norms_monitor_sol(sos, sos.contracts[0])
 
     def test_rego_carries_the_contract_as_one_json_text(self):
         """No text of the .cadl file is Rego code: the model is one JSON
@@ -804,10 +825,18 @@ WINDOWS = """\
            content: "until(A.ok == true, A.done == true, 4s)", deadline: 5s}
         - {id: th2, kind: obligation, bearer: A, content: "throughout(1s, A.y == 1)",
            deadline: 8s}
+        - {id: wz, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(3s, A.x > 5) OR A.z == 1", deadline: 4s}
+        - {id: nt, kind: prohibition, bearer: A, trigger: "B -> A : start",
+           content: "NOT throughout(2s, A.x > 2) AND A.ok == true", deadline: 6s}
+        - {id: ua, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "until(A.ok == true, A.done == true, 3s) AND A.y == 1", deadline: 5s}
+        - {id: nw, kind: obligation, bearer: A, content: "NOT (within(2s, A.x == 0) OR A.z == 1)",
+           deadline: 7s}
         - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
-           effects: {suspend: [w, th, un, th2]}}
+           effects: {suspend: [w, th, un, th2, wz, nt, ua, nw]}}
         - {id: re, kind: power, bearer: B, content: "B -> A : resume",
-           effects: {resume: [w, th, un, th2]}}
+           effects: {resume: [w, th, un, th2, wz, nt, ua, nw]}}
 """
 
 
@@ -817,7 +846,8 @@ def _window_trace(rng: random.Random) -> list:
         rec: dict = {"t": t}
         values = {}
         for name, choices in (("A.x", [0, 3, 6, 9, 10, None]), ("A.ok", [True, True, False, None]),
-                              ("A.done", [False, False, True, None]), ("A.y", [1, 1, 1, 0, None])):
+                              ("A.done", [False, False, True, None]), ("A.y", [1, 1, 1, 0, None]),
+                              ("A.z", [0, 0, 1, None])):
             if rng.random() < (0.8 if k == 0 else 0.35):
                 values[name] = rng.choice(choices)
         if values:
@@ -879,3 +909,78 @@ def test_evm_gas_of_a_temporal_content_is_bounded(tmp_path):
     [raw] = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", [run], tmp_path)
     gas = [r["gas"] for r in raw]
     assert max(gas[20:]) < 1.05 * min(gas[20:]) and max(gas) < 500_000, (min(gas), max(gas))
+
+
+# === The range of exact numbers, exact deadlines, runtime size =======================
+
+RANGE_ITEMS = ("      guarantee:\n        - \"A.x > 0\"\n        - \"A.x == 0.0000001\"\n"
+               "        - \"A.x * 10 == 0.000001\"\n        - \"A.x + 1000 > 1000\"\n")
+
+
+@needs_opa
+@pytest.mark.parametrize("number", ["1e-7", "1E-7", "-0.0", "1e400", "1e-400", "1e-700",
+                                    "123456789012345678901234567890.5", "0e5000",
+                                    "1" + "0" * 300, "1" + "0" * 400])
+def test_opa_range_of_exact_numbers(number, tmp_path):
+    """p12 of the review: the scales of 10^-309 and below used to compare as
+    equal in Rego. Inside the range of F.5 OPA agrees with norms-eval,
+    outside it both refuse the observation."""
+    sos = _small(RANGE_ITEMS)
+    lines = ['{"t": 0, "values": {"A.x": %s}}' % number, '{"t": 1e0, "end": true}']
+    refs = [S.reference(sos, lines)]
+    got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]), monitor_package("C"),
+                    [lines], refs, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+def test_rego_refuses_a_product_beyond_its_scales():
+    product = " * ".join(["A.x"] * 11)
+    sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
+                 f"content: \"{product} > 1\"}}\n")
+    with pytest.raises(NormsTargetUnsupported, match="more than 4095 decimals"):
+        generate_norms_monitor_rego(sos, sos.contracts[0])
+
+
+DEADLINE = ("      norms:\n        - {id: o, kind: obligation, bearer: A, trigger: \"B -> A : req\",\n"
+            "           content: \"B -> A : ack\", deadline: 0.0005}\n")
+
+
+@needs_opa
+def test_opa_numeric_deadline_is_exact(tmp_path):
+    sos = _small(DEADLINE)
+    m = '"messages": [{"from": "B", "to": "A", "name": "%s"}]'
+    traces = [['{"t": 0, %s}' % (m % "req"), '{"t": %s, %s}' % (at, m % "ack")]
+              for at in ("0.0005", "0.0006")]
+    refs = [S.reference(sos, l) for l in traces]
+    assert [r["steps"][-1]["norms"]["o"][0] for r in refs] == ["fulfilled", "violated"]
+    got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]), monitor_package("C"),
+                    traces, refs, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+@needs_evm
+def test_evm_numeric_deadline_is_exact(tmp_path):
+    m = '"messages": [{"from": "B", "to": "A", "name": "%s"}]'
+    traces = [['{"t": 0, %s}' % (m % "req"), '{"t": %s, %s}' % (at, m % "ack")]
+              for at in ("0.0005", "0.0006")]
+    refs, got = _evm(_small(DEADLINE), traces, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+@needs_solc
+def test_runtime_estimate_is_above_solc(tmp_path):
+    """The runtime code does not depend on the CADL contract; cadl codegen
+    refuses a monitor whose estimate exceeds EIP-170, and the estimate is
+    above what solc writes with 1 and with 200 runs."""
+    from cadl.codegen.solidity.norms_monitor_sol import RUNTIME_ESTIMATE, RUNTIME_LIMIT
+    sos = parse_file(RICH)
+    text = generate_norms_monitor_sol(sos, sos.contracts[0])
+    assert "pragma solidity >=0.8.24 <0.9.0;" in text
+    for runs in (1, 200):
+        compiled = S.compile_solidity(text, "CNormsMonitor", tmp_path / str(runs), runs=runs)
+        for name, c in compiled.items():
+            if not c["bin"]:
+                continue
+            short = name.split(":")[1]
+            key = "monitor" if short == "CNormsMonitor" else short
+            assert c["runtime"] <= RUNTIME_ESTIMATE[key] <= RUNTIME_LIMIT, (runs, short)

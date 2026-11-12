@@ -55,13 +55,43 @@ def _q(value: Any) -> dict:
     return {"$q": [n, k]}
 
 
+# The scales (decimals) the library computes with: an input number has at
+# most INPUT_SCALE decimals, and pow10 is defined up to MAX_SCALE.
+INPUT_SCALE = 400
+MAX_SCALE = 4095
+
+
+def _scale(nodes: list[dict], k: int) -> int:
+    """The largest number of decimals the value of node k can have."""
+    nd = nodes[k]
+    op = nd["op"]
+    if op == "lit":
+        v = nd["v"]
+        if isinstance(v, bool) or not isinstance(v, (int, float, Fraction)):
+            return 0
+        return decimal_parts(v)[1]
+    if op in ("name", "mem", "req", "sym"):
+        return INPUT_SCALE
+    if op == "bin" and nd["o"] == "*":
+        return _scale(nodes, nd["l"]) + _scale(nodes, nd["r"])
+    if op == "bin":
+        return max(_scale(nodes, nd["l"]), _scale(nodes, nd["r"]))
+    if op == "in":
+        return max(_scale(nodes, i) for i in [nd["l"], *nd["items"]])
+    return 0
+
+
 def _problem(nodes: list[dict], root: int) -> str | None:
     """What the Rego monitor does not evaluate: division, whose result is
-    not always a decimal number (the monitor computes exactly)."""
+    not always a decimal number, and a product whose exact value could have
+    more than MAX_SCALE decimals (the monitor computes exactly)."""
     for k in subtree(nodes, root):
         if nodes[k]["op"] == "bin" and nodes[k]["o"] == "/":
             return ("the operator / (the Rego monitor computes with exact decimal numbers, "
                     "and a quotient is not always one)")
+        if _scale(nodes, k) > MAX_SCALE:
+            return (f"a product whose exact value can have more than {MAX_SCALE} decimals "
+                    f"(each number has at most {INPUT_SCALE})")
     return None
 
 

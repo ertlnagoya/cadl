@@ -85,6 +85,9 @@ struct EvalData {
     mapping(bytes32 => Scan) scans;       // incremental temporal operators, by (node, start)
     int256[] obsT;
     string[] obsSt;          // lifecycle state before each observation
+    // while `over`, node overNode evaluates to overVal (the content of a
+    // norm with its temporal operator replaced, F.5)
+    bool over; uint256 overNode; Val overVal;
 }
 
 // Functions of the monitor without state, in a library of their own (the
@@ -276,6 +279,16 @@ library CadlNormsEval {
         return ev(data, id, p, n);
     }
 
+    /// The truth of `root` at observation n with `node` read as `v`.
+    function evaluateWith(EvalData storage data, uint256 root, uint256 n, uint256 node, Val memory v)
+            public returns (Val memory r) {
+        data.over = true;
+        data.overNode = node;
+        data.overVal = v;
+        r = truth(ev(data, root, n, n));
+        data.over = false;
+    }
+
     function boolVal(bool b) internal pure returns (Val memory) {
         return Val(K_B, b ? int256(1) : int256(0), "");
     }
@@ -338,6 +351,7 @@ library CadlNormsEval {
     }
 
     function ev(EvalData storage data, uint256 id, uint256 p, uint256 n) internal returns (Val memory) {
+        if (data.over && id == data.overNode) return data.overVal;
         Node storage nd = data.nodes[id];
         uint8 op = nd.op;
         if (op == OP_LIT) return nd.lit;
@@ -478,21 +492,46 @@ uint8 constant W_WITHIN = 1;
 uint8 constant W_THROUGHOUT = 2;
 uint8 constant W_UNTIL = 3;
 
+// The temporal operator of the content of a norm: its kind (with `neg`,
+// the dual operator on the negated operand: NOT within(d, p) is
+// throughout(d, NOT p) and NOT throughout(d, p) is within(d, NOT p)), its
+// operands (p, and q of until), its duration, the operator node and the
+// root of the content.
+struct Temporal { uint8 mode; bool neg; uint256 tp; uint256 tq; int256 td; uint256 node; uint256 root; }
+
 /// The judgement of the candidates of a temporal content, with a cost per
-/// observation that does not depend on the number of candidates: two
+/// observation that does not depend on the number of candidates: a few
 /// binary searches over them, a few deletions of decided ones.
+///
+/// The rest of the content is decided at the observation of a candidate
+/// (its names are fixed, see makeKnown), so a candidate is one of: true
+/// whatever the operator gives (a hit), never true (not kept), true
+/// exactly when the operator (or its dual) is true (`live`), or never
+/// true but undecided until the operator is decided (`dead`: it keeps
+/// the norm pending, as F.5 does).
 library CadlNormsWindows {
     // truth values of an operand
     uint8 internal constant F = 0;
     uint8 internal constant T = 1;
     uint8 internal constant U = 2;
+    // what a new candidate is
+    uint8 internal constant C_HIT = 0;
+    uint8 internal constant C_DROP = 1;
+    uint8 internal constant C_LIVE = 2;
+    uint8 internal constant C_DEAD = 3;
 
-    /// What an observation says about the operand, for the candidates it
-    /// has (also while the norm is suspended).
-    function note(Window storage w, EvalData storage data, uint8 mode, uint256 tp, uint256 tq,
-                  uint256 n, int256 t) public {
+    /// What an observation says about the operands, for the candidates
+    /// there are (also while the norm is suspended).
+    function note(Window storage live, Window storage dead, EvalData storage data,
+                  Temporal storage tm, uint256 n, int256 t) public {
+        if (live.head == live.tail && dead.head == dead.tail) return;
+        (uint8 pv, uint8 qv) = operands(live, data, tm, n);
+        summarize(live, tm.mode, n, t, pv, qv);
+        summarize(dead, tm.mode, n, t, pv, qv);
+    }
+
+    function summarize(Window storage w, uint8 mode, uint256 n, int256 t, uint8 pv, uint8 qv) internal {
         if (w.head == w.tail) return;
-        (uint8 pv, uint8 qv) = operands(w, data, mode, tp, tq, n);
         if (mode == W_THROUGHOUT) {
             if (pv == F && !w.ffSet) { w.ffSet = true; w.ff = t; }
             if (pv == U && !w.fuSet) { w.fuSet = true; w.fu = t; }
@@ -506,35 +545,66 @@ library CadlNormsWindows {
         }
     }
 
-    /// The judgement of observation n (F.5, item 2 and 3) when the norm is
-    /// active: whether a candidate holds (hit), and whether no candidate
-    /// is left afterwards (empty).
-    function judge(Window storage w, EvalData storage data, uint8 mode, uint256 tp, uint256 tq,
-                   int256 d, uint256 n, int256 t, bool open) public returns (bool hit, bool empty) {
-        (uint8 pv, uint8 qv) = operands(w, data, mode, tp, tq, n);
-        if (w.head < w.tail) hit = oldHit(w, mode, d, t);
-        if (!hit && open && ((mode == W_WITHIN && pv == T) || (mode == W_UNTIL && qv == T))) hit = true;
+    /// The judgement of observation n (F.5, items 2 and 3) when the norm
+    /// is active: whether a candidate holds (hit), and whether none is left
+    /// (empty). `open`: the deadline has not passed, so n is a candidate.
+    function judge(Window storage live, Window storage dead, EvalData storage data,
+                   Temporal storage tm, uint256 n, int256 t, bool open) public returns (bool hit, bool empty) {
+        (uint8 pv, uint8 qv) = operands(live, data, tm, n);
+        // the operator is true at n for a candidate of n itself
+        bool trueNow = (tm.mode == W_WITHIN && pv == T) || (tm.mode == W_UNTIL && qv == T);
+        uint8 cls = open ? classify(data, tm, n) : C_DROP;
+        hit = cls == C_HIT || (cls == C_LIVE && trueNow)
+            || (live.head < live.tail && oldHit(live, tm.mode, tm.td, t));
         if (hit) {
-            w.head = w.tail;
+            live.head = live.tail;
+            dead.head = dead.tail;
         } else {
-            if (w.head < w.tail) {
-                if ((mode == W_THROUGHOUT && w.ffSet) || (mode == W_UNTIL && w.pFalse)) {
-                    w.head = w.tail;                        // false in every open window
-                } else {
-                    if ((mode == W_THROUGHOUT && w.fuSet) || (mode == W_UNTIL && w.pUnknown)) {
-                        w.luSet = true;
-                        w.lu = w.k[w.tail - 1];
-                    }
-                    w.head = firstFrom(w, t - d);           // the windows that are over
+            advance(live, tm, n, t, pv, cls == C_LIVE, false);
+            advance(dead, tm, n, t, pv, cls == C_DEAD && !trueNow, true);
+        }
+        reset(live);
+        reset(dead);
+        empty = live.head == live.tail && dead.head == dead.tail;
+    }
+
+    /// The candidates after an observation without a hit: false in every
+    /// window (throughout: an operand false; until: p false) removes them
+    /// all, an unknown operand marks them, the windows that are over go;
+    /// then the new candidate (unless the operator is decided at it).
+    function advance(Window storage w, Temporal storage tm, uint256 n, int256 t, uint8 pv, bool add,
+                     bool isDead) internal {
+        uint8 mode = tm.mode;
+        int256 d = tm.td;
+        if (isDead && mode == W_UNTIL && w.head < w.tail && w.jSet && (!w.pSet || w.j <= w.pFirst)) {
+            // until is decided (true) for the clean candidates whose window has j: never
+            // true for a dead candidate, so they go
+            uint256 from = firstFrom(w, w.jt - d);
+            uint256 firstClean = firstAfterK(w, w.luSet, w.lu);
+            uint256 cut = from > firstClean ? from : firstClean;
+            if (cut < w.tail) w.tail = cut;
+        }
+        if (w.head < w.tail) {
+            if ((mode == W_THROUGHOUT && w.ffSet) || (mode == W_UNTIL && w.pFalse)
+                    || (mode == W_WITHIN && w.ftSet)) {
+                w.head = w.tail;
+            } else {
+                if ((mode == W_THROUGHOUT && w.fuSet) || (mode == W_UNTIL && w.pUnknown)) {
+                    w.luSet = true;
+                    w.lu = w.k[w.tail - 1];
                 }
-            }
-            if (open && !((mode == W_THROUGHOUT || mode == W_UNTIL) && pv == F)) {
-                if ((mode == W_THROUGHOUT || mode == W_UNTIL) && pv == U) { w.luSet = true; w.lu = n; }
-                w.k[w.tail] = n;
-                w.t[w.tail] = t;
-                w.tail++;
+                w.head = firstFrom(w, t - d);
             }
         }
+        if (add && !((mode == W_THROUGHOUT || mode == W_UNTIL) && pv == F)) {
+            if ((mode == W_THROUGHOUT || mode == W_UNTIL) && pv == U) { w.luSet = true; w.lu = n; }
+            w.k[w.tail] = n;
+            w.t[w.tail] = t;
+            w.tail++;
+        }
+    }
+
+    function reset(Window storage w) internal {
         w.ffSet = false; w.fuSet = false; w.ftSet = false;
         w.jSet = false; w.pSet = false; w.pFalse = false; w.pUnknown = false;
         for (uint256 x = 0; x < 4 && w.purge < w.head; x++) {
@@ -542,15 +612,28 @@ library CadlNormsWindows {
             delete w.t[w.purge];
             w.purge++;
         }
-        empty = w.head == w.tail;
     }
 
-    /// The operands at observation n (0 false, 1 true, 2 unknown), once per observation.
-    function operands(Window storage w, EvalData storage data, uint8 mode, uint256 tp, uint256 tq,
-                      uint256 n) internal returns (uint8 pv, uint8 qv) {
+    /// What candidate n is, from the content with the operator read as
+    /// undecided, true and false (F.5: an undefined content is false).
+    function classify(EvalData storage data, Temporal storage tm, uint256 n) internal returns (uint8) {
+        if (tm.root == tm.node) return C_LIVE;
+        Val memory g = CadlNormsEval.evaluateWith(data, tm.root, n, tm.node, Val(K_D, 0, ""));
+        if (g.k == K_B) return g.n == 1 ? C_HIT : C_DROP;
+        if (g.k != K_D) return C_DROP;
+        // the operator itself is true for a hit of the window when not neg
+        g = CadlNormsEval.evaluateWith(data, tm.root, n, tm.node, Val(K_B, tm.neg ? int256(0) : int256(1), ""));
+        return g.k == K_B && g.n == 1 ? C_LIVE : C_DEAD;
+    }
+
+    /// The operands at observation n (0 false, 1 true, 2 unknown), once per
+    /// observation; with neg, p is negated (Kleene).
+    function operands(Window storage w, EvalData storage data, Temporal storage tm, uint256 n)
+            internal returns (uint8 pv, uint8 qv) {
         if (w.at == n + 1) return (w.pv, w.qv);
-        pv = code(CadlNormsEval.evaluate(data, tp, n, n));
-        qv = mode == W_UNTIL ? code(CadlNormsEval.evaluate(data, tq, n, n)) : 0;
+        pv = code(CadlNormsEval.evaluate(data, tm.tp, n, n));
+        if (tm.neg && pv != U) pv = pv == T ? F : T;
+        qv = tm.mode == W_UNTIL ? code(CadlNormsEval.evaluate(data, tm.tq, n, n)) : 0;
         w.at = n + 1;
         w.pv = pv;
         w.qv = qv;
@@ -592,6 +675,80 @@ library CadlNormsWindows {
         }
         return lo;
     }
+
+    /// The first candidate in [head, tail) with k > lu (all when !luSet).
+    function firstAfterK(Window storage w, bool luSet, uint256 lu) internal view returns (uint256) {
+        if (!luSet) return w.head;
+        uint256 lo = w.head;
+        uint256 hi = w.tail;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (w.k[mid] <= lu) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+}
+
+// The assume: and guarantee: items (value: 0 not decided, 1 true, 2 false,
+// 3 undefined), in a library of their own.
+struct Item { string text; bool temporal; bool broken; bool unsupported; uint256 root; }
+struct ItemRec { uint8 value; bool seen; uint8 verdict; }
+
+library CadlNormsItems {
+    /// assume: before guarantee: (an assumption that fails excuses a
+    /// guarantee that fails at the same observation). Returns whether an
+    /// assumption has failed, now or before.
+    function step(Item[] storage a, ItemRec[] storage ar, Item[] storage g, ItemRec[] storage gr,
+                  EvalData storage data, uint256 n, bool failed) public returns (bool) {
+        for (uint256 i = 0; i < a.length; i++) {
+            if (itemStep(a[i], ar[i], data, n) == 2) failed = true;
+        }
+        for (uint256 i = 0; i < g.length; i++) {
+            if (itemStep(g[i], gr[i], data, n) == 2) gr[i].verdict = failed ? 3 : 2;
+        }
+        return failed;
+    }
+
+    /// 2 when the item has just been found false
+    function itemStep(Item storage it, ItemRec storage r, EvalData storage data, uint256 n) internal returns (uint8) {
+        if (it.broken || it.unsupported || r.value != 0) return 0;
+        if (it.temporal) {
+            Val memory v = CadlNormsEval.evaluate(data, it.root, 0, n);
+            if (v.k == K_D) return 0;
+            if (v.k != K_B && v.k != K_N) { r.value = 3; return 0; }
+            r.value = v.n != 0 ? 1 : 2;
+            return r.value;
+        }
+        Val memory w = CadlNormsEval.evaluate(data, it.root, n, n);
+        if ((w.k == K_B || w.k == K_N) && w.n != 0) { r.seen = true; return 0; }
+        if (w.k == K_B || w.k == K_N) { r.value = 2; return 2; }
+        return 0;
+    }
+
+    function finish(Item[] storage a, ItemRec[] storage ar, Item[] storage g, ItemRec[] storage gr,
+                    bool endHere) public {
+        for (uint256 i = 0; i < a.length; i++) finishItem(a[i], ar[i], endHere);
+        for (uint256 i = 0; i < g.length; i++) finishItem(g[i], gr[i], endHere);
+    }
+
+    function finishItem(Item storage it, ItemRec storage r, bool endHere) internal {
+        if (it.broken || it.unsupported) return;
+        if (r.value == 0 && !it.temporal && endHere && r.seen) r.value = 1;
+        if (r.value == 1) r.verdict = 1;
+    }
+
+    /// Whether a temporal item is not decided (it reads the first observation).
+    function pending(Item[] storage a, ItemRec[] storage ar, Item[] storage g, ItemRec[] storage gr)
+            public view returns (bool) {
+        return pendingIn(a, ar) || pendingIn(g, gr);
+    }
+
+    function pendingIn(Item[] storage items, ItemRec[] storage rs) internal view returns (bool) {
+        for (uint256 i = 0; i < items.length; i++) {
+            if (items[i].temporal && !items[i].broken && !items[i].unsupported && rs[i].value == 0) return true;
+        }
+        return false;
+    }
 }
 
 abstract contract CadlNormsMonitorBase {
@@ -626,20 +783,16 @@ abstract contract CadlNormsMonitorBase {
         string severity; bool hasSanction; string sanction; int256 reparation;
         bool hasReparationId; string reparationId; bool hasTransition; string transition;
         uint256[] activate; uint256[] suspend; uint256[] resume; uint256[] discharge;
-        // a content that is one temporal operator: W_WITHIN, W_THROUGHOUT or
-        // W_UNTIL, its operands (p, and q of until) and its duration
-        uint8 tmode; uint256 tp; uint256 tq; int256 td;
+        // a content with a temporal operator (see `temporals`), else 0
+        uint8 tmode;
     }
     struct Rule { string creates; bool broken; int256 when; int256 cond; }
-    struct Item { string text; bool temporal; bool broken; bool unsupported; uint256 root; }
     struct ActorDecl { bool declared; bool isIndexed; bool hasLo; int256 lo; bool hasHi; int256 hi; }
 
     struct NormRec {
         uint8 state; uint8 verdict; bool hasAt; int256 activatedAt; int256 act; bool hasSince;
         int256 since; int256 before; uint256 from;
     }
-    // value of an item: 0 not decided, 1 true, 2 false, 3 undefined
-    struct ItemRec { uint8 value; bool seen; uint8 verdict; }
     struct Ev { string name; bool hasPerformer; string performer; string source; }
     struct Act { string content; string performer; string desc; }
 
@@ -657,7 +810,11 @@ abstract contract CadlNormsMonitorBase {
     mapping(bytes32 => bool) internal lcTerminal;
     // the bare names read inside a temporal operator (see makeKnown)
     mapping(bytes32 => bool) internal temporalName;
-    mapping(uint256 => Window) internal windows;     // by norm, for a temporal content
+    // by norm, for a content with a temporal operator: the operator, and
+    // the candidates that are true with it and those that are never true
+    mapping(uint256 => Temporal) internal temporals;
+    mapping(uint256 => Window) internal windows;
+    mapping(uint256 => Window) internal deadWindows;
 
     // --- who may record the instance -------------------------------------------------
     /// Only this address may call begin, observe, addQuantities and finish.
@@ -797,16 +954,10 @@ abstract contract CadlNormsMonitorBase {
     /// temporal content keep what they need in their window).
     function updateKeepFrom(uint256 n) internal {
         uint256 k = n;
-        if (k > 0 && (pendingTemporal(assumeItems, assumeRecs) || pendingTemporal(guaranteeItems, guaranteeRecs))) k = 0;
+        if (k > 0 && CadlNormsItems.pending(assumeItems, assumeRecs, guaranteeItems, guaranteeRecs)) k = 0;
         data.keepFrom = k;
     }
 
-    function pendingTemporal(Item[] storage items, ItemRec[] storage rs) internal view returns (bool) {
-        for (uint256 i = 0; i < items.length; i++) {
-            if (items[i].temporal && !items[i].broken && !items[i].unsupported && rs[i].value == 0) return true;
-        }
-        return false;
-    }
 
     /// Drop values of a quantity that no lookup can read any more: at most
     /// four per new value, so that the cost of an observation stays bounded
@@ -909,7 +1060,10 @@ abstract contract CadlNormsMonitorBase {
         }
         if (st == VIOLATED) r.verdict = failed ? V_EXCUSED : V_VIOLATED;
         else if (st == FULFILLED || st == DISCHARGED) r.verdict = V_FULFILLED;
-        if (st >= FULFILLED) windows[i].head = windows[i].tail;
+        if (st >= FULFILLED) {
+            windows[i].head = windows[i].tail;
+            deadWindows[i].head = deadWindows[i].tail;
+        }
     }
 
     function elapsed(uint256 i, int256 t) internal view returns (int256) {
@@ -919,43 +1073,15 @@ abstract contract CadlNormsMonitorBase {
     }
 
     function contractItems(uint256 n, int256 t) internal {
-        for (uint256 i = 0; i < assumeItems.length; i++) {
-            if (itemStep(assumeItems[i], assumeRecs[i], n) == 2 && !failed) { failed = true; failedAt = t; }
-        }
-        for (uint256 i = 0; i < guaranteeItems.length; i++) {
-            if (itemStep(guaranteeItems[i], guaranteeRecs[i], n) == 2) {
-                guaranteeRecs[i].verdict = failed ? V_EXCUSED : V_VIOLATED;
-            }
-        }
-    }
-
-    /// 2 when the item has just been found false
-    function itemStep(Item storage it, ItemRec storage r, uint256 n) internal returns (uint8) {
-        if (it.broken || it.unsupported || r.value != 0) return 0;
-        if (it.temporal) {
-            Val memory v = evalTruth(it.root, 0, n);
-            if (v.k == K_D) return 0;
-            if (v.k == K_U) { r.value = 3; return 0; }
-            r.value = v.n == 1 ? 1 : 2;
-            return r.value;
-        }
-        Val memory w = evalTruth(it.root, n, n);
-        if (w.k == K_B && w.n == 1) { r.seen = true; return 0; }
-        if (w.k == K_B) { r.value = 2; return 2; }
-        return 0;
+        bool was = failed;
+        failed = CadlNormsItems.step(assumeItems, assumeRecs, guaranteeItems, guaranteeRecs, data, n, was);
+        if (failed && !was) failedAt = t;
     }
 
     function finishItems(bool endHere, int256 t) internal {
         if (endHere) ended = true;
-        for (uint256 i = 0; i < assumeItems.length; i++) finishItem(assumeItems[i], assumeRecs[i], endHere);
-        for (uint256 i = 0; i < guaranteeItems.length; i++) finishItem(guaranteeItems[i], guaranteeRecs[i], endHere);
+        CadlNormsItems.finish(assumeItems, assumeRecs, guaranteeItems, guaranteeRecs, endHere);
         t;
-    }
-
-    function finishItem(Item storage it, ItemRec storage r, bool endHere) internal {
-        if (it.broken || it.unsupported) return;
-        if (r.value == 0 && !it.temporal && endHere && r.seen) r.value = 1;
-        if (r.value == 1) r.verdict = V_FULFILLED;
     }
 
     // --- counts-as (step 1) ---------------------------------------------------------
@@ -1141,7 +1267,7 @@ abstract contract CadlNormsMonitorBase {
     function judgeWindow(uint256 i, uint256 n, int256 t) internal returns (bool) {
         NormDef storage d = normDefs[i];
         bool open = !d.hasDeadline || elapsed(i, t) <= d.deadline;
-        (bool hit, bool empty) = CadlNormsWindows.judge(windows[i], data, d.tmode, d.tp, d.tq, d.td,
+        (bool hit, bool empty) = CadlNormsWindows.judge(windows[i], deadWindows[i], data, temporals[i],
                                                         n, t, open);
         return decide(i, n, t, hit, !hit && !open && empty);
     }
@@ -1149,8 +1275,8 @@ abstract contract CadlNormsMonitorBase {
     function noteWindows(uint256 n, int256 t) internal {
         for (uint256 i = 0; i < normDefs.length; i++) {
             NormDef storage d = normDefs[i];
-            if (d.tmode == 0 || d.frozen || windows[i].head == windows[i].tail) continue;
-            CadlNormsWindows.note(windows[i], data, d.tmode, d.tp, d.tq, n, t);
+            if (d.tmode == 0 || d.frozen) continue;
+            CadlNormsWindows.note(windows[i], deadWindows[i], data, temporals[i], n, t);
         }
     }
 
@@ -1195,7 +1321,8 @@ abstract contract CadlNormsMonitorBase {
             if (d.frozen || r.state >= FULFILLED) continue;
             bool inForce = r.state == ACTIVE || r.state == SUSPENDED;
             if (inForce && r.act == int256(n)) { setSt(i, DISCHARGED, n, t); continue; }
-            if (inForce && (d.kind == OBLIGATION || d.kind == PROHIBITION) && windows[i].head < windows[i].tail) continue;
+            if (inForce && (d.kind == OBLIGATION || d.kind == PROHIBITION)
+                && (windows[i].head < windows[i].tail || deadWindows[i].head < deadWindows[i].tail)) continue;
             if (inForce && d.kind == OBLIGATION) {
                 if (!d.hasDeadline) { setSt(i, VIOLATED, n, t); late[c++] = i; }
                 else if (elapsed(i, t) <= d.deadline) setSt(i, DISCHARGED, n, t);
@@ -1376,6 +1503,13 @@ abstract contract CadlNormsMonitorBase {
         d.reparation = -1;
         NormRec storage r = recs.push();
         r.act = -1;
+    }
+
+    function _temporal(uint8 mode, bool neg, uint256 tp, uint256 tq, int256 td, uint256 node,
+                       uint256 root) internal {
+        uint256 i = normDefs.length - 1;
+        normDefs[i].tmode = mode;
+        temporals[i] = Temporal(mode, neg, tp, tq, td, node, root);
     }
 
     function _actor(string memory name, bool isIndexed_, bool hasLo, int256 lo, bool hasHi, int256 hi) internal {

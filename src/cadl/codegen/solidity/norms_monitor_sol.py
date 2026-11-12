@@ -45,6 +45,18 @@ _INT256 = 2 ** 255
 
 # EIP-3860: the creation code of a contract is at most 49152 bytes.
 INITCODE_LIMIT = 49152
+# EIP-170: the runtime code of a contract (and of each library) is at most
+# 24576 bytes.
+RUNTIME_LIMIT = 24576
+# The solc versions the generated file has been compiled and run with.
+SOLC_CHECKED = ("0.8.24", "0.8.37")
+# Upper estimates of the runtime code of the contract and the libraries:
+# they do not depend on the CADL contract (its model is data written by
+# the constructor). Measured with the versions above, the optimizer with 1
+# and with 200 runs, plus 3 %; tests/test_norms_monitor_targets.py checks
+# them against solc.
+RUNTIME_ESTIMATE = {"monitor": 24410, "CadlNormsValues": 7810, "CadlNormsEval": 8290,
+                    "CadlNormsItems": 2370, "CadlNormsWindows": 4410}
 
 
 def estimated_initcode(text: str) -> int:
@@ -151,14 +163,32 @@ def _problem(nodes: list[dict], root: int) -> str | None:
     return None
 
 
+def _temporal_nodes(nodes: list[dict], root: int) -> list[int]:
+    return [k for k in _subtree(nodes, root)
+            if nodes[k]["op"] in ("within", "throughout", "until")]
+
+
+def _content_roots(ir: dict) -> list[int]:
+    """The roots of the contents of norms that have a temporal operator."""
+    out = []
+    for nd in ir["norms"]:
+        c = nd.get("content")
+        if (nd["frozen"] is None and c and c.get("kind") == "predicate" and not c.get("error")
+                and _temporal_nodes(ir["exprs"], c["expr"])):
+            out.append(c["expr"])
+    return out
+
+
 def temporal_names(ir: dict, skip: set = frozenset()) -> list[str]:
-    """The bare names read inside a temporal operator, which can be a
-    quantity or a symbol (not `now`, nor `state` with a lifecycle)."""
+    """The bare names read inside a temporal operator, and anywhere in the
+    content of a norm with one (the rest of such a content is decided at
+    the observation of a candidate), which can be a quantity or a symbol
+    (not `now`, nor `state` with a lifecycle)."""
     nodes = ir["exprs"]
+    roots = [k for k, nd in enumerate(nodes) if k not in skip
+             and nd["op"] in ("within", "throughout", "until")] + _content_roots(ir)
     names = set()
-    for k, nd in enumerate(nodes):
-        if k in skip or nd["op"] not in ("within", "throughout", "until"):
-            continue
+    for k in roots:
         for j in _subtree(nodes, k):
             if nodes[j]["op"] == "name":
                 names.add(nodes[j]["n"])
@@ -168,41 +198,66 @@ def temporal_names(ir: dict, skip: set = frozenset()) -> list[str]:
     return sorted(names)
 
 
+def _path_to(nodes: list[dict], root: int, target: int) -> list[int] | None:
+    if root == target:
+        return [root]
+    for c in _children(nodes[root]):
+        p = _path_to(nodes, c, target)
+        if p is not None:
+            return [root] + p
+    return None
+
+
 def solidity_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
     """`build_ir` with what the Solidity monitor cannot evaluate on top:
     a guarantee item is marked unsupported (left out), anything else
     refuses the contract."""
     ir = apply_limits(build_ir(sos, contract), _problem)
     reasons = []
+    nodes = ir["exprs"]
     for nd in ir["norms"]:
         c = nd.get("content")
-        if (nd["frozen"] is None and c and c.get("kind") == "predicate" and not c.get("error")
-                and _temporal_inside(ir["exprs"], c["expr"])
-                and ir["exprs"][c["expr"]]["op"] not in _WINDOW_MODES):
-            reasons.append(
-                f"norm '{nd['id']}', content: a temporal operator that is not the whole "
-                f"content (the Solidity monitor decides the candidates of a temporal content "
-                f"together, from the operator and its operands)")
+        if not (nd["frozen"] is None and c and c.get("kind") == "predicate" and not c.get("error")):
+            continue
+        ops = _temporal_nodes(nodes, c["expr"])
+        if not ops:
+            continue
+        where = f"norm '{nd['id']}', content"
+        if len(ops) > 1:
+            reasons.append(f"{where}: two temporal operators (the Solidity monitor decides the "
+                           f"candidates of a content from one operator)")
+            continue
+        path = _path_to(nodes, c["expr"], ops[0])
+        if any(nodes[k]["op"] not in ("and", "or", "not") for k in path[:-1]):
+            reasons.append(f"{where}: a temporal operator inside a comparison or an IN")
+            continue
+        neg = sum(1 for k in path[:-1] if nodes[k]["op"] == "not") % 2 == 1
+        if neg and nodes[ops[0]]["op"] == "until":
+            reasons.append(f"{where}: NOT until(...) (it has no dual among within, throughout "
+                           f"and until)")
+            continue
+        nd["temporal"] = {"node": ops[0], "neg": neg}
     if reasons:
         raise NormsTargetUnsupported(reasons)
     return ir
 
 
 _WINDOW_MODES = {"within": 1, "throughout": 2, "until": 3}
+_DUAL = {"within": "throughout", "throughout": "within"}
 
 
 def _window_line(ir: dict, nd: dict) -> str | None:
-    """The fields of a norm whose content is one temporal operator."""
-    c = nd.get("content")
-    if not c or c.get("kind") != "predicate" or c.get("error"):
+    """The temporal operator of the content of a norm (`_temporal`): with
+    an odd number of NOT above it, the dual operator on the negated
+    operand."""
+    tm = nd.get("temporal")
+    if tm is None:
         return None
-    node = ir["exprs"][c["expr"]]
-    mode = _WINDOW_MODES.get(node["op"])
-    if mode is None:
-        return None
+    node = ir["exprs"][tm["node"]]
+    op = _DUAL[node["op"]] if tm["neg"] else node["op"]
     p, q = (node["p"], node["q"]) if node["op"] == "until" else (node["x"], 0)
-    return (f"        d.tmode = {mode}; d.tp = {p}; d.tq = {q}; "
-            f"d.td = {scaled(node['d'], 'a duration')};")
+    return (f"        _temporal({_WINDOW_MODES[op]}, {str(tm['neg']).lower()}, {p}, {q}, "
+            f"{scaled(node['d'], 'a duration')}, {tm['node']}, {nd['content']['expr']});")
 
 
 def _node_lines(nodes: list[dict], skip: set) -> list[str]:
@@ -370,8 +425,10 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
         "// specification, norms 0.1). Generated by `cadl codegen -t solidity`. Do not edit.",
         "// Compile with solc 0.8.24 or later and --optimize --optimize-runs 1 (without the",
         "// optimizer the runtime code exceeds the limit of EIP-170); deploy and link the",
-        "// libraries CadlNormsValues, CadlNormsEval and CadlNormsWindows, in this order.",
-        "pragma solidity ^0.8.24;",
+        "// libraries CadlNormsValues, CadlNormsEval, CadlNormsWindows and CadlNormsItems,",
+        "// in this order.",
+        f"// Checked with solc {' and '.join(SOLC_CHECKED)}.",
+        "pragma solidity >=0.8.24 <0.9.0;",
         "",
         base,
         "",
@@ -385,6 +442,11 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
         "",
     ]
     text = "\n".join(lines)
+    big = {k: v for k, v in RUNTIME_ESTIMATE.items() if v > RUNTIME_LIMIT}
+    if big:
+        raise NormsTargetUnsupported([
+            f"the runtime code of {', '.join(big)} is estimated above the limit of "
+            f"{RUNTIME_LIMIT} bytes of EIP-170"])
     size = estimated_initcode(text)
     if size > INITCODE_LIMIT:
         raise NormsTargetUnsupported([

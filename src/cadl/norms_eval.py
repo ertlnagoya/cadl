@@ -187,12 +187,65 @@ class _Written(float):
     __slots__ = ("text",)
 
 
+# The range of the exact numbers (F.5): at most NUMBER_LIMIT significant
+# digits, at most NUMBER_LIMIT digits after the decimal point, and an
+# absolute value below 10**308 (the floats of JSON). A number outside it
+# is refused: written exactly, 1e-100000000 takes time and memory without
+# bound.
+NUMBER_LIMIT = 400
+_RANGE_TEXT = (f"at most {NUMBER_LIMIT} significant digits, at most {NUMBER_LIMIT} "
+               f"decimals and an absolute value below 10**308")
+
+
+class NumberRangeError(ValueError):
+    """A number of a trace is outside the range of the exact numbers."""
+
+
+def _in_range(d: Decimal) -> bool:
+    sign, digits, exp = d.as_tuple()
+    if not isinstance(exp, int):
+        return False
+    while len(digits) > 1 and digits[0] == 0:
+        digits = digits[1:]
+    return (len(digits) <= NUMBER_LIMIT and exp >= -NUMBER_LIMIT
+            and (digits == (0,) or len(digits) + exp <= 308))
+
+
+def _checked(text: str) -> Decimal:
+    d = Decimal(text)
+    if not _in_range(d):
+        raise NumberRangeError(
+            f"the number {text if len(text) <= 40 else text[:37] + '...'} is outside the "
+            f"range of exact numbers ({_RANGE_TEXT})")
+    return d
+
+
 def _finite(text: str) -> float:
+    _checked(text)
     value = _Written(text)
     if not math.isfinite(value):
         raise ValueError(f"{text} is not a finite number")
     value.text = text
     return value
+
+
+def _integer(text: str) -> int:
+    _checked(text)
+    return int(text)
+
+
+def _deadline(d: Any) -> Any:
+    """The deadline of a norm in seconds, exactly: a numeric `deadline:`
+    as written (deadline_ms rounds it to milliseconds)."""
+    if d.deadline_ms is None:
+        return None
+    text = getattr(d, "deadline_text", None)
+    if text is not None:
+        try:
+            return Fraction(Decimal(text))
+        except ArithmeticError:
+            pass
+    return Fraction(d.deadline_ms, 1000)
 
 
 def _exact(v: Any) -> Any:
@@ -228,14 +281,29 @@ def _plain(v: Any) -> Any:
 
 
 def _literal_number(expr: Any) -> Fraction:
-    """A number literal of a predicate exactly as written."""
+    """A number literal of a predicate exactly as written (in range: the
+    engine does not evaluate a predicate with another, see `unsupported`)."""
     text = getattr(expr, "text", None)
     if text is not None:
         try:
-            return Fraction(Decimal(text))
+            return Fraction(_checked(text))
         except (ArithmeticError, ValueError):
             pass
     return _exact(float(expr.value))
+
+
+def _literal_in_range(expr: Any) -> bool:
+    text = getattr(expr, "text", None)
+    if isinstance(expr, IntLiteral):
+        if expr.value.bit_length() > 4 * NUMBER_LIMIT:
+            return False
+        text = str(expr.value)
+    if text is None:
+        return True
+    try:
+        return _in_range(Decimal(text))
+    except (ArithmeticError, ValueError):
+        return False
 
 
 def _duration(expr: Any) -> Any:
@@ -279,7 +347,8 @@ def _no_lone_surrogates(obj: Any) -> None:
 def loads_strict(line: str) -> Any:
     """`json.loads` that rejects NaN, Infinity, numbers that overflow to
     infinity, and lone surrogates in strings; raises ValueError."""
-    obj = json.loads(line, parse_constant=_not_json_number, parse_float=_finite)
+    obj = json.loads(line, parse_constant=_not_json_number, parse_float=_finite,
+                     parse_int=_integer)
     _no_lone_surrogates(obj)
     return obj
 
@@ -820,6 +889,8 @@ def parse_trace(lines, path: str | None = None) -> Trace:
         where = f"line {lineno}"
         try:
             rec = loads_strict(line)
+        except NumberRangeError as e:
+            raise TraceError(f"{where}: {e}") from None
         except json.JSONDecodeError as e:
             raise TraceError(f"{where}: not JSON ({e.msg})") from None
         except ValueError as e:
@@ -913,6 +984,8 @@ class _Evaluator:
         variables of the enclosing quantifiers and comprehensions to their
         set (None for a range of integers)."""
         bound = bound or {}
+        if isinstance(expr, (IntLiteral, FloatLiteral)) and not _literal_in_range(expr):
+            return f"the number is outside the range of exact numbers ({_RANGE_TEXT})"
         if isinstance(expr, (IntLiteral, FloatLiteral, BoolLiteral, StringLiteral, DurationLiteral)):
             return None
         if isinstance(expr, ActorRef):
@@ -1664,7 +1737,7 @@ class _NormInst:
         self.trigger = _Term(d.trigger, events, ev) if d.trigger else None
         self.until = _Term(d.until, events, ev) if d.until else None
         self.content = _Term(d.content, events, ev, temporal=True)
-        self.deadline = None if d.deadline_ms is None else _exact(d.deadline_ms) / Fraction(1000)
+        self.deadline = _deadline(d)
         self.frozen: str | None = None
         for key, term in (("trigger", self.trigger), ("until", self.until), ("content", self.content)):
             if term is not None and term.error and not self.frozen:

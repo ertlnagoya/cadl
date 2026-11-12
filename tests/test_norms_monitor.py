@@ -405,6 +405,18 @@ class TestExamples:
         got = _run_module(packages, mod, EXAMPLE_TRACES[0], "--contract", "NOPE")
         assert got.returncode == 2 and "no contract 'NOPE'" in got.stderr
 
+    def test_number_outside_the_range_is_a_trace_error(self, packages, tmp_path):
+        """F.5: a number beyond the range of exact numbers is refused with
+        its line, at once (1e-100000000 written exactly would not end)."""
+        mod = "norms_robot_delivery.norms_monitor"
+        bad = tmp_path / "far.jsonl"
+        bad.write_text('{"t": 0}\n{"t": 1e-100000000}\n', encoding="utf-8")
+        got = _run_module(packages, mod, bad)
+        expected = _cli_norms_eval(EXAMPLE, bad, "json")
+        assert got.returncode == expected.returncode == 2
+        assert got.stderr == expected.stderr
+        assert "line 2" in got.stderr and "outside the range" in got.stderr
+
     @pytest.mark.parametrize("cadl_file", sorted(EXAMPLES.glob("*.cadl")), ids=lambda p: p.stem)
     def test_every_example_generates_and_loads(self, cadl_file, tmp_path):
         """Every example still generates; where it declares norms 0.1 the

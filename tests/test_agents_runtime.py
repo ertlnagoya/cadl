@@ -1741,7 +1741,7 @@ class TestTraceValues:
         ('{"t": NaN, %s}', "not JSON"),
         ('{"t": Infinity, %s}', "not JSON"),
         ('{"t": -Infinity, %s}', "not JSON"),
-        ('{"t": 1e999, %s}', "not JSON"),
+        ('{"t": 1e999, %s}', "outside the range"),
         ('{"t": true, %s}', "must be a number"),
         ('{"t": 1e18, %s}', "at most"),
         ('{"t": 9.1e15, %s}', "at most"),
@@ -1755,7 +1755,7 @@ class TestTraceValues:
         ('{"t": 1, "messages": [{"from": "PLANNER", "to": "FILES", "name": "delete file"}]}',
          "message name"),
         ('{"t": 1, "messages": [{"from": "PLANNER", "to": "FILES", "name": "x", '
-         '"args": [1e999]}]}', "not JSON"),
+         '"args": [1e999]}]}', "outside the range"),
     ])
     def test_rejected_by_both_trace_readers(self, line, text):
         from cadl.norms_eval import parse_trace
@@ -2116,6 +2116,11 @@ class TestTimeBase:
         parse_run_trace(['{"t": %d}' % 2 ** 53])
         with pytest.raises(TraceError, match="2\\*\\*53"):
             parse_run_trace(['{"t": %d}' % (2 ** 53 + 2)])
+
+    def test_number_outside_the_range_is_a_trace_error(self):
+        # F.5: refused with its line, at once (written exactly it would not end).
+        with pytest.raises(TraceError, match="line 2: the number .* outside the range"):
+            parse_run_trace(['{"t": 0}', '{"t": 1e-100000000}'])
 
     def test_with_epoch_every_time_and_deadline_is_an_instant(self):
         late = '"epoch": "9999-12-31T23:55:00Z"'

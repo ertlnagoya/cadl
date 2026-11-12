@@ -1510,7 +1510,7 @@ class TestTraceValues:
     @pytest.mark.parametrize("line, text", [
         ('{"t": NaN}', "not JSON"),
         ('{"t": Infinity}', "not JSON"),
-        ('{"t": 1e999}', "not JSON"),
+        ('{"t": 1e999}', "outside the range"),
         ('{"t": 1e16}', "at most"),
         ('{"t": 1, "messages": [{"from": "D D", "to": "R[1]", "name": "x"}]}', "concrete actor"),
         ('{"t": 1, "messages": [{"from": "D", "to": "R[ 1 ]", "name": "x"}]}', "concrete actor"),
@@ -1610,3 +1610,41 @@ class TestExactNumbers:
                  '{"t": 1, "end": true}']
         r = evaluate(parse(_EXACT), parse_trace(lines))
         assert r["guarantees"][0]["verdict"] == "violated"
+
+
+class TestRangeOfNumbers:
+    """Exact numbers have a range (F.5): at most 400 significant digits,
+    at most 400 decimals, an absolute value below 10^308. A number of a
+    trace outside it is a trace error with its line; written exactly it
+    would take time and memory without bound."""
+
+    @pytest.mark.parametrize("number", ["1e-100000000", "1e-401", "1e308", "1e400",
+                                        "1" + "0" * 400, "0." + "1" * 401])
+    def test_refused_with_the_line(self, number):
+        import time
+        start = time.time()
+        with pytest.raises(TraceError, match="line 2: the number .* outside the range"):
+            parse_trace(['{"t": 0}', '{"t": 1, "values": {"A.x": %s}}' % number])
+        assert time.time() - start < 1
+
+    @pytest.mark.parametrize("number", ["1e-400", "9.99e307", "1" + "0" * 300, "0e5000", "-0.0"])
+    def test_accepted(self, number):
+        parse_trace(['{"t": 0, "values": {"A.x": %s}}' % number])
+
+    def test_literal_outside_the_range_is_not_evaluated(self):
+        sos = parse(_EXACT.replace('"A.x + A.y == 0.3"', '"A.x > 1e-500"'))
+        r = evaluate(sos, parse_trace(['{"t": 0, "values": {"A.x": 1}}', '{"t": 1}']))
+        assert "outside the range of exact numbers" in r["guarantees"][0]["reason"]
+
+
+class TestExactDeadline:
+    """A numeric deadline in seconds is exact too: 0.0005 is half a
+    millisecond (deadline_ms rounds it to 0 for the other checks)."""
+
+    def test_half_a_millisecond(self):
+        text = _EXACT.replace("deadline: 100ms", "deadline: 0.0005")
+        m = '"messages": [{"from": "A", "to": "B", "name": "%s"}]'
+        for at, state in (("0.0005", "fulfilled"), ("0.0006", "violated")):
+            r = evaluate(parse(text), parse_trace(
+                ['{"t": 0, %s}' % (m % "req"), '{"t": %s, %s}' % (at, m % "ack")]))
+            assert r["norms"][0]["state"] == state, at
