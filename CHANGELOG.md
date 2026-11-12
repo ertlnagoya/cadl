@@ -115,6 +115,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the sets; notes say when a set has one member by default, when
   `--members` is below the declared size, and that instances start
   together.
+- `cadl norms-check`: lists of a trace are not always comparable
+  (`[1, "a"] < [1, 2]` is undefined), so quantities ordered against each
+  other get lists that realise every pattern of pairwise outcomes (equal,
+  less, greater, not comparable): 3 lists for two quantities (4
+  patterns), 8 for three (29 patterns); four or more such quantities are
+  refused. A false conflict between two norms over such quantities is no
+  longer reported. The limit on combinations of classes in one group is
+  raised from 20000 to 50000.
 
 
 ### Fixed

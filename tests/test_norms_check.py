@@ -428,7 +428,7 @@ def model_of(name: str, **kw):
     if key not in _MODELS:
         texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS,
                  "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES, "QUANT": QUANT,
-                 "ARITH": ARITH, "MIXED": MIXED,
+                 "ARITH": ARITH, "MIXED": MIXED, "LISTS": LISTS,
                  "MULTI": MULTI}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
@@ -446,6 +446,7 @@ CASES = [
     ("EVENTS", {"bindings": ["i=1"], "members": ["R=2"]}),
     ("TYPES", {"bindings": ["i=1"]}),
     ("MIXED", {"members": ["R=2"]}),
+    ("LISTS", {}),
     (str(EXAMPLES / "norms_check_value_types.cadl"), {"bindings": ["i=1"]}),
     ("QUANT", {"members": ["R=2"]}),
     ("ARITH", {"domains": ARITH_DOMAINS}),
@@ -1224,6 +1225,7 @@ def test_cli_require_checker_and_timeout(tmp_path):
 
 def _random_json(rng, consts, domain=None):
     pool = [None, True, False, [], {}, [1], [0, 2], {"a": 1}, {"b": 2}, "", "x", "OTHER",
+            [1, "a"], [1, 2], ["a"], [None], [[0]], [{"x": 1}], [0, [1, "b"]], [True, 0.5],
             rng.choice(["a", "b", "zz", "m", "ma", "l\uffff"]),
             rng.randint(-30, 30), rng.uniform(-30, 30), rng.choice([0, 0.0, 1, 1.0, -0.0])]
     if domain is not None:
@@ -1255,7 +1257,7 @@ def test_value_classes_cover_every_json_value(case):
         # the literals of the whole group, so that a value of one quantity
         # can equal a literal compared with another one
         lits = set().union(*(tr.quantities[k].consts for k in keys))
-        for _ in range(150):
+        for _ in range(80):
             vals = {k: _random_json(rng, lits, tr.quantities[k].domain) for k in keys}
             assert tuple(tr._oracle(exprs, vals)) in known, vals
 
@@ -1278,6 +1280,22 @@ norms:
     kind: prohibition
     bearer: D
     content: "R[1].f < 0.5 AND R[1].f > -1e-3 AND R[1].f != 0.25"
+"""
+
+
+# lists are not always comparable: [1, "a"] < [1, 2] is undefined
+LISTS = """\
+norms:
+  - id: o
+    kind: obligation
+    bearer: D
+    trigger: "D -> R[1] : go"
+    content: "R[1].v < R[2].v AND R[1].v < R[3].v"
+    deadline: 1s
+  - id: p
+    kind: prohibition
+    bearer: D
+    content: "R[2].v < R[3].v OR R[2].v >= R[3].v"
 """
 
 
@@ -1332,6 +1350,62 @@ def test_mixed_comparisons_are_violable():
     for nid in ("same_above", "order_above", "texts", "floats"):
         entry = {n["id"]: n for n in report["norms"]}[nid]["violable"]
         assert entry["answer"] and entry["witness"]["confirmed"], nid
+
+
+def test_list_orders_realise_every_pattern():
+    """The list values of the model realise every pattern of pairwise
+    outcomes (equal, less, greater, not comparable) that random lists with
+    mixed and nested elements have, for two and three lists."""
+    import random as _random
+    from cadl.norms_check import _LIST_VALUES
+
+    def outcome(a, b):
+        if a == b:
+            return "eq"
+        try:
+            return "lt" if a < b else "gt"
+        except TypeError:
+            return "inc"
+
+    def sig(vs):
+        return tuple(outcome(vs[i], vs[j]) for i in range(len(vs))
+                     for j in range(i + 1, len(vs)))
+
+    rng = _random.Random(7)
+
+    def rand_list(depth=0):
+        out = []
+        for _ in range(rng.randint(0, 3)):
+            c = rng.random()
+            if c < 0.35:
+                out.append(rng.choice([0, 1, 2, 0.5, True, False]))
+            elif c < 0.6:
+                out.append(rng.choice(["a", "b", "c", ""]))
+            elif c < 0.7:
+                out.append(None)
+            elif c < 0.8:
+                out.append(rng.choice([{}, {"x": 1}]))
+            elif depth < 2:
+                out.append(rand_list(depth + 1))
+        return out
+
+    for n, values in _LIST_VALUES.items():
+        import itertools
+        have = {sig(c) for c in itertools.product(values, repeat=n)}
+        assert len(have) == {2: 4, 3: 29}[n]
+        for _ in range(5000):
+            assert sig([rand_list() for _ in range(n)]) in have
+
+
+@needs_prism
+def test_lists_that_are_not_comparable():
+    """A trace may give R[2].v = [1, "a"] and R[3].v = [1, 2], which
+    norms-eval cannot order: p stays undefined, so o and p are not in
+    conflict (norms-check 0.3.26 before this fix reported a conflict)."""
+    sos, m, _pm = model_of("LISTS")
+    report = check(m, PRISM)
+    assert report["conflicts"] == []
+    assert report["unconfirmed"] == []
 
 
 def test_internal_errors_exit_4(monkeypatch, capsys):

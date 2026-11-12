@@ -84,7 +84,7 @@ IN_FORCE = (ACTIVE, SUSPENDED)
 # Limits of v0.1 (F.12): larger models are refused.
 MAX_HORIZON = 1000
 MAX_CHOICES = 8192
-MAX_VALUATIONS = 20000
+MAX_VALUATIONS = 50000
 MAX_ATOMS = 16
 MAX_INSTANCES = 4
 MAX_COMMANDS = 32768
@@ -560,6 +560,7 @@ class Quantity:
     raw: bool = False      # its value is used otherwise than in an atom
     domain: tuple | None = None     # (lo, hi) of --domain, for arithmetic
     order: int = 1         # quantities compared with each other in its group
+    list_order: int = 1    # quantities ordered (<, <=, >, >=) against each other
 
 
 class _Name(str):
@@ -573,6 +574,29 @@ class Pred:
     text: str
     keys: frozenset
     owner: Any = None          # the Translator of its instance
+
+
+# Lists for quantities ordered against each other. Two lists compare
+# lexicographically in norms-eval (Python), and two elements of different
+# kinds make them not comparable (undefined): [1, "a"] < [1, 2] is
+# undefined while [1] < [1, "a"] and [1] < [1, 2] are true. The pairwise
+# outcomes (equal, less, greater, not comparable) of n lists form one of
+# 4 patterns for n = 2 and 29 for n = 3; these lists realise all of them
+# (an exhaustive enumeration of lists of length at most 2 over 0, 1, 2,
+# "a", "b", two objects and null, which suffices because the outcomes of
+# three lists are decided at the at most two points where their elements
+# first differ, F.12).
+_LIST_VALUES = {2: [[], [0], ["a"]],
+                3: [[], [0], [1], ["a"], ["b"], [{"d": 0}], [0, 0], [0, "a"]]}
+
+
+def _list_values(q: Any) -> list:
+    if q.list_order not in _LIST_VALUES:
+        raise NormsCheckError(
+            f"{q.key} is ordered (<, <=, >, >=) against {q.list_order - 1} other quantities; "
+            f"norms-check translates such orders of at most 3 quantities, since a trace may "
+            f"give them lists, which are not always comparable")
+    return [list(v) for v in _LIST_VALUES[q.list_order]]
 
 
 def _exact_number(v: Fraction) -> Any:
@@ -662,6 +686,7 @@ class Translator:
         self.contract = contract
         self.domain_patterns = dict(domains or {})     # pattern -> (lo, hi)
         self.links: list = []                           # keys compared with each other
+        self.order_links: list = []                     # ... by <, <=, >, >=
         self.notes: list[str] = []
         self.actors = declared_actors(sos)
         self.bindings = dict(bindings)
@@ -1107,6 +1132,10 @@ class Translator:
                     # an order or equality between quantities: exact with
                     # enough values between the literals (F.12)
                     info["links"].append(frozenset(x[1]) | frozenset(y[1]))
+                    if o in ("<", "<=", ">", ">=") and x[0] == y[0] == "qty":
+                        # lists of a trace are ordered too, and not always
+                        # comparable: see _list_values
+                        info["order_links"].append(frozenset(x[1]) | frozenset(y[1]))
                     info["raw"].update(x[1])
                     info["raw"].update(y[1])
                 elif y[0] == "num":
@@ -1122,11 +1151,12 @@ class Translator:
         if key in self._pred_index:
             return self._pred_index[key]
         info: dict = {"consts": {}, "domain": set(), "keys": set(), "atoms": {}, "raw": set(),
-                      "links": []}
+                      "links": [], "order_links": []}
         self._cond(expr, {}, info)
         if info["domain"]:
             self._needs_domain(info["domain"])
         self.links += info["links"]
+        self.order_links += info["order_links"]
         for k, cs in info["consts"].items():
             self._quantity(k).consts.update(c for c in cs if c is not None)
         for k, atoms in info["atoms"].items():
@@ -1406,8 +1436,9 @@ class Translator:
                     other += "_"
                 others.append(other)
         # lists are ordered among themselves, objects only equal or not
-        objects = ([[]] if k == 1 else [[j] for j in range(k)]
-                   + [{}] + [{"k": j} for j in range(1, k)])
+        objects = (_list_values(q) if q.list_order > 1
+                   else [[]] if k == 1 else [[j] for j in range(k)])
+        objects += [] if k == 1 else [{}] + [{"k": j} for j in range(1, k)]
         # plain values first, so that a witness shows them when they will do
         reps = ([None] + sorted(numbers, key=lambda x: (abs(x), x)) + texts + others
                 + [True, False] + objects)
@@ -1512,8 +1543,10 @@ class Environment:
         # quantities: the same key is the same quantity in every instance
         self.quantities: dict = {}
         self.links: list = []
+        self.order_links: list = []
         for tr in trs:
             self.links += tr.links
+            self.order_links += tr.order_links
             for key, q in tr.quantities.items():
                 g = self.quantities.setdefault(key, Quantity(key))
                 g.consts |= q.consts
@@ -1639,6 +1672,23 @@ class Environment:
                 k = parent[k]
             return k
 
+        lparent: dict = {}
+
+        def lroot(k: str) -> str:
+            while lparent.setdefault(k, k) != k:
+                k = lparent[k]
+            return k
+
+        for link in self.order_links:
+            link = sorted(link)
+            for k in link[1:]:
+                lparent[lroot(k)] = lroot(link[0])
+        lgroups: dict = {}
+        for k in lparent:
+            lgroups.setdefault(lroot(k), []).append(k)
+        for keys in lgroups.values():
+            for k in keys:
+                self.quantities[k].list_order = len(keys)
         for link in self.links:
             link = sorted(link)
             for k in link[1:]:
