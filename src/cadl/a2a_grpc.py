@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from . import a2a_rest as A2ARest
-from .gateway_core import INTERNAL_ERROR, INVALID_PARAMS, GatewayError
+from .gateway_core import INVALID_PARAMS, GatewayError
 
 SERVICE = "lf.a2a.v1.A2AService"
 # RPC -> (request message, response message, server streaming)
