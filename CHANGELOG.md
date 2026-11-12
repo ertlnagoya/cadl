@@ -6,6 +6,27 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.26] — 2026-11-12
+
+Resolves the open items of 0.3.25. `cadl norms-check` now handles values
+of every JSON type, quantified predicates, comparisons of quantities and
+arithmetic over a given domain, several contract instances and
+amendments (F.12). Numbers and times are exact in norms-eval, the
+generated monitors and agents-run (F.5), and the Solidity monitor uses
+bounded gas per observation for temporal contents (D.5). The gateways
+stream A2A messages, sign published holds, and are tested against the
+official MCP and A2A SDKs in CI, as is the Solidity monitor on an EVM
+(G.13). Exact results of any size are written by game-check and
+model-check. Each part was reviewed independently before the release.
+
+Known limits: `norms-check` refuses four or more ordered list
+quantities in one group, arithmetic without `--domain`, and amendments
+together with several instances; the A2A gateway does not offer push
+notifications or the gRPC binding, and hosts in several networks can
+still fill its readers; the Solidity monitor refuses a content with two
+temporal operators, `NOT until`, or a temporal operator inside a
+comparison.
+
 ### Added
 
 - `cadl a2a-gateway` streams: `SendStreamingMessage` and `SubscribeToTask`
