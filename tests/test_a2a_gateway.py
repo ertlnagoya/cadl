@@ -660,8 +660,7 @@ class TestMalformed:
         assert loc.post(rpc("SendMessage", p), version="0.3").body["error"]["code"] == -32009
         assert loc.post(rpc("SendMessage", p), ctype="text/plain").status == 415
         assert loc.post(rpc("SendMessage", p), ctype=None).status == 415
-        for method, code in (("SendStreamingMessage", -32004), ("SubscribeToTask", -32004),
-                             ("ListTasks", -32004), ("GetExtendedAgentCard", -32004),
+        for method, code in (("ListTasks", -32004), ("GetExtendedAgentCard", -32004),
                              ("CreateTaskPushNotificationConfig", -32003),
                              ("message/send", -32601), ("tasks/get", -32601)):
             assert loc.post(rpc(method, p)).body["error"]["code"] == code
@@ -670,7 +669,7 @@ class TestMalformed:
         assert loc.sent == []
         assert [r["reason"] for r in read_records(loc.audit)
                 if r.get("event") == "method_refused"] == [
-            "SendStreamingMessage", "SubscribeToTask", "ListTasks", "GetExtendedAgentCard",
+            "ListTasks", "GetExtendedAgentCard",
             "CreateTaskPushNotificationConfig", "message/send", "tasks/get"]
         loc.stop_and_replay()
 
@@ -1326,3 +1325,485 @@ def test_peer_key_groups_ipv6_by_prefix():
     assert k(("::ffff:192.0.2.7", 1, 0, 0)) == k(("192.0.2.7", 5)) == "192.0.2.7"
     assert k(("192.0.2.7", 1)) != k(("192.0.2.8", 1))
     assert k(("fe80::1%lo0", 1, 0, 0)) == "fe80::/64"
+
+
+def _open_stream(r: "Run", actor: str, p, id_=1, method="SendStreamingMessage"):
+    """A streamed request on a raw socket, read by the test as it comes."""
+    body = json.dumps(rpc(method, p, id_)).encode()
+    sock = socket.create_connection(("127.0.0.1", r.client.port))
+    auth = authorization(CLIENT_KEYS[actor], actor, r.run_id, body)
+    sock.sendall((f"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  f"A2A-Version: 1.0\r\nContent-Length: {len(body)}\r\n"
+                  f"Authorization: {auth}\r\n\r\n").encode() + body)
+    sock.settimeout(30)
+    return sock
+
+
+def read_sse(r: "Run", actor: str, method: str, p, id_=1, timeout=30.0):
+    """A streamed request: the status, the content type, the comments and
+    the events (event name, JSON) of the answer."""
+    body = json.dumps(rpc(method, p, id_)).encode()
+    conn = http.client.HTTPConnection("127.0.0.1", r.client.port, timeout=timeout)
+    try:
+        conn.request("POST", "/", body=body, headers={
+            "Content-Type": "application/json", "A2A-Version": "1.0",
+            "Authorization": authorization(CLIENT_KEYS[actor], actor, r.run_id, body)})
+        resp = conn.getresponse()
+        ctype = resp.getheader("Content-Type")
+        data = resp.read().decode()
+    finally:
+        conn.close()
+    if not ctype.startswith("text/event-stream"):
+        return resp.status, ctype, [], [("json", json.loads(data))]
+    comments, events, name, lines = [], [], "message", []
+    for line in data.split("\n"):
+        if not line:
+            if lines:
+                events.append((name, json.loads("\n".join(lines))))
+            name, lines = "message", []
+        elif line.startswith(":"):
+            comments.append(line)
+        elif line.startswith("event: "):
+            name = line[7:]
+        elif line.startswith("data: "):
+            lines.append(line[6:])
+    return resp.status, ctype, comments, events
+
+
+class TestStreaming:
+    """SendStreamingMessage and SubscribeToTask (SSE, JSON-RPC binding)."""
+
+    def test_allow_deny_and_events(self, tmp_path, capsys):
+        r = Run(tmp_path)
+        status, ctype, comments, events = read_sse(r, "PLANNER", "SendStreamingMessage",
+                                                   params("summarize"), id_="s1")
+        assert status == 200 and ctype.startswith("text/event-stream")
+        assert comments == []                   # the agent's comment is not passed on
+        assert [next(iter(e["result"])) for _, e in events] == [
+            "task", "statusUpdate", "artifactUpdate", "statusUpdate"]
+        assert {e["id"] for _, e in events} == {"s1"}
+        _, _, _, events = read_sse(r, "PLANNER", "SendStreamingMessage", params("translate"))
+        assert len(events) == 1
+        assert events[0][1]["result"]["task"]["status"]["state"] == "TASK_STATE_REJECTED"
+        # Own tasks only, for subscriptions too.
+        _, _, _, events = read_sse(r, "OPERATOR", "SubscribeToTask", {"id": "up-task-1"})
+        assert events[0][1]["error"]["code"] == -32001
+        _, _, _, events = read_sse(r, "PLANNER", "SubscribeToTask", {"id": "up-task-1"}, 7)
+        assert [e["result"]["task"]["id"] for _, e in events[:1]] == ["up-task-1"]
+        r.stop()
+        assert r.agent.sent("SendStreamingMessage") == ["summarize"]
+        assert r.agent.sent("SubscribeToTask") == ["up-task-1"]
+        result = r.replay_check()
+        assert decisions(result) == [("PLANNER", "summarize", "allow", "permission"),
+                                     ("PLANNER", "translate", "deny", "default")]
+        capsys.readouterr()
+
+    def test_held_stream_approved_and_rejected(self, tmp_path, capsys):
+        r = Run(tmp_path)
+        sock = _open_stream(r, "PLANNER", params("publish", "x"))
+        seen = b""
+        while b": held as h-1" not in seen:              # wait for state, not time
+            chunk = sock.recv(4096)
+            assert chunk, "the stream ended while held"
+            seen += chunk
+        assert r.agent.sent("SendStreamingMessage") == []
+        r.approve("h-1")
+        while not seen.endswith(b"0\r\n\r\n"):
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            seen += chunk
+        sock.close()
+        events = [(None, json.loads(line[6:])) for line in seen.decode().split("\n")
+                  if line.startswith("data: ")]
+        assert events[-1][1]["result"]["statusUpdate"]["status"]["state"] == \
+            "TASK_STATE_COMPLETED"
+        fut = r.pool.submit(read_sse, r, "PLANNER", "SendStreamingMessage", params("publish"))
+        r.approve("h-2", "reject")
+        _, _, _, events = fut.result(timeout=30)
+        assert [e["result"]["task"]["status"]["state"] for _, e in events] == [
+            "TASK_STATE_REJECTED"]
+        r.stop()
+        assert r.agent.sent("SendStreamingMessage") == ["publish"]
+        assert [h["state"] for h in r.replay_check()["holds"]] == ["approved", "rejected"]
+        capsys.readouterr()
+
+    def test_held_stream_withdrawn_on_disconnect(self, tmp_path, capsys):
+        r = Run(tmp_path)
+        body = json.dumps(rpc("SendStreamingMessage", params("publish"))).encode()
+        sock = socket.create_connection(("127.0.0.1", r.client.port))
+        auth = authorization(CLIENT_KEYS["PLANNER"], "PLANNER", r.run_id, body)
+        sock.sendall((f"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                      f"A2A-Version: 1.0\r\nContent-Length: {len(body)}\r\n"
+                      f"Authorization: {auth}\r\n\r\n").encode() + body)
+        hold = r.wait_hold("h-1")
+        late = approval_file(r.inbox, "h-1", "approve", "OPERATOR", APPROVER_KEYS["OPERATOR"])
+        sock.close()
+        wait_for(lambda: not hold.exists(), "the withdrawal")
+        (r.inbox / "late.json").write_text(json.dumps(late))
+        r.wait_inbox_done()
+        r.stop()
+        assert r.agent.sent("SendStreamingMessage") == []
+        assert [h["state"] for h in r.replay_check()["holds"]] == ["withdrawn"]
+        capsys.readouterr()
+
+    def test_returns_immediately_and_subscription(self, tmp_path, capsys):
+        r = Run(tmp_path)
+        _, _, _, events = read_sse(r, "PLANNER", "SendStreamingMessage",
+                                   params("publish", returnImmediately=True))
+        task = events[0][1]["result"]["task"]
+        assert len(events) == 1 and task["status"]["state"] == "TASK_STATE_SUBMITTED"
+        fut = r.pool.submit(read_sse, r, "PLANNER", "SubscribeToTask", {"id": task["id"]}, 2)
+        time.sleep(0.3)
+        r.approve("h-1")
+        _, _, _, events = fut.result(timeout=30)
+        ids = {(e["result"].get("task") or {}).get("id") for _, e in events if "task" in
+               e["result"]} | {e["result"][k]["taskId"] for _, e in events
+                               for k in ("statusUpdate", "artifactUpdate") if k in e["result"]}
+        assert ids == {task["id"]}               # the gateway's id, not the agent's
+        r.stop()
+        assert r.agent.sent() == ["publish"] and r.agent.sent("SubscribeToTask") == ["up-task-1"]
+        r.replay_check()
+        capsys.readouterr()
+
+    @pytest.mark.parametrize("text,why,good", [("stream-foreign", "not of a task", 1),
+                                               ("stream-cr", "carriage return", 2)])
+    def test_bad_events_end_the_stream(self, tmp_path, capsys, text, why, good):
+        r = Run(tmp_path)
+        _, _, _, events = read_sse(r, "PLANNER", "SendStreamingMessage",
+                                   params("summarize", text))
+        name, last = events[-1]
+        assert name == "error" and last["error"]["code"] == -32006
+        assert all("result" in e for _, e in events[:-1])
+        assert len(events) == good + 1         # nothing after the bad event
+        r.stop()
+        assert any(why in (x["reason"] or "") for x in read_records(r.audit)
+                   if x.get("event") == "invalid_response")
+        r.replay_check()
+        capsys.readouterr()
+
+
+HOLD_KEY = b"gateway-hold-key-0123456789abcdef"
+
+
+class TestSignedHolds:
+    """--hold-key: the gateway signs every published hold, and mcp-approve
+    verifies it before it shows or signs it."""
+
+    def _gw(self, tmp_path, hold_key=HOLD_KEY):
+        return Local(tmp_path, inbox=tmp_path / "inbox",
+                     approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]},
+                     hold_key=hold_key)
+
+    def _hold(self, loc, tmp_path):
+        loc.post(rpc("SendMessage", params("publish", "real", returnImmediately=True)))
+        path = tmp_path / "inbox" / "holds" / "h-1.json"
+        return path, json.loads(path.read_text())
+
+    def _approve(self, loc, tmp_path, hold_key):
+        from cadl.gateway_core import _drop
+        obj = approval_file(tmp_path / "inbox", "h-1", "approve", "OPERATOR",
+                            APPROVER_KEYS["OPERATOR"], hold_key)
+        _drop(tmp_path / "inbox", obj)
+        loc.gw.tick()
+
+    def test_signed_hold_verifies(self, tmp_path):
+        from cadl.gateway_core import hold_mac
+        loc = self._gw(tmp_path)
+        path, hold = self._hold(loc, tmp_path)
+        assert hold["kind"] == "hold" and hold["hold_mac"] == hold_mac(HOLD_KEY, hold)
+        run = json.loads((tmp_path / "inbox" / "run.json").read_text())
+        assert run["holds_signed"] is True
+        self._approve(loc, tmp_path, HOLD_KEY)
+        assert loc.gw.runtime.hold_state("h-1") == "approved"
+        loc.stop_and_replay()
+
+    @pytest.mark.parametrize("forge", ["params", "strip_mac", "other_key"])
+    def test_forged_hold_is_refused(self, tmp_path, forge):
+        """Someone who can write the inbox replaces the published hold: other
+        arguments with their own SHA-256, the MAC removed, or a MAC under
+        another key. mcp-approve refuses to show or sign it."""
+        import hashlib
+
+        from cadl.audit_log import canonical
+        from cadl.gateway_core import hold_mac
+        loc = self._gw(tmp_path)
+        path, hold = self._hold(loc, tmp_path)
+        hold["params"]["message"]["parts"] = [{"text": "harmless"}]
+        hold["params_sha256"] = hashlib.sha256(canonical(hold["params"])).hexdigest()
+        if forge == "strip_mac":
+            del hold["hold_mac"]
+        elif forge == "other_key":
+            hold["hold_mac"] = hold_mac(b"x" * 32, hold)
+        path.write_text(json.dumps(hold))
+        with pytest.raises(GatewayError, match="not signed"):
+            approval_file(tmp_path / "inbox", "h-1", "approve", "OPERATOR",
+                          APPROVER_KEYS["OPERATOR"], HOLD_KEY)
+        if forge != "strip_mac":                       # a signed hold needs the key
+            with pytest.raises(GatewayError, match="give --hold-key"):
+                approval_file(tmp_path / "inbox", "h-1", "approve", "OPERATOR",
+                              APPROVER_KEYS["OPERATOR"], None)
+        (tmp_path / "op.key").write_bytes(APPROVER_KEYS["OPERATOR"])
+        (tmp_path / "hold.key").write_bytes(HOLD_KEY)
+        assert main(["mcp-approve", str(tmp_path / "inbox"), "h-1", "approve", "--as",
+                     "OPERATOR", "--key", str(tmp_path / "op.key"), "--hold-key",
+                     str(tmp_path / "hold.key")]) == 2
+        assert loc.gw.runtime.hold_state("h-1") == "held"
+        loc.stop_and_replay()
+
+    def test_shown_arguments_must_match_their_hash(self, tmp_path):
+        """Without --hold-key, mcp-approve still checks that the arguments
+        it shows have the SHA-256 it signs; a forged hold whose arguments
+        and hash agree is signed, and the gateway refuses the approval
+        (wrong_message), because the hash is not that of the held request."""
+        import hashlib
+
+        from cadl.audit_log import canonical
+        loc = self._gw(tmp_path, hold_key=None)
+        path, hold = self._hold(loc, tmp_path)
+        assert "hold_mac" not in hold
+        hold["params"]["message"]["parts"] = [{"text": "harmless"}]
+        path.write_text(json.dumps(hold))
+        with pytest.raises(GatewayError, match="do not have the SHA-256"):
+            approval_file(tmp_path / "inbox", "h-1", "approve", "OPERATOR",
+                          APPROVER_KEYS["OPERATOR"])
+        hold["params_sha256"] = hashlib.sha256(canonical(hold["params"])).hexdigest()
+        path.write_text(json.dumps(hold))
+        self._approve(loc, tmp_path, None)
+        assert loc.gw.runtime.hold_state("h-1") == "held"
+        assert ("unauthorised_approval", "wrong_message") in host_events(loc.audit)
+        loc.stop_and_replay()
+
+    def test_hold_key_options(self, tmp_path):
+        with pytest.raises(GatewayError, match="approver key"):
+            self._gw(tmp_path, hold_key=APPROVER_KEYS["OPERATOR"])
+        with pytest.raises(GatewayError, match="give --approvals"):
+            Local(tmp_path, hold_key=HOLD_KEY)
+
+    def test_mcp_gateway_signs_holds(self, tmp_path):
+        from cadl.gateway_core import _drop
+        from cadl.mcp_gateway import Gateway
+        out: list = []
+        inbox = tmp_path / "inbox"
+        gw = Gateway(ROOT / "examples" / "agents_tool_governance.cadl", "PLANNER", "FILES",
+                     tmp_path / "m.jsonl", tmp_path / "m.trace.jsonl", to_client=out.append,
+                     to_server=out.append, inbox=inbox,
+                     approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]}, hold_key=HOLD_KEY)
+        gw.client_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "delete_file",
+                                              "arguments": {"path": "/x"}}}))
+        assert "hold_mac" in json.loads((inbox / "holds" / "h-1.json").read_text())
+        _drop(inbox, approval_file(inbox, "h-1", "approve", "OPERATOR",
+                                   APPROVER_KEYS["OPERATOR"], HOLD_KEY))
+        gw.tick()
+        assert gw.runtime.hold_state("h-1") == "approved"
+        gw.stop()
+
+
+class TestLowFindings:
+    """The Low findings of the fifth review."""
+
+    def test_index_variable_receiver_uses_the_hold_bindings(self, tmp_path):
+        """`OPERATOR -> SUMMARIZER[i] : approve` with the instance binding i
+        to 2, at an MCP gateway in front of FILES: the approval through the
+        inbox is the message to SUMMARIZER[2], the receiver that the hold's
+        contract instance binds, not the first member of the set."""
+        from cadl.gateway_core import _drop
+        from cadl.mcp_gateway import Gateway
+        text = (ROOT / "examples" / "agents_tool_governance.cadl").read_text()
+        text = (text.replace("- id: SUMMARIZER\n", "- id: SUMMARIZER[1..2]\n")
+                .replace("PLANNER, SUMMARIZER, FILES", 'PLANNER, "SUMMARIZER[i]", FILES')
+                .replace("to: [PLANNER, SUMMARIZER]", 'to: [PLANNER, "SUMMARIZER[*]"]')
+                .replace("OPERATOR -> PLANNER : approve", "OPERATOR -> SUMMARIZER[i] : approve")
+                .replace("OPERATOR -> PLANNER : reject", "OPERATOR -> SUMMARIZER[i] : reject"))
+        g = tmp_path / "bound.cadl"
+        g.write_text(text)
+        inbox = tmp_path / "inbox"
+        out: list = []
+        gw = Gateway(g, "PLANNER", "FILES", tmp_path / "m.jsonl", tmp_path / "m.trace.jsonl",
+                     to_client=out.append, to_server=out.append, inbox=inbox,
+                     approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]},
+                     init={"bindings": {"i": 2}})
+        assert {to for _, _, to, _ in gw.approval_rules} == {"SUMMARIZER[1]"}   # static
+        gw.client_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "delete_file",
+                                              "arguments": {"path": "/x"}}}))
+        _drop(inbox, approval_file(inbox, "h-1", "approve", "OPERATOR",
+                                   APPROVER_KEYS["OPERATOR"]))
+        gw.tick()
+        assert gw.runtime.hold_state("h-1") == "approved"
+        gw.stop()
+        names = [(r["message"]["to"], r["message"]["name"]) for r in
+                 read_records(tmp_path / "m.jsonl") if "decision" in r]
+        assert ("SUMMARIZER[2]", "approve") in names
+        replayed = tmp_path / "r.jsonl"
+        assert main(["agents-run", str(g), "--trace", str(tmp_path / "m.trace.jsonl"),
+                     "--audit", str(replayed)]) == 0
+        assert replayed.read_bytes() == (tmp_path / "m.jsonl").read_bytes()
+
+    @pytest.mark.parametrize("head", [
+        b"Content-Length: 5\r\nTransfer-Encoding : chunked\r\n",
+        b"Content-Length: 5\r\nTransfer-Encoding\t: chunked\r\n",
+        b"Content-Length: 5\r\nX-Folded: one\r\n two\r\n",
+        b"Content-Length: 5\r\nX-Cr: a\rb\r\n",
+    ])
+    def test_malformed_header_lines(self, tmp_path, head):
+        """A header with whitespace before its colon (which the parser of the
+        standard library takes as the end of the headers), a folded header
+        or a bare carriage return: 400, nothing read as a request."""
+        import threading
+        from cadl.a2a_gateway import _Server
+        loc = Local(tmp_path)
+        srv = _Server(("127.0.0.1", 0), loc.gw, socket.AF_INET)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        sock = socket.create_connection(("127.0.0.1", srv.server_address[1]))
+        sock.sendall(b"POST / HTTP/1.1\r\nHost: x\r\n" + head + b"\r\n{}\r\n")
+        sock.settimeout(10)
+        answer = sock.recv(64)
+        assert answer.split(b" ")[1] == b"400", answer
+        sock.close()
+        srv.shutdown()
+        srv.server_close()
+        assert loc.sent == [] and loc.gw.runtime.steps == []
+        assert host_events(loc.audit) == []              # not even authenticated
+        loc.stop_and_replay()
+
+    def test_caps_per_address_and_prefix(self, tmp_path):
+        """A connection beyond the cap of its address, or of its /24, gets 503
+        at once. All connections come from 127.0.0.1, so the test names their
+        addresses by their source ports."""
+        import threading
+        from cadl.a2a_gateway import _Server
+        loc = Local(tmp_path)
+        srv = _Server(("127.0.0.1", 0), loc.gw, socket.AF_INET, max_readers_per_address=1,
+                      max_readers_per_prefix=2, read_timeout=5)
+        addresses: dict = {}
+        srv.peer_key = lambda addr: addresses.get(addr[1], addr)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+
+        def connect(address):
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            addresses[s.getsockname()[1]] = address
+            s.connect(("127.0.0.1", port))
+            s.sendall(b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n")
+            s.settimeout(3)
+            return s
+
+        def status(s):
+            try:
+                return s.recv(32)[:12]
+            except socket.timeout:
+                return b"(waiting)"
+        first = connect("10.0.0.1")
+        wait_for(lambda: srv.address_count.get("10.0.0.1") == 1, "the first reader")
+        same = connect("10.0.0.1")                      # the same address
+        assert status(same) == b"HTTP/1.1 503"
+        second = connect("10.0.0.2")                    # same /24 (127.0.0.0/24)
+        wait_for(lambda: sum(srv.prefix_count.values()) == 2, "the second reader")
+        third = connect("10.0.0.3")                     # beyond the /24 cap
+        assert status(third) == b"HTTP/1.1 503"
+        threads = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+        assert threads == []                            # one thread for all deadlines
+        for s in (first, same, second, third):
+            s.close()
+        srv.shutdown()
+        srv.server_close()
+        assert sorted(set(_events(loc.audit, "overloaded"))) == ["address", "prefix"]
+        loc.stop_and_replay()
+
+
+
+class TestSixthReview:
+    """The Low findings of the review of 0.3.26."""
+
+    def test_departed_client_of_a_silent_stream(self, tmp_path, capsys):
+        """The agent sends some events and then nothing; the client leaves.
+        The gateway sees it, ends the request to the agent and frees the
+        place of the client (here the only one, --max-handlers-per-actor 1)."""
+        r = Run(tmp_path, extra=("--max-handlers-per-actor", "1"))
+        sock = _open_stream(r, "PLANNER", params("summarize", "stream-wait"))
+        seen = b""
+        while b"artifactUpdate" not in seen:
+            chunk = sock.recv(4096)
+            assert chunk
+            seen += chunk
+        sock.close()
+
+        def served():
+            status, _, body = r.client.post("PLANNER", rpc("SendMessage",
+                                                           params("summarize"), 2))
+            return status == 200 and body
+        body = wait_for(served, "the place of the client to be free")
+        assert body["result"]["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        r.agent.release.set()
+        r.stop()
+        r.replay_check()
+        capsys.readouterr()
+
+    def test_json_answer_to_a_stream_is_strict(self, tmp_path, capsys):
+        r = Run(tmp_path)
+        _, _, _, events = read_sse(r, "PLANNER", "SendStreamingMessage",
+                                   params("summarize", "stream-json-bad"))
+        assert events[-1][0] == "error" and events[-1][1]["error"]["code"] == -32006
+        r.stop()
+        assert any("not UTF-8" in (x["reason"] or "") for x in read_records(r.audit)
+                   if x.get("event") == "invalid_response")
+        r.replay_check()
+        capsys.readouterr()
+
+    def test_hold_key_is_not_a_client_key(self, tmp_path):
+        with pytest.raises(GatewayError, match="client key"):
+            Local(tmp_path, inbox=tmp_path / "inbox",
+                  approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]},
+                  hold_key=CLIENT_KEYS["PLANNER"])
+
+    def test_unsigned_hold_where_holds_are_signed(self, tmp_path):
+        """mac and kind stripped: without --hold-key, mcp-approve refuses it
+        when run.json says holds_signed, and with --require-signed-hold."""
+        loc = Local(tmp_path, inbox=tmp_path / "inbox",
+                    approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]}, hold_key=HOLD_KEY)
+        loc.post(rpc("SendMessage", params("publish", returnImmediately=True)))
+        path = tmp_path / "inbox" / "holds" / "h-1.json"
+        hold = json.loads(path.read_text())
+        del hold["hold_mac"], hold["kind"]
+        hold["deadline"] = "2099-01-01T00:00:00.000Z"
+        path.write_text(json.dumps(hold))
+        with pytest.raises(GatewayError, match="signed hold is required"):
+            approval_file(tmp_path / "inbox", "h-1", "approve", "OPERATOR",
+                          APPROVER_KEYS["OPERATOR"])
+        (tmp_path / "op.key").write_bytes(APPROVER_KEYS["OPERATOR"])
+        assert main(["mcp-approve", str(tmp_path / "inbox"), "h-1", "approve", "--as",
+                     "OPERATOR", "--key", str(tmp_path / "op.key")]) == 2
+        loc.stop_and_replay()
+
+    def test_require_signed_hold_option(self, tmp_path, capsys):
+        loc = Local(tmp_path, inbox=tmp_path / "inbox",
+                    approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]})
+        loc.post(rpc("SendMessage", params("publish", returnImmediately=True)))
+        (tmp_path / "op.key").write_bytes(APPROVER_KEYS["OPERATOR"])
+        args = ["mcp-approve", str(tmp_path / "inbox"), "h-1", "approve", "--as", "OPERATOR",
+                "--key", str(tmp_path / "op.key")]
+        assert main(args + ["--require-signed-hold"]) == 2
+        assert "signed hold is required" in capsys.readouterr().err
+        assert main(args) == 0                          # unsigned gateway: a warning
+        assert "not signed" in capsys.readouterr().err
+        loc.stop_and_replay()
+
+    def test_invisible_characters_are_shown_escaped(self, tmp_path, capsys):
+        from cadl.gateway_core import visible_json
+        text = "rm \u202ecod.exe \x1b[2J\u200b\u2028\x85\U000F0000"
+        shown = visible_json({"t": text})
+        for ch in ("\u202e", "\x1b", "\u200b", "\u2028", "\x85", "\U000F0000"):
+            assert ch not in shown
+        assert "\\u202e" in shown and "\\udb80\\udc00" in shown
+        assert json.loads(shown) == {"t": text}           # the same value
+        loc = Local(tmp_path, inbox=tmp_path / "inbox",
+                    approver_keys={"OPERATOR": APPROVER_KEYS["OPERATOR"]})
+        loc.post(rpc("SendMessage", params("publish", text, returnImmediately=True)))
+        assert main(["mcp-approve", str(tmp_path / "inbox"), "h-1", "approve", "--as",
+                     "OPERATOR", "--show"]) == 0
+        out = capsys.readouterr().out
+        assert "\u202e" not in out and "\\u202ecod.exe" in out
+        loc.stop_and_replay()

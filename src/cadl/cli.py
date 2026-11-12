@@ -162,6 +162,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="JSON object from actor to the key file (or {\"hex\": ...}) "
                              "with which its inbox files are authenticated "
                              "(HMAC-SHA256); required with --approvals")
+    gw_cmd.add_argument("--hold-key", type=Path, default=None, metavar="FILE",
+                        help="Sign every published hold with this key (HMAC-SHA256); "
+                             "approvers verify it with mcp-approve --hold-key")
     gw_cmd.add_argument("--insecure-approvals", action="store_true",
                         help="Read the inbox without authentication (for tests only)")
     gw_cmd.add_argument("--allow-method", action="append", default=[], metavar="NAME",
@@ -219,6 +222,9 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--approver-keys", type=Path, default=None, metavar="FILE",
                          help="The keys of the approvers and other senders of the "
                               "inbox; required with --approvals")
+    a2a_cmd.add_argument("--hold-key", type=Path, default=None, metavar="FILE",
+                         help="Sign every published hold with this key (HMAC-SHA256); "
+                              "approvers verify it with mcp-approve --hold-key")
     a2a_cmd.add_argument("--insecure-approvals", action="store_true",
                          help="Read the inbox without authentication (for tests only)")
     a2a_cmd.add_argument("--init", type=Path, default=None, metavar="FILE.json",
@@ -251,6 +257,9 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--max-readers-per-address", type=int, default=4, metavar="N",
                          help="Of those, connections of one remote address, IPv4 address or IPv6 /64 (default 4); "
                               "beyond that the connection is closed at once")
+    a2a_cmd.add_argument("--max-readers-per-prefix", type=int, default=16, metavar="N",
+                         help="Of those, connections of one IPv4 /24 or IPv6 /48 "
+                              "(default 16); beyond that 503")
     a2a_cmd.add_argument("--max-handlers-per-actor", type=int, default=16, metavar="N",
                          help="Authenticated requests of one actor handled at the same "
                               "time, held blocking requests included (default 16); "
@@ -282,6 +291,13 @@ def main(argv: list[str] | None = None) -> int:
     approve_cmd.add_argument("--show", action="store_true",
                              help="Show the held call and its arguments, and write "
                                   "nothing")
+    approve_cmd.add_argument("--hold-key", type=Path, default=None, metavar="FILE",
+                             help="The gateway's hold key: verify the MAC of the published "
+                                  "hold before showing or signing it; required when the "
+                                  "gateway signs its holds")
+    approve_cmd.add_argument("--require-signed-hold", action="store_true",
+                             help="Refuse a hold that the gateway did not sign; also the "
+                                  "default when DIR/run.json says holds_signed")
     approve_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
                              help="The key of the actor (HMAC-SHA256); the gateway "
                                   "requires it unless it runs with --insecure-approvals")

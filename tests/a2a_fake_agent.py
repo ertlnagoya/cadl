@@ -23,6 +23,7 @@ class FakeAgent:
     def __init__(self):
         self.requests: list[dict] = []
         self.tasks: dict[str, dict] = {}
+        self.release = threading.Event()
         self.lock = threading.Lock()
         self.ids = itertools.count(1)
         agent = self
@@ -42,6 +43,30 @@ class FakeAgent:
                                            "params": req.get("params"),
                                            "raw": raw.decode("ascii"),
                                            "headers": dict(self.headers)})
+                text0 = ((req.get("params") or {}).get("message") or {}).get(
+                    "parts", [{}])[0].get("text", "")
+                if req.get("method") == "SendStreamingMessage" and text0 == "stream-json-bad":
+                    data = (b'{"jsonrpc":"2.0","id":%d,"error":{"code":-1,"message":"\xff"}}'
+                            % req["id"])
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if req.get("method") in ("SendStreamingMessage", "SubscribeToTask"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    for chunk in agent.stream(req):
+                        try:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                        except OSError:
+                            break
+                    self.close_connection = True
+                    return
                 body = agent.answer(req)
                 data = body if isinstance(body, bytes) else json.dumps(body).encode()
                 self.send_response(200)
@@ -68,13 +93,55 @@ class FakeAgent:
             for r in self.requests:
                 if r["method"] != method:
                     continue
-                if method == "SendMessage":
+                if method in ("SendMessage", "SendStreamingMessage"):
                     meta = r["params"]["message"].get("metadata", {})
                     ext = next(iter(meta.values()), {}) if meta else {}
                     out.append(ext.get("name") if isinstance(ext, dict) else None)
                 else:
                     out.append(r["params"]["id"])
         return out
+
+    def stream(self, req: dict):
+        """The SSE events of a streamed request."""
+        id_ = req.get("id")
+        params = req.get("params") or {}
+
+        def ev(result):
+            return ("data: " + json.dumps({"jsonrpc": "2.0", "id": id_, "result": result})
+                    + "\n\n").encode()
+        if req["method"] == "SubscribeToTask":
+            with self.lock:
+                task = self.tasks.get(params.get("id"))
+            if task is None:
+                yield ("event: error\ndata: " + json.dumps({"jsonrpc": "2.0", "id": id_,
+                       "error": {"code": -32001, "message": "TaskNotFoundError"}})
+                       + "\n\n").encode()
+                return
+            yield ev({"task": task})
+            yield ev({"statusUpdate": {"taskId": task["id"], "contextId": task["contextId"],
+                                       "status": {"state": "TASK_STATE_COMPLETED"}}})
+            return
+        msg = params["message"]
+        text = msg["parts"][0].get("text", "")
+        with self.lock:
+            n = next(self.ids)
+        tid, ctx = f"up-task-{n}", msg.get("contextId", f"up-ctx-{n}")
+        task = {"id": tid, "contextId": ctx, "status": {"state": "TASK_STATE_SUBMITTED"}}
+        with self.lock:
+            self.tasks[tid] = task
+        yield b": a comment\n\n"
+        yield ev({"task": task})
+        other = "other-task" if text == "stream-foreign" else tid
+        yield ev({"statusUpdate": {"taskId": other, "contextId": ctx,
+                                   "status": {"state": "TASK_STATE_WORKING"}}})
+        if text == "stream-cr":
+            yield b"data: {\"jsonrpc\": \"2.0\"}\r{\"x\": 1}\n\n"
+        yield ev({"artifactUpdate": {"taskId": tid, "contextId": ctx, "artifact": {
+            "artifactId": "a1", "parts": [{"text": f"artifact: {text}"}]}}})
+        if text == "stream-wait":
+            self.release.wait(30)
+        yield ev({"statusUpdate": {"taskId": tid, "contextId": ctx,
+                                   "status": {"state": "TASK_STATE_COMPLETED"}}})
 
     def answer(self, req: dict):
         id_ = req.get("id")

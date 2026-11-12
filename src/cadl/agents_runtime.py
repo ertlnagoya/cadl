@@ -1750,6 +1750,17 @@ class AgentsRuntime:
                  "deadline": None if h.deadline is None else self._time(h.deadline)}
                 for h in self.holds if h.state == "held"]
 
+    def hold_bindings(self, hold_id: str) -> list[tuple[str, dict]]:
+        """(contract, bindings) of the contract instances of the grounds of
+        a hold, for a host that resolves an index variable of an approval
+        rule (G.6)."""
+        h = next((x for x in self.holds if x.hold_id == hold_id), None)
+        if h is None:
+            return []
+        by_key = {i.key: i for i in self.instances}
+        return [(c, dict(by_key[(c, n)].bindings)) for c, n in h.instances
+                if (c, n) in by_key]
+
     def hold_state(self, hold_id: str) -> str | None:
         """The state of a hold, or None when there is no such hold."""
         return next((h.state for h in self.holds if h.hold_id == hold_id), None)
