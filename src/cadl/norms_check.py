@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
+from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -482,7 +483,7 @@ class Atom:
                 "args": list(self.args)}
 
     def text(self) -> str:
-        args = f"({', '.join(json.dumps(a) for a in self.args)})" if self.args else ""
+        args = f"({', '.join(json_text(a) for a in self.args)})" if self.args else ""
         return f"{self.sender} -> {self.receiver} : {self.name}{args}"
 
 
@@ -599,30 +600,100 @@ def _list_values(q: Any) -> list:
     return [list(v) for v in _LIST_VALUES[q.list_order]]
 
 
-def _exact_number(v: Fraction) -> Any:
-    return int(v) if v.denominator == 1 else float(v)
+# Numbers of the classes of values (F.12) are exact decimals: norms-eval
+# reads a number of a trace exactly as it is written (F.5), so a value of a
+# class is written into a witness with the digits of its exact value, and
+# the evaluator of norms-eval reads it back as the same value.
+
+def _is_decimal(f: Fraction) -> bool:
+    d = f.denominator
+    for p in (2, 5):
+        while d % p == 0:
+            d //= p
+    return d == 1
 
 
-def _numbers_between(a: Fraction, b: Fraction, k: int) -> list:
-    """k numbers (integers first, else floats) strictly between a and b, or
-    every float between them when there are fewer."""
-    out: list = []
+def _decimal_text(f: Fraction) -> str:
+    """The exact decimal text of a number with a finite decimal expansion."""
+    if f.denominator == 1:
+        return str(f.numerator)
+    k = 0
+    while (10 ** k) % f.denominator:
+        k += 1
+    n = abs(f.numerator) * (10 ** k // f.denominator)
+    digits = str(n).rjust(k + 1, "0")
+    text = f"{digits[:-k]}.{digits[-k:]}".rstrip("0")
+    return ("-" if f < 0 else "") + text
+
+
+def _num(f: Fraction) -> Any:
+    """A value of a class: an int, or a float that keeps its exact decimal
+    text (norms_eval reads it exactly, and `json_text` writes it)."""
+    from .norms_eval import _Written
+    f = Fraction(f)
+    if f.denominator == 1:
+        return int(f)
+    text = _decimal_text(f)
+    w = _Written(text)
+    w.text = text
+    return w
+
+
+def exact_value(v: Any) -> Fraction:
+    """The exact value of a number of a class or a literal."""
+    text = getattr(v, "text", None)
+    if text is not None:
+        return Fraction(Decimal(text))
+    if isinstance(v, float):
+        return Fraction(repr(v))
+    return Fraction(v)
+
+
+def _decimals_between(a: Fraction, b: Fraction, k: int) -> list:
+    """k distinct short decimals strictly between a and b (a < b)."""
     if b - a >= k + 1 and a.denominator == 1:
         return [int(a) + j for j in range(1, k + 1)]
+    out: list = []
     for j in range(1, k + 1):
-        v = _exact_number(a + (b - a) * Fraction(j, k + 1))
-        if a < Fraction(v) < b and v not in out:
-            out.append(v)
-    x = float(a)
-    while len(out) < k:
-        x = math.nextafter(x, math.inf)
-        if Fraction(x) <= a:
-            continue
-        if Fraction(x) >= b:
-            break
-        if x not in out:
-            out.append(x)
-    return sorted(out)
+        t = a + (b - a) * Fraction(j, k + 1)
+        for digits in range(0, 80):
+            c = Fraction(round(t * 10 ** digits), 10 ** digits)
+            if a < c < b and c not in out:
+                out.append(c)
+                break
+    return [_num(c) for c in sorted(out)]
+
+
+def _report_value(v: Any) -> Any:
+    """A value of a class for the JSON report: a number that a float holds
+    exactly as a float, else its exact decimal text."""
+    if isinstance(v, float) and getattr(v, "text", None) is not None:
+        return float(v) if Fraction(repr(float(v))) == exact_value(v) else v.text
+    return v
+
+
+def json_text(v: Any) -> str:
+    """JSON text of a value, numbers of the classes with their exact
+    decimal digits (json.dumps would round them to a float)."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        text = getattr(v, "text", None)
+        return text if text is not None else json.dumps(v)
+    if isinstance(v, Fraction):
+        return _decimal_text(v) if _is_decimal(v) else json.dumps(float(v))
+    if isinstance(v, str):
+        return json.dumps(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(json_text(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ", ".join(f"{json.dumps(str(k))}: {json_text(x)}"
+                               for k, x in v.items()) + "}"
+    return json.dumps(v)
 
 
 def _expr_text(expr: Any) -> str:
@@ -857,7 +928,11 @@ class Translator:
         return [f"{ref.name}[{v}]"] if v in members else []
 
     def _arg_value(self, a: Any) -> Any:
-        if isinstance(a, (IntLiteral, FloatLiteral, BoolLiteral, StringLiteral)):
+        if isinstance(a, FloatLiteral):
+            from .norms_eval import _literal_number
+            f = Fraction(_literal_number(a))          # exactly as written
+            return _num(f) if _is_decimal(f) else float(a.value)
+        if isinstance(a, (IntLiteral, BoolLiteral, StringLiteral)):
             return a.value
         if isinstance(a, ActorRef) and a.index is None:
             if a.name in self.bindings:
@@ -1007,12 +1082,15 @@ class Translator:
         from .ast_nodes import Comprehension, QuantifiedExpr
         if isinstance(e, BoolLiteral):
             return self._lit(e.value)
-        if isinstance(e, (IntLiteral, FloatLiteral, StringLiteral)):
+        if isinstance(e, FloatLiteral):
+            from .norms_eval import _literal_number
+            return self._lit(Fraction(_literal_number(e)))      # as written, exactly
+        if isinstance(e, (IntLiteral, StringLiteral)):
             return self._lit(e.value)
         if isinstance(e, UnaryOp) and e.op == "-":
             s = self._shape(e.operand, scope, info)
-            if s[0] == "lit" and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                                     for v in s[1]):
+            if s[0] == "lit" and all(isinstance(v, (int, float, Fraction))
+                                     and not isinstance(v, bool) for v in s[1]):
                 return ("lit", tuple(-v for v in s[1]))
             return ("num", self._keys(s))
         if isinstance(e, UnaryOp) and e.op == "NOT":
@@ -1063,6 +1141,9 @@ class Translator:
                 for x in a[1]:
                     for y in b[1]:
                         try:
+                            if isinstance(x, (bool, str)) or isinstance(y, (bool, str)):
+                                raise TypeError
+                            x, y = Fraction(x), Fraction(y)       # exact, as norms-eval
                             vals.append(x + y if e.op == "+" else x - y if e.op == "-"
                                         else x * y if e.op == "*" else x / y)
                         except Exception:
@@ -1401,10 +1482,11 @@ class Translator:
         of a number used as a condition, and 1 when a boolean literal is
         compared with it, since an ordering compares true as 1), the text
         literals and names compared with it, and one other text."""
-        nums = {c for c in q.consts if isinstance(c, (int, float)) and not isinstance(c, bool)}
-        nums.add(0)
+        nums = {exact_value(c) for c in q.consts
+                if isinstance(c, (int, float, Fraction)) and not isinstance(c, bool)}
+        nums.add(Fraction(0))
         if any(isinstance(c, bool) for c in q.consts):
-            nums.update((0, 1))
+            nums.update((Fraction(0), Fraction(1)))
         cs = sorted(nums)
         k = q.order
         if q.domain is not None:
@@ -1415,12 +1497,15 @@ class Translator:
             # (computed exactly; a value of a trace is an integer or a float,
             # so the values are k integers or floats strictly inside each gap,
             # or all of them when the gap holds fewer)
-            numbers = [_exact_number(Fraction(cs[0]) - j) for j in range(k, 0, -1)]
+            # (exact decimals: a literal that has no finite decimal, such as
+            # 1/3 from arithmetic, is not a value of a trace)
+            numbers = [math.floor(cs[0]) - j for j in range(k, 0, -1)]
             for i, c in enumerate(cs):
-                numbers.append(c)
+                if _is_decimal(c):
+                    numbers.append(_num(c))
                 if i + 1 < len(cs):
-                    numbers += _numbers_between(Fraction(c), Fraction(cs[i + 1]), k)
-            numbers += [_exact_number(Fraction(cs[-1]) + j) for j in range(1, k + 1)]
+                    numbers += _decimals_between(c, cs[i + 1], k)
+            numbers += [math.ceil(cs[-1]) + j for j in range(1, k + 1)]
         lits = sorted({str(c) for c in q.consts if isinstance(c, str)})
         ordered = k > 1 or any(a[0] in ("<", "<=", ">", ">=") and isinstance(a[1], str)
                                for a in q.atoms)
@@ -1440,7 +1525,8 @@ class Translator:
                    else [[]] if k == 1 else [[j] for j in range(k)])
         objects += [] if k == 1 else [{}] + [{"k": j} for j in range(1, k)]
         # plain values first, so that a witness shows them when they will do
-        reps = ([None] + sorted(numbers, key=lambda x: (abs(x), x)) + texts + others
+        reps = ([None] + sorted(numbers, key=lambda x: (abs(exact_value(x)), exact_value(x)))
+                + texts + others
                 + [True, False] + objects)
         if q.raw:
             return reps
@@ -1487,8 +1573,12 @@ class Translator:
             return BoolLiteral(v)
         if isinstance(v, int):
             return IntLiteral(v)
+        if isinstance(v, Fraction):
+            if v.denominator == 1:
+                return IntLiteral(int(v))
+            return FloatLiteral(float(v), text=_decimal_text(v) if _is_decimal(v) else None)
         if isinstance(v, float):
-            return FloatLiteral(v)
+            return FloatLiteral(v, text=getattr(v, "text", None) or repr(v))
         if isinstance(v, _Name):
             return ActorRef(name=str(v))
         return StringLiteral(v)
@@ -1505,9 +1595,10 @@ class Translator:
     def _oracle(self, exprs: list, values: dict, keys=None) -> list:
         """The values (T, F, U) of state predicates for one valuation of the
         quantities, computed by the evaluator of norms-eval."""
-        from .norms_eval import UNKNOWN, _Evaluator
+        from .norms_eval import UNKNOWN, _Evaluator, _exact
         keys = self.quantities if keys is None else keys
-        obs = Observation(t=0.0, values={k: values.get(k) for k in keys},
+        # as the trace reader of norms-eval stores them: numbers exact
+        obs = Observation(t=0.0, values={k: _exact(values.get(k)) for k in keys},
                           messages=[], state=None, state_after=None)
         trace = Trace(observations=[obs], bindings=self.bindings)
         ev = _Evaluator(trace, self.contract.lifecycle is not None, [])
@@ -2513,7 +2604,7 @@ class NormsModel:
             lines.append(f"// predicate {pid}: {self._comment(p.text)}")
         for q in tr.quantities.values():
             lines.append(self._comment(f"// quantity {q.key}: values "
-                                       f"{', '.join(json.dumps(v) for v in q.reps)}"))
+                                       f"{', '.join(json_text(v) for v in q.reps)}"))
         return lines
 
     @staticmethod
@@ -2595,7 +2686,7 @@ class NormsModel:
 
     def choice_text(self, ch: Choice, end: bool) -> str:
         msgs = ", ".join(self.tr.atoms[i].text() for i in ch.messages) or "no message"
-        vals = ", ".join(f"{k}={json.dumps(v)}" for k, v in sorted(ch.values.items())
+        vals = ", ".join(f"{k}={json_text(v)}" for k, v in sorted(ch.values.items())
                          if v is not None)
         return f"{msgs}{'; ' + vals if vals else ''}{'; end' if end else ''}"
 
@@ -2864,7 +2955,7 @@ def trace_lines(tr: Translator, path: list) -> list[str]:
             obs["messages"] = [tr.atoms[i].message() for i in ch.messages]
         if _ends(tr, end):
             obs["end"] = True
-        lines.append(json.dumps(obs))
+        lines.append(json_text(obs))
     return lines
 
 
@@ -2996,7 +3087,7 @@ def random_paths(tr: Translator, count: int, seed: int = 0, p_message: float = 0
     by_values: dict = {}
     for ch in tr.choices:
         index.setdefault(ch.messages, []).append(ch.index)
-        by_values[(ch.messages, json.dumps(ch.values, sort_keys=True))] = ch.index
+        by_values[(ch.messages, json_text(dict(sorted(ch.values.items()))))] = ch.index
     paths = []
     for _ in range(count):
         path: list = []
@@ -3005,7 +3096,7 @@ def random_paths(tr: Translator, count: int, seed: int = 0, p_message: float = 0
             j = rng.choice(index[msgs])
             if path and rng.random() < p_keep:
                 prev = split_choice(tr, path[-1][0])[0].values
-                j = by_values[(msgs, json.dumps(prev, sort_keys=True))]
+                j = by_values[(msgs, json_text(dict(sorted(prev.items()))))]
             amended = sum(1 for jj, _e in path if jj >= len(tr.choices))
             if amended < len(getattr(tr, "version_names", [])) and rng.random() < p_amend:
                 j += len(tr.choices)
@@ -3668,7 +3759,8 @@ def _report_head(model: NormsModel) -> dict:
             "step_ms": tr.step_ms,
             "horizon": model.H,
             "messages": [a.text() for a in tr.atoms],
-            "quantities": {q.key: q.reps for q in tr.quantities.values()},
+            "quantities": {q.key: [_report_value(v) for v in q.reps]
+                           for q in tr.quantities.values()},
             "choices": len(tr.choices),
             "domains": {q.key: list(q.domain) for q in tr.quantities.values()
                         if q.domain is not None},
@@ -3754,10 +3846,11 @@ def export(model: NormsModel, report: dict | None, directory) -> list[str]:
         out = []
         for line in lines:
             if '"amend"' in line:
-                obs = json.loads(line)
+                from .norms_eval import loads_strict
+                obs = loads_strict(line)       # keeps the digits of the numbers
                 if obs.get("amend") in paths:
                     obs["amend"] = os.path.relpath(paths[obs["amend"]], d.resolve())
-                line = json.dumps(obs)
+                line = json_text(obs)
             out.append(line)
         return "\n".join(out)
 

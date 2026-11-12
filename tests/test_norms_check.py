@@ -1240,6 +1240,103 @@ def _random_json(rng, consts, domain=None):
     return rng.choice(pool)
 
 
+def _vectors_read_back(m):
+    """Every choice of the model, written as an observation of a trace and
+    read back by norms-eval, gives its predicates the values the model has
+    for that choice: the values of the classes are written exactly."""
+    from cadl.norms_eval import _Evaluator
+    tr = m.tr
+    exprs = {i: p for i, p in enumerate(tr.preds)}
+    for ch in tr.choices:
+        line = trace_lines(tr, [(ch.index, True)])[0]
+        obs = parse_trace([line]).observations[0]
+        for i, p in exprs.items():
+            t = p.owner
+            from cadl.norms_eval import Trace as _Trace, UNKNOWN
+            ev = _Evaluator(_Trace(observations=[obs], bindings=t.bindings),
+                            t.contract.lifecycle is not None, [])
+            ev.actors = t.actors
+            v = ev.holds(p.expr, 0, 0)
+            got = "T" if v is True else "F" if v is False else "U"
+            assert got == ch.vector[i], (line, p.text, got, ch.vector[i])
+
+
+@pytest.mark.parametrize("case", CASES, ids=case_id)
+def test_witness_values_read_back_exactly(case):
+    name, kw = case
+    _sos, m, _pm = model_of(name, **kw)
+    _vectors_read_back(m)
+
+
+def _decimal(rng, places):
+    v = rng.randint(-10 ** (places + 1), 10 ** (places + 1))
+    return f"{v / 10 ** places:.{places}f}"
+
+
+def test_decimal_literals_round_trip():
+    """Pairs of decimal literals with 1 to 6 places, negative values and
+    values close together: every class, written into a trace, is read by
+    norms-eval as the value the model gives it, and a gap between two
+    close literals has a value strictly inside it."""
+    import random as _random
+    rng = _random.Random(11)
+    pairs = [("0.1", "0.2"), ("0.1", "0.10001"), ("-0.3", "-0.29999"), ("1e-3", "0.5"),
+             ("-1.5", "-1.25"), ("0.000001", "0.000002"),
+             ("0.1", "0.100000000000000000001")]          # beyond a float
+    pairs += [tuple(sorted((_decimal(rng, p), _decimal(rng, p)), key=float))
+              for p in range(1, 7) for _ in range(3)]
+    for a, b in pairs:
+        if a == b:
+            continue
+        sos = make_sos(f"""\
+norms:
+  - id: p
+    kind: prohibition
+    bearer: D
+    content: "R[1].v > {a} AND R[1].v < {b}"
+  - id: q
+    kind: prohibition
+    bearer: D
+    content: "R[1].v == {a} OR R[2].v >= {b}"
+""")
+        m = build_model(sos, members={"R": 2})
+        _vectors_read_back(m)
+        pid = next(i for i, p in enumerate(m.tr.preds) if "AND" in p.text)
+        assert any(ch.vector[pid] == "T" for ch in m.tr.choices), (a, b)
+
+
+FRACTIONS = """\
+norms:
+  - id: no_flagged_driving
+    kind: prohibition
+    bearer: "R[1]"
+    content: "R[1].low == true AND R[1].speed > 0.1 AND R[1].speed < 0.2"
+  - id: report
+    kind: obligation
+    bearer: "R[1]"
+    trigger: "D -> R[1] : ask"
+    content: "R[1].speed >= 0.1 AND R[1].speed <= 0.10001"
+    deadline: 1s
+"""
+
+
+@needs_prism
+def test_decimal_witnesses_are_confirmed():
+    """The reproducer of 0.3.26: the witness of a violation in the gap
+    (0.1, 0.2) was written with speed 0.1 and not confirmed."""
+    sos = make_sos(FRACTIONS)
+    m = build_model(sos, bindings={"i": 1})
+    report = check(m, PRISM)
+    assert report["unconfirmed"] == []
+    norms = {n["id"]: n for n in report["norms"]}
+    for nid, key in (("no_flagged_driving", "violable"), ("report", "fulfillable")):
+        w = norms[nid][key]["witness"]
+        assert w["confirmed"]
+        r = evaluate(sos, parse_trace(w["trace"]))
+        want = "violated" if key == "violable" else "fulfilled"
+        assert {n["id"]: n["state"] for n in r["norms"]}[nid] == want
+
+
 @pytest.mark.parametrize("case", CASES, ids=case_id)
 def test_value_classes_cover_every_json_value(case):
     """Exactness of the classes of values (F.12): for random JSON values of
