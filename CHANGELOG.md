@@ -6,6 +6,44 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `cadl a2a-gateway` streams: `SendStreamingMessage` and `SubscribeToTask`
+  over Server-Sent Events (JSON-RPC binding of A2A 1.0.0). A streamed
+  request is decided once, as `SendMessage`, before anything is passed
+  on; every relayed event is parsed strictly, has to answer the request
+  and belong to one task or message of the same client, and is
+  re-serialised. A denial is one rejected task; a held stream sends
+  comments until the hold closes (a client that goes withdraws it); with
+  `returnImmediately` it is one event, the gateway's submitted task.
+  Push notifications (server-side request forgery) and gRPC (HTTP/2 and
+  Protocol Buffers, a new dependency) stay refused (Appendix G, G.13).
+- `--hold-key FILE` for `cadl mcp-gateway` and `cadl a2a-gateway`: every
+  published hold carries `hold_mac`, an HMAC-SHA256 over its canonical
+  JSON (arguments and their SHA-256 included); `cadl mcp-approve
+  --hold-key` verifies it before it shows or signs the hold. Optional for
+  backward compatibility.
+- `--max-readers-per-prefix` (default 16) for `cadl a2a-gateway`: a cap on
+  the connections read before authentication per IPv4 /24 or IPv6 /48,
+  above the cap per address.
+- Interoperability tests against the official SDKs, `mcp` 2.3.0 and
+  `a2a-sdk` 1.3.0 (`tests/test_sdk_interop.py`), skipped without them,
+  and a CI job `sdk-interop` that installs them on Python 3.12. The SDKs
+  are not dependencies of cadl.
+
+### Changed
+- `cadl mcp-approve` refuses a published hold whose shown arguments do
+  not have the SHA-256 it names, and, without `--hold-key`, a hold that
+  the gateway signed. With `--require-signed-hold`, or when `run.json` of
+  the inbox says `holds_signed`, it refuses an unsigned hold. It shows the
+  arguments with every invisible character escaped (controls,
+  bidirectional overrides, zero-width and other format characters,
+  private use, surrogates, unassigned code points, line and paragraph
+  separators).
+- `cadl a2a-gateway` refuses a hold key that is a client key.
+- `cadl a2a-gateway` answers a connection beyond the cap of its address
+  with HTTP 503 (it was closed without an answer), and keeps the read
+  deadlines of all connections in one thread.
+
 ### Fixed
 
 - `cadl game-check` and `cadl model-check` no longer stop with
@@ -16,6 +54,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `cadl.stochastic.int_text` and `fraction_text`, which split such an
   integer by powers of ten and leave the limit of the process unchanged;
   the output is the same as with the limit lifted.
+- A relayed stream kept its place among the requests handled at the same
+  time after its client had gone, while the agent sent nothing or only
+  comments; the gateway now watches the client while the agent is silent
+  and ends the stream and the request to the agent. A plain JSON answer
+  to a streamed request is read with the size cap and strict UTF-8.
+- An approval rule whose receiver is an index variable (`A[i]`) took the
+  first member of the set; it now takes the receiver from the bindings of
+  the contract instance of the hold's grounds.
+- `cadl a2a-gateway`: a header line with whitespace before its colon,
+  which the standard library's parser takes as the end of the headers,
+  hid the headers after it, among them a `Transfer-Encoding`; such lines,
+  folded lines and bare carriage returns in the headers now get 400.
+- `cadl a2a-gateway` refused `SendStreamingMessage`, which the `a2a-sdk`
+  client sends by default when the agent card says `streaming: true`.
 
 ## [0.3.25] — 2026-11-12
 
