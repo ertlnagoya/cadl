@@ -56,7 +56,7 @@ BASES = [
                                      "domains": ["ROBOT[*].load=0..3", "DEPOT.capacity=2..4"]}),
 ]
 
-DEADLINES = ["1s", "2s", "3s", "4s", "6s", "10s"]
+DEADLINES = ["1s", "2s", "3s", "4s", "6s", "10s", "1.5s", "2.5s", 2.5, 0.5]
 
 
 # --- Versions ---------------------------------------------------------------------
@@ -80,7 +80,7 @@ def _refs(c: dict) -> set:
 
 def _mutate_new(rng: random.Random, c: dict, log: list, k: int | None = None) -> None:
     norms = c["norms"]
-    k = rng.choice([0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]) if k is None else k
+    k = rng.choice([0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10]) if k is None else k
     timed = [n for n in norms if n["kind"] in ("obligation", "prohibition")]
     if k == 0 and timed:                                   # deadline changed
         n = rng.choice(timed)
@@ -148,6 +148,21 @@ def _mutate_new(rng: random.Random, c: dict, log: list, k: int | None = None) ->
                  "effects": {rng.choice(["suspend", "suspend", "resume"]): [target]}}
             norms.append(p)
             log.append(f"added the power {p['id']} over {target}")
+    elif k == 9:                                           # a temporal content
+        preds = [n for n in norms if n["kind"] in ("obligation", "prohibition")
+                 and "->" not in str(n["content"]) and "(" not in str(n["content"])]
+        if preds:
+            n = rng.choice(preds)
+            op = rng.choice(["throughout", "within"])
+            n["content"] = f"{op}({rng.choice(['1s', '2s', '3s'])}, {n['content']})"
+            log.append(f"content of {n['id']}: {n['content']}")
+    elif k == 10:                                          # a temporal norm gets late
+        temporal = [n for n in norms if n["kind"] in ("obligation", "prohibition")
+                    and str(n["content"]).startswith(("throughout(", "within("))]
+        if temporal:
+            n = rng.choice(temporal)
+            n["deadline"] = rng.choice(["0.5s", "1s", "1.5s", "2s"])
+            log.append(f"deadline of {n['id']}: {n['deadline']}")
     else:                                                  # a deadline of a new norm
         n = rng.choice(norms)
         if n["kind"] in ("obligation", "prohibition"):
@@ -193,7 +208,7 @@ def make_pair(rng: random.Random, tries: int = 100):
         old = copy.deepcopy(base)
         log: list = []
         for _ in range(rng.choice([0, 1, 2])):             # the old version mutated too
-            _mutate_new(rng, _contract(old), log, 7 if rng.random() < .5 else None)
+            _mutate_new(rng, _contract(old), log, rng.choice([7, 7, 9, 9, None]))
         new = copy.deepcopy(old)
         for _ in range(rng.randint(1, 4)):
             _mutate_new(rng, _contract(new), log)
@@ -251,7 +266,8 @@ def make_trace(rng: random.Random, old_sos, new_sos, kw) -> tuple[list[str], int
 
 def _snap(engine, t) -> dict:
     return {x.d.id: {"state": x.state, "kind": x.d.kind, "elapsed": x.elapsed(t),
-                     "frozen": x.frozen is not None, "deadline": x.deadline}
+                     "frozen": x.frozen is not None, "deadline": x.deadline,
+                     "candidates": list(x.candidates), "history": len(x.history)}
             for x in engine.norms}
 
 
@@ -280,6 +296,8 @@ def run_at_amendment(old_sos, new_sos, lines: list[str], k: int) -> dict:
     engine._finish_items()
     out["result"] = engine.result()
     out["effects"] = engine.amendments[0]["effects"] if engine.amendments else []
+    out["engine"] = engine
+    out["last"] = n
     return out
 
 
@@ -323,11 +341,19 @@ def predict(diff: dict, contract_id: str, before: dict, old_ids: list) -> dict:
         else:
             exp = {"state": s, "elapsed": b["elapsed"]}
             ch = (fs.get("carry_over_changed") or {}).get("changes", {})
+            # pending candidates of a temporal content carry over only
+            # with the same content (F.6)
+            pending = [] if "content" in ch else b["candidates"]
             deadline = b["deadline"]
             if "deadline" in ch:
                 new_s = ch["deadline"]["new_s"]
                 deadline = None if new_s is None else Fraction(Decimal(new_s))
-            if deadline is not None and not b["frozen"] and b["elapsed"] > deadline:
+            if deadline is not None and not b["frozen"] and b["elapsed"] > deadline \
+                    and b["kind"] in ("obligation", "prohibition") and pending:
+                # the window has closed, but a pending candidate may still
+                # hold: step 4 decides the instance when the candidates are
+                exp["by_candidates"] = pending
+            elif deadline is not None and not b["frozen"] and b["elapsed"] > deadline:
                 if b["kind"] == "obligation":
                     exp["state"] = "violated"
                 elif b["kind"] == "prohibition":
@@ -382,7 +408,35 @@ def compare(name, old_sos, new_sos, lines, k, old_ids) -> list[str]:
                 and e["elapsed"] != a["elapsed"]:
             bad.append(f"{nid}: elapsed {a['elapsed']} after the amendment, "
                        f"expected {e['elapsed']}")
+        elif "by_candidates" in e:
+            bad += _settled_by_candidates(run, nid, e["by_candidates"], a["history"])
     return bad
+
+
+def _settled_by_candidates(run: dict, nid: str, pending: list, start: int) -> list[str]:
+    """A late instance kept in force by pending candidates: when step 4
+    later decides it, a candidate whose content holds must have decided it
+    (violated prohibition, fulfilled obligation), and otherwise every
+    pending candidate must be false (fulfilled prohibition, violated
+    obligation). The candidates are evaluated by the content alone."""
+    engine = run["engine"]
+    x = engine.by_id.get(nid)
+    if x is None:
+        return []
+    later = x.history[start:]
+    step4 = [h for h in later if h["state"] in ("violated", "fulfilled")
+             and h["reason"].split()[0] in ("content", "deadline", "window")]
+    if not step4 or later.index(step4[0]) != 0:
+        return []                    # suspended, discharged or ended first
+    h = step4[0]
+    truth = [x.content.content(k, run["last"], []) for k in pending]
+    hit = h["reason"].startswith("content")
+    good = {"prohibition": "violated", "obligation": "fulfilled"}[x.d.kind]
+    if hit and (h["state"] != good or True not in truth):
+        return [f"{nid}: decided by its content ({h['state']}), candidates {truth}"]
+    if not hit and (h["state"] == good or True in truth):
+        return [f"{nid}: decided by its window ({h['state']}), candidates {truth}"]
+    return []
 
 
 def run_random(seed: int, count: int) -> dict:

@@ -19,7 +19,7 @@ import random
 import pytest
 
 from cadl import norms_diff, norms_eval
-from cadl.norms_check import PrismModel, all_paths, build_model, compare_path
+from cadl.norms_check import NormsModel, PrismModel, all_paths, build_model, compare_path, random_paths
 from cadl.norms_diff import diff_versions
 from cadl.norms_eval import evaluate, parse_trace
 from cadl.parser import parse
@@ -119,11 +119,11 @@ MUTANTS = {
     "a transform target that is not inactive is activated": (
         E, "_amend", 'elif x.state != "inactive" or x.frozen:', "elif x.frozen:"),
     "a late prohibition stays in force": (
-        E, "_amend", 'elif (nd.kind == "prohibition" and inst.deadline is not None',
-        'elif (False and inst.deadline is not None'),
-    "a late obligation stays in force": (
-        E, "_amend", "and elapsed > inst.deadline):\n                    why = (f\"the elapsed",
-        "and False):\n                    why = (f\"the elapsed"),
+        E, "_amend", "                elif late:\n", "                elif False:\n"),
+    "a late obligation is not violated": (
+        E, "_amend", 'if late and nd.kind == "obligation":', 'if False and nd.kind == "obligation":'),
+    "pending candidates are ignored at the amendment": (
+        E, "_amend", "if late and inst.candidates:", "if False:"),
     # norms-diff
     "removed norms are not reported": (
         norms_diff, "_diff_contract", '"norm_removed", f"{nid}: removed',
@@ -188,7 +188,17 @@ PAUSE = """\
           content: "D -> R : pause"
           effects: {suspend: [duty]}
 """
+HOT = '        - {id: hot, kind: %s, bearer: R, content: "throughout(3s, R.v > 5)"%s}\n'
+HOT_TRACE = ['{"t": 0, "values": {"R.v": 6}}', '{"t": 1}', '{"t": 2}',
+             '{"t": 2.5, "amend": "new"}', '{"t": 3}', '{"t": 4}']
 HAND = {
+    # A late instance with pending candidates of a temporal content is
+    # decided by them (F.6), as under the new version from the start.
+    "late prohibition with a pending candidate": (
+        HOT % ("prohibition", ""), HOT % ("prohibition", ", deadline: 2s"), HOT_TRACE, 3),
+    "late obligation with a pending candidate": (
+        HOT % ("obligation", ", deadline: 10s"), HOT % ("obligation", ", deadline: 2s"),
+        HOT_TRACE, 3),
     "late obligation": (
         _norm("duty", "obligation", "R -> D : done", f"{ASK}, deadline: 5s"),
         _norm("duty", "obligation", "R -> D : done", f"{ASK}, deadline: 1s"),
@@ -252,16 +262,65 @@ def test_late_prohibition_is_fulfilled_by_the_amendment(pause_at):
     assert "fulfilled when the new version takes effect" in text
 
 
-def test_norms_check_follows_the_late_prohibition():
-    """The model of F.12 applies the same rule: every path of at most four
-    observations agrees with norms-eval."""
+def _model_pairs():
     v1, v2 = _versions()
-    m = build_model(v1, versions=[("v2", v2)], step="1s", horizon=4)
-    pm = PrismModel(m.prism_text(), {"early_end": True})
-    paths = all_paths(m.tr, 4)
-    assert len(paths) > 1000
-    for p in paths:
-        assert not compare_path(m, pm, p), p
+    yield "pause", v1, v2
+    for kind, d1 in (("prohibition", ""), ("obligation", ", deadline: 10s")):
+        yield kind, parse(HEAD + HOT % (kind, d1)), parse(HEAD + HOT % (kind, ", deadline: 2s"))
+
+
+def check_models_of_late_norms():
+    """The model of F.12 against norms-eval on the pairs above: every path
+    of at most three observations, and random paths of seven observations
+    that amend with probability 0.3 at each and seldom end early, so that
+    the instance goes on after the amendment."""
+    for name, v1, v2 in _model_pairs():
+        m = build_model(v1, versions=[("v2", v2)], step="500ms" if name != "pause" else "1s",
+                        horizon=6)
+        pm = PrismModel(m.prism_text(), {"early_end": True})
+        paths = all_paths(m.tr, 3) + random_paths(m.tr, 300, seed=5, p_amend=0.3,
+                                                  p_message=0.4, full_length=True, p_keep=0.5)
+        for p in paths:
+            d = compare_path(m, pm, p)
+            assert not d, (name, d, p)
+
+
+def test_norms_check_follows_the_late_norms():
+    check_models_of_late_norms()
+
+
+IR_MUTANTS = {
+    "a late prohibition stays in force": (
+        'elif nd.kind == "prohibition" and nd.deadline is not None and o.id in el:',
+        "elif False:"),
+    "pending candidates are ignored": (
+        "if o.id in slots and nd.content_text == o.content_text:", "if False:"),
+}
+
+
+@pytest.mark.parametrize("mutant", sorted(IR_MUTANTS))
+def test_model_mutants_are_detected(mutant, monkeypatch):
+    _patch(monkeypatch, NormsModel, "_amend_ir", *IR_MUTANTS[mutant])
+    with pytest.raises(AssertionError):
+        check_models_of_late_norms()
+
+
+@pytest.mark.parametrize("kind", ["prohibition", "obligation"])
+def test_late_norm_with_a_pending_candidate(kind):
+    """A throughout(3s) content that held from t=0, amended at t=2.5 to a
+    deadline of 2s: the candidate of t=0 is decided at t=4, and the verdict is
+    the one under the new version from the start (prohibition violated,
+    obligation fulfilled). With the rule of 0.3.26 and the first fix the
+    prohibition was fulfilled and the obligation violated at t=2.5."""
+    d1 = "" if kind == "prohibition" else ", deadline: 10s"
+    v1, v2 = parse(HEAD + HOT % (kind, d1)), parse(HEAD + HOT % (kind, ", deadline: 2s"))
+    amended = evaluate(v1, parse_trace(HOT_TRACE), versions={"new": v2})
+    plain = evaluate(v2, parse_trace([x for x in HOT_TRACE if "amend" not in x]))
+    a, b = amended["norms"][0], plain["norms"][0]
+    want = "violated" if kind == "prohibition" else "fulfilled"
+    assert (a["state"], a["time"]) == (b["state"], b["time"]) == (want, 4)
+    (effect,) = amended["amendments"][0]["effects"]
+    assert effect["to_state"] == "active" and "pending candidate" in effect["reason"]
 
 
 def test_discharge_is_reported():

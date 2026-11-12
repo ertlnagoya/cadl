@@ -1986,21 +1986,29 @@ class _Engine:
                 changes = []
                 if o.d.content.strip() != nd.content.strip():
                     changes.append("content changes")
-                if o.d.deadline_ms != nd.deadline_ms:
+                if _deadline(o.d) != _deadline(nd):
                     changes.append(f"deadline changes from {_fmt_d(o.d.deadline_ms)} "
                                    f"to {_fmt_d(nd.deadline_ms)}")
                 elapsed = inst.elapsed(t)
-                if (nd.kind == "obligation" and inst.deadline is not None and not inst.frozen
-                        and elapsed > inst.deadline):
+                late = (nd.kind in ("obligation", "prohibition") and inst.deadline is not None
+                        and not inst.frozen and elapsed > inst.deadline)
+                # F.6: the window of a late instance has closed. Without a
+                # pending candidate it is decided now, before step 1, also
+                # when suspended; with one, it stays in force and step 4
+                # decides it when its candidates are decided, as under the
+                # new version from the start.
+                if late and inst.candidates:
+                    changes.append(f"the elapsed time of {_fmt_t(elapsed)}s exceeds the new "
+                                   f"deadline of {_fmt_t(inst.deadline)}s; "
+                                   f"{len(inst.candidates)} pending candidate(s) decide it")
+                    late = False
+                if late and nd.kind == "obligation":
                     why = (f"the elapsed time of {_fmt_t(elapsed)}s exceeds the new deadline "
                            f"of {_fmt_t(inst.deadline)}s")
                     self._set(inst, n, "violated", f"amendment: {why}", log=False)
                     self._amend_violated.append(inst)
                     effect(oid, "carry_over", state, "violated", why)
-                elif (nd.kind == "prohibition" and inst.deadline is not None
-                      and not inst.frozen and elapsed > inst.deadline):
-                    # F.6: the window has closed, also for a suspended
-                    # instance, before step 1 of this observation
+                elif late:
                     why = (f"the elapsed time of {_fmt_t(elapsed)}s exceeds the new deadline "
                            f"of {_fmt_t(inst.deadline)}s; the window has closed")
                     self._set(inst, n, "fulfilled", f"amendment: {why}", log=False)

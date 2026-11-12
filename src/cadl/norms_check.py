@@ -2426,18 +2426,28 @@ class NormsModel:
                 forced = ir.C(DISCHARGED)
             else:
                 forced = st
+                # candidates pending before this observation (F.6: a late
+                # instance with one is decided by step 4, not here)
+                pending = ir.FALSE
+                if o.id in slots and nd.content_text == o.content_text:
+                    stem = stems[o.id]
+                    pending = ir.OR(ir.V(f"ht_{stem}"), ir.V(f"sf_{stem}"),
+                                    *(ir.NOT(ir.EQ(ir.V(f"sl_{stem}_{a}"), 0))
+                                      for a in range(len(slots[o.id]))))
                 if nd.content_text != o.content_text and o.id in slots:
                     # the candidates are kept only when the content is the same
                     slots[o.id] = [ir.ITE(inforce, ir.C(0), x) for x in slots[o.id]]
                     ht[o.id] = ir.AND(ir.NOT(inforce), ht[o.id])
                     sf[o.id] = ir.AND(ir.NOT(inforce), sf[o.id])
                 if nd.kind == "obligation" and nd.deadline is not None and o.id in el:
-                    late = ir.AND(inforce, ir.NOT(ir.LE(el[o.id], nd.deadline)))
+                    late = ir.AND(inforce, ir.NOT(ir.LE(el[o.id], nd.deadline)),
+                                  ir.NOT(pending))
                     forced = ir.ITE(late, viol_code, st)
                     amend_viol[o.id] = late
                 elif nd.kind == "prohibition" and nd.deadline is not None and o.id in el:
                     # the window has closed, also for a suspended instance
-                    late = ir.AND(inforce, ir.NOT(ir.LE(el[o.id], nd.deadline)))
+                    late = ir.AND(inforce, ir.NOT(ir.LE(el[o.id], nd.deadline)),
+                                  ir.NOT(pending))
                     forced = ir.ITE(late, ir.C(FULFILLED), st)
             inactive_to = ir.C(ABSENT) if nd is None else ir.C(INACTIVE)
             S[o.id] = ir.ITE(ir.IN(st, FINAL), st,

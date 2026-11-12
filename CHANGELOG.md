@@ -8,21 +8,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Amendments (F.6): a carried-over prohibition whose elapsed time exceeds
-  its new deadline is `fulfilled` when the new version takes effect,
-  before step 1, also when it is suspended. Up to 0.3.26 `cadl
-  norms-eval`, the Python monitor and the model of `cadl norms-check`
-  left it active until step 4 of the observation (so that a power at the
-  same observation could suspend it) and left a suspended one suspended.
-  Reproducer: a prohibition without deadline, suspended at t=3 and
-  amended at t=5 to a version with `deadline: 2s`, stayed suspended.
+- Amendments (F.6): a carried-over obligation or prohibition whose
+  elapsed time exceeds its new deadline is decided when the new version
+  takes effect, before step 1, also when it is suspended (an obligation
+  `violated`, a prohibition `fulfilled`), unless a candidate of its
+  temporal content is still pending; then it stays in force and step 4
+  decides it when the candidates are decided, which gives the verdict of
+  the new version applied from the start. Applied in `cadl norms-eval`,
+  the Python monitor and the model of `cadl norms-check`. Up to 0.3.26 a
+  late prohibition stayed active until step 4 (so that a power at the
+  same observation could suspend it) and a suspended one stayed
+  suspended; and a late obligation was violated at the amendment even
+  when a pending candidate fulfilled it later. Reproducers: a prohibition
+  without deadline, suspended at t=3 and amended at t=5 to `deadline:
+  2s`, stayed suspended; an obligation `throughout(3s, R.v > 5)` with
+  `deadline: 10s` and `R.v = 6` from t=0, amended at t=2.5 to `deadline:
+  2s`, was violated at t=2.5, while the new version from the start
+  fulfils it at t=4.
 - `cadl norms-diff` reports every norm whose `on_amendment:` is
   `discharge` (finding `discharge`), gives the kind of a `transform:`
   target (`target_kind`), compares deadlines exactly (two numeric
   deadlines that round to the same millisecond were reported as equal;
   the changes now carry `old_s` and `new_s` in seconds), and says for a
   shorter deadline what happens to an obligation or a prohibition, also
-  a suspended one, whose elapsed time exceeds it.
+  a suspended one, whose elapsed time exceeds it. It no longer reports
+  `discharge` for a norm that the new version removes.
 - The README comment of `-t agent-cedar` said that a Deny by the forbid
   of a static prohibition is final. It is not when the contract has no
   running instance and the message is not a tool call: the contract then
@@ -47,8 +57,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - `tests/test_norms_amend_diff.py`: `cadl norms-diff` against what `cadl
   norms-eval` does at an amendment, for every norm instance, on random
   pairs of versions made from the bundled examples and random traces
-  from the models of `cadl norms-check`, with 15 injected errors that
-  the comparison must detect. `CADL_NORMS_AMEND_PAIRS` sets the number
+  from the models of `cadl norms-check`, with injected errors that the
+  comparison must detect (16 in the two commands, 2 in the model of
+  `cadl norms-check`). `CADL_NORMS_AMEND_PAIRS` sets the number
   of pairs.
 
 ## [0.3.26] — 2026-11-12
