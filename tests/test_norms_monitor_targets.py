@@ -190,7 +190,7 @@ class TestGeneration:
     @pytest.mark.parametrize("content,match", [
         ("A.x * 2 > 3", "the operator \\*"), ("A.x / 2 > 3", "the operator /"),
         ("A.x > 0.0000001", "more than 6 decimals"),
-        ("within(5s, throughout(2s, A.x > 3))", "inside another"),
+        ("within(5s, until(A.x > 3, A.y > 1, 2s))", "until inside within or throughout"),
     ])
     def test_solidity_refuses_what_its_fixed_point_cannot_hold(self, content, match):
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
@@ -233,15 +233,44 @@ class TestGeneration:
         assert temporal_names(solidity_ir(sos, sos.contracts[0])) == ["flag"]
         assert "temporalName[keccak256" in generate_norms_monitor_sol(sos, sos.contracts[0])
 
-    def test_solidity_refuses_three_temporal_operators_in_a_content(self):
+    def test_solidity_refuses_five_temporal_operators_in_a_content(self):
         """The Solidity monitor decides the candidates of a content from at
-        most two temporal operators; OPA monitors such a content too."""
-        content = "within(3s, A.x > 1) OR throughout(2s, A.y == 1) OR within(1s, A.z == 1)"
+        most four temporal operators (the 4^m values of the content in one
+        word); OPA monitors such a content too."""
+        content = ("within(3s, A.x > 1) OR throughout(2s, A.y == 1) OR within(1s, A.z == 1) "
+                   "OR throughout(1s, A.x > 0) OR within(2s, A.y == 0)")
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
                      f"content: \"{content}\"}}\n")
         generate_norms_monitor_rego(sos, sos.contracts[0])
-        with pytest.raises(NormsTargetUnsupported, match="3 temporal operators"):
+        with pytest.raises(NormsTargetUnsupported, match="5 temporal operators .* at most 4"):
             generate_norms_monitor_sol(sos, sos.contracts[0])
+
+    @pytest.mark.parametrize("content,match", [
+        ("until(A.x > 1, within(2s, A.y == 1), 3s)", "until with a temporal operator in an operand"),
+        ("within(3s, until(A.x > 1, A.y == 1, 2s))", "until inside within or throughout"),
+        ("within(3s, throughout(2s, A.y == 1) AND A.x > 1)", "more than that operator or its negation"),
+        ("throughout(3s, throughout(2s, A.y == 1) == true)", "more than that operator or its negation"),
+        ("within(3s, throughout(2s, within(1s, A.y == 1)))", "three nested temporal operators"),
+    ])
+    def test_solidity_refuses_nested_operators_it_does_not_feed_in_order(self, content, match):
+        """A temporal operator inside another one is fed in the order of the
+        observations only when it is the operand (or its negation) and is
+        within or throughout over an operand without one (D.5)."""
+        sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
+                     f"content: \"{content}\"}}\n")
+        generate_norms_monitor_rego(sos, sos.contracts[0])
+        with pytest.raises(NormsTargetUnsupported, match=match):
+            generate_norms_monitor_sol(sos, sos.contracts[0])
+
+    def test_solidity_nested_operators_outside_contents(self):
+        """Outside the content of a norm a window is scanned once, so a
+        nested operator refuses an assumption and leaves out a guarantee."""
+        item = "within(3s, throughout(1s, A.x > 1))"
+        sos = _small(f"      assume:\n        - \"{item}\"\n")
+        with pytest.raises(NormsTargetUnsupported, match="outside the content of a norm"):
+            generate_norms_monitor_sol(sos, sos.contracts[0])
+        sos = _small(f"      guarantee:\n        - \"{item}\"\n")
+        assert "_guarantee(" in generate_norms_monitor_sol(sos, sos.contracts[0])
 
     @pytest.mark.parametrize("content,call", [
         ("within(3s, A.x > 1) OR A.y == 1", "_temporal(1, "),
@@ -252,11 +281,19 @@ class TestGeneration:
         ("until(A.x > 1, A.y == 1, 3s) <= A.z", "_temporal(3, "),
         ("within(3s, A.x > 1) OR throughout(2s, A.y == 1)", "_multi("),
         ("within(3s, A.x > 1) == throughout(2s, A.y == 1)", "_multi("),
+        ("within(3s, A.x > 1) OR throughout(2s, A.y == 1) OR within(1s, A.z == 1)", "_multi(13, 1);"),
+        ("within(3s, A.x > 1) OR throughout(2s, A.y == 1) OR within(1s, A.z == 1) "
+         "OR NOT until(A.x > 0, A.y == 0, 2s)", "_multi(22, 5);"),
+        ("within(3s, throughout(1s, A.x > 1))", "_nested(1, 3000000, 4, 2, false, false, 1000000);"),
+        ("throughout(3s, NOT within(1s, A.x > 1))", "_nested(2, 3000000, 5, 2, true, false, 1000000);"),
+        ("within(3s, NOT NOT within(1s, A.x > 1)) OR A.z == 1",
+         "_nested(1, 3000000, 6, 2, true, true, 1000000);"),
     ])
     def test_solidity_temporal_contents_it_decides(self, content, call):
         """One temporal operator anywhere in a content (under NOT, in a
-        comparison) goes to the queues of CadlNormsWindows, two to the
-        segment tree of CadlNormsMulti."""
+        comparison) goes to the queues of CadlNormsWindows; two to four,
+        and a nested one, to the segment tree of CadlNormsMulti (a node of
+        one word up to three operators, of five words for four)."""
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
                      f"content: \"{content}\"}}\n")
         assert call in generate_norms_monitor_sol(sos, sos.contracts[0])
@@ -978,6 +1015,62 @@ TWO = """\
 """
 
 
+# Three and four temporal operators in one content (CadlNormsMulti with
+# nodes of one and of five storage words), and a temporal operator inside
+# another one (W_NESTED): within and throughout, negated or not, with
+# reparation, suspension and deadlines.
+THREE = """\
+      norms:
+        - {id: t3, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(3s, A.x > 5) AND throughout(2s, A.ok == true) OR within(1s, A.done == true)",
+           deadline: 5s, on_violation: {severity: Major, reparation: tr}}
+        - {id: t4, kind: prohibition, bearer: A,
+           content: "within(1s, A.x == 0) OR NOT until(A.ok == true, A.done == true, 2s) AND throughout(1.5s, A.y == 1) OR within(2s, A.z == 1)"}
+        - {id: tq, kind: obligation, bearer: A, trigger: "B -> A : start",
+           content: "until(A.ok == true, A.done == true, 3s) == NOT within(2s, A.x > 8) AND throughout(1s, A.y == 1)",
+           deadline: 6s}
+        - {id: tr, kind: obligation, bearer: A,
+           content: "throughout(1s, A.y == 1) OR within(2s, A.done == true) OR within(0.5s, A.x == 9)", deadline: 3s}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [t3, t4, tq, tr]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [t3, t4, tq, tr]}}
+"""
+
+FOUR = """\
+      norms:
+        - {id: f4, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(3s, A.x > 5) AND throughout(2s, A.ok == true) OR within(1s, A.done == true) AND NOT until(A.ok == true, A.y == 0, 2s)",
+           deadline: 5s, on_violation: {severity: Major, reparation: fp}}
+        - {id: fp, kind: prohibition, bearer: A,
+           content: "(within(1s, A.x == 0) == throughout(1.5s, A.y == 1)) OR (within(2s, A.z == 1) AND within(2s, throughout(1s, A.ok == true)))"}
+        - {id: fm, kind: obligation, bearer: A, trigger: "B -> A : start",
+           content: "throughout(1s, NOT within(0.5s, A.x > 8)) OR within(2s, A.done == true) AND A.z == 0 OR until(A.ok == true, A.done == true, 3s) AND within(1s, A.y == 0)",
+           deadline: 6s}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [f4, fp, fm]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [f4, fp, fm]}}
+"""
+
+NESTED = """\
+      norms:
+        - {id: wt, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(3s, throughout(1s, A.ok == true))", deadline: 5s,
+           on_violation: {severity: Major, reparation: tw}}
+        - {id: tw, kind: prohibition, bearer: A, content: "throughout(2s, within(1.5s, A.x > 5))"}
+        - {id: nn, kind: obligation, bearer: A, trigger: "B -> A : start",
+           content: "within(2s, NOT within(1s, A.done == true)) OR A.z == 1", deadline: 6s}
+        - {id: tt, kind: prohibition, bearer: A, trigger: "B -> A : go",
+           content: "NOT throughout(2.5s, NOT throughout(1s, A.y == 1)) AND within(1s, A.x > 2)",
+           deadline: 4s}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [wt, tw, nn, tt]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [wt, tw, nn, tt]}}
+"""
+
+
 def _epoch_trace(rng: random.Random, length: int | None = None) -> list:
     """Like _window_trace, with values that are often undefined (null),
     and in half of the traces epoch timestamps with fractions of a second."""
@@ -1058,7 +1151,8 @@ EDGES = [
 
 
 TEMPORAL_SETS = [("release", RELEASE, 20261301), ("compare", COMPARE, 20261302),
-                 ("two", TWO, 20261303)]
+                 ("two", TWO, 20261303), ("three", THREE, 20261304), ("four", FOUR, 20261305),
+                 ("nested", NESTED, 20261306)]
 
 
 @needs_evm

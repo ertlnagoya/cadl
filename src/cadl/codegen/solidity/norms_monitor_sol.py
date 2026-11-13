@@ -142,17 +142,20 @@ def _temporal_inside(nodes: list[dict], root: int) -> bool:
     return any(nodes[k]["op"] in ("within", "throughout", "until") for k in _subtree(nodes, root))
 
 
-def _problem(nodes: list[dict], root: int) -> str | None:
-    """Why the Solidity monitor cannot evaluate a predicate, or None."""
+def _problem(nodes: list[dict], root: int, content: bool = False) -> str | None:
+    """Why the Solidity monitor cannot evaluate a predicate, or None.
+    `content`: the predicate is the content of a norm, where a temporal
+    operator inside another one is checked by `_nesting`."""
     for k in _subtree(nodes, root):
         nd = nodes[k]
         if nd["op"] == "bin" and nd["o"] not in _BOPS:
             return (f"the operator {nd['o']} (the Solidity monitor uses fixed-point numbers "
                     f"and supports + and - only)")
-        if nd["op"] in ("within", "throughout", "until") and any(
+        if not content and nd["op"] in ("within", "throughout", "until") and any(
                 _temporal_inside(nodes, c) for c in _children(nd)):
-            return ("a temporal operator inside another one (the Solidity monitor scans "
-                    "each window once, which needs an operand without a temporal operator)")
+            return ("a temporal operator inside another one outside the content of a norm "
+                    "(the Solidity monitor scans such a window once, which needs an operand "
+                    "without a temporal operator)")
         try:
             if nd["op"] == "lit" and isinstance(nd["v"], (int, float, Fraction)) \
                     and not isinstance(nd["v"], bool):
@@ -167,6 +170,47 @@ def _problem(nodes: list[dict], root: int) -> str | None:
 def _temporal_nodes(nodes: list[dict], root: int) -> list[int]:
     return [k for k in _subtree(nodes, root)
             if nodes[k]["op"] in ("within", "throughout", "until")]
+
+
+def _top_temporal(nodes: list[dict], root: int) -> list[int]:
+    """The temporal operators of a predicate that are not inside another one."""
+    k = root
+    if nodes[k]["op"] in ("within", "throughout", "until"):
+        return [k]
+    return [x for c in _children(nodes[k]) for x in _top_temporal(nodes, c)]
+
+
+# The most temporal operators in one content (D.5). CadlNormsEval.table
+# keeps the 4^m values of a content in one 256-bit word, so the bound is
+# at most 4; a node of the segment tree has 5^(m - 3) words for m > 3.
+MAX_TEMPORAL = 4
+
+
+def _nesting(nodes: list[dict], k: int) -> tuple[dict | None, str | None]:
+    """A temporal operator k of a content with a temporal operator inside:
+    its record for `_nested`, or why the monitor refuses it."""
+    outer = nodes[k]
+    if outer["op"] == "until":
+        return None, ("until with a temporal operator in an operand (the decided values of "
+                      "such an operand do not reach until in the order of the observations, "
+                      "see D.5)")
+    x, negations = outer["x"], 0
+    while nodes[x]["op"] == "not":
+        x, negations = nodes[x]["x"], negations + 1
+    inner = nodes[x]
+    if inner["op"] not in ("within", "throughout", "until"):
+        return None, ("an operand of within or throughout that has a temporal operator and "
+                      "is more than that operator or its negation (its value can be decided "
+                      "before that of an earlier observation, see D.5)")
+    if inner["op"] == "until":
+        return None, ("until inside within or throughout (until decides a later observation "
+                      "before an earlier one, see D.5)")
+    if _temporal_inside(nodes, inner["x"]):
+        return None, "three nested temporal operators (the monitor nests two)"
+    is_within = inner["op"] == "within"
+    return {"node": k, "outer": _WINDOW_MODES[outer["op"]], "d": outer["d"], "p": inner["x"],
+            "ineg": is_within, "oneg": (negations % 2 == 1) != is_within,
+            "id": inner["d"]}, None
 
 
 def _content_roots(ir: dict) -> list[int]:
@@ -213,25 +257,44 @@ def solidity_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
     """`build_ir` with what the Solidity monitor cannot evaluate on top:
     a guarantee item is marked unsupported (left out), anything else
     refuses the contract."""
-    ir = apply_limits(build_ir(sos, contract), _problem)
+    ir = build_ir(sos, contract)
+    contents = {nd["content"]["expr"] for nd in ir["norms"]
+                if nd["frozen"] is None and nd.get("content")
+                and nd["content"].get("kind") == "predicate" and not nd["content"].get("error")}
+    ir = apply_limits(ir, lambda nodes, root: _problem(nodes, root, root in contents))
     reasons = []
     nodes = ir["exprs"]
     for nd in ir["norms"]:
         c = nd.get("content")
         if not (nd["frozen"] is None and c and c.get("kind") == "predicate" and not c.get("error")):
             continue
-        ops = _temporal_nodes(nodes, c["expr"])
+        ops = sorted(_top_temporal(nodes, c["expr"]))
         if not ops:
             continue
         where = f"norm '{nd['id']}', content"
-        if len(ops) > 2:
-            reasons.append(f"{where}: {len(ops)} temporal operators (the Solidity monitor decides "
-                           f"the candidates of a content from at most two)")
+        if len(ops) > MAX_TEMPORAL:
+            reasons.append(
+                f"{where}: {len(ops)} temporal operators (the Solidity monitor decides the "
+                f"candidates of a content from at most {MAX_TEMPORAL}: it reads the content for "
+                f"the 4^m combinations of their values in one 256-bit word, and a node of its "
+                f"segment tree has 5^(m - 3) storage words)")
             continue
-        if len(ops) == 2:
-            nd["multi"] = sorted(ops)
+        specs, nested = [], False
+        for k in ops:
+            if any(_temporal_inside(nodes, ch) for ch in _children(nodes[k])):
+                spec, why = _nesting(nodes, k)
+                if why:
+                    reasons.append(f"{where}: {why}")
+                    break
+                specs.append(spec)
+                nested = True
+            else:
+                specs.append({"node": k})
         else:
-            nd["temporal"] = {"node": ops[0]}
+            if len(ops) >= 2 or nested:
+                nd["multi"] = specs
+            else:
+                nd["temporal"] = {"node": ops[0]}
     if reasons:
         raise NormsTargetUnsupported(reasons)
     return ir
@@ -247,17 +310,29 @@ def _op_args(ir: dict, k: int) -> str:
     return (f"{_WINDOW_MODES[node['op']]}, {p}, {q}, {scaled(node['d'], 'a duration')}, {k}")
 
 
-def _window_line(ir: dict, nd: dict) -> str | None:
-    """The temporal operators of the content of a norm: one (`_temporal`)
-    or two (`_multi`)."""
+def node_words(m: int) -> int:
+    """The storage words of a node of the segment tree for m operators."""
+    return 1 if m <= 3 else 5 ** (m - 3)
+
+
+def _window_lines(ir: dict, nd: dict) -> list[str]:
+    """The temporal operators of the content of a norm: one (`_temporal`),
+    or two or more, or a nested one (`_multi`)."""
     if nd.get("multi"):
-        root = nd["content"]["expr"]
-        a, b = nd["multi"]
-        return f"        _multi({root}, {_op_args(ir, a)}, {_op_args(ir, b)});"
+        specs = nd["multi"]
+        out = [f"        _multi({nd['content']['expr']}, {node_words(len(specs))});"]
+        for sp in specs:
+            if "outer" not in sp:
+                out.append(f"        _op({_op_args(ir, sp['node'])});")
+                continue
+            out.append(f"        _nested({sp['outer']}, {scaled(sp['d'], 'a duration')}, "
+                       f"{sp['node']}, {sp['p']}, {str(sp['ineg']).lower()}, "
+                       f"{str(sp['oneg']).lower()}, {scaled(sp['id'], 'a duration')});")
+        return out
     tm = nd.get("temporal")
     if tm is None:
-        return None
-    return f"        _temporal({_op_args(ir, tm['node'])}, {nd['content']['expr']});"
+        return []
+    return [f"        _temporal({_op_args(ir, tm['node'])}, {nd['content']['expr']});"]
 
 
 def _node_lines(nodes: list[dict], skip: set) -> list[str]:
@@ -375,9 +450,7 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
             f"{str(nd['target']).lower()});")
         if nd["frozen"] is not None:
             continue
-        window = _window_line(ir, nd)
-        if window:
-            norm_lines.append(window)
+        norm_lines += _window_lines(ir, nd)
         if nd["bearer"] is not None:
             norm_lines.append("        d.hasBearer = true;")
             norm_lines.append(f"        _pat(d.bearer, {_pat_args(nd['bearer'])});")
