@@ -1016,21 +1016,23 @@ TWO = """\
 
 
 # Three and four temporal operators in one content (CadlNormsMulti with
-# nodes of one and of five storage words), and a temporal operator inside
-# another one (W_NESTED): within and throughout, negated or not, with
-# reparation, suspension and deadlines.
+# nodes of one and of five storage words; `fr` rarely holds, so that its
+# tree grows over a long trace), and a temporal operator inside
+# another one (W_NESTED): within and throughout, negated or not, inner
+# windows shorter and longer than the outer ones, with reparation,
+# suspension and deadlines.
 THREE = """\
       norms:
         - {id: t3, kind: obligation, bearer: A, trigger: "B -> A : go",
            content: "within(3s, A.x > 5) AND throughout(2s, A.ok == true) OR within(1s, A.done == true)",
            deadline: 5s, on_violation: {severity: Major, reparation: tr}}
         - {id: t4, kind: prohibition, bearer: A,
-           content: "within(1s, A.x == 0) OR NOT until(A.ok == true, A.done == true, 2s) AND throughout(1.5s, A.y == 1) OR within(2s, A.z == 1)"}
+           content: "within(1s, A.x == 0) OR NOT until(A.ok == true, A.done == true, 2s) AND throughout(1s, A.y == 1) OR within(2s, A.z == 1)"}
         - {id: tq, kind: obligation, bearer: A, trigger: "B -> A : start",
-           content: "until(A.ok == true, A.done == true, 3s) == NOT within(2s, A.x > 8) AND throughout(1s, A.y == 1)",
+           content: "until(A.ok == true, A.done == true, 3s) == (NOT within(2s, A.x > 8)) AND throughout(1s, A.y == 1)",
            deadline: 6s}
         - {id: tr, kind: obligation, bearer: A,
-           content: "throughout(1s, A.y == 1) OR within(2s, A.done == true) OR within(0.5s, A.x == 9)", deadline: 3s}
+           content: "throughout(1s, A.y == 1) OR within(2s, A.done == true) OR within(0s, A.x == 9)", deadline: 3s}
         - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
            effects: {suspend: [t3, t4, tq, tr]}}
         - {id: re, kind: power, bearer: B, content: "B -> A : resume",
@@ -1043,14 +1045,16 @@ FOUR = """\
            content: "within(3s, A.x > 5) AND throughout(2s, A.ok == true) OR within(1s, A.done == true) AND NOT until(A.ok == true, A.y == 0, 2s)",
            deadline: 5s, on_violation: {severity: Major, reparation: fp}}
         - {id: fp, kind: prohibition, bearer: A,
-           content: "(within(1s, A.x == 0) == throughout(1.5s, A.y == 1)) OR (within(2s, A.z == 1) AND within(2s, throughout(1s, A.ok == true)))"}
+           content: "(within(1s, A.x == 0) == throughout(2s, A.y == 1)) OR (within(2s, A.z == 1) AND within(2s, throughout(1s, A.ok == true)))"}
         - {id: fm, kind: obligation, bearer: A, trigger: "B -> A : start",
-           content: "throughout(1s, NOT within(0.5s, A.x > 8)) OR within(2s, A.done == true) AND A.z == 0 OR until(A.ok == true, A.done == true, 3s) AND within(1s, A.y == 0)",
+           content: "throughout(1s, NOT within(1s, A.x > 8)) OR within(2s, A.done == true) AND A.z == 0 OR until(A.ok == true, A.done == true, 3s) AND within(1s, A.y == 0)",
            deadline: 6s}
+        - {id: fr, kind: prohibition, bearer: A,
+           content: "within(1s, A.x == 9) AND within(2s, A.y == 0) AND within(1s, A.z == 1) AND NOT until(A.ok == true, A.done == true, 2s)"}
         - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
-           effects: {suspend: [f4, fp, fm]}}
+           effects: {suspend: [f4, fp, fm, fr]}}
         - {id: re, kind: power, bearer: B, content: "B -> A : resume",
-           effects: {resume: [f4, fp, fm]}}
+           effects: {resume: [f4, fp, fm, fr]}}
 """
 
 NESTED = """\
@@ -1058,16 +1062,20 @@ NESTED = """\
         - {id: wt, kind: obligation, bearer: A, trigger: "B -> A : go",
            content: "within(3s, throughout(1s, A.ok == true))", deadline: 5s,
            on_violation: {severity: Major, reparation: tw}}
-        - {id: tw, kind: prohibition, bearer: A, content: "throughout(2s, within(1.5s, A.x > 5))"}
+        - {id: tw, kind: prohibition, bearer: A, content: "throughout(3s, within(1s, A.x > 5))"}
         - {id: nn, kind: obligation, bearer: A, trigger: "B -> A : start",
            content: "within(2s, NOT within(1s, A.done == true)) OR A.z == 1", deadline: 6s}
         - {id: tt, kind: prohibition, bearer: A, trigger: "B -> A : go",
-           content: "NOT throughout(2.5s, NOT throughout(1s, A.y == 1)) AND within(1s, A.x > 2)",
+           content: "NOT throughout(2s, NOT throughout(1s, A.y == 1)) AND within(1s, A.x > 2)",
            deadline: 4s}
+        - {id: wl, kind: prohibition, bearer: A, trigger: "B -> A : start",
+           content: "within(1s, throughout(3s, A.ok == true))", deadline: 5s}
+        - {id: tl, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "throughout(1s, NOT within(3s, A.x > 5))", deadline: 3s}
         - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
-           effects: {suspend: [wt, tw, nn, tt]}}
+           effects: {suspend: [wt, tw, nn, tt, wl, tl]}}
         - {id: re, kind: power, bearer: B, content: "B -> A : resume",
-           effects: {resume: [wt, tw, nn, tt]}}
+           effects: {resume: [wt, tw, nn, tt, wl, tl]}}
 """
 
 
@@ -1188,15 +1196,23 @@ def test_opa_more_temporal_contents(name, blocks, seed, tmp_path, monkeypatch):
 
 GAS_CONTENTS = ["NOT until(A.x >= 0, A.x < 0, 1000s)", "throughout(1000s, A.x >= 0) == true",
                 "within(1000s, A.x < 0) OR throughout(1000s, A.x >= 0)",
-                "within(1000s, A.x >= 0) AND throughout(1000s, A.x >= 0)"]
+                "within(1000s, A.x >= 0) AND throughout(1000s, A.x >= 0)",
+                "within(1000s, A.x < 0) OR throughout(1000s, A.x >= 0) OR within(1000s, A.x < -1)",
+                "within(1000s, A.x < 0) OR throughout(1000s, A.x >= 0) OR within(1000s, A.x < -1) "
+                "OR throughout(1000s, A.x >= -1)",
+                "within(1000s, throughout(500s, A.x < 0))", "throughout(1000s, within(10s, A.x < 0))"]
+# the largest gas of an observation in these tests (four operators: nodes of five words)
+GAS_MAX = {GAS_CONTENTS[4]: 1_500_000, GAS_CONTENTS[5]: 3_000_000}
 
 
 @needs_evm
 @pytest.mark.parametrize("content", GAS_CONTENTS)
 def test_evm_gas_of_more_temporal_contents_is_bounded(content, tmp_path):
-    """NOT until, a comparison and two temporal operators (from the
-    second set on): 320 observations at one per second into windows of
-    1000 s, each a candidate that stays undecided. The mean cost of the
+    """NOT until, a comparison, two, three and four temporal operators,
+    and nested ones: 320 observations at one per second into windows of
+    1000 s, each a candidate that stays undecided (in the last, the inner
+    values decided from the eleventh second on decide the candidates
+    false one at a time). The mean cost of the
     last 50 observations stays within 15 % of that of observations 20 to
     70; with two operators the cost grows with the depth of the tree, a
     step at each power of two of the candidates."""
@@ -1211,7 +1227,7 @@ def test_evm_gas_of_more_temporal_contents_is_bounded(content, tmp_path):
     [raw] = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", [run], tmp_path)
     gas = [r["gas"] for r in raw]
     early, late = sum(gas[20:70]) / 50, sum(gas[-50:]) / 50
-    assert late < 1.15 * early and max(gas) < 1_000_000, (early, late, max(gas))
+    assert late < 1.15 * early and max(gas) < GAS_MAX.get(content, 1_000_000), (early, late, max(gas))
 
 
 # === The range of exact numbers, exact deadlines, runtime size =======================
