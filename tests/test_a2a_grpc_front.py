@@ -345,10 +345,10 @@ def test_half_open_after_a_call(grpc, streaming):
 
 def test_client_that_stops_reading_floods_settings(grpc):
     """Review H1: after one call, a client sends empty SETTINGS frames and
-    reads none of the ACKs. The bytes for it pile up; once more than
-    PENDING wait and none goes out within the drain deadline (here 2 s),
-    both sides are reset and recorded (`grpc stalled`), and the place
-    comes back."""
+    reads none of the ACKs. The place comes back: either gRPC closes the
+    connection (which the Front then sees) or, once more than PENDING
+    bytes wait and none goes out within the drain deadline (here 2 s),
+    both sides are reset and recorded (`grpc stalled`)."""
     b = Backend(grpc, deadline=30.0, max_per_address=1, drain_timeout=2.0)
     try:
         s = h2_call(b.port, rcvbuf=2048)
@@ -364,11 +364,54 @@ def test_client_that_stops_reading_floods_settings(grpc):
             except OSError:
                 break
         wait_for(lambda: b.front.total == 0, "the place to come back", timeout=20)
-        wait_for(lambda: b.gw.count("read_timeout", "grpc stalled") == 1, "the record")
+        assert b.gw.count("read_timeout", "grpc stalled") <= 1
         assert b.who(b.channel()) == "127.0.0.1"
         s.close()
     finally:
         b.close()
+
+
+def test_stalled_client_is_reset():
+    """Review H1, deterministic: a server that sends 8 MiB and never
+    closes, a client that never reads. Once more than PENDING bytes wait
+    and nothing goes out within the drain deadline (here 1 s), both sides
+    are reset and recorded (`grpc stalled`)."""
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("no Unix sockets")
+    gw = Recorder()
+    f = Front(gw, ("127.0.0.1", 0), deadline=30.0, drain_timeout=1.0)
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(f.path)
+    srv.listen(8)
+    held = []
+
+    def backend():
+        c, _ = srv.accept()
+        held.append(c)
+        peer = "unix:" + c.getpeername()
+        while f.client(peer) is None:
+            time.sleep(0.01)
+        try:
+            c.settimeout(10)
+            c.sendall(b"x" * (8 << 20))
+        except OSError:
+            pass
+    threading.Thread(target=backend, daemon=True).start()
+    f.start()
+    try:
+        cl = socket.socket()
+        cl.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        cl.connect(("127.0.0.1", f.port))
+        wait_for(lambda: f.total == 1, "the connection")
+        wait_for(lambda: f.total == 0, "the reset", timeout=20)
+        wait_for(lambda: gw.count("read_timeout", "grpc stalled") == 1, "the record")
+        cl.close()
+    finally:
+        f.stop()
+        for c in held:
+            c.close()
+        srv.close()
+        f.cleanup()
 
 
 def test_server_close_seen_while_client_does_not_read(grpc):
