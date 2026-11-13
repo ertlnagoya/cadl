@@ -1061,12 +1061,15 @@ library CadlNormsMulti {
 
     /// The inner value x at the observations [s, e], fed to the outer
     /// operator: a decisive value decides the candidates whose window has
-    /// one of these observations; an undefined one marks them.
+    /// one of these observations; an undefined one marks the candidates up
+    /// to e. A run of undefined values starts at the first observation not
+    /// fed before, so a candidate whose window ended before it was decided
+    /// at the previous observation, and every other candidate up to e has
+    /// that observation or itself in its window.
     function feed(Multi storage mu, MOp storage op, uint256 i, EvalData storage data, uint256 s, uint256 e, uint8 x)
             internal returns (uint8 y) {
         y = op.oneg && x != X_U ? (x == X_T ? X_F : X_T) : x;
         int256 ts = data.obsT[s];
-        over(mu, op, i, ts);
         if (y == decisive(op)) assignRange(mu, i, y, firstFrom(mu, ts - op.td), firstAfter(mu, true, e));
         else if (y == X_U) { op.uSet = true; op.u = e; }
     }
