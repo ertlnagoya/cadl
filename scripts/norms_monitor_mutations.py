@@ -2,7 +2,7 @@
 (tests/test_norms_monitor_targets.py, Appendix D, D.5).
 
 Each mutant of norms_monitor_base.sol runs the traces of one set of
-contents (RELEASE, COMPARE, TWO, THREE, FOUR, NESTED: the boundary traces, N random traces and
+contents (RELEASE, COMPARE, TWO, THREE, FOUR, NESTED, ZERO, MIX: the boundary traces, N random traces and
 three long ones) on the EVM; it is killed when a trace differs from
 `cadl norms-eval`. Needs the EVM of the tests (CADL_EVM_PYTHON, CADL_SOLC).
 
@@ -62,7 +62,8 @@ MUT = [
  ("nest-u-mark", "nested", "else if (y == X_U) { op.uSet = true; op.u = e; }", ""),
 ]
 SETS = {"release": (T.RELEASE, 20261301), "compare": (T.COMPARE, 20261302), "two": (T.TWO, 20261303),
-        "three": (T.THREE, 20261304), "four": (T.FOUR, 20261305), "nested": (T.NESTED, 20261306)}
+        "three": (T.THREE, 20261304), "four": (T.FOUR, 20261305), "nested": (T.NESTED, 20261306),
+        "zero": (T.ZERO, 20261307), "mix": (T.MIX, 20261308)}
 base = M.BASE.read_text()
 names = sys.argv[4:]
 for name, st, old, new in MUT:

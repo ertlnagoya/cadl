@@ -1079,6 +1079,41 @@ NESTED = """\
 """
 
 
+# Windows of 0 s, inside and outside (ZERO); two nested operators in one
+# content, and four operators of which two are nested (MIX).
+ZERO = """\
+      norms:
+        - {id: a, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(0s, throughout(0s, A.ok == true))", deadline: 4s}
+        - {id: b, kind: prohibition, bearer: A,
+           content: "throughout(0s, NOT within(1s, A.x > 5))"}
+        - {id: c, kind: prohibition, bearer: A, trigger: "B -> A : start",
+           content: "within(2s, throughout(0s, A.y == 1))", deadline: 3s}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [a, b, c]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [a, b, c]}}
+"""
+
+MIX = """\
+      norms:
+        - {id: m1, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(2s, throughout(1s, A.ok == true)) AND throughout(3s, NOT within(1s, A.x > 5)) OR within(1s, A.done == true) OR A.z == 1",
+           deadline: 5s}
+        - {id: m2, kind: prohibition, bearer: A, trigger: "B -> A : start",
+           content: "(within(1s, NOT throughout(2s, A.y == 1)) == within(2s, A.x > 8)) OR NOT until(A.ok == true, A.done == true, 2s) AND throughout(1s, within(0s, A.z == 1))",
+           deadline: 6s}
+        - {id: m3, kind: obligation, bearer: A,
+           content: "NOT within(3s, NOT NOT throughout(2s, A.ok == true))", deadline: 3s}
+        - {id: m4, kind: prohibition, bearer: A, trigger: "B -> A : go",
+           content: "throughout(1s, throughout(1s, A.y == 1)) OR within(1s, within(3s, A.x == 9))"}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [m1, m2, m3, m4]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [m1, m2, m3, m4]}}
+"""
+
+
 def _epoch_trace(rng: random.Random, length: int | None = None) -> list:
     """Like _window_trace, with values that are often undefined (null),
     and in half of the traces epoch timestamps with fractions of a second."""
@@ -1160,7 +1195,7 @@ EDGES = [
 
 TEMPORAL_SETS = [("release", RELEASE, 20261301), ("compare", COMPARE, 20261302),
                  ("two", TWO, 20261303), ("three", THREE, 20261304), ("four", FOUR, 20261305),
-                 ("nested", NESTED, 20261306)]
+                 ("nested", NESTED, 20261306), ("zero", ZERO, 20261307), ("mix", MIX, 20261308)]
 
 
 @needs_evm
