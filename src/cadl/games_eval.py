@@ -1134,6 +1134,12 @@ class CornerTable:
     enclosed by `poly_bounds` instead."""
 
     def __init__(self, game: Game, cell: tuple):
+        if not game.multi_affine:
+            # A probability that is not multi-affine is not a mixture of its
+            # values at the corners with weights common to all commands
+            # (I.9); bounds from the corners would not be sound.
+            raise ValueError("the coupled bounds of I.9 need probabilities that are "
+                             "multi-affine in the open parameters")
         self.game = game
         self.cell = cell
         self.corners = cell_corners(cell)
@@ -1240,6 +1246,9 @@ class CoupledPlays:
     advantages of different commands share them."""
 
     def __init__(self, game: Game, proc: Process, table: CornerTable):
+        if not game.multi_affine or table.game is not game:
+            raise ValueError("the coupled bounds of I.9 need a CornerTable of the same game, "
+                             "whose probabilities are multi-affine in the open parameters")
         self.game = game
         self.proc = proc
         self.table = table

@@ -216,6 +216,23 @@ def fuzz_games(seed: int, count: int, **options) -> list:
 
 
 class TestCoupledProcess:
+    def test_not_for_probabilities_that_are_not_multi_affine(self):
+        for g, model in fuzz_games(13, 40):
+            query = next(q for q in model.equilibria if q.id == "on_region")
+            game = prepare_map(model, query, model.designs[0], None)
+            if game.multi_affine:
+                continue
+            cell = tuple(g["region"][n] for n in game.names)
+            with pytest.raises(ValueError):
+                CornerTable(game, cell)
+            table = CornerTable(GAME, tuple(tuple(QUERY.over[n]) for n in GAME.names))
+            proc = build_process(game, g["players"][0], "sigma",
+                                 point_distributions(game, tuple(lo for lo, _ in cell)))
+            with pytest.raises(ValueError):
+                CoupledPlays(game, proc, table)
+            return
+        pytest.fail("no game with a probability that is not multi-affine")
+
     def test_backward_induction_and_policy_iteration_agree(self):
         # The fuzzed games have cycles; on the pairs of an acyclic part
         # both ways must give the same value.
