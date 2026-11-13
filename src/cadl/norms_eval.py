@@ -120,6 +120,44 @@ _MESSAGE_KEYS = {"from", "to", "name", "args"}
 FINAL_STATES = ("fulfilled", "violated", "discharged")
 _STATE_IGNORED = "the trace gives 'state' but the contract has no lifecycle:; it is ignored"
 _END_LAST = "last observation of the trace"
+# What is often written for a duration, a string or an operator of A.10
+# and is not: `2.5s`, `'k'`, `and`.
+_FRACTIONAL_DURATION_RE = re.compile(
+    r"(?<![\w.])(\d*\.\d+|\d+\.)\s*(ms|s|min|h)(?![A-Za-z0-9_])")
+_LOWER_KEYWORD_RE = re.compile(r"(?<![\w.])(and|or|not)(?![\w(])")
+
+
+def duration_hint(text: str) -> str:
+    """How to write a fractional duration such as `2.5s` as a duration
+    literal (an integer followed by a unit, A.1), or ''."""
+    m = _FRACTIONAL_DURATION_RE.search(text)
+    if m is None:
+        return ""
+    value = Fraction(Decimal(m.group(1))) * _UNIT_SECONDS[m.group(2)]
+    for unit in ("h", "min", "s", "ms"):
+        n = value / _UNIT_SECONDS[unit]
+        if n.denominator == 1:
+            return (f"a duration is an integer followed by ms, s, min or h (A.1), "
+                    f"so write {m.group(0).replace(' ', '')} as {n.numerator}{unit}")
+    return (f"a duration is an integer followed by ms, s, min or h (A.1), and "
+            f"{m.group(0).replace(' ', '')} is not a whole number of milliseconds")
+
+
+def syntax_hint(text: str) -> str:
+    """Why a text is probably not a predicate of A.10, for the forms that
+    are often written by mistake, or ''."""
+    hints = []
+    d = duration_hint(text)
+    if d:
+        hints.append(d)
+    if "'" in text:
+        hints.append("a string is written in double quotes (A.1), as in \"k\"; "
+                     "single quotes do not delimit a string")
+    m = _LOWER_KEYWORD_RE.search(text)
+    if m:
+        hints.append(f"the operators are written AND, OR and NOT in capitals, "
+                     f"not '{m.group(1)}'")
+    return "; ".join(hints)
 
 
 class TraceError(ValueError):
@@ -982,7 +1020,8 @@ class _Evaluator:
 
     # --- static -----------------------------------------------------------
 
-    def unsupported(self, expr: Any, temporal: bool, bound: dict | None = None) -> str | None:
+    @staticmethod
+    def unsupported(expr: Any, temporal: bool, bound: dict | None = None) -> str | None:
         """Why an expression cannot be evaluated, or None. `bound` maps the
         variables of the enclosing quantifiers and comprehensions to their
         set (None for a range of integers)."""
@@ -995,27 +1034,27 @@ class _Evaluator:
             if expr.index == "*" or isinstance(expr.index, RangeExpr):
                 return "a wildcard or range actor reference is not evaluable"
             if expr.index is not None and not isinstance(expr.index, (str, int)):
-                return self.unsupported(expr.index, False, bound)
+                return _Evaluator.unsupported(expr.index, False, bound)
             return None
         if isinstance(expr, MemberAccess):
             obj = expr.obj
             if obj.index is None and obj.name in bound and bound[obj.name] is None:
                 return (f"'{obj.name}' ranges over integers, not over the members of a "
                         f"set, so '{obj.name}.{expr.member}' is not evaluable")
-            return self.unsupported(obj, False, bound)
+            return _Evaluator.unsupported(obj, False, bound)
         if isinstance(expr, UnaryOp):
-            return self.unsupported(expr.operand, temporal, bound)
+            return _Evaluator.unsupported(expr.operand, temporal, bound)
         if isinstance(expr, BinaryOp):
-            return (self.unsupported(expr.left, temporal, bound)
-                    or self.unsupported(expr.right, temporal, bound))
+            return (_Evaluator.unsupported(expr.left, temporal, bound)
+                    or _Evaluator.unsupported(expr.right, temporal, bound))
         if isinstance(expr, QuantifiedExpr):
-            return (self._domain_error(expr.domain, False)
-                    or self.unsupported(expr.predicate, temporal,
+            return (_Evaluator._domain_error(expr.domain, False)
+                    or _Evaluator.unsupported(expr.predicate, temporal,
                                         {**bound, expr.variable: expr.domain.name}))
         if isinstance(expr, FunctionCall):
             if expr.name == "__in__":
                 for a in expr.args:
-                    r = self.unsupported(a, False, bound)
+                    r = _Evaluator.unsupported(a, False, bound)
                     if r:
                         return r
                 return None
@@ -1027,7 +1066,7 @@ class _Evaluator:
                     return f"{expr.name}() does not have the arguments of F.4"
                 for i, a in enumerate(expr.args):
                     if i != dpos:
-                        r = self.unsupported(a, True, bound)
+                        r = _Evaluator.unsupported(a, True, bound)
                         if r:
                             return r
                 return None
@@ -1035,8 +1074,8 @@ class _Evaluator:
                     and isinstance(expr.args[0], Comprehension)):
                 comp = expr.args[0]
                 dom = comp.domain
-                return (self._domain_error(dom, True)
-                        or self.unsupported(comp.element, False, {
+                return (_Evaluator._domain_error(dom, True)
+                        or _Evaluator.unsupported(comp.element, False, {
                             **bound,
                             comp.variable: None if isinstance(dom, RangeExpr) else dom.name}))
             if _is_aggregate_shorthand(expr):
@@ -1655,7 +1694,9 @@ class _Term:
             try:
                 self.expr = desugar_wildcards(_parse_rule(self.text))
             except Exception:
-                self.error = "it is not a predicate (Appendix A.10)"
+                hint = syntax_hint(self.text)
+                self.error = ("it is not a predicate (Appendix A.10)"
+                              + (f": {hint}" if hint else ""))
             else:
                 self.error = ev.unsupported(self.expr, temporal)
 
@@ -1742,6 +1783,11 @@ class _NormInst:
         self.content = _Term(d.content, events, ev, temporal=True)
         self.deadline = _deadline(d)
         self.frozen: str | None = None
+        bad = getattr(d, "invalid_deadline", None)
+        if bad is not None:
+            hint = duration_hint(str(bad))
+            self.frozen = (f"deadline '{bad}' is not a duration (N-4)"
+                           + (f": {hint}" if hint else ""))
         for key, term in (("trigger", self.trigger), ("until", self.until), ("content", self.content)):
             if term is not None and term.error and not self.frozen:
                 self.frozen = f"not evaluable: {key} '{term.text}': {term.error}"
@@ -1826,9 +1872,12 @@ class _Engine:
         self.end_reason: str | None = None
 
     def _warn_frozen(self, norm: _NormInst) -> None:
+        """A norm that could never be judged is refused, not left inactive:
+        `cadl check` reports the same text as an error (N-16), so this is
+        reached only through the API with a file that was not checked."""
         if norm.frozen:
-            self.ev.warn(f"norm '{norm.d.id}' is not judged ({norm.frozen})")
-
+            raise NormsEvalError(f"norm '{norm.d.id}' cannot be judged ({norm.frozen}); "
+                                 f"cadl check reports it as an error (N-16)")
 
     def _build_rules(self) -> None:
         self.rules = []
@@ -1839,9 +1888,10 @@ class _Engine:
                 cond.error = cond.error or "it is not a predicate"
             for key, term in (("when", when), ("if", cond)):
                 if term is not None and term.error:
-                    self.ev.warn(
-                        f"counts_as rule creating '{r.creates}' is not evaluated: "
-                        f"{key} '{term.text}': {term.error}")
+                    raise NormsEvalError(
+                        f"counts_as rule creating '{r.creates}' cannot be evaluated: "
+                        f"{key} '{term.text}': {term.error}; cadl check reports it as "
+                        f"an error (N-16)")
             self.rules.append((r, when, cond))
 
     def _init_states(self) -> None:

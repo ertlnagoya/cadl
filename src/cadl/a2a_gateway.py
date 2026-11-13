@@ -2632,44 +2632,78 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
         socket.getaddrinfo(host, port, family)
     except OSError as e:
         raise GatewayError(f"--listen {listen}: {e}") from None
-    gw = A2AGateway(**gw_args)
+    # The handlers are installed before the gateway publishes run.json and
+    # before a port file announces that it is ready: a SIGTERM sent as soon
+    # as one appears stops the gateway in order (status 0) instead of
+    # killing it (-15).
+    done = threading.Event()
+    previous = install_stop_handlers(done.set)
     try:
-        server = _Server((host, port), gw, family, max_readers, read_timeout,
-                         max_readers_per_address, max_readers_per_prefix,
-                         mtls=client_ca is not None, max_handshakes=max_handshakes)
-    except OSError as e:
-        gw.stop()
-        raise GatewayError(f"cannot listen on {listen}: {e}") from None
-    if context is not None:
-        # The handshake happens in the thread of the connection, so that a
-        # client that does not finish it does not stop the others.
-        server.socket = context.wrap_socket(server.socket, server_side=True,
-                                            do_handshake_on_connect=False)
-    actual = server.server_address[1]
-    scheme = "https" if context is not None else "http"
-    shown = f"[{host}]" if ":" in host else host
-    if gw.push_policy is not None and gw.push_url is None:
-        if not _is_loopback(host):
+        gw = A2AGateway(**gw_args)
+        try:
+            server = _Server((host, port), gw, family, max_readers, read_timeout,
+                             max_readers_per_address, max_readers_per_prefix,
+                             mtls=client_ca is not None, max_handshakes=max_handshakes)
+        except OSError as e:
             gw.stop()
-            server.server_close()
-            raise GatewayError("--push-allow on an address other than loopback needs "
-                               "--push-url, the URL at which the agent reaches the gateway")
-        gw.push_url = f"{scheme}://{shown}:{actual}"
+            raise GatewayError(f"cannot listen on {listen}: {e}") from None
+        if context is not None:
+            # The handshake happens in the thread of the connection, so that a
+            # client that does not finish it does not stop the others.
+            server.socket = context.wrap_socket(server.socket, server_side=True,
+                                                do_handshake_on_connect=False)
+        actual = server.server_address[1]
+        scheme = "https" if context is not None else "http"
+        shown = f"[{host}]" if ":" in host else host
+        if gw.push_policy is not None and gw.push_url is None:
+            if not _is_loopback(host):
+                gw.stop()
+                server.server_close()
+                raise GatewayError("--push-allow on an address other than loopback "
+                                   "needs --push-url, the URL at which the agent reaches "
+                                   "the gateway")
+            gw.push_url = f"{scheme}://{shown}:{actual}"
+        return _serve_until_done(gw, server, done, grpc_address, grpc_port_file, port_file,
+                                 actual, f"{scheme}://{shown}:{actual}/", poll,
+                                 dict(tls_cert=tls_cert, tls_key=tls_key,
+                                      client_ca=client_ca, read_timeout=read_timeout,
+                                      max_readers=max_readers,
+                                      max_readers_per_address=max_readers_per_address,
+                                      max_readers_per_prefix=max_readers_per_prefix,
+                                      max_connections=max_grpc_connections,
+                                      max_connections_per_address=(
+                                          max_grpc_connections_per_address),
+                                      max_connections_per_prefix=(
+                                          max_grpc_connections_per_prefix)))
+    finally:
+        restore_handlers(previous)
+
+
+def install_stop_handlers(stop) -> dict | None:
+    """Make SIGTERM and SIGINT call `stop()`. Returns the handlers they
+    replace, for `restore_handlers`; None outside the main thread, where
+    Python cannot install handlers."""
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    return {sig: signal.signal(sig, lambda *_: stop())
+            for sig in (signal.SIGTERM, signal.SIGINT)}
+
+
+def restore_handlers(previous: dict | None) -> None:
+    for sig, handler in (previous or {}).items():
+        signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
+
+
+def _serve_until_done(gw, server, done: threading.Event, grpc_address, grpc_port_file,
+                      port_file, actual: int, url: str, poll: float, grpc: dict) -> int:
+    """Announce the gateway (the port files) and serve until `done`."""
     grpc_server = None
     if grpc_address is not None:
         from .a2a_grpc import start
         try:
-            grpc_server, grpc_port = start(gw, grpc_address, tls_cert, tls_key, client_ca,
-                                           max_handlers=gw.max_handlers,
-                                           read_timeout=read_timeout,
-                                           max_readers=max_readers,
-                                           max_readers_per_address=max_readers_per_address,
-                                           max_readers_per_prefix=max_readers_per_prefix,
-                                           max_connections=max_grpc_connections,
-                                           max_connections_per_address=(
-                                               max_grpc_connections_per_address),
-                                           max_connections_per_prefix=(
-                                               max_grpc_connections_per_prefix))
+            grpc_server, grpc_port = start(gw, grpc_address, grpc.pop("tls_cert"),
+                                           grpc.pop("tls_key"), grpc.pop("client_ca"),
+                                           max_handlers=gw.max_handlers, **grpc)
         except GatewayError:
             gw.stop()
             server.server_close()
@@ -2683,8 +2717,7 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
         tmp = Path(str(port_file) + f".{secrets.token_hex(4)}.tmp")
         tmp.write_text(f"{actual}\n", encoding="utf-8")
         os.replace(tmp, port_file)
-    _log(f"listening on {scheme}://{shown}:{actual}/ (run {gw.run_id})")
-    done = threading.Event()
+    _log(f"listening on {url} (run {gw.run_id})")
     threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1},
                      daemon=True).start()
 
@@ -2698,9 +2731,6 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
                 done.set()
 
     threading.Thread(target=ticker, daemon=True).start()
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGTERM, lambda *_: done.set())
-        signal.signal(signal.SIGINT, lambda *_: done.set())
     try:
         done.wait()
     except KeyboardInterrupt:

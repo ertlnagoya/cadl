@@ -1524,12 +1524,15 @@ norms:
 
 
 def test_comments_cannot_carry_model_text():
+    # The text is in a string literal: up to 0.3.29 this test used 'x...',
+    # which is not a string (A.1), so the norm was frozen and its text
+    # reached the model only as the reason; it is an error of N-16 now.
     sos = make_sos("""\
 norms:
   - id: p
     kind: prohibition
     bearer: "R[1]"
-    content: "R[1].m == 'x\nlabel \\"evil\\" = true; //'"
+    content: "R[1].m == \\"x\\nlabel 'evil' = true; //\\""
 """)
     text = build_model(sos, bindings={"i": 1}).prism_text()
     assert all("evil" not in line.split("//")[0] for line in text.splitlines())

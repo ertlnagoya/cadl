@@ -45,6 +45,22 @@ from .a2a_fake_agent import FakeAgent
 ROOT = Path(__file__).parent.parent
 CADL = Path(__file__).parent / "data" / "a2a_delegated_work.cadl"
 BOOT = "import sys; from cadl.cli import main; sys.exit(main(sys.argv[1:]))"
+# The gateway sends itself SIGTERM at the moment it writes the port file,
+# as a test that stops it as soon as the file appears may do.
+BOOT_TERM_AT_PORT_FILE = """
+import os, signal, sys
+import cadl.a2a_gateway as g
+class _Os:
+    def __getattr__(self, name):
+        return getattr(os, name)
+    def replace(self, src, dst):
+        os.replace(src, dst)
+        if os.path.basename(str(dst)) == "port":
+            os.kill(os.getpid(), signal.SIGTERM)
+g.os = _Os()
+from cadl.cli import main
+sys.exit(main(sys.argv[1:]))
+"""
 KEY = b"a2a-gateway-test-key-0123456789"
 CLIENT_KEYS = {"PLANNER": b"planner-client-key-0123456789",
                "OPERATOR": b"operator-client-key-0123456789"}
@@ -175,7 +191,7 @@ class Run:
     """A gateway subprocess in front of a fake agent, and a fake client."""
 
     def __init__(self, tmp_path, cadl=CADL, key: bool = False, upstream: str | None = None,
-                 extra=(), name="gw"):
+                 extra=(), name="gw", boot=BOOT, wait=True):
         self.dir = tmp_path / name
         self.dir.mkdir()
         self.cadl = cadl
@@ -197,8 +213,10 @@ class Run:
             self.key = self.dir / "key"
             self.key.write_bytes(KEY)
             args += ["--audit-key", str(self.key)]
-        self.proc = subprocess.Popen([sys.executable, "-c", BOOT, *args],
+        self.proc = subprocess.Popen([sys.executable, "-c", boot, *args],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not wait:
+            return
         # Wait for the published files, not only for the trace.
         wait_for(lambda: self.port_file.exists() and self.port_file.read_text().strip(),
                  "the port file")
@@ -260,6 +278,20 @@ class Run:
 # === Scenarios through the subprocess ==========================================
 
 class TestScenarios:
+
+    def test_sigterm_as_soon_as_the_port_file_appears(self, tmp_path):
+        """The handlers of SIGTERM and SIGINT are installed before the port
+        file is written: a SIGTERM at that moment stops the gateway in
+        order (status 0). Up to 0.3.29 it killed it (-15), which made the
+        tests that stop a gateway right after a few calls fail now and then."""
+        r = Run(tmp_path, boot=BOOT_TERM_AT_PORT_FILE, wait=False)
+        try:
+            code = r.proc.wait(timeout=60)
+            err = r.proc.stderr.read().decode()
+        finally:
+            r.agent.close()
+        assert code == 0, err
+        assert r.port_file.exists() and "listening on" in err
 
     def test_allow_deny_and_own_tasks(self, tmp_path, capsys):
         r = Run(tmp_path, key=True)

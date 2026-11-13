@@ -641,6 +641,89 @@ class TestRules:
         res = check("counts_as:\n  - creates: e\n")
         assert with_rule(res.errors, "F.3")
 
+    # N-16: what could never be evaluated is an error, not a norm that
+    # stays inactive (up to 0.3.29 a warning "kept as text", or nothing).
+    @pytest.mark.parametrize("content, hint", [
+        ("until(R[1].ok == true, R[1].done == true, 2.5s)", "write 2.5s as 2500ms"),
+        ("within(1.5min, R[1].x > 1)", "write 1.5min as 90s"),
+        ("within(0.0005s, R[1].x > 1)", "not a whole number of milliseconds"),
+        ("R[1].k == 'k'", "double quotes"),
+        ("R[1].x > 1 and R[1].y < 2", "AND, OR and NOT in capitals"),
+        ("within(2s, R[1].x == 0) IN (R[1].ok, false)", ""),
+        ("R[1].x === 2", ""),
+        ("R[1].x > 1 AND", ""),
+        ("(R[1].x > 1", ""),
+        ("nonsense text here", ""),
+        ("for all i in 1..3: R[i].x > 0", ""),
+    ])
+    def test_n16_content_not_a_predicate(self, content, hint):
+        res = check(norms(norm(id="a", kind="prohibition", bearer="D",
+                               content=json.dumps(content))))
+        errors = with_rule(res.errors, "N-16") + [
+            e for e in with_rule(res.errors, "N-10, N-16")]
+        assert errors, res.errors + res.warnings
+        assert hint in " ".join(errors)
+        assert not [w for w in res.warnings if "kept as text" in str(w)]
+
+    @pytest.mark.parametrize("content, why", [
+        ("foo(R[1].x) > 1", "foo() is not evaluable"),
+        ("sum(R[1].x) > 1", "sum() is not evaluable"),
+        ("count(i for i in R[1].x) > 1", "the domain of a quantifier"),
+        ("count(i.x for i in 1..3) > 1", "ranges over integers"),
+        ("sum(R[*].v + X.w + D.w) > 0 AND sum(R[*].v * R[*].w) > 0", ""),
+    ])
+    def test_n16_content_not_evaluable(self, content, why):
+        res = check(norms(norm(id="a", kind="prohibition", bearer="D",
+                               content=json.dumps(content))))
+        if not why:          # one group: evaluated
+            assert not with_rule(res.errors, "N-16"), res.errors
+            return
+        assert any(why in e for e in with_rule(res.errors, "N-16")), res.errors
+
+    def test_n16_aggregate_of_two_sets(self):
+        # Q is not a declared set, but its reference still forms a group.
+        res = check(norms(norm(id="a", kind="prohibition", bearer="D",
+                               content='"sum(R[*].v + Q[*].v) > 0"')))
+        assert any("aggregate ranges over one set" in e
+                   for e in with_rule(res.errors, "N-16")), res.errors
+        assert not [w for w in with_rule(res.warnings, "N-15") if "sum()" in w]
+
+    @pytest.mark.parametrize("key", ["trigger", "until"])
+    @pytest.mark.parametrize("text", ["R[1].k == 'k'", "f(R[1].x)", "R[1].x =< 2"])
+    def test_n16_trigger_and_until(self, key, text):
+        res = check(norms(norm(id="a", kind="obligation", bearer="D", content='"D.x > 0"',
+                               **{key: json.dumps(text)})))
+        assert with_rule(res.errors, "N-16"), res.errors
+
+    @pytest.mark.parametrize("rule", [
+        'when: "R[1].k == \'k\'"', 'when: "D -> R[1] : go now"',
+        'when: "D -> R[1] : go(R[*].x)"', 'when: "D.x > 0"\n    if: "D -> R[1] : m"',
+        'when: "D.x > 0"\n    if: "g(D.x)"'])
+    def test_n16_counts_as(self, rule):
+        res = check(f"counts_as:\n  - {rule}\n    creates: e\n")
+        assert with_rule(res.errors, "N-16"), res.errors
+
+    def test_n16_message_content(self):
+        res = check(norms(norm(id="a", kind="obligation", bearer="D",
+                               content='"D -> R[1] : m(1, 2"')))
+        assert with_rule(res.errors, "N-16"), res.errors
+
+    def test_n16_a_well_formed_norm_is_not_reported(self):
+        res = check(norms(norm(id="a", kind="obligation", bearer="D",
+                               trigger=json.dumps('D -> R[1] : go(1, "x")'),
+                               content=json.dumps('within(2500ms, R[1].k == "k") '
+                                                  'IN [D.ok, false]'),
+                               deadline="5s")))
+        assert res.ok, res.errors
+
+    @pytest.mark.parametrize("deadline, hint", [
+        ("2.5s", "write 2.5s as 2500ms"), ("0.5h", "write 0.5h as 30min"),
+        ('"1.5 min"', "write 1.5min as 90s")])
+    def test_n4_fractional_deadline_hint(self, deadline, hint):
+        res = check(norms(norm(id="a", kind="obligation", bearer="D", content='"D.x > 0"',
+                               deadline=deadline)))
+        assert any(hint in e for e in with_rule(res.errors, "N-4")), res.errors
+
 
 # --- Verifier (F.7) --------------------------------------------------------
 

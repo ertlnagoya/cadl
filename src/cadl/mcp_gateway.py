@@ -454,14 +454,6 @@ def serve(gw_args: dict, server_cmd: list[str], poll: float = 0.05,
         except (OSError, ValueError, AttributeError):
             pass
 
-    # The gateway checks the file and creates the logs before the server runs.
-    gw = Gateway(to_client=to_client, to_server=to_server, **gw_args)
-    try:
-        proc = subprocess.Popen(server_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    except OSError as e:
-        gw.stop()
-        raise GatewayError(f"cannot start the MCP server {server_cmd[0]!r}: {e}") from None
-    server["proc"] = proc
     done = threading.Event()
     status = {"code": 0}
 
@@ -469,6 +461,31 @@ def serve(gw_args: dict, server_cmd: list[str], poll: float = 0.05,
         if not done.is_set():
             status["code"] = code
             done.set()
+
+    # The handler is installed before the gateway creates its logs and
+    # before the server starts: a SIGTERM sent as soon as the trace appears
+    # or the client sees an answer stops the gateway in order (status 0)
+    # instead of killing it (-15).
+    main = threading.current_thread() is threading.main_thread()
+    if main:
+        previous = signal.signal(signal.SIGTERM, lambda *_: finish(0))
+    try:
+        # The gateway checks the file and creates the logs before the server runs.
+        gw = Gateway(to_client=to_client, to_server=to_server, **gw_args)
+        return _serve(gw, server, server_cmd, stdin, done, finish, status, out_lock, poll)
+    finally:
+        if main:
+            signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+
+
+def _serve(gw, server: dict, server_cmd: list[str], stdin, done: threading.Event,
+           finish, status: dict, out_lock: threading.Lock, poll: float) -> int:
+    try:
+        proc = subprocess.Popen(server_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    except OSError as e:
+        gw.stop()
+        raise GatewayError(f"cannot start the MCP server {server_cmd[0]!r}: {e}") from None
+    server["proc"] = proc
 
     def decode(raw: bytes) -> str | None:
         try:
@@ -514,8 +531,6 @@ def serve(gw_args: dict, server_cmd: list[str], poll: float = 0.05,
 
     for fn in (client_reader, server_reader, ticker):
         threading.Thread(target=fn, daemon=True).start()
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGTERM, lambda *_: finish(0))
     try:
         done.wait()
     except KeyboardInterrupt:

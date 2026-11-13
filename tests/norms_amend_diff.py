@@ -56,7 +56,9 @@ BASES = [
                                      "domains": ["ROBOT[*].load=0..3", "DEPOT.capacity=2..4"]}),
 ]
 
-DEADLINES = ["1s", "2s", "3s", "4s", "6s", "10s", "1.5s", "2.5s", 2.5, 0.5]
+# "1.5s" is not a duration (A.1): up to 0.3.29 it was read as no deadline,
+# silently; the fractional deadlines are 1500ms and the numeric 2.5 and 0.5.
+DEADLINES = ["1s", "2s", "3s", "4s", "6s", "10s", "1500ms", "2500ms", 2.5, 0.5]
 
 
 # --- Versions ---------------------------------------------------------------------
@@ -161,7 +163,7 @@ def _mutate_new(rng: random.Random, c: dict, log: list, k: int | None = None) ->
                     and str(n["content"]).startswith(("throughout(", "within("))]
         if temporal:
             n = rng.choice(temporal)
-            n["deadline"] = rng.choice(["0.5s", "1s", "1.5s", "2s"])
+            n["deadline"] = rng.choice(["500ms", "1s", "1500ms", "2s"])
             log.append(f"deadline of {n['id']}: {n['deadline']}")
     else:                                                  # a deadline of a new norm
         n = rng.choice(norms)
