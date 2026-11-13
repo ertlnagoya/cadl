@@ -35,8 +35,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   to 256 KiB wait for the client, so it sees the server close a
   connection also when the client reads nothing, and resets the client's
   side at most 5 seconds later; when more waits, or the server does not
-  take the client's bytes, and nothing goes out for 30 seconds, both
-  sides are reset (`read_timeout`, `grpc stalled`). A connection counts
+  take the client's bytes, and the backlog does not drain within 30
+  seconds, both sides are reset (`read_timeout`, `grpc stalled`). A connection counts
   against the caps until its sockets are closed; refusals are recorded
   by a thread of their own; `localhost` is listened on at 127.0.0.1 and
   ::1, as gRPC did. No new dependency.

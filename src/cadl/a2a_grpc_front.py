@@ -29,8 +29,10 @@ The listener bounds:
   connection. A call that gRPC refuses before the gateway sees it (an
   unknown method, or beyond the workers) does not count;
 - the time a side may refuse the bytes for the other: when the bytes
-  written to the client (or to the gRPC server) do not go out within
-  `DRAIN_TIMEOUT` seconds, both sides are reset and recorded
+  that wait for the client (beyond `PENDING`) or for the gRPC server
+  (beyond the high-water mark of the transport) do not drain to its
+  low-water mark within `DRAIN_TIMEOUT` seconds, both sides are reset
+  and recorded
   (`read_timeout`, reason `grpc stalled`). The gRPC server is read on
   while up to `PENDING` bytes wait for the client, so that its closing is
   seen at once; then the client's side is closed after what was sent to
@@ -60,6 +62,7 @@ the lock of the gateway never hold up the relay.
 from __future__ import annotations
 
 import asyncio
+import errno
 import ipaddress
 import itertools
 import os
@@ -69,6 +72,8 @@ import socket
 import tempfile
 import threading
 from typing import Any
+
+from .gateway_core import log
 
 CHUNK = 1 << 16
 CLOSE_GRACE = 5.0          # seconds to flush a connection that is closed
@@ -163,43 +168,74 @@ class _Recorder:
         self._flush()
 
 
-def _listen_sockets(host: str, port: int) -> list[socket.socket]:
-    """Listening sockets for every address of `host` (as gRPC binds
-    `localhost` to 127.0.0.1 and ::1), all on the same port."""
-    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM,
-                               flags=socket.AI_PASSIVE)
-    seen, socks = set(), []
+def _listen_socket(family: int, addr: tuple) -> socket.socket:
+    sock = socket.socket(family, socket.SOCK_STREAM)
     try:
-        for family, _, _, _, addr in infos:
-            if (family, addr[0]) in seen or family not in (socket.AF_INET, socket.AF_INET6):
-                continue
-            seen.add((family, addr[0]))
-            sock = socket.socket(family, socket.SOCK_STREAM)
-            socks.append(sock)
-            if os.name == "nt":
-                # SO_REUSEADDR on Windows lets another socket take the port.
-                if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            else:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if family == socket.AF_INET6:
-                # [::] takes IPv4 clients too, as the listener of gRPC did;
-                # any other IPv6 address only IPv6 ones.
-                unspecified = ipaddress.ip_address(addr[0].split("%", 1)[0]).is_unspecified
-                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY,
-                                0 if unspecified else 1)
-            if socks[:-1]:
-                addr = (addr[0], socks[0].getsockname()[1], *addr[2:])
-            sock.bind(addr)
-            sock.listen(128)
-            sock.setblocking(False)
+        if os.name == "nt":
+            # SO_REUSEADDR on Windows lets another socket take the port.
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            # [::] takes IPv4 clients too, as the listener of gRPC did; any
+            # other IPv6 address only IPv6 ones.
+            unspecified = ipaddress.ip_address(addr[0].split("%", 1)[0]).is_unspecified
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0 if unspecified else 1)
+        sock.bind(addr)
+        sock.listen(128)
+        sock.setblocking(False)
     except BaseException:
-        for sock in socks:
-            sock.close()
+        sock.close()
         raise
-    if not socks:
+    return sock
+
+
+def _listen_sockets(host: str, port: int, attempts: int = 8) -> list[socket.socket]:
+    """Listening sockets for the addresses of `host` (as gRPC binds
+    `localhost` to 127.0.0.1 and ::1), all on the same port. As with
+    gRPC, an address that cannot be bound (::1 where IPv6 is off) is left
+    out and logged, as long as one is bound; with port 0, a port that the
+    first address got but a later one cannot take is given up for another
+    one."""
+    infos, seen = [], set()
+    for family, _, _, _, addr in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM,
+                                                    flags=socket.AI_PASSIVE):
+        if family in (socket.AF_INET, socket.AF_INET6) and (family, addr[0]) not in seen:
+            seen.add((family, addr[0]))
+            infos.append((family, addr))
+    if not infos:
         raise OSError(f"no address for {host}")
-    return socks
+    for attempt in range(attempts):
+        socks: list[socket.socket] = []
+        skipped: list[str] = []
+        retry = False
+        try:
+            for family, addr in infos:
+                if socks:
+                    addr = (addr[0], socks[0].getsockname()[1], *addr[2:])
+                try:
+                    socks.append(_listen_socket(family, addr))
+                except OSError as e:
+                    if socks and port == 0 and e.errno == errno.EADDRINUSE \
+                            and attempt + 1 < attempts:
+                        retry = True
+                        break
+                    skipped.append(f"{addr[0]}: {e}")
+        except BaseException:
+            for sock in socks:
+                sock.close()
+            raise
+        if retry:
+            for sock in socks:
+                sock.close()
+            continue
+        if not socks:
+            raise OSError(f"cannot listen on {host}: {'; '.join(skipped)}")
+        for why in skipped:
+            log("cadl a2a-gateway", f"--grpc-listen: {why}; the other addresses are used")
+        return socks
+    raise OSError(f"cannot find a free port for every address of {host}")
 
 
 class Front:
@@ -484,10 +520,11 @@ class Front:
                 self.peers[name] = conn
             up = asyncio.ensure_future(self._pump(reader, bwriter))
             down = asyncio.ensure_future(self._pump(breader, writer, PENDING))
-            # The gRPC server closing its side, seen also while the relay
-            # waits for the client to read.
-            gone = asyncio.ensure_future(bwriter.wait_closed())
-            tasks = {up, down, gone}
+            # The end of either pump ends the relay: `down` reads the gRPC
+            # server on while up to PENDING bytes wait for the client, so it
+            # sees the server close (EOF) or reset (an error) also when the
+            # client reads nothing; above that, the drain deadline holds.
+            tasks = {up, down}
             done, _ = await asyncio.wait(tasks, timeout=self.deadline,
                                          return_when=asyncio.FIRST_COMPLETED)
             if not done:

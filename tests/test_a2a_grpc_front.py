@@ -456,9 +456,20 @@ def test_start_failure_is_raised(monkeypatch):
         f.cleanup()
 
 
-def test_localhost_binds_every_address(grpc):
+def _ipv6_loopback() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6) as probe:
+            probe.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+def test_localhost_binds_every_address():
     """Review L6: `localhost` is listened on at each of its addresses, on
     one port, as gRPC did."""
+    if not _ipv6_loopback():
+        pytest.skip("no IPv6 loopback")
     infos = {i[4][0] for i in socket.getaddrinfo("localhost", 0, type=socket.SOCK_STREAM)}
     f = Front(Recorder(), ("localhost", 0))
     try:
@@ -467,6 +478,49 @@ def test_localhost_binds_every_address(grpc):
     finally:
         f.stop()
         f.cleanup()
+
+
+def test_unbindable_address_is_left_out(monkeypatch, capsys):
+    """Review L-b: an address of the host that cannot be bound (::1 where
+    IPv6 is off) is logged and left out while another one is bound; with
+    port 0, a port that a later address cannot take is given up for
+    another one."""
+    import errno
+
+    from cadl import a2a_grpc_front as F
+    infos = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+             (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0))]
+    monkeypatch.setattr(F.socket, "getaddrinfo", lambda *a, **k: infos)
+    real = F._listen_socket
+
+    def off(family, addr):
+        if family == socket.AF_INET6:
+            raise OSError(errno.EADDRNOTAVAIL, "Can't assign requested address")
+        return real(family, addr)
+    monkeypatch.setattr(F, "_listen_socket", off)
+    socks = F._listen_sockets("localhost", 0)
+    assert [s.family for s in socks] == [socket.AF_INET]
+    assert "::1" in capsys.readouterr().err
+    for s in socks:
+        s.close()
+
+    busy = iter([True, False])
+
+    def collide(family, addr):
+        if family == socket.AF_INET6 and next(busy):
+            raise OSError(errno.EADDRINUSE, "Address already in use")
+        if family == socket.AF_INET6:
+            family, addr = socket.AF_INET, ("127.0.0.1", 0)    # stands in for ::1
+        return real(family, addr)
+    monkeypatch.setattr(F, "_listen_socket", collide)
+    socks = F._listen_sockets("localhost", 0)
+    assert len(socks) == 2          # the second attempt bound both
+    for s in socks:
+        s.close()
+    with pytest.raises(OSError):
+        monkeypatch.setattr(F, "_listen_socket",
+                            lambda f, a: (_ for _ in ()).throw(OSError(errno.EACCES, "no")))
+        F._listen_sockets("localhost", 0)
 
 
 # === Through the gateway ===========================================================
