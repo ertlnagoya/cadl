@@ -55,9 +55,9 @@ SOLC_CHECKED = ("0.8.24", "0.8.37")
 # the constructor). Measured with the versions above, the optimizer with 1
 # and with 200 runs, plus 3 %; tests/test_norms_monitor_targets.py checks
 # them against solc.
-RUNTIME_ESTIMATE = {"monitor": 16840, "CadlNormsValues": 7810, "CadlNormsEval": 10310,
-                    "CadlNormsItems": 2370, "CadlNormsWindows": 5070, "CadlNormsActs": 12170,
-                    "CadlNormsMulti": 4430}
+RUNTIME_ESTIMATE = {"monitor": 16840, "CadlNormsValues": 7810, "CadlNormsEval": 10410,
+                    "CadlNormsItems": 2370, "CadlNormsWindows": 5230, "CadlNormsActs": 12170,
+                    "CadlNormsMulti": 7490}
 
 
 def estimated_initcode(text: str) -> int:

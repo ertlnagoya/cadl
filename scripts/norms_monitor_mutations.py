@@ -2,7 +2,7 @@
 (tests/test_norms_monitor_targets.py, Appendix D, D.5).
 
 Each mutant of norms_monitor_base.sol runs the traces of one set of
-contents (RELEASE, COMPARE, TWO: the boundary traces, N random traces and
+contents (RELEASE, COMPARE, TWO, THREE, FOUR, NESTED: the boundary traces, N random traces and
 three long ones) on the EVM; it is killed when a trace differs from
 `cadl norms-eval`. Needs the EVM of the tests (CADL_EVM_PYTHON, CADL_SOLC).
 
@@ -27,14 +27,42 @@ MUT = [
  ("cmp-no-dual", "compare", "bool f = ts >> X_F & 1 != 0;", "bool f = false;"),
  ("cmp-both-live", "compare", "return l ? (f ? C_BOTH : C_LIVE)", "return l ? (f ? C_LIVE : C_LIVE)"),
  ("cmp-u-as-d", "two", "if (c == X_U) return mark(K_U);", "if (c == X_U) return mark(K_D);"),
- ("two-no-close-u", "two", "assign(mu, i, X_U, a < x ? a : x);", ""),
- ("two-tag-mask", "two", "(x >> 16 & f)", "(x >> 16)"),
- ("two-until-prefix", "two", "assignFrom(mu, i, firstAfter(mu, op.puSet, op.pu));", "assignFrom(mu, i, 0);"),
- ("two-no-pend", "two", "mu.pend = !hit && w & CUR_D != 0;", "mu.pend = false;"),
- ("two-no-push", "two", "if (w >> (128 + 3 * j) & 1 == 0) continue;", "continue;"),
+ ("two-no-close-u", "two", "            assign(mu, i, X_U, a < x ? a : x);\n            assign(mu, i, op.mode",
+  "            assign(mu, i, op.mode"),
+ ("two-tag-mask", "two", "| ((y & BITS) >> sh & kp);", "| ((y & BITS) >> sh);"),
+ ("two-until-prefix", "two", "assignRange(mu, i, X_T, firstAfter(mu, op.puSet, op.pu), mu.tail);",
+  "assignRange(mu, i, X_T, 0, mu.tail);"),
+ ("two-no-pend", "two", "mu.pend = !hit && und;", "mu.pend = false;"),
+ ("two-no-push", "two", "if (tv == 0) continue;", "continue;"),
  ("two-root", "two", "for (uint256 lvl = 1; lvl <= mu.h; lvl++) {", "for (uint256 lvl = 1; lvl < mu.h; lvl++) {"),
+ # three and four operators: the states of 5^m pairs, the words of a node
+ ("three-shift", "three", "uint256 sh = 2 * (1 + v) * 5 ** i;", "uint256 sh = 2 * v * 5 ** i;"),
+ ("three-keep", "three", "return i == 0 ? KEEP0 : i == 1 ? KEEP1 : KEEP2;", "return i == 0 ? KEEP0 : KEEP1;"),
+ ("three-no-push", "three", "if (tv == 0) continue;", "continue;"),
+ ("three-leaf", "three", "if (si == X_D) p += (1 + c) * f;", "if (si == X_D) p += c * f;"),
+ ("three-cur", "three", "uint256 internal constant CUR_T = 0x5014000000001405;",
+  "uint256 internal constant CUR_T = 0x1405;"),
+ ("four-word-move", "four", "if (w / st % 5 == 0) x[w] |= x[w + (1 + v) * st] & BITS;",
+  "if (w / st % 5 == 0) x[w] |= x[w + v * st] & BITS;"),
+ ("four-current", "four", "for (; w > 0; w /= 5) if (w % 5 > 1) return false;", "w;"),
+ ("four-tag-word", "four", "x[i / 3] |= v << (250 + 2 * (i % 3));", "x[0] |= v << (250 + 2 * (i % 3));"),
+ ("four-undecided", "four", "if (w / st % 5 != 0 && x[w] & BITS != 0) return true;",
+  "if (w / st % 5 > 1 && x[w] & BITS != 0) return true;"),
+ # nested operators: the inner values fed in the order of the observations
+ ("nest-split", "nested", "split = op.iu + 1 < b ? op.iu + 1 : b;", "split = op.iu < b ? op.iu : b;"),
+ ("nest-no-iu", "nested", "if (pv == X_U) { op.iuSet = true; op.iu = n; }\n            op.fed = b;",
+  "op.fed = b;"),
+ ("nest-feed-over", "nested", "        over(mu, op, i, ts);\n", ""),
+ ("nest-final-tau", "nested", "over(mu, op, i, op.fed <= n ? data.obsT[op.fed] : t);", "over(mu, op, i, t);"),
+ ("nest-range-lo", "nested", "assignRange(mu, i, y, firstFrom(mu, ts - op.td), firstAfter(mu, true, e));",
+  "assignRange(mu, i, y, firstFrom(mu, data.obsT[e] - op.td), firstAfter(mu, true, e));"),
+ ("nest-oneg", "nested", "y = op.oneg && x != X_U ?", "y = false && x != X_U ?"),
+ ("nest-now", "nested", "if (y == decisive(op)) now_ = y;", ""),
+ ("nest-reset", "nested", "if (mu.tail == 0) { op.fed = n; op.iuSet = false; op.uSet = false; }", ""),
+ ("nest-u-mark", "nested", "else if (y == X_U) { op.uSet = true; op.u = e; }", ""),
 ]
-SETS = {"release": (T.RELEASE, 20261301), "compare": (T.COMPARE, 20261302), "two": (T.TWO, 20261303)}
+SETS = {"release": (T.RELEASE, 20261301), "compare": (T.COMPARE, 20261302), "two": (T.TWO, 20261303),
+        "three": (T.THREE, 20261304), "four": (T.FOUR, 20261305), "nested": (T.NESTED, 20261306)}
 base = M.BASE.read_text()
 names = sys.argv[4:]
 for name, st, old, new in MUT:
