@@ -125,6 +125,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   (5 230) and `CadlNormsMulti` (7 490); the main contract stays at
   16 840.
 
+- `cadl norms-check` translates a group of four quantities ordered
+  against each other (F.12). When the classes of a component exceed
+  50,000 combinations, or a group has four or more ordered quantities,
+  each group whose quantities have the same classes apart from lists
+  takes its
+  valuations by types and patterns: a type for each quantity (no
+  value, true, false, number, text, object, list) and, per type, the
+  literal or gap of each number or text with their order within a gap,
+  which objects are equal, and the pattern of pairwise outcomes of the
+  lists. The patterns of n lists are the partitions into equal lists
+  with a series-parallel order of the classes (1, 4, 29, 331, 5,262 for
+  n = 1..5), realised by series and parallel composition with the
+  prefixes 0, 1 and `"a"`. Four ordered quantities without other
+  literals have 26,035 valuations (built in about 2 s; a contract with
+  four predicates over them: 68 choices, 272 commands, 1,626 states,
+  about 20 s with PRISM), 46,285 with one more numeric literal. A group
+  of five or more quantities compared with each other, ordered or only
+  tested for equality, has at least 424,213 valuations and is refused,
+  with the numbers of patterns per type and the hint about `--members`
+  (about 30 s to build without the limit). The number of valuations is
+  computed from the sizes of the gaps before any is built, so such a
+  refusal takes less than a second and the building checks
+  `--timeout`. Four or more ordered quantities in a component with
+  linear arithmetic or with a domain (given or assumed) are refused
+  too, with the reason. Tests: every consistent pattern of four lists
+  (331 of 355 are series-parallel), random nested lists of four and
+  five, random JSON values of every type against the choices, every
+  4-tuple of dense values of each type and of a small pool of every
+  type for four quantities with number and text literals, the
+  differential test with `cadl norms-eval` and the witnesses, the
+  valuations by types and patterns against the product of the classes
+  for groups of two and three, and the time to refuse large groups.
+  Of 14 injected errors, 13 were detected; the 14th (at most two
+  different objects) gives the same choices, since lists that are
+  pairwise not comparable behave as different objects do.
+
 ### Fixed
 
 - Tests: contents of the test sets with fractional durations (`2.5s`)
