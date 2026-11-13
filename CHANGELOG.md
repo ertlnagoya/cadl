@@ -82,6 +82,43 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   by a thread of their own; `localhost` is listened on at 127.0.0.1 and
   ::1, as gRPC did. No new dependency.
 
+- Equilibrium maps (`cadl game-check --certify`) use the coupled bounds
+  of the advantages (I.9) also in designs whose probabilities are not
+  multi-affine in the open parameters (`p * p`, `4 * p * (1 - p)`,
+  `p * q * (1 - q)`). Each such probability a + b · R(x) is lifted: R
+  becomes a new coordinate with the interval of an exact enclosure on
+  the cell (interval arithmetic intersected with the Bernstein
+  coefficients of R), and the two plays draw a corner of this lifted
+  cell in each step. Every probability is multi-affine in the lifted
+  coordinates and equals the original at (x, R(x)), so the distribution
+  at a valuation is a mixture of the distributions at the lifted
+  corners with weights common to all commands; a corner is used only
+  where its distribution is one of the relaxed process (I.9 gives the
+  proof). The lifted cell has at most 10 coordinates. On the second
+  three-parameter example of I.14 with (1 − p_fail)² the undecided
+  fraction after 39 999 cells falls from 0.673 to 0.174, with
+  1 − 4 · p_fail · (1 − p_fail) from 0.891 to 0.431, and with
+  1 − p_fail · q_local · (1 − q_local) (over λ, p_fail, q_local) the map
+  reaches the resolution 0.1 after 32 083 cells instead of leaving 0.180
+  undecided after 39 999. A cell costs more (wall-clock, measured two
+  at a time: 161 s and 237 s, 148 s and 237 s, 142 s and 146 s
+  without and with the lifting). The Bernstein coefficients are
+  computed per variable and only up to 4 096 of them, and the lifted
+  cell only on cells where a coupled bound is computed. The first example with (1 − p_fail)²
+  is unchanged. `games_eval.USE_LIFTING = False` gives the maps of
+  0.3.28, `games_eval.LIFT_BERNSTEIN = False` the lifting with interval
+  arithmetic only.
+- `tests/games_fuzz.py --mode nonaffine` generates games with mostly
+  probabilities that are not multi-affine, compares the coupled bounds
+  of these games directly with the advantages of the oracle, and has
+  three new deliberate soundness bugs of the lifting
+  (`lift_corners_only`, `lift_centre_range`, `lift_lower_range`); it
+  also generates commands with several lifted functions, λ in
+  probabilities and degrees up to 6;
+  3 800 games with the final code (90 372 exact point evaluations,
+  147 959 direct comparisons in games that are not multi-affine) gave
+  no wrong claim and no bound that misses an advantage.
+
 ### Changed
 
 - Runtime estimates of `CadlNormsEval` (10 410 bytes), `CadlNormsWindows`
