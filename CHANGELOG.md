@@ -27,8 +27,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   1 − p_fail · q_local · (1 − q_local) (over λ, p_fail, q_local) the map
   reaches the resolution 0.1 after 32 083 cells instead of leaving 0.180
   undecided after 39 999. A cell costs more (wall-clock, measured two
-  at a time: 770 s and 1 124 s, 258 s and 557 s, 818 s and 846 s
-  without and with the lifting). The first example with (1 − p_fail)²
+  at a time: 161 s and 237 s, 148 s and 237 s, 142 s and 146 s
+  without and with the lifting). The Bernstein coefficients are
+  computed per variable and only up to 4 096 of them, and the lifted
+  cell only on cells where a coupled bound is computed. The first example with (1 − p_fail)²
   is unchanged. `games_eval.USE_LIFTING = False` gives the maps of
   0.3.28, `games_eval.LIFT_BERNSTEIN = False` the lifting with interval
   arithmetic only.
@@ -36,7 +38,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   probabilities that are not multi-affine, compares the coupled bounds
   of these games directly with the advantages of the oracle, and has
   three new deliberate soundness bugs of the lifting
-  (`lift_corners_only`, `lift_centre_range`, `lift_lower_range`);
+  (`lift_corners_only`, `lift_centre_range`, `lift_lower_range`); it
+  also generates commands with several lifted functions, λ in
+  probabilities and degrees up to 6;
   3 800 games with the final code (90 372 exact point evaluations,
   147 959 direct comparisons in games that are not multi-affine) gave
   no wrong claim and no bound that misses an advantage.
