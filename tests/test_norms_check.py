@@ -587,7 +587,8 @@ def model_of(name: str, **kw):
                  "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES, "QUANT": QUANT,
                  "ARITH": ARITH, "MIXED": MIXED, "LISTS": LISTS,
                  "MULTI": MULTI, "STAGGER": STAGGER, "LINEAR": LINEAR,
-                 "NONLINEAR": NONLINEAR, "LINEAR2": LINEAR2, "FOUR": FOUR}
+                 "NONLINEAR": NONLINEAR, "LINEAR2": LINEAR2, "FOUR": FOUR,
+                 "FOUR_EQ": FOUR_EQ}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
         _MODELS[key] = (sos, m, PrismModel(m.prism_text(), {"early_end": True}))
@@ -2054,16 +2055,36 @@ norms:
 """
 
 
-def test_four_ordered_quantities_cover_every_json_value():
-    """Four quantities ordered against each other (F.12): valuations by
-    types and patterns, 26 035 here; random JSON values of every type,
+# three quantities ordered against each other and a fourth only compared
+# for equality: the lists of the classes differ, the patterns do not
+FOUR_EQ = """\
+norms:
+  - id: p
+    kind: prohibition
+    bearer: D
+    content: "R[1].a < R[1].b AND R[1].c > 1.5"
+  - id: q
+    kind: prohibition
+    bearer: D
+    content: "R[1].b >= R[1].c"
+  - id: r
+    kind: prohibition
+    bearer: D
+    content: "R[1].c == R[1].d OR NOT R[1].d"
+"""
+
+
+@pytest.mark.parametrize("name, orders", [("FOUR", {4}), ("FOUR_EQ", {1, 3})])
+def test_four_ordered_quantities_cover_every_json_value(name, orders):
+    """Four quantities compared with each other (F.12): valuations by
+    types and patterns, 26 035 for FOUR; random JSON values of every type,
     with nested lists and objects and copies for equalities, give the
     predicates the values of one of the choices."""
     import random as _random
-    _sos, m, _pm = model_of("FOUR")
+    _sos, m, _pm = model_of(name)
     tr = m.trs[0]
     assert all(n.status == "model" for n in tr.norms)
-    assert {q.list_order for q in tr.quantities.values()} == {4}
+    assert {q.list_order for q in tr.quantities.values()} == orders
     rng = _random.Random(4)
     (ids, vecs), = tr.components
     keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))

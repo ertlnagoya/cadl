@@ -2003,8 +2003,15 @@ class Environment:
         (a --domain)."""
         qs = [self.quantities[k] for k in keys]
         ref = qs[0]
+
+        def plain(q: Any) -> str:
+            # the lists differ between quantities ordered against others and
+            # those only tested for equality; the patterns of lists stand for both
+            return repr([v for v in q.reps if not isinstance(v, list)]
+                        + [any(isinstance(v, list) for v in q.reps)])
+
         if any(q.domain is not None or not q.raw or q.num_lits != ref.num_lits
-               or q.text_lits != ref.text_lits or repr(q.reps) != repr(ref.reps) for q in qs):
+               or q.text_lits != ref.text_lits or plain(q) != plain(ref) for q in qs):
             return None
         reps = ref.reps
 
@@ -2124,18 +2131,18 @@ class Environment:
         for k in rest:
             total *= len(self.quantities[k].reps)
         if total > MAX_VALUATIONS:
-            detail = "; ".join(
+            detail = "; ".join([
                 f"the {len(g)} quantities {', '.join(g)} compared with each other have "
                 f"{'at least ' if not e else ''}{c} valuations by types and patterns "
                 f"(patterns of numbers {s.get('number', [0])[1:]}, texts "
                 f"{s.get('text', [0])[1:]}, objects {s.get('object', [0])[1:]} and lists "
                 f"{s.get('list', [0])[1:]} for 1, 2, ... quantities of that type)"
-                for g, c, e, s in counts)
+                for g, c, e, s in counts] + ([
+                f"the other quantities {', '.join(rest)} take their classes"] if rest else []))
             raise NormsCheckError(
                 f"the predicates {', '.join(repr(self.preds[i].text) for i in ids)} read "
                 f"{len(keys)} quantities with {size} combinations of classes; {detail}"
-                + (f", and the other quantities {', '.join(rest)} their classes" if rest else "")
-                + f": {total} valuations together, and norms-check refuses more than "
+                f": {total} valuations together, and norms-check refuses more than "
                 f"{MAX_VALUATIONS} (F.12)")
         options = [self._group_valuations(g, parts) for g, parts in groups]
         options += [[{k: v} for v in self.quantities[k].reps] for k in rest]
