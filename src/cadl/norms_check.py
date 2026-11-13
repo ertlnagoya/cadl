@@ -642,6 +642,28 @@ def _list_tuples(n: int) -> tuple:
     return _LIST_TUPLES[n]
 
 
+_STIRLING: dict = {}
+
+
+def _stirling2(n: int, k: int) -> int:
+    """Stirling numbers of the second kind: partitions of n into k blocks."""
+    if (n, k) not in _STIRLING:
+        if n == k:
+            v = 1
+        elif k == 0 or k > n:
+            v = 0
+        else:
+            v = k * _stirling2(n - 1, k) + _stirling2(n - 1, k - 1)
+        _STIRLING[(n, k)] = v
+    return _STIRLING[(n, k)]
+
+
+def _binomial_convolution(a: list, b: list, n: int) -> list:
+    """The numbers of ways to split m labelled positions into two sets
+    counted by a and b, for m = 0..n."""
+    return [sum(math.comb(m, i) * a[m - i] * b[i] for i in range(m + 1)) for m in range(n + 1)]
+
+
 def _list_values(q: Any) -> list:
     if q.list_order in _LIST_VALUES:
         return [list(v) for v in _LIST_VALUES[q.list_order]]
@@ -1934,14 +1956,10 @@ class Environment:
 
     def _too_many(self, ids: list, keys: list, size: int) -> None:
         sizes = ", ".join(f"{k} ({len(self.quantities[k].reps)} classes)" for k in keys)
-        sets = sorted({m.group(1) for k in keys
-                       for m in [re.match(r"([A-Za-z_]\w*)\[\d+\]", k)] if m})
         raise NormsCheckError(
             f"the predicates {', '.join(repr(self.preds[i].text) for i in ids)} read "
             f"{sizes}: {size} combinations together, and norms-check refuses more than "
-            f"{MAX_VALUATIONS}. Use fewer --members"
-            + (f" ({', '.join(sets)})" if sets else "")
-            + " or, for quantities used in arithmetic, a smaller --domain")
+            f"{MAX_VALUATIONS}" + self._fewer(keys))
 
     # --- groups of quantities compared with each other (F.12) -------------------
     #
@@ -1962,15 +1980,17 @@ class Environment:
     def _weak_orders(s: int, blocks: int) -> list:
         """The ranks of s positions with ranks 0..r-1 all used, r <= blocks."""
         out = []
-        for ranks in itertools.product(range(min(s, blocks)), repeat=s):
+        for i, ranks in enumerate(itertools.product(range(min(s, blocks)), repeat=s)):
+            if i % 4096 == 0:
+                _generation_time()
             if set(ranks) == set(range(max(ranks) + 1 if ranks else 0)):
                 out.append(ranks)
         return out
 
-    @classmethod
-    def _located(cls, values: list, lits: frozenset, key: Any, j: int) -> list:
-        """The tuples of j values (numbers or texts) of the grid that are
-        literals or the first grid values of their gaps, in order."""
+    @staticmethod
+    def _grid(values: list, lits: frozenset, key: Any) -> tuple:
+        """The values of a grid that are literals, and the values of each gap
+        in order."""
         fixed = [v for v in values if key(v) in lits]
         gaps: dict = {}
         for v in values:
@@ -1978,9 +1998,18 @@ class Environment:
                 gaps.setdefault(sum(1 for c in lits if c < key(v)), []).append(v)
         for g in gaps.values():
             g.sort(key=key)
-        locs = [("lit", v) for v in fixed] + [("gap", g) for g in gaps.values()]
+        return fixed, list(gaps.values())
+
+    @classmethod
+    def _located(cls, values: list, lits: frozenset, key: Any, j: int) -> list:
+        """The tuples of j values (numbers or texts) of the grid that are
+        literals or the first grid values of their gaps, in order."""
+        fixed, gaps = cls._grid(values, lits, key)
+        locs = [("lit", v) for v in fixed] + [("gap", g) for g in gaps]
         out = []
-        for assign in itertools.product(range(len(locs)), repeat=j):
+        for n_, assign in enumerate(itertools.product(range(len(locs)), repeat=j)):
+            if n_ % 1024 == 0:
+                _generation_time()
             in_gap: dict = {}
             for pos, li in enumerate(assign):
                 if locs[li][0] == "gap":
@@ -1996,13 +2025,33 @@ class Environment:
                 out.append(tuple(vals))
         return out
 
-    def _group_parts(self, keys: list) -> dict | None:
-        """For each type of the classes of a group, the tuples of values of
-        j quantities of that type, one per pattern (a function of j); None
-        when the group does not have the same classes for every quantity
-        (a --domain)."""
+    @staticmethod
+    def _located_counts(fixed: int, gaps: list, n: int) -> list:
+        """len(_located(..., j)) for j = 0..n, computed without enumerating:
+        each literal holds any subset of the quantities, and each gap of L
+        grid values a weak order of its quantities with at most L classes."""
+        dp = [1] + [0] * n
+        factors = [[1] * (n + 1)] * fixed + [
+            [sum(math.factorial(b) * _stirling2(s, b) for b in range(min(s, length) + 1))
+             for s in range(n + 1)] for length in gaps]
+        for f in factors:
+            dp = _binomial_convolution(dp, f, n)
+        return dp
+
+    def _group_parts(self, keys: list) -> tuple:
+        """For each type of the classes of a group, the number of patterns of
+        j quantities of that type (counts[t][j]) and a function that gives
+        their tuples of values; or None and the reason when the quantities
+        of the group do not all have the same classes."""
         qs = [self.quantities[k] for k in keys]
         ref = qs[0]
+        for q in qs:
+            if q.domain is not None:
+                how = ("a domain assumed from the literals of its predicate (arithmetic that "
+                       "is not linear)" if q.assumed else "a --domain")
+                return None, f"{q.key} has {how}"
+            if not q.raw:
+                return None, f"{q.key} keeps only the classes that its comparisons tell apart"
 
         def plain(q: Any) -> str:
             # the lists differ between quantities ordered against others and
@@ -2010,10 +2059,11 @@ class Environment:
             return repr([v for v in q.reps if not isinstance(v, list)]
                         + [any(isinstance(v, list) for v in q.reps)])
 
-        if any(q.domain is not None or not q.raw or q.num_lits != ref.num_lits
-               or q.text_lits != ref.text_lits or plain(q) != plain(ref) for q in qs):
-            return None
+        for q in qs:
+            if q.num_lits != ref.num_lits or q.text_lits != ref.text_lits or plain(q) != plain(ref):
+                return None, f"{q.key} and {ref.key} have different classes of values"
         reps = ref.reps
+        n = len(keys)
 
         def number(v: Any) -> bool:
             return isinstance(v, (int, float, Fraction)) and not isinstance(v, bool)
@@ -2021,22 +2071,31 @@ class Environment:
         nums = [v for v in reps if number(v)]
         texts = [v for v in reps if isinstance(v, str)]
         objects = [v for v in reps if isinstance(v, dict)]
-        parts: dict = {}
+        parts: dict = {}           # type -> (counts for 0..n, tuples(j))
+        ones = [1] * (n + 1)
         if any(v is None for v in reps):
-            parts["none"] = lambda j: [(None,) * j]
+            parts["none"] = (ones, lambda j: [(None,) * j])
         for b in (True, False):
             if any(v is b for v in reps):
-                parts[b] = lambda j, b=b: [(b,) * j]
-        if nums:
-            parts["number"] = lambda j: self._located(nums, ref.num_lits, exact_value, j)
-        if texts:
-            parts["text"] = lambda j: self._located(texts, ref.text_lits, str, j)
+                parts[b] = (ones, lambda j, b=b: [(b,) * j])
+        for t, values, lits, key in (("number", nums, ref.num_lits, exact_value),
+                                     ("text", texts, ref.text_lits, str)):
+            if values:
+                fixed, gaps = self._grid(values, lits, key)
+                parts[t] = (self._located_counts(len(fixed), [len(g) for g in gaps], n),
+                            lambda j, values=values, lits=lits, key=key:
+                            self._located(values, lits, key, j))
         if objects:
-            parts["object"] = lambda j: [tuple(objects[r] for r in ranks)
-                                         for ranks in self._set_partitions(j, len(objects))]
+            parts["object"] = ([sum(_stirling2(j, b) for b in range(min(j, len(objects)) + 1))
+                                for j in range(n + 1)],
+                               lambda j: [tuple(objects[r] for r in ranks)
+                                          for ranks in self._set_partitions(j, len(objects))])
         if any(isinstance(v, list) for v in reps):
-            parts["list"] = lambda j: [tuple(list(x) for x in t) for t in _list_tuples(j)]
-        return parts
+            # more than five lists: the set partitions, a lower bound of the patterns
+            parts["list"] = ([len(_list_tuples(j)) if j <= 5 else
+                              sum(_stirling2(j, b) for b in range(j + 1)) for j in range(n + 1)],
+                             lambda j: [tuple(list(x) for x in t) for t in _list_tuples(j)])
+        return parts, ""
 
     @staticmethod
     def _set_partitions(j: int, blocks: int) -> list:
@@ -2047,24 +2106,14 @@ class Environment:
         return out
 
     @staticmethod
-    def _group_count(parts: dict, n: int, sizes: dict) -> tuple:
+    def _group_count(parts: dict, n: int) -> tuple:
         """The number of valuations of a group of n quantities: the sum over
         the types of the quantities of the products of the numbers of
-        patterns. `sizes` gives these numbers per type and size; for lists
-        of more than five quantities the number of set partitions, a lower
-        bound, stands for them (the count is then a lower bound)."""
+        patterns; a lower bound (False) when more than five may be lists."""
         dp = [1] + [0] * n
-        exact = True
-        for t in parts:
-            new = [0] * (n + 1)
-            for m in range(n + 1):
-                for i in range(m + 1):
-                    if dp[m - i]:
-                        new[m] += math.comb(m, i) * dp[m - i] * sizes[t][i]
-            dp = new
-        if "list" in parts and n > 5:
-            exact = False
-        return dp[n], exact
+        for counts, _f in parts.values():
+            dp = _binomial_convolution(dp, counts, n)
+        return dp[n], not ("list" in parts and n > 5)
 
     def _group_valuations(self, keys: list, parts: dict) -> list:
         n = len(keys)
@@ -2072,7 +2121,7 @@ class Environment:
 
         def tuples(t: Any, j: int) -> list:
             if (t, j) not in cache:
-                cache[(t, j)] = parts[t](j)
+                cache[(t, j)] = parts[t][1](j)
             return cache[(t, j)]
 
         types = [t for t in self._TYPES if t in parts]
@@ -2091,59 +2140,65 @@ class Environment:
                 out.append(vals)
         return out
 
+    def _fewer(self, keys: list) -> str:
+        sets = sorted({m.group(1) for k in keys
+                       for m in [re.match(r"([A-Za-z_]\w*)\[\d+\]", k)] if m})
+        return (". Use fewer --members" + (f" ({', '.join(sets)})" if sets else "")
+                + " or, for quantities used in arithmetic, a smaller --domain")
+
     def _reduced_valuations(self, ids: list, keys: list, size: int) -> list:
         """The valuations of a component whose product of classes exceeds the
         limit or that has a group of more than three quantities ordered
         against each other: per group, the valuations by types and patterns;
-        the other quantities take their classes."""
+        the other quantities take their classes. The number of valuations is
+        computed, and checked against the limit, before any is built."""
         groups, rest, counts = [], list(keys), []
         for g in self.link_groups:
             if len(g) < 2 or not set(g) <= set(keys):
                 continue
-            parts = self._group_parts(g)
+            parts, why = self._group_parts(g)
             many = max(self.quantities[k].list_order for k in g) > len(_LIST_VALUES) + 1
             if parts is None:
                 if many:
                     raise NormsCheckError(
                         f"the quantities {', '.join(g)} are ordered (<, <=, >, >=) against each "
-                        f"other and do not all have the same classes of values (a --domain); "
-                        f"norms-check translates such a group of more than 3 quantities only "
-                        f"when they have the same classes (F.12)")
+                        f"other, and {why}; norms-check translates a group of more than 3 "
+                        f"quantities ordered against each other only when they all have the "
+                        f"same classes of values (F.12)")
                 continue
-            sizes: dict = {}
-            for t, f in parts.items():
-                if t == "list":
-                    sizes[t] = [len(_list_tuples(j)) if j <= 5 else
-                                len(self._set_partitions(j, j)) for j in range(len(g) + 1)]
-                elif t == "number" or t == "text":
-                    sizes[t] = [len(f(j)) for j in range(len(g) + 1)]
-                elif t == "object":
-                    sizes[t] = [len(f(j)) for j in range(len(g) + 1)]
-                else:
-                    sizes[t] = [1] * (len(g) + 1)
-            count, exact = self._group_count(parts, len(g), sizes)
+            count, exact = self._group_count(parts, len(g))
             groups.append((g, parts))
-            counts.append((g, count, exact, sizes))
+            counts.append((g, count, exact, parts))
             rest = [k for k in rest if k not in g]
         total = 1
-        for _g, c, _e, _s in counts:
+        for _g, c, _e, _p in counts:
             total *= c
         for k in rest:
             total *= len(self.quantities[k].reps)
         if total > MAX_VALUATIONS:
+            def seq(parts: dict, t: str, n: int) -> str:
+                if t not in parts:
+                    return "[]"
+                c = parts[t][0][1:]
+                if t == "list" and n > 5:
+                    return (f"[{', '.join(map(str, c[:5]))}, and at least "
+                            f"{', '.join(map(str, c[5:]))} (set partitions)]")
+                return str(c)
+
             detail = "; ".join([
                 f"the {len(g)} quantities {', '.join(g)} compared with each other have "
                 f"{'at least ' if not e else ''}{c} valuations by types and patterns "
-                f"(patterns of numbers {s.get('number', [0])[1:]}, texts "
-                f"{s.get('text', [0])[1:]}, objects {s.get('object', [0])[1:]} and lists "
-                f"{s.get('list', [0])[1:]} for 1, 2, ... quantities of that type)"
-                for g, c, e, s in counts] + ([
+                f"(patterns of numbers {seq(p, 'number', len(g))}, texts "
+                f"{seq(p, 'text', len(g))}, objects {seq(p, 'object', len(g))} and lists "
+                f"{seq(p, 'list', len(g))} for 1, 2, ... quantities of that type)"
+                for g, c, e, p in counts] + ([
                 f"the other quantities {', '.join(rest)} take their classes"] if rest else []))
             raise NormsCheckError(
                 f"the predicates {', '.join(repr(self.preds[i].text) for i in ids)} read "
                 f"{len(keys)} quantities with {size} combinations of classes; {detail}"
-                f": {total} valuations together, and norms-check refuses more than "
-                f"{MAX_VALUATIONS} (F.12)")
+                f": {'at least ' if any(not e for _g, _c, e, _p in counts) else ''}"
+                f"{total} valuations together, and norms-check refuses more than "
+                f"{MAX_VALUATIONS} (F.12)" + self._fewer(keys))
         options = [self._group_valuations(g, parts) for g, parts in groups]
         options += [[{k: v} for v in self.quantities[k].reps] for k in rest]
         owners: dict = {}

@@ -588,7 +588,7 @@ def model_of(name: str, **kw):
                  "ARITH": ARITH, "MIXED": MIXED, "LISTS": LISTS,
                  "MULTI": MULTI, "STAGGER": STAGGER, "LINEAR": LINEAR,
                  "NONLINEAR": NONLINEAR, "LINEAR2": LINEAR2, "FOUR": FOUR,
-                 "FOUR_EQ": FOUR_EQ}
+                 "FOUR_EQ": FOUR_EQ, "EXACT4": EXACT4}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
         _MODELS[key] = (sos, m, PrismModel(m.prism_text(), {"early_end": True}))
@@ -2099,6 +2099,84 @@ def test_four_ordered_quantities_cover_every_json_value(name, orders):
         assert tuple(tr._oracle(exprs, vals)) in known, vals
 
 
+# four ordered quantities with number and text literals, true, a chain of
+# four distinct values inside one gap (0 < a < b < c < d < 1), two distinct
+# texts in one gap (c < a < 'k'), and predicates that only false (p5) and
+# only the number 1 (p6) satisfy
+EXACT4 = """\
+norms:
+  - id: p1
+    kind: prohibition
+    bearer: D
+    content: "R[1].a < R[1].b AND R[1].b < R[1].c AND R[1].c < R[1].d AND R[1].d < 1 AND R[1].a > 0"
+  - id: p2
+    kind: prohibition
+    bearer: D
+    content: "R[1].a <= R[1].b AND R[1].b >= true"
+  - id: p3
+    kind: prohibition
+    bearer: D
+    content: "R[1].a == R[1].c OR R[1].b > R[1].d"
+  - id: p4
+    kind: prohibition
+    bearer: D
+    content: "R[1].c < R[1].a AND R[1].a < \\"k\\" AND R[1].d > \\"k\\""
+  - id: p5
+    kind: prohibition
+    bearer: D
+    content: "R[1].c >= 0 AND R[1].c <= 0 AND R[1].c != 0"
+  - id: p6
+    kind: prohibition
+    bearer: D
+    content: "R[1].d >= true AND R[1].d <= true AND R[1].d != true"
+"""
+
+
+def test_four_ordered_quantities_exact_on_dense_values():
+    """Every vector of predicate values that dense values give is a choice
+    of the model of four ordered quantities with number and text literals:
+    every 4-tuple of numbers (four in the gap between 0 and 1), of texts
+    (four below and two above the literal 'k'), of objects and of lists
+    (comparable and not), of a compact pool of every type, and random
+    tuples of mixed types."""
+    import itertools
+    import random as _random
+    _sos, m, _pm = model_of("EXACT4")
+    tr = m.trs[0]
+    assert all(n.status == "model" for n in tr.norms)
+    (ids, vecs), = tr.components
+    keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+    exprs = [tr.preds[i].expr for i in ids]
+    known = {v for v, _vals in vecs}
+    numbers = [-1, 0, 0.1, 0.2, 0.3, 0.4, 1, 2]
+    texts = ["", "a", "b", "c", "k", "ka", "kb"]
+    objects = [{}, {"x": 1}, {"x": 2}, {"y": 0}]
+    lists = [[], [0], [1], ["a"], ["b"], [0, 0], [0, "a"], [{}]]
+    other = [None, True, False]
+    seen = set()
+
+    def check(vals):
+        v = tuple(tr._oracle(exprs, vals))
+        assert v in known, vals
+        seen.add(v)
+
+    compact = [None, True, False, 0, 0.1, 0.2, 1, 2, "a", "b", "k", "ka", {}, [0]]
+    for pool in (numbers, texts, objects, lists, compact):
+        for combo in itertools.product(pool, repeat=4):
+            check(dict(zip(keys, combo)))
+    rng = _random.Random(8)
+    mixed = numbers + texts + objects + lists + other
+    for _ in range(20000 if LONG else 6000):
+        vals = {k: rng.choice(mixed) for k in keys}
+        if rng.random() < 0.3:
+            a, b = rng.sample(keys, 2)
+            vals[a] = vals[b]
+        check(vals)
+    # the dense values reach most choices (the rest need, for example, four
+    # numbers above 1 or lists with longer common prefixes)
+    assert len(seen) >= 0.9 * len(known), (len(seen), len(known))
+
+
 def test_reduced_valuations_agree_with_the_classes():
     """The valuations by types and patterns give the same vectors of
     predicate values as the product of the classes, for groups of two and
@@ -2143,6 +2221,44 @@ norms:
     four = body.replace(" AND R[1].d < R[1].e", " AND R[1].a > 3 AND R[1].d < 9")
     with pytest.raises(NormsCheckError, match=r"valuations by types and patterns"):
         build_model(make_sos(four))
+
+
+def test_large_groups_are_refused_quickly():
+    """A group too large for the limit is refused from the counts of its
+    patterns, before any pattern is built: twelve quantities compared for
+    equality, and a wildcard comparison over eight members, within a few
+    seconds (the first version built every pattern and ignored
+    --timeout). The refusal marks the lower bounds for more than five
+    lists and keeps the hint about --members."""
+    import time
+    chain = " AND ".join(f"R[1].q{i} == R[1].q{i + 1}" for i in range(11))
+    body = f"""\
+norms:
+  - id: eq
+    kind: prohibition
+    bearer: D
+    content: "{chain}"
+"""
+    t = time.monotonic()
+    with pytest.raises(NormsCheckError) as e:
+        build_model(make_sos(body))
+    assert time.monotonic() - t < 10
+    assert "at least" in str(e.value) and "(set partitions)" in str(e.value)
+    body = """\
+norms:
+  - id: same
+    kind: prohibition
+    bearer: D
+    content: "R[*].load == D.load AND R[*].v == D.v"
+"""
+    t = time.monotonic()
+    with pytest.raises(NormsCheckError, match=r"Use fewer --members \(R\)"):
+        build_model(make_sos(body), members=["R=3"])
+    assert time.monotonic() - t < 10
+    # five quantities only compared for equality are refused as well
+    chain = " AND ".join(f"R[1].q{i} == R[1].q{i + 1}" for i in range(4))
+    with pytest.raises(NormsCheckError, match=r"have 424213 valuations"):
+        build_model(make_sos(body.replace("R[*].load == D.load AND R[*].v == D.v", chain)))
 
 
 def test_ordered_quantities_with_linear_arithmetic_are_refused():
