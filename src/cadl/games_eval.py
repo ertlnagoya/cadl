@@ -115,6 +115,7 @@ class Game:
     _selection: dict = field(default_factory=dict)
     _target: dict = field(default_factory=dict)
     _rho: dict = field(default_factory=dict)
+    _lifting: Any = field(default=False, repr=False)   # False: not yet computed
 
     @property
     def multi_affine(self) -> bool:
@@ -1126,33 +1127,197 @@ def cell_corners(cell: tuple) -> list:
     return list(itertools.product(*cell))
 
 
+# The largest number of coordinates of a lifted cell (open parameters and
+# lifted functions, I.9); a game that needs more does not use the coupled
+# bounds.
+LIFT_LIMIT = 10
+# Whether designs with probabilities that are not multi-affine use the
+# coupled bounds through the lifting of I.9 (False gives the maps of cadl
+# 0.3.28).
+USE_LIFTING = True
+
+
+class CouplingUnavailable(Exception):
+    """A coupled bound cannot be computed on this cell (I.9): a corner of
+    the lifted cell gives a command a distribution that is not one the
+    relaxed process may choose. Leaving the bound out is sound."""
+
+
+@dataclass
+class Lifting:
+    """The lifting of I.9 of the probabilities of a game. Each probability
+    that is not multi-affine in the open parameters x is written
+    a + b · R(x), with R one of the *lifted functions* (no constant term,
+    first coefficient 1), and R is replaced by a new coordinate y. A
+    probability of a row is then a multi-affine polynomial L in (x, y)
+    with L(x, R(x)) equal to it, and the polynomials of a row sum to 1
+    identically in (x, y): when the forms a + b · y do not, the last
+    probability that is not multi-affine is replaced by 1 minus the
+    others. The coordinates are shared by all rows, so that two commands
+    with the same probability have the same value at every corner of the
+    lifted cell."""
+    functions: list                    # canonical polynomials R in x
+    rows: dict                         # id(row) -> tuple of lifted polynomials
+
+    def dimension(self, n: int) -> int:
+        return n + len(self.functions)
+
+
+def _lifted_form(poly: tuple, n: int) -> tuple:
+    """(a, b, R) with poly = a + b · R, R without constant term and with
+    first coefficient 1 (canonical)."""
+    zero = (0,) * n
+    a = ZERO
+    rest = []
+    for e, c in poly:
+        if e == zero:
+            a = c
+        else:
+            rest.append((e, c))
+    b = rest[0][1]
+    return a, b, tuple((e, c / b) for e, c in rest)
+
+
+def lift_game(game: Game) -> "Lifting | None":
+    """The lifting of the probabilities of the game (`Lifting`), computed
+    once; None when the lifted cell would have more than LIFT_LIMIT
+    coordinates."""
+    if game._lifting is not False:
+        return game._lifting
+    n = len(game.names)
+    zero = (0,) * n
+    rows = {}
+    for cmds in game.commands:
+        for c in cmds:
+            rows.setdefault(id(c.row), c.row)
+    keys: dict = {}                    # R -> position among the lifted functions
+    forms: dict = {}
+    for key, row in rows.items():
+        if row.multi_affine:
+            continue
+        form = []
+        for p in row.polys:
+            if _multi_affine(p):
+                form.append((dict(p), None))
+            else:
+                a, b, r = _lifted_form(p, n)
+                form.append(({zero: a} if a else {}, (b, r)))
+        # Whether the forms sum to 1 identically in (x, y).
+        affine: dict = {}
+        ys: dict = {}
+        for x_part, y_part in form:
+            affine = _p_add(affine, x_part)
+            if y_part is not None:
+                ys[y_part[1]] = ys.get(y_part[1], ZERO) + y_part[0]
+        if _canonical(affine) != ((zero, ONE),) or any(ys.values()):
+            last = max(j for j, (_, y) in enumerate(form) if y is not None)
+            form[last] = ("rest", None)
+        forms[key] = form
+        for x_part, y_part in form:
+            if y_part is not None and y_part[1] not in keys:
+                keys[y_part[1]] = len(keys)
+    if n + len(keys) > LIFT_LIMIT:
+        game._lifting = None
+        return None
+    m = n + len(keys)
+    pad = (0,) * len(keys)
+
+    def extend(p: dict) -> dict:
+        return {e + pad: c for e, c in p.items() if c}
+
+    lifted: dict = {}
+    for key, row in rows.items():
+        if row.multi_affine:
+            lifted[key] = tuple(_canonical(extend(dict(p))) for p in row.polys)
+            continue
+        out = []
+        for x_part, y_part in forms[key]:
+            if x_part == "rest":
+                out.append(None)
+                continue
+            q = extend(x_part)
+            if y_part is not None:
+                b, r = y_part
+                e = [0] * m
+                e[n + keys[r]] = 1
+                q = _p_add(q, {tuple(e): b})
+            out.append(q)
+        if None in out:
+            j = out.index(None)
+            rest: dict = {(0,) * m: ONE}
+            for q in out:
+                if q is not None:
+                    rest = _p_add(rest, q, -1)
+            out[j] = rest
+        lifted[key] = tuple(_canonical(q) for q in out)
+    game._lifting = Lifting(functions=list(keys), rows=lifted)
+    return game._lifting
+
+
+def coupling_applies(game: Game) -> bool:
+    """Whether the coupled bounds of I.9 can be computed for the game: its
+    probabilities are multi-affine in the open parameters, or the lifted
+    cell has at most LIFT_LIMIT coordinates."""
+    return game.multi_affine or (USE_LIFTING and lift_game(game) is not None)
+
+
 class CornerTable:
     """Exact values of the probabilities and step payoffs of a game at the
-    corners of one cell, computed when first asked for. The probabilities
-    of every command must be multi-affine in the open parameters
-    (`game.multi_affine`); a step payoff that is not multi-affine is
-    enclosed by `poly_bounds` instead."""
+    corners of one lifted cell (I.9), computed when first asked for. When
+    the probabilities of every command are multi-affine in the open
+    parameters, the lifted cell is the cell. Otherwise each lifted
+    function R (`lift_game`) adds the coordinate y with the interval of an
+    exact enclosure of R on the cell, which contains R(v) for every v of
+    the cell; a probability that is not multi-affine is evaluated at a
+    corner by its lifted polynomial. Its value there lies in its own
+    enclosure, the set of distributions of the relaxed process, only when
+    it is checked (`distribution` raises `CouplingUnavailable` otherwise).
+    A step payoff that is not multi-affine is enclosed by `poly_bounds`."""
 
     def __init__(self, game: Game, cell: tuple):
-        if not game.multi_affine:
-            # A probability that is not multi-affine is not a mixture of its
-            # values at the corners with weights common to all commands
-            # (I.9); bounds from the corners would not be sound.
-            raise ValueError("the coupled bounds of I.9 need probabilities that are "
-                             "multi-affine in the open parameters")
+        lifting = lift_game(game)
+        if lifting is None:
+            raise ValueError(f"the coupled bounds of I.9 need at most {LIFT_LIMIT} "
+                             f"coordinates of the lifted cell")
         self.game = game
         self.cell = cell
-        self.corners = cell_corners(cell)
+        self.lifting = lifting
+        ranges = tuple(_p_interval(r, cell) for r in lifting.functions)
+        # A lifted function whose enclosure is a point adds no corners.
+        self.corners = list(itertools.product(*[sorted({a, b}) for a, b in cell + ranges]))
         self._rows: dict = {}
         self._rho: dict = {}
+        self._checked: dict = {}
+
+    def _relaxed(self, row: Row) -> list:
+        """The intervals of the relaxed process for the probabilities of a
+        row that is not multi-affine (as `_row_actions`)."""
+        key = id(row)
+        if key not in self._checked:
+            out = []
+            for p in row.polys:
+                lo, hi = _p_interval(p, self.cell)
+                out.append((max(lo, ZERO), min(hi, ONE)))
+            self._checked[key] = out
+        return self._checked[key]
 
     def distribution(self, g: int, k: int, c: int) -> dict:
         """The distribution of command k of the game state g at corner c,
-        as a dict from successor state indices to positive probabilities."""
+        as a dict from successor state indices to positive probabilities.
+        Raises `CouplingUnavailable` when it is not a distribution of the
+        relaxed process on the cell."""
         cmd = self.game.commands[g][k]
         key = (id(cmd.row), c)
         if key not in self._rows:
-            self._rows[key] = [_p_eval(p, self.corners[c]) for p in cmd.row.polys]
+            polys = self.lifting.rows[id(cmd.row)]
+            values = [_p_eval(p, self.corners[c]) for p in polys]
+            if not cmd.row.multi_affine:
+                if sum(values, ZERO) != ONE or any(
+                        not lo <= x <= hi for x, (lo, hi) in zip(values, self._relaxed(cmd.row))):
+                    raise CouplingUnavailable(
+                        f"command {cmd.row.command}: a corner of the lifted cell is not a "
+                        f"distribution of the relaxed process")
+            self._rows[key] = values
         out: dict = {}
         for j, p in zip(cmd.targets, self._rows[key]):
             if p != 0:
@@ -1167,7 +1332,7 @@ class CornerTable:
             if not poly:
                 self._rho[key] = (ZERO, ZERO)
             elif _multi_affine(poly):
-                x = _p_eval(poly, self.corners[c])
+                x = _p_eval(poly, self.corners[c][:len(self.cell)])
                 self._rho[key] = (x, x)
             else:
                 self._rho[key] = poly_bounds(poly, self.cell)
@@ -1217,8 +1382,9 @@ USE_COUPLING = True
 
 class CoupledPlays:
     """The coupled relaxation of I.9 of the advantages of one player on one
-    cell. The probabilities of the game must be multi-affine in the open
-    parameters (`game.multi_affine`).
+    cell, over the corners of the lifted cell of a `CornerTable` (the
+    corners of the cell when the probabilities of the game are
+    multi-affine in the open parameters).
 
     A_p(s, c, v) = Q_p(s, c, v) − Q_p(s, σ(s), v) is the difference of the
     expected payoffs of two plays that start in s, one with c and one with
@@ -1240,15 +1406,22 @@ class CoupledPlays:
     payoff that is not multi-affine is replaced by its bound on the cell
     in the direction of the bound sought.
 
+    With probabilities that are not multi-affine, the same holds over the
+    lifted cell: w_e is taken at the lifted point (v, R(v)), every lifted
+    polynomial L satisfies L(v, R(v)) = Σ_e w_e · L(e), and a corner e
+    is used only when the distribution of each command there is one of
+    the relaxed process (`CornerTable.distribution`).
+
     Every policy of the process on pairs ends with probability 1, since
-    each play alone follows a policy of the relaxed process of I.9, all of
-    whose policies reach the target. Values of pairs are kept, so the
-    advantages of different commands share them."""
+    each play alone follows a policy of the relaxed process of I.9 (a
+    mixture of its distributions), all of whose policies reach the
+    target. Values of pairs are kept, so the advantages of different
+    commands share them. `bound` raises `CouplingUnavailable` when a
+    corner is not usable."""
 
     def __init__(self, game: Game, proc: Process, table: CornerTable):
-        if not game.multi_affine or table.game is not game:
-            raise ValueError("the coupled bounds of I.9 need a CornerTable of the same game, "
-                             "whose probabilities are multi-affine in the open parameters")
+        if table.game is not game:
+            raise ValueError("the coupled bounds of I.9 need a CornerTable of the same game")
         self.game = game
         self.proc = proc
         self.table = table
@@ -1277,6 +1450,8 @@ class CoupledPlays:
             per_corner = []
             for c in range(len(self.table.corners)):
                 d = self.table.distribution(g, k, c)
+                if any(j not in self.local for j in d):
+                    raise CouplingUnavailable("a successor outside the relaxed process")
                 d = {self.local[j]: p for j, p in d.items()}
                 sig = tuple(d.items())
                 if sig not in index:
@@ -1532,7 +1707,7 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
             return out
         if adv is not None and pd_minus(proc, out, adv, at, epsilon, every_state):
             return out
-    if adv is not None and game.multi_affine and \
+    if adv is not None and coupling_applies(game) and \
             (USE_COUPLING if use_coupling is None else use_coupling):
         # PD+ and PD− again, with the bounds of the advantages narrowed by
         # the coupled relaxation (I.9): the upper bounds that are positive
@@ -1547,8 +1722,8 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
             narrowed = False
             for key, (a, b) in adv.items():
                 if b > 0 and plays.may_narrow(*key, lower, upper):
-                    c = plays.bound(*key, maximize=True)
-                    if c < b:
+                    c = _coupled_bound(plays, key, True)
+                    if c is not None and c < b:
                         adv[key] = (a, c)
                         narrowed = True
             if narrowed and pd_plus(proc, out, adv, epsilon, every_state):
@@ -1562,8 +1737,8 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
                 key = (local.get(g), k)
                 if key in adv and plays.may_narrow(*key, lower, upper):
                     a, b = adv[key]
-                    c = plays.bound(*key, maximize=False)
-                    if c > a:
+                    c = _coupled_bound(plays, key, False)
+                    if c is not None and c > a:
                         adv[key] = (c, b)
                         narrowed = True
             if narrowed and at.deviation and \
@@ -1573,6 +1748,15 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
     if every_state and at.admissible and at.state_gain > epsilon:
         state_deviation(game, profile, proc, out, at, lo, upper, cell, epsilon, adv)
     return out
+
+
+def _coupled_bound(plays: CoupledPlays, key: tuple, maximize: bool) -> Fraction | None:
+    """A coupled bound of an advantage, or None when a corner of the lifted
+    cell that it needs is not usable (`CouplingUnavailable`)."""
+    try:
+        return plays.bound(*key, maximize=maximize)
+    except CouplingUnavailable:
+        return None
 
 
 def pd_plus(proc: Process, out: PlayerOnCell, adv: dict, epsilon: Fraction,
@@ -1710,7 +1894,7 @@ def bound_verdict(game: Game, query: EquilibriumQuery, cell: EqCell) -> None:
     every = query.concept == "every_reachable_state"
     try:
         dists = cell_distributions(game, box)
-        table = CornerTable(game, box) if game.multi_affine else None
+        table = CornerTable(game, box) if coupling_applies(game) else None
         players = []
         for p in game.model.players:
             on = player_on_cell(game, query.profile, p.id, box, dists, query.epsilon, every,

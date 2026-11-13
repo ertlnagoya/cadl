@@ -71,6 +71,18 @@ WEIGHTS = [
     ("p - lam", lambda v: v["p"] - v["lam"]),
     ("-p", lambda v: -v["p"]),
 ]
+# mode="nonaffine": more probabilities that are not multi-affine (the
+# lifting of the coupled bounds, I.9); every one lies in [0, 1].
+PROBS_NONAFFINE = [
+    ("p * p", lambda v: v["p"] ** 2),
+    ("1 - p * p", lambda v: 1 - v["p"] ** 2),
+    ("4 * p * (1 - p)", lambda v: 4 * v["p"] * (1 - v["p"])),
+    ("p * q * (1 - q)", lambda v: v["p"] * v["q"] * (1 - v["q"])),
+    ("q * q", lambda v: v["q"] ** 2),
+    ("p * p * q", lambda v: v["p"] ** 2 * v["q"]),
+    ("(1 - p) * (1 - p)", lambda v: (1 - v["p"]) ** 2),
+    ("0.5 + 0.5 * p * (1 - q) * q", lambda v: F(1, 2) + v["p"] * (1 - v["q"]) * v["q"] / 2),
+]
 # J-14 mode: λ (`lam`, in [0, 2]) in a probability (violates condition 2)
 PROBS_LAM = [
     ("0.5 * lam", lambda v: v["lam"] / 2),
@@ -118,6 +130,9 @@ def generate(rng: random.Random, j14: bool = False, mode: str | None = None,
     lam_in_prob = j14 and rng.random() < 0.3
     not_affine = j14 and rng.random() < 0.3
     probs = PROBS_LAM + PROBS_LAM + PROBS[:4] if lam_in_prob else PROBS
+    nonaffine = mode == "nonaffine"
+    if nonaffine:
+        probs = PROBS_NONAFFINE + PROBS_NONAFFINE + PROBS
     weights = WEIGHTS_NOT_AFFINE + WEIGHTS_NOT_AFFINE + WEIGHTS_J14 if not_affine else \
         WEIGHTS_J14 if j14 else WEIGHTS
     n = rng.choice([3, 4, 4, 5])                 # states 0..n-1; n is the goal
@@ -142,13 +157,20 @@ def generate(rng: random.Random, j14: bool = False, mode: str | None = None,
                 rng.shuffle(targets)
                 updates = [(prob, targets[0]), (None, targets[1])]
             else:
+                second = rng.choice(PROBS_NONAFFINE) if nonaffine and rng.random() < 0.6 \
+                    else rng.choice(PROBS[2:6]) if rng.random() < 0.8 else PROBS[4]
                 updates = [(("0.2", lambda v: F(1, 5)), forward),
-                           (rng.choice(PROBS[2:6]) if rng.random() < 0.8 else PROBS[4],
-                            rng.randrange(0, n + 1)),
+                           (second, rng.randrange(0, n + 1)),
                            (None, any_)]
                 # 0.2 + e <= 1 needs e <= 0.8: halve the second probability.
                 text, fn = updates[1][0]
                 updates[1] = ((f"0.5 * ({text})", lambda v, fn=fn: fn(v) / 2), updates[1][1])
+            if nonaffine and k > 0 and rng.random() < 0.5:
+                # The probabilities of the first command of the state, with
+                # other successors (as the attempts with and without care).
+                first = cmds[0]["updates"]
+                succs = [u[1] for u in updates] + [rng.randrange(0, n + 1) for _ in first]
+                updates = [(prob, succ) for (prob, _), succ in zip(first, succs)]
             cmds.append({"action": f"a{i}_{k}", "updates": updates})
         states.append({"owner": owner, "cmds": cmds})
     actions = [c["action"] for s in states for c in s["cmds"]]
@@ -186,6 +208,9 @@ def generate(rng: random.Random, j14: bool = False, mode: str | None = None,
         open_ = ["p", "q", "lam"]
     if mode == "scale" and rng.random() < 0.7:
         open_ = ["p", "q", "lam"]
+    if nonaffine:
+        open_ = rng.choice([["p", "q", "lam"], ["p", "q", "lam"], ["p", "lam"], ["p", "q"],
+                            ["p"]])
     if not j14:
         region = {name: rng.choice(REGIONS[name]) for name in open_}
     fixed = {"p": rng.choice([F(1, 2), F(3, 10), F(1)]), "q": rng.choice([F(1, 2), F(4, 5)]),
@@ -537,7 +562,7 @@ def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
     import cadl.games_eval as ge
     query = next(q for q in model.equilibria if q.id == "on_region")
     game = ge.prepare_map(model, query, model.designs[0], None)
-    if not game.multi_affine:
+    if not ge.coupling_applies(game):
         return 0
     region = {n: g["region"][n] for n in game.names}
     boxes = [dict(region)]
@@ -548,7 +573,7 @@ def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
             k = rng.randrange(parts)
             box[n] = (lo + (hi - lo) * F(k, parts), lo + (hi - lo) * F(k + 1, parts))
         boxes.append(box)
-    compared = 0
+    compared = lifted = 0
     for box in boxes:
         cell = tuple(box[n] for n in game.names)
         try:
@@ -578,7 +603,11 @@ def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
                     action = game.commands[gi][k].command.action
                     c = next(c for c, cmd in enumerate(g["states"][loc]["cmds"])
                              if cmd["action"] == action)
-                    bounds[(loc, c)] = (plays.bound(i, k, False), plays.bound(i, k, True))
+                    try:
+                        bounds[(loc, c)] = (plays.bound(i, k, False), plays.bound(i, k, True))
+                    except ge.CouplingUnavailable:
+                        stats["advantages_unavailable"] = \
+                            stats.get("advantages_unavailable", 0) + 1
             for point, oracle in oracles:
                 a = oracle.analyse(pl)
                 if not a["admissible"]:
@@ -595,11 +624,14 @@ def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
                         for k in (c, sigma)}
                     adv = q[c] - q[sigma]
                     compared += 1
+                    if not game.multi_affine:
+                        lifted += 1
                     if not lo <= adv <= hi:
                         raise Unsound(f"coupled bounds [{lo}, {hi}] of the advantage of "
                                       f"{pl} for command {c} in state {s} miss {adv} "
                                       f"at {point} in {box}")
     stats["advantages_compared"] = stats.get("advantages_compared", 0) + compared
+    stats["advantages_compared_lifted"] = stats.get("advantages_compared_lifted", 0) + lifted
     return compared
 
 
@@ -676,6 +708,8 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
         on = original_on(*args, **kwargs)
         if on is not None and on.coupled:
             count("players_decided_by_coupling")
+            if not args[0].multi_affine:
+                count("players_decided_by_coupling_lifted")
         return on
     ge.player_on_cell = counting
     try:
@@ -732,8 +766,9 @@ def mutation(name: str | None):
               "reward_bounds", "endpoint_parameter_free_model", "endpoint_affine_weights",
               "endpoint_monotone_states", "certified_reach", "player_on_cell",
               "USE_ADVANTAGES", "advantage_bounds", "advantage_reward", "poly_bounds",
-              "CoupledPlays", "_coupling")}
-    if name is not None and name not in ADVANTAGE_MUTATIONS + COUPLING_MUTATIONS:
+              "CoupledPlays", "_coupling", "CornerTable")}
+    if name is not None and name not in ADVANTAGE_MUTATIONS + COUPLING_MUTATIONS \
+            + LIFTING_MUTATIONS:
         # The other mutants concern N, E1, E2, N_s and the end points: the
         # conditions PD+ and PD− are switched off, so that the cells reach
         # the mutated condition as they did before PD+ and PD− existed.
@@ -837,6 +872,36 @@ def mutation(name: str | None):
                     return [(F(0), F(0), d) for _, _, d in opts]
                 return opts
         ge.CoupledPlays = FirstOnly
+    elif name == "lift_corners_only":
+        # No lifting: a probability that is not multi-affine evaluated at the
+        # corners of the cell, as if it were multi-affine.
+        class CornersOnly(saved["CornerTable"]):
+            def distribution(self, g, k, c):
+                cmd = self.game.commands[g][k]
+                point = self.corners[c][:len(self.cell)]
+                out = {}
+                for j, poly in zip(cmd.targets, cmd.row.polys):
+                    x = ge._p_eval(poly, point)
+                    if x != 0:
+                        out[j] = out.get(j, F(0)) + x
+                return out
+        ge.CornerTable = CornersOnly
+    elif name in ("lift_centre_range", "lift_lower_range"):
+        # The interval of a lifted coordinate: the value of the lifted
+        # function at the centre of the cell, or the lower half of its
+        # enclosure, instead of the whole enclosure.
+        class Narrow(saved["CornerTable"]):
+            def __init__(self, game, cell):
+                super().__init__(game, cell)
+                centre = tuple((a + b) / 2 for a, b in cell)
+                ranges = []
+                for r in self.lifting.functions:
+                    lo, hi = ge._p_interval(r, cell)
+                    x = ge._p_eval(r, centre)
+                    ranges.append((x, x) if name == "lift_centre_range" else (lo, (lo + hi) / 2))
+                self.corners = list(itertools.product(
+                    *[sorted({a, b}) for a, b in tuple(cell) + tuple(ranges)]))
+        ge.CornerTable = Narrow
     elif name is not None:
         raise ValueError(name)
     try:
@@ -855,6 +920,9 @@ ADVANTAGE_MUTATIONS = ("advantage_drop_successors", "advantage_swap_sides",
                        "advantage_centre_only")
 COUPLING_MUTATIONS = ("coupling_swap_sides", "coupling_drop_first_payoff",
                       "coupling_drop_later_payoffs")
+# Bugs of the lifting of probabilities that are not multi-affine (I.9);
+# they are found with mode="nonaffine".
+LIFTING_MUTATIONS = ("lift_corners_only", "lift_centre_range", "lift_lower_range")
 
 
 def run(seed: int, count: int, mutant: str | None = None, max_cells: int = 24,
@@ -894,16 +962,17 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--extra", type=int, default=4)
     parser.add_argument("--mutation", default=None,
                         choices=MUTATIONS + ENDPOINT_MUTATIONS + EVERY_STATE_MUTATIONS
-                        + ADVANTAGE_MUTATIONS + COUPLING_MUTATIONS)
+                        + ADVANTAGE_MUTATIONS + COUPLING_MUTATIONS + LIFTING_MUTATIONS)
     parser.add_argument("--no-direct", action="store_true",
                         help="do not check the coupled bounds of the advantages directly "
                              "(only the claims of the maps)")
     parser.add_argument("--j14", action="store_true",
                         help="one-parameter maps over lam in files that declare grounding "
                              "0.1 (the end-point certification of I.9, through J-14)")
-    parser.add_argument("--mode", choices=("endpoints", "scale"), default=None,
+    parser.add_argument("--mode", choices=("endpoints", "scale", "nonaffine"), default=None,
                         help="endpoints: one-parameter maps over lam in files without "
-                             "grounding; scale: 3 or 4 players, mostly 3 open parameters")
+                             "grounding; scale: 3 or 4 players, mostly 3 open parameters; "
+                             "nonaffine: mostly probabilities that are not multi-affine")
     parser.add_argument("--concept", choices=("nash", "every", "both"), default="nash")
     args = parser.parse_args(argv)
     start = time.time()
