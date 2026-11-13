@@ -49,6 +49,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   ends before each run, which the previous observation already made, and
   the reset of the inner summary at the first candidate).
 
+- `cadl a2a-gateway --grpc-listen` accepts its connections in a front
+  listener of its own (new module `cadl.a2a_grpc_front`, standard
+  library only, one asyncio thread) and passes the bytes of each one
+  unchanged to the gRPC server, which now listens on a Unix socket in a
+  directory of mode 0700 (on 127.0.0.1 with a port of the system where
+  there are no Unix sockets). TLS and mutual TLS still end in gRPC, so
+  certificates and identities are unchanged. New options
+  `--max-grpc-connections` (64), `--max-grpc-connections-per-address`
+  (4, an IPv4 address or an IPv6 /64) and
+  `--max-grpc-connections-per-prefix` (16, an IPv4 /24 or IPv6 /48); a
+  connection beyond them is reset at once and recorded at the capped
+  rate (`overloaded`, `connections`). A connection that has carried no
+  call within `--read-timeout` of its accept is reset and recorded
+  (`read_timeout`, `grpc handshake`). Each connection to the gRPC server
+  comes from an address of its own, which the gateway maps back to the
+  accepted connection, so the caps on calls not yet authenticated still
+  count the real client address; a call that does not come through the
+  front listener is refused (`UNAVAILABLE`). One address thus has at
+  most 4 connections and 64 concurrent calls (G.13). The gRPC server
+  now pings a connection with a call open after 60 seconds without data
+  and closes it when the answer does not come within 20 seconds (before,
+  the default of 2 hours applied); `grpcio` 1.85 times that answer with
+  `grpc.http2.ping_timeout_ms`, not with `grpc.keepalive_timeout_ms`,
+  so both are set. The front listener reads the gRPC server on while up
+  to 256 KiB wait for the client, so it sees the server close a
+  connection also when the client reads nothing, and resets the client's
+  side at most 5 seconds later; when more waits, or the server does not
+  take the client's bytes, and the backlog does not drain within 30
+  seconds, both sides are reset (`read_timeout`, `grpc stalled`). A connection counts
+  against the caps until its sockets are closed; refusals are recorded
+  by a thread of their own; `localhost` is listened on at 127.0.0.1 and
+  ::1, as gRPC did. No new dependency.
+
 ### Changed
 
 - Runtime estimates of `CadlNormsEval` (10 410 bytes), `CadlNormsWindows`
@@ -59,6 +92,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 - Tests: contents of the test sets with fractional durations (`2.5s`)
   are not parsed and froze their norms; the new sets use whole seconds.
+
 
 ## [0.3.28] — 2026-11-13
 
