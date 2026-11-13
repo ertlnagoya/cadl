@@ -1,5 +1,5 @@
-"""An A2A agent built with the official `a2a-sdk` (JSON-RPC binding,
-Starlette and uvicorn), for the interoperability tests of
+"""An A2A agent built with the official `a2a-sdk` (JSON-RPC binding at /
+and HTTP+JSON binding at its routes, Starlette and uvicorn), for the interoperability tests of
 `cadl a2a-gateway` (tests/test_sdk_interop.py). It runs in a thread of the
 test.
 
@@ -20,8 +20,17 @@ import uvicorn
 from a2a.helpers.proto_helpers import get_message_text, new_task, new_text_part
 from a2a.server.agent_execution import AgentExecutor
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.server.routes import (
+    create_agent_card_routes,
+    create_jsonrpc_routes,
+    create_rest_routes,
+)
+from a2a.server.tasks import (
+    BasePushNotificationSender,
+    InMemoryPushNotificationConfigStore,
+    InMemoryTaskStore,
+    TaskUpdater,
+)
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
@@ -58,13 +67,14 @@ class Recorder(AgentExecutor):
         await up.cancel()
 
 
-def agent_card(url: str, extension_uri: str, streaming: bool = True) -> AgentCard:
+def agent_card(url: str, extension_uri: str, streaming: bool = True,
+               binding: str = "JSONRPC", push: bool = False) -> AgentCard:
     return AgentCard(
         name="summarizer", description="CADL interoperability test agent", version="1",
-        supported_interfaces=[AgentInterface(url=url, protocol_binding="JSONRPC",
+        supported_interfaces=[AgentInterface(url=url, protocol_binding=binding,
                                              protocol_version="1.0")],
         capabilities=AgentCapabilities(
-            streaming=streaming,
+            streaming=streaming, push_notifications=push,
             extensions=[AgentExtension(uri=extension_uri, required=True)]),
         default_input_modes=["text"], default_output_modes=["text"],
         skills=[AgentSkill(id="summarize", name="summarize", description="summarize",
@@ -82,14 +92,24 @@ def free_port() -> int:
 class Agent:
     """The agent on a free port of 127.0.0.1."""
 
-    def __init__(self, extension_uri: str) -> None:
+    def __init__(self, extension_uri: str, push: bool = False) -> None:
         port = free_port()
         self.url = f"http://127.0.0.1:{port}/"
         self.executor = Recorder()
-        card = agent_card(self.url, extension_uri)
-        handler = DefaultRequestHandler(self.executor, InMemoryTaskStore(), card)
+        card = agent_card(self.url, extension_uri, push=push)
+        kw = {}
+        if push:
+            # Push notifications with the sender of the SDK, which POSTs to
+            # the URL of each configuration (here the gateway's).
+            import httpx
+            store = InMemoryPushNotificationConfigStore()
+            kw = {"push_config_store": store,
+                  "push_sender": BasePushNotificationSender(httpx.AsyncClient(timeout=30),
+                                                            store)}
+        handler = DefaultRequestHandler(self.executor, InMemoryTaskStore(), card, **kw)
+        # The JSON-RPC binding at / and the HTTP+JSON binding at its routes.
         app = Starlette(routes=create_jsonrpc_routes(handler, "/")
-                        + create_agent_card_routes(card))
+                        + create_agent_card_routes(card) + create_rest_routes(handler))
         self.server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
                                                     log_level="warning"))
         threading.Thread(target=self.server.run, daemon=True).start()
