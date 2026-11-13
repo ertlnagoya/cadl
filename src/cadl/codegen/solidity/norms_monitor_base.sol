@@ -35,6 +35,11 @@ uint8 constant B_ADD = 6;
 uint8 constant B_SUB = 7;
 
 struct Val { uint8 k; int256 n; string s; }
+// a truth value as a code: undecided, true, false, undefined
+uint8 constant X_D = 0;
+uint8 constant X_T = 1;
+uint8 constant X_F = 2;
+uint8 constant X_U = 3;
 // a value of an observation, of the request or a binding (k: K_U for null)
 struct ValIn { string name; uint8 k; int256 n; string s; }
 struct Msg { string from; string to; string name; ValIn[] args; }
@@ -85,9 +90,6 @@ struct EvalData {
     mapping(bytes32 => Scan) scans;       // incremental temporal operators, by (node, start)
     int256[] obsT;
     string[] obsSt;          // lifecycle state before each observation
-    // while `over`, node overNode evaluates to overVal (the content of a
-    // norm with its temporal operator replaced, F.5)
-    bool over; uint256 overNode; Val overVal;
 }
 
 // Functions of the monitor without state, in a library of their own (the
@@ -279,14 +281,100 @@ library CadlNormsEval {
         return ev(data, id, p, n);
     }
 
-    /// The truth of `root` at observation n with `node` read as `v`.
-    function evaluateWith(EvalData storage data, uint256 root, uint256 n, uint256 node, Val memory v)
-            public returns (Val memory r) {
-        data.over = true;
-        data.overNode = node;
-        data.overVal = v;
-        r = truth(ev(data, root, n, n));
-        data.over = false;
+    /// The truth of `root` at observation n for every combination of the
+    /// values of the nodes a and b (temporal operators): entry e reads a as
+    /// e % 4 and b as e / 4 (X_D, X_T, X_F, X_U); b may be no node. Returns
+    /// the entries at which the content is true and those at which it is
+    /// undecided. The rest of the content is read once.
+    function table(EvalData storage data, uint256 root, uint256 n, uint256 a, uint256 b)
+            public returns (uint256 ts, uint256 ds) {
+        Vt memory r = vt(data, root, n, a, b);
+        uint256 v = r.x ? r.v : spread(code(truth(r.s)));
+        for (uint256 e = 0; e < 16; e++) {
+            uint256 c = v >> (2 * e) & 3;
+            if (c == X_T) ts |= 1 << e;
+            if (c == X_D) ds |= 1 << e;
+        }
+    }
+
+    /// A node as one value s (no operator a or b below it), or (x) as the
+    /// codes v of its 16 entries (truth values: a value with a or b below it
+    /// is one).
+    struct Vt { bool x; Val s; uint256 v; }
+
+    function vt(EvalData storage data, uint256 id, uint256 n, uint256 a, uint256 b) internal returns (Vt memory) {
+        if (id == a) return Vt(true, mark(K_U), 0xe4e4e4e4);
+        if (id == b) return Vt(true, mark(K_U), 0xffaa5500);
+        Node storage nd = data.nodes[id];
+        uint8 op = nd.op;
+        if (op == OP_NOT || op == OP_AND || op == OP_OR || op == OP_BIN) {
+            Vt memory l = vt(data, nd.a, n, a, b);
+            Vt memory r = op == OP_NOT ? Vt(false, mark(K_U), 0) : vt(data, nd.b, n, a, b);
+            if (!l.x && !r.x) return Vt(false, combine(op, nd.bop, l.s, r.s), 0);
+            return Vt(true, mark(K_U), entries(op, nd.bop, l, r));
+        }
+        if (op == OP_IN) return inVec(data, nd, n, a, b);
+        return Vt(false, ev(data, id, n, n), 0);
+    }
+
+    function entries(uint8 op, uint8 bop, Vt memory l, Vt memory r) internal pure returns (uint256 out) {
+        uint256 seen = 0;
+        Val[16] memory memo;
+        for (uint256 e = 0; e < 16; e++) {
+            uint256 cl = l.v >> (2 * e) & 3;
+            uint256 cr = r.v >> (2 * e) & 3;
+            uint256 j = (l.x ? cl : 0) + 4 * (r.x ? cr : 0);
+            if (seen >> j & 1 == 0) {
+                memo[j] = combine(op, bop, l.x ? codeVal(cl) : l.s, r.x ? codeVal(cr) : r.s);
+                seen |= 1 << j;
+            }
+            out |= uint256(code(truth(memo[j]))) << (2 * e);
+        }
+    }
+
+    function combine(uint8 op, uint8 bop, Val memory l, Val memory r) internal pure returns (Val memory) {
+        if (op == OP_NOT) {
+            Val memory v = truth(l);
+            return v.k == K_B ? boolVal(v.n == 0) : v;
+        }
+        if (op == OP_BIN) return CadlNormsValues.binop(bop, l, r);
+        return andOr(op == OP_OR, truth(l), truth(r));
+    }
+
+    function inVec(EvalData storage data, Node storage nd, uint256 n, uint256 a, uint256 b)
+            internal returns (Vt memory) {
+        uint256 m = nd.items.length;
+        Vt[] memory xs = new Vt[](m + 1);
+        bool any = false;
+        for (uint256 j = 0; j <= m; j++) {
+            xs[j] = vt(data, j == 0 ? nd.a : nd.items[j - 1], n, a, b);
+            any = any || xs[j].x;
+        }
+        uint256 out = 0;
+        for (uint256 e = 0; e < (any ? 16 : 1); e++) {
+            Val[] memory items = new Val[](m);
+            for (uint256 j = 1; j <= m; j++) items[j - 1] = xs[j].x ? codeVal(xs[j].v >> (2 * e) & 3) : xs[j].s;
+            Val memory r = inVals(xs[0].x ? codeVal(xs[0].v >> (2 * e) & 3) : xs[0].s, items);
+            if (!any) return Vt(false, r, 0);
+            out |= uint256(code(truth(r))) << (2 * e);
+        }
+        return Vt(true, mark(K_U), out);
+    }
+
+    function code(Val memory v) internal pure returns (uint8) {
+        if (v.k == K_D) return X_D;
+        if (v.k == K_B) return v.n == 1 ? X_T : X_F;
+        return X_U;
+    }
+
+    function codeVal(uint256 c) internal pure returns (Val memory) {
+        if (c == X_D) return mark(K_D);
+        if (c == X_U) return mark(K_U);
+        return boolVal(c == X_T);
+    }
+
+    function spread(uint8 c) internal pure returns (uint256 v) {
+        for (uint256 e = 0; e < 16; e++) v |= uint256(c) << (2 * e);
     }
 
     function boolVal(bool b) internal pure returns (Val memory) {
@@ -351,7 +439,6 @@ library CadlNormsEval {
     }
 
     function ev(EvalData storage data, uint256 id, uint256 p, uint256 n) internal returns (Val memory) {
-        if (data.over && id == data.overNode) return data.overVal;
         Node storage nd = data.nodes[id];
         uint8 op = nd.op;
         if (op == OP_LIT) return nd.lit;
@@ -387,11 +474,18 @@ library CadlNormsEval {
     function inList(EvalData storage data, Node storage nd, uint256 p, uint256 n) internal returns (Val memory) {
         Val memory l = ev(data, nd.a, p, n);
         if (l.k == K_U || l.k == K_D) return l;
+        Val[] memory items = new Val[](nd.items.length);
+        for (uint256 i = 0; i < nd.items.length; i++) items[i] = ev(data, nd.items[i], p, n);
+        return inVals(l, items);
+    }
+
+    function inVals(Val memory l, Val[] memory items) internal pure returns (Val memory) {
+        if (l.k == K_U || l.k == K_D) return l;
         if (l.k == K_S) return mark(K_U);
         bool sawD = false;
         bool sawU = false;
-        for (uint256 i = 0; i < nd.items.length; i++) {
-            Val memory it = ev(data, nd.items[i], p, n);
+        for (uint256 i = 0; i < items.length; i++) {
+            Val memory it = items[i];
             if (it.k == K_S && l.k != K_T) it = mark(K_U);
             if (it.k == K_D) { sawD = true; continue; }
             if (it.k == K_U) { sawU = true; continue; }
@@ -470,34 +564,45 @@ library CadlNormsEval {
 }
 
 
-// The candidates of a norm whose content is one temporal operator (F.4,
+// The candidates of a norm whose content has one temporal operator (F.4,
 // F.5): the observations at which the content has to be decided, oldest
 // first, with what the observations since the last judgement say about
-// the operand. Each candidate is decided from these summaries; no
+// the operands. Each candidate is decided from these summaries; no
 // window is scanned per candidate, so the cost of an observation does
 // not grow with the number of candidates.
 struct Window {
     uint256 head; uint256 tail; uint256 purge;     // candidates [head, tail); entries before purge are deleted
     bool luSet; uint256 lu;                        // candidates at or before lu have an operand that was unknown
-    bool ffSet; int256 ff; bool fuSet; int256 fu;  // throughout: the first time false, unknown
+                                                   // (release: a p that was not true)
+    bool luqSet; uint256 luq;                      // release: candidates at or before luq have seen q not false
+    bool ffSet; int256 ff; uint256 ffi;            // throughout: the first time false; release: the first p false
+    bool fuSet; int256 fu;                         // throughout: the first time unknown
     bool ftSet; int256 ft;                         // within: the first time true
-    bool jSet; uint256 j; int256 jt;               // until: the first observation with q true
-    bool pSet; uint256 pFirst; bool pFalse; bool pUnknown;   // until: p not true
+    bool jSet; uint256 j; int256 jt;               // until, release: the first observation with q true
+    bool pSet; uint256 pFirst; bool pFalse; bool pUnknown;   // until, release: p not true
+    bool qnSet; uint256 qn; int256 qnt;            // release: the first observation with q not false
     uint256 at; uint8 pv; uint8 qv;                // the operands at observation at - 1
     mapping(uint256 => uint256) k;                 // the observation of a candidate
     mapping(uint256 => int256) t;                  // its time
 }
 
+// The three queues of a norm: the candidates that are true exactly when
+// the operator is true, those that are true exactly when it is false (the
+// dual operator on the negated operands: NOT within(d, p) is throughout(d,
+// NOT p), NOT throughout(d, p) is within(d, NOT p), NOT until(p, q, d) is
+// the release of D.5), and those that are never true but undecided until
+// the operator is decided.
+struct Windows { Window live; Window dual; Window dead; }
+
 uint8 constant W_WITHIN = 1;
 uint8 constant W_THROUGHOUT = 2;
 uint8 constant W_UNTIL = 3;
+uint8 constant W_RELEASE = 4;
 
-// The temporal operator of the content of a norm: its kind (with `neg`,
-// the dual operator on the negated operand: NOT within(d, p) is
-// throughout(d, NOT p) and NOT throughout(d, p) is within(d, NOT p)), its
-// operands (p, and q of until), its duration, the operator node and the
-// root of the content.
-struct Temporal { uint8 mode; bool neg; uint256 tp; uint256 tq; int256 td; uint256 node; uint256 root; }
+// The temporal operator of the content of a norm: its kind, its operands
+// (p, and q of until), its duration, the operator node and the root of the
+// content.
+struct Temporal { uint8 mode; uint256 tp; uint256 tq; int256 td; uint256 node; uint256 root; }
 
 /// The judgement of the candidates of a temporal content, with a cost per
 /// observation that does not depend on the number of candidates: a few
@@ -506,9 +611,10 @@ struct Temporal { uint8 mode; bool neg; uint256 tp; uint256 tq; int256 td; uint2
 /// The rest of the content is decided at the observation of a candidate
 /// (its names are fixed, see makeKnown), so a candidate is one of: true
 /// whatever the operator gives (a hit), never true (not kept), true
-/// exactly when the operator (or its dual) is true (`live`), or never
-/// true but undecided until the operator is decided (`dead`: it keeps
-/// the norm pending, as F.5 does).
+/// exactly when the operator is true (`live`), true exactly when it is
+/// false (`dual`), true when it is true or false (in both), or never true
+/// but undecided until the operator is decided (`dead`: it keeps the norm
+/// pending, as F.5 does).
 library CadlNormsWindows {
     // truth values of an operand
     uint8 internal constant F = 0;
@@ -519,15 +625,18 @@ library CadlNormsWindows {
     uint8 internal constant C_DROP = 1;
     uint8 internal constant C_LIVE = 2;
     uint8 internal constant C_DEAD = 3;
+    uint8 internal constant C_DUAL = 4;
+    uint8 internal constant C_BOTH = 5;
 
     /// What an observation says about the operands, for the candidates
     /// there are (also while the norm is suspended).
-    function note(Window storage live, Window storage dead, EvalData storage data,
-                  Temporal storage tm, uint256 n, int256 t) public {
-        if (live.head == live.tail && dead.head == dead.tail) return;
-        (uint8 pv, uint8 qv) = operands(live, data, tm, n);
-        summarize(live, tm.mode, n, t, pv, qv);
-        summarize(dead, tm.mode, n, t, pv, qv);
+    function note(Windows storage ws, EvalData storage data, Temporal storage tm, uint256 n, int256 t) public {
+        if (ws.live.head == ws.live.tail && ws.dual.head == ws.dual.tail && ws.dead.head == ws.dead.tail) return;
+        (uint8 pv, uint8 qv) = operands(ws.live, data, tm, n);
+        uint8 mode = tm.mode;
+        summarize(ws.live, mode, n, t, pv, qv);
+        summarize(ws.dual, dualMode(mode), n, t, dualP(mode, pv), qv);
+        summarize(ws.dead, mode, n, t, pv, qv);
     }
 
     function summarize(Window storage w, uint8 mode, uint256 n, int256 t, uint8 pv, uint8 qv) internal {
@@ -542,70 +651,111 @@ library CadlNormsWindows {
             if (pv != T && !w.pSet) { w.pSet = true; w.pFirst = n; }
             if (pv == F) w.pFalse = true;
             if (pv == U) w.pUnknown = true;
+            if (mode == W_RELEASE) {
+                if (qv != F && !w.qnSet) { w.qnSet = true; w.qn = n; w.qnt = t; }
+                if (pv == F && !w.ffSet) { w.ffSet = true; w.ff = t; w.ffi = n; }
+            }
         }
     }
 
     /// The judgement of observation n (F.5, items 2 and 3) when the norm
     /// is active: whether a candidate holds (hit), and whether none is left
     /// (empty). `open`: the deadline has not passed, so n is a candidate.
-    function judge(Window storage live, Window storage dead, EvalData storage data,
-                   Temporal storage tm, uint256 n, int256 t, bool open) public returns (bool hit, bool empty) {
-        (uint8 pv, uint8 qv) = operands(live, data, tm, n);
-        // the operator is true at n for a candidate of n itself
-        bool trueNow = (tm.mode == W_WITHIN && pv == T) || (tm.mode == W_UNTIL && qv == T);
+    function judge(Windows storage ws, EvalData storage data, Temporal storage tm, uint256 n, int256 t, bool open)
+            public returns (bool hit, bool empty) {
+        (uint8 pv, uint8 qv) = operands(ws.live, data, tm, n);
+        uint8 mode = tm.mode;
         uint8 cls = open ? classify(data, tm, n) : C_DROP;
-        hit = cls == C_HIT || (cls == C_LIVE && trueNow)
-            || (live.head < live.tail && oldHit(live, tm.mode, tm.td, t));
+        bool toLive = cls == C_LIVE || cls == C_BOTH;
+        bool toDual = cls == C_DUAL || cls == C_BOTH;
+        hit = cls == C_HIT || (toLive && trueNow(mode, pv, qv))
+            || (toDual && trueNow(dualMode(mode), dualP(mode, pv), qv))
+            || (ws.live.head < ws.live.tail && oldHit(ws.live, mode, tm.td, t))
+            || (ws.dual.head < ws.dual.tail && oldHit(ws.dual, dualMode(mode), tm.td, t));
         if (hit) {
-            live.head = live.tail;
-            dead.head = dead.tail;
+            clear(ws);
         } else {
-            advance(live, tm, n, t, pv, cls == C_LIVE, false);
-            advance(dead, tm, n, t, pv, cls == C_DEAD && !trueNow, true);
+            advance(ws.live, mode, tm.td, n, t, pv, qv, toLive);
+            advance(ws.dual, dualMode(mode), tm.td, n, t, dualP(mode, pv), qv, toDual);
+            advance(ws.dead, mode, tm.td, n, t, pv, qv, cls == C_DEAD && !trueNow(mode, pv, qv));
         }
-        reset(live);
-        reset(dead);
-        empty = live.head == live.tail && dead.head == dead.tail;
+        reset(ws.live);
+        reset(ws.dual);
+        reset(ws.dead);
+        empty = ws.live.head == ws.live.tail && ws.dual.head == ws.dual.tail && ws.dead.head == ws.dead.tail;
+    }
+
+    function clear(Windows storage ws) internal {
+        ws.live.head = ws.live.tail;
+        ws.dual.head = ws.dual.tail;
+        ws.dead.head = ws.dead.tail;
+    }
+
+    function pending(Windows storage ws) internal view returns (bool) {
+        return ws.live.head < ws.live.tail || ws.dual.head < ws.dual.tail || ws.dead.head < ws.dead.tail;
+    }
+
+    function dualMode(uint8 mode) internal pure returns (uint8) {
+        return mode == W_WITHIN ? W_THROUGHOUT : mode == W_THROUGHOUT ? W_WITHIN : W_RELEASE;
+    }
+
+    /// The operand p of the dual operator: NOT p for within and throughout;
+    /// the release reads p and q as they are.
+    function dualP(uint8 mode, uint8 pv) internal pure returns (uint8) {
+        if (mode == W_UNTIL || pv == U) return pv;
+        return pv == T ? F : T;
+    }
+
+    /// The operator is true at n for a candidate of n itself.
+    function trueNow(uint8 mode, uint8 pv, uint8 qv) internal pure returns (bool) {
+        if (mode == W_WITHIN) return pv == T;
+        if (mode == W_UNTIL) return qv == T;
+        if (mode == W_RELEASE) return qv == F && pv == F;
+        return false;
     }
 
     /// The candidates after an observation without a hit: false in every
-    /// window (throughout: an operand false; until: p false) removes them
-    /// all, an unknown operand marks them, the windows that are over go;
-    /// then the new candidate (unless the operator is decided at it).
-    function advance(Window storage w, Temporal storage tm, uint256 n, int256 t, uint8 pv, bool add,
-                     bool isDead) internal {
-        uint8 mode = tm.mode;
-        int256 d = tm.td;
-        if (isDead && mode == W_UNTIL && w.head < w.tail && w.jSet && (!w.pSet || w.j <= w.pFirst)) {
-            // until is decided (true) for the clean candidates whose window has j: never
-            // true for a dead candidate, so they go
+    /// window (throughout: an operand false; until: p false; release: p
+    /// false) removes them all, an unknown operand marks them, the windows
+    /// that are over go; then the new candidate (unless the operator is
+    /// decided at it).
+    function advance(Window storage w, uint8 mode, int256 d, uint256 n, int256 t, uint8 pv, uint8 qv, bool add)
+            internal {
+        bool until = mode == W_UNTIL || mode == W_RELEASE;
+        if (until && w.head < w.tail && w.jSet && (!w.pSet || w.j <= w.pFirst)) {
+            // until is true for the candidates with p true before j whose
+            // window has j: a candidate here is then decided (dead: never
+            // true; release: false), so they go
             uint256 from = firstFrom(w, w.jt - d);
             uint256 firstClean = firstAfterK(w, w.luSet, w.lu);
             uint256 cut = from > firstClean ? from : firstClean;
             if (cut < w.tail) w.tail = cut;
         }
         if (w.head < w.tail) {
-            if ((mode == W_THROUGHOUT && w.ffSet) || (mode == W_UNTIL && w.pFalse)
-                    || (mode == W_WITHIN && w.ftSet)) {
+            if ((mode == W_THROUGHOUT && w.ffSet) || (until && w.pFalse) || (mode == W_WITHIN && w.ftSet)) {
                 w.head = w.tail;
             } else {
-                if ((mode == W_THROUGHOUT && w.fuSet) || (mode == W_UNTIL && w.pUnknown)) {
+                if ((mode == W_THROUGHOUT && w.fuSet) || (until && w.pUnknown)) {
                     w.luSet = true;
                     w.lu = w.k[w.tail - 1];
+                }
+                if (mode == W_RELEASE && w.qnSet) {
+                    w.luqSet = true;
+                    w.luq = w.k[w.tail - 1];
                 }
                 w.head = firstFrom(w, t - d);
             }
         }
-        if (add && !((mode == W_THROUGHOUT || mode == W_UNTIL) && pv == F)) {
-            if ((mode == W_THROUGHOUT || mode == W_UNTIL) && pv == U) { w.luSet = true; w.lu = n; }
-            w.k[w.tail] = n;
-            w.t[w.tail] = t;
-            w.tail++;
-        }
+        if (!add || (mode != W_WITHIN && pv == F) || (mode == W_RELEASE && qv == T)) return;
+        if (mode != W_WITHIN && pv == U) { w.luSet = true; w.lu = n; }
+        if (mode == W_RELEASE && qv == U) { w.luqSet = true; w.luq = n; }
+        w.k[w.tail] = n;
+        w.t[w.tail] = t;
+        w.tail++;
     }
 
     function reset(Window storage w) internal {
-        w.ffSet = false; w.fuSet = false; w.ftSet = false;
+        w.ffSet = false; w.fuSet = false; w.ftSet = false; w.qnSet = false;
         w.jSet = false; w.pSet = false; w.pFalse = false; w.pUnknown = false;
         for (uint256 x = 0; x < 4 && w.purge < w.head; x++) {
             delete w.k[w.purge];
@@ -618,21 +768,20 @@ library CadlNormsWindows {
     /// undecided, true and false (F.5: an undefined content is false).
     function classify(EvalData storage data, Temporal storage tm, uint256 n) internal returns (uint8) {
         if (tm.root == tm.node) return C_LIVE;
-        Val memory g = CadlNormsEval.evaluateWith(data, tm.root, n, tm.node, Val(K_D, 0, ""));
-        if (g.k == K_B) return g.n == 1 ? C_HIT : C_DROP;
-        if (g.k != K_D) return C_DROP;
-        // the operator itself is true for a hit of the window when not neg
-        g = CadlNormsEval.evaluateWith(data, tm.root, n, tm.node, Val(K_B, tm.neg ? int256(0) : int256(1), ""));
-        return g.k == K_B && g.n == 1 ? C_LIVE : C_DEAD;
+        (uint256 ts, uint256 ds) = CadlNormsEval.table(data, tm.root, n, tm.node, type(uint256).max);
+        if (ts & 1 != 0) return C_HIT;
+        if (ds & 1 == 0) return C_DROP;
+        bool l = ts >> X_T & 1 != 0;
+        bool f = ts >> X_F & 1 != 0;
+        return l ? (f ? C_BOTH : C_LIVE) : (f ? C_DUAL : C_DEAD);
     }
 
     /// The operands at observation n (0 false, 1 true, 2 unknown), once per
-    /// observation; with neg, p is negated (Kleene).
+    /// observation.
     function operands(Window storage w, EvalData storage data, Temporal storage tm, uint256 n)
             internal returns (uint8 pv, uint8 qv) {
         if (w.at == n + 1) return (w.pv, w.qv);
         pv = code(CadlNormsEval.evaluate(data, tm.tp, n, n));
-        if (tm.neg && pv != U) pv = pv == T ? F : T;
         qv = tm.mode == W_UNTIL ? code(CadlNormsEval.evaluate(data, tm.tq, n, n)) : 0;
         w.at = n + 1;
         w.pv = pv;
@@ -655,6 +804,18 @@ library CadlNormsWindows {
         if (mode == W_WITHIN) return w.ftSet && w.t[last] + d >= w.ft;
         if (mode == W_UNTIL) {
             return w.jSet && (!w.pSet || w.j <= w.pFirst) && clean(w, last) && w.t[last] + d >= w.jt;
+        }
+        if (mode == W_RELEASE) {
+            // p false at ffi inside the window of the newest candidate, with
+            // q false before it and at it
+            if (w.ffSet && w.t[last] + d >= w.ff && (!w.luqSet || w.k[last] > w.luq)
+                && (!w.qnSet || w.qn > w.ffi)) return true;
+            // or a window that is over before p was false, with q false in it
+            int256 lim = t;
+            if (w.ffSet && w.ff < lim) lim = w.ff;
+            if (w.qnSet && w.qnt < lim) lim = w.qnt;
+            uint256 i = firstAfterK(w, w.luqSet, w.luq);
+            return i < w.tail && w.t[i] + d < lim;
         }
         // throughout: the newest candidate whose window ended before the
         // first value that is not true, and before now
@@ -686,6 +847,260 @@ library CadlNormsWindows {
             if (w.k[mid] <= lu) lo = mid + 1; else hi = mid;
         }
         return lo;
+    }
+}
+
+// A content with two temporal operators (F.4, F.5). Each operator has its
+// own record of what the observations say about its operands, and the
+// candidates of the norm are the leaves of a segment tree in storage. A
+// leaf holds, for its candidate, the values of the content for every
+// combination of operator values that the candidate can still reach: the
+// rest of the content is decided at the observation of the candidate, so
+// these values are computed there once (CadlNormsEval.table). An operator
+// is decided for a range of candidates at a time (a window that is over,
+// an operand that decides every open window), so an observation changes a
+// few ranges of the tree, each in a number of steps that grows with the
+// logarithm of the number of candidates; the root then says whether some
+// candidate holds and whether some candidate is still undecided.
+//
+// A node word: bits 0..63 say which (state, future) pairs have a candidate
+// whose content is true in that future, bits 64..127 the same for an
+// undecided content; a pair is 16 * d + f, where d says which operators are
+// still undecided for the candidate (bit 0: the first, bit 1: the second)
+// and f = va + 4 * vb gives the values of the two operators in the future
+// (X_D, X_T, X_F or X_U). Bits 128..133 hold the tags of the lazy
+// propagation: an operator decided to a value for the candidates below.
+struct MOp {
+    uint8 mode; uint256 tp; uint256 tq; int256 td; uint256 node;
+    bool uSet; uint256 u;        // the candidates at or before u have seen an undefined operand
+    bool puSet; uint256 pu;      // until: the last observation with p undefined
+}
+
+struct Multi {
+    uint256 root;                // the root of the content
+    MOp a;
+    MOp b;
+    uint256 gen;                 // the tree of the current activation
+    uint256 tail;                // the number of candidates
+    uint256 h;                   // the tree covers the candidates [0, 2^h)
+    bool pend;                   // a candidate was undecided at the last judgement
+    uint256 noted;               // n + 1 once observation n has been applied
+    uint8 sa; uint8 sb;          // the operators for a candidate at that observation
+    mapping(uint256 => uint256) k;       // the observation of a candidate
+    mapping(uint256 => int256) t;        // its time
+    mapping(uint256 => uint256) nodes;
+}
+
+library CadlNormsMulti {
+    uint256 internal constant BITS = (1 << 128) - 1;
+    uint256 internal constant CUR_T = 0x1000e1110eee0;
+    uint256 internal constant CUR_D = 0x1000e1110eee00000000000000000;
+
+    /// An observation, for the candidates there are (also while the norm
+    /// is suspended).
+    function note(Multi storage mu, EvalData storage data, uint256 n, int256 t) public {
+        if (mu.tail > 0) observe(mu, data, n, t);
+    }
+
+    /// The judgement of observation n when the norm is active: whether a
+    /// candidate holds, and whether none is undecided. `open`: the deadline
+    /// has not passed, so n is a candidate.
+    function judge(Multi storage mu, EvalData storage data, uint256 n, int256 t, bool open)
+            public returns (bool hit, bool empty) {
+        if (mu.noted != n + 1) observe(mu, data, n, t);
+        if (open) add(mu, data, n, t);
+        uint256 w = mu.tail == 0 ? 0 : mu.nodes[key(mu, mu.h, 0)];
+        hit = w & CUR_T != 0;
+        mu.pend = !hit && w & CUR_D != 0;
+        empty = !mu.pend;
+    }
+
+    /// A new activation starts without candidates.
+    function clear(Multi storage mu) internal {
+        mu.gen++;
+        mu.tail = 0;
+        mu.h = 0;
+        mu.pend = false;
+    }
+
+    function observe(Multi storage mu, EvalData storage data, uint256 n, int256 t) internal {
+        mu.noted = n + 1;
+        mu.sa = decide(mu, mu.a, 0, data, n, t);
+        mu.sb = decide(mu, mu.b, 1, data, n, t);
+    }
+
+    /// What observation n decides about operator i, for the candidates
+    /// before n; returns its value for a candidate at n.
+    function decide(Multi storage mu, MOp storage op, uint256 i, EvalData storage data, uint256 n, int256 t)
+            internal returns (uint8 now_) {
+        uint8 pv = code(CadlNormsEval.evaluate(data, op.tp, n, n));
+        uint8 qv = op.mode == W_UNTIL ? code(CadlNormsEval.evaluate(data, op.tq, n, n)) : X_F;
+        // the candidates whose window is over without a decisive value:
+        // undefined when an operand was undefined in it
+        uint256 x = firstFrom(mu, t - op.td);
+        if (x > 0) {
+            uint256 a = firstAfter(mu, op.uSet, op.u);
+            assign(mu, i, X_U, a < x ? a : x);
+            assign(mu, i, op.mode == W_THROUGHOUT ? X_T : X_F, x);
+        }
+        if (op.mode == W_WITHIN) {
+            if (pv == X_T) assign(mu, i, X_T, mu.tail);
+            if (pv == X_U) { op.uSet = true; op.u = n; }
+            return pv == X_T ? X_T : X_D;
+        }
+        if (op.mode == W_THROUGHOUT) {
+            if (pv == X_F) assign(mu, i, X_F, mu.tail);
+            if (pv == X_U) { op.uSet = true; op.u = n; }
+            return pv == X_F ? X_F : X_D;
+        }
+        // until(p, q): q true decides the candidates with p true since them,
+        // and makes the others uncertain; p false ends every window
+        if (qv == X_T) {
+            assignFrom(mu, i, firstAfter(mu, op.puSet, op.pu));
+            if (op.puSet && (!op.uSet || op.u < op.pu)) { op.uSet = true; op.u = op.pu; }
+        } else if (qv == X_U) {
+            op.uSet = true;
+            op.u = n;
+        }
+        if (pv == X_F) {
+            uint256 a = firstAfter(mu, op.uSet, op.u);
+            assign(mu, i, X_U, a);
+            assign(mu, i, X_F, mu.tail);
+        } else if (pv == X_U) {
+            op.puSet = true;
+            op.pu = n;
+        }
+        if (qv == X_T) return X_T;
+        if (pv == X_F) return qv == X_U ? X_U : X_F;
+        return X_D;
+    }
+
+    /// Candidate n, with the values of the content computed at n.
+    function add(Multi storage mu, EvalData storage data, uint256 n, int256 t) internal {
+        (uint256 ts, uint256 ds) = CadlNormsEval.table(data, mu.root, n, mu.a.node, mu.b.node);
+        uint256 sa = mu.sa;
+        uint256 sb = mu.sb;
+        if ((ts | ds) >> (sa + 4 * sb) & 1 == 0) return;     // decided, and not true
+        insert(mu, n, t, leaf(ts, ds, sa, sb));
+    }
+
+    /// The leaf of a candidate whose operators are sa and sb now.
+    function leaf(uint256 ts, uint256 ds, uint256 sa, uint256 sb) internal pure returns (uint256 bits) {
+        uint256 d = (sa == X_D ? 1 : 0) | (sb == X_D ? 2 : 0);
+        for (uint256 e = 0; e < 16; e++) {
+            if ((sa != X_D && e & 3 != sa) || (sb != X_D && e >> 2 != sb)) continue;
+            if (ts >> e & 1 != 0) bits |= 1 << (16 * d + e);
+            if (ds >> e & 1 != 0) bits |= 1 << (64 + 16 * d + e);
+        }
+    }
+
+    function insert(Multi storage mu, uint256 n, int256 t, uint256 bits) internal {
+        uint256 c = mu.tail;
+        // a new root above the old one when the tree is full (the loop
+        // below writes it)
+        if (c > 0 && c == 1 << mu.h) mu.h++;
+        mu.k[key(mu, 255, c)] = n;
+        mu.t[key(mu, 255, c)] = t;
+        mu.tail = c + 1;
+        mu.nodes[key(mu, 0, c)] = bits;
+        for (uint256 lvl = 1; lvl <= mu.h; lvl++) {
+            uint256 idx = c >> lvl;
+            mu.nodes[key(mu, lvl, idx)] = (mu.nodes[key(mu, lvl - 1, 2 * idx)]
+                                           | mu.nodes[key(mu, lvl - 1, 2 * idx + 1)]) & BITS;
+        }
+    }
+
+    // --- the tree ----------------------------------------------------------------------
+
+    function key(Multi storage mu, uint256 lvl, uint256 idx) internal view returns (uint256) {
+        return mu.gen << 128 | lvl << 64 | idx;
+    }
+
+    /// Operator i is v for the undecided candidates among [0, x).
+    function assign(Multi storage mu, uint256 i, uint8 v, uint256 x) internal {
+        if (x > 0) rec(mu, i, v, mu.h, 0, 0, x);
+    }
+
+    /// Operator i is true for the undecided candidates from y on.
+    function assignFrom(Multi storage mu, uint256 i, uint256 y) internal {
+        if (y < mu.tail) rec(mu, i, X_T, mu.h, 0, y, mu.tail);
+    }
+
+    function rec(Multi storage mu, uint256 i, uint8 v, uint256 lvl, uint256 idx, uint256 lo, uint256 hi) internal {
+        uint256 l = idx << lvl;
+        uint256 r = l + (1 << lvl);
+        if (r <= lo || l >= hi) return;
+        uint256 kk = key(mu, lvl, idx);
+        uint256 w = mu.nodes[kk];
+        if (w & undecided(i) == 0) return;               // nothing to decide below
+        if (lo <= l && r <= hi) {
+            mu.nodes[kk] = tagged(w, i, v);
+            return;
+        }
+        uint256 kl = key(mu, lvl - 1, 2 * idx);
+        uint256 kr = key(mu, lvl - 1, 2 * idx + 1);
+        // push the tags of the node to its children
+        for (uint256 j = 0; j < 2; j++) {
+            if (w >> (128 + 3 * j) & 1 == 0) continue;
+            uint8 vj = uint8(w >> (129 + 3 * j) & 3);
+            mu.nodes[kl] = tagged(mu.nodes[kl], j, vj);
+            mu.nodes[kr] = tagged(mu.nodes[kr], j, vj);
+        }
+        rec(mu, i, v, lvl - 1, 2 * idx, lo, hi);
+        rec(mu, i, v, lvl - 1, 2 * idx + 1, lo, hi);
+        mu.nodes[kk] = (mu.nodes[kl] | mu.nodes[kr]) & BITS;
+    }
+
+    function undecided(uint256 i) internal pure returns (uint256) {
+        return i == 0 ? 0xffff0000ffff0000ffff0000ffff0000 : 0xffffffff00000000ffffffff00000000;
+    }
+
+    /// The node with operator i decided to v for its undecided candidates.
+    function tagged(uint256 w, uint256 i, uint8 v) internal pure returns (uint256) {
+        if (w & undecided(i) == 0) return w;
+        uint256 x = w & BITS;
+        uint256 f;
+        uint256 vv = v;
+        if (i == 0) {
+            f = (1 << vv) | (1 << (vv + 4)) | (1 << (vv + 8)) | (1 << (vv + 12));
+            f = f | f << 32 | f << 64 | f << 96;
+            x = (x & 0xffff0000ffff0000ffff0000ffff) | (x >> 16 & f);
+        } else {
+            f = 0xf << (4 * vv);
+            f = f | f << 16 | f << 64 | f << 80;
+            x = (x & 0xffffffff00000000ffffffff) | (x >> 32 & f);
+        }
+        return x | (w & ~BITS) | (1 | vv << 1) << (128 + 3 * i);
+    }
+
+    // --- the candidates ----------------------------------------------------------------
+
+    /// The first candidate with a time at or after x, or tail.
+    function firstFrom(Multi storage mu, int256 x) internal view returns (uint256) {
+        uint256 lo = 0;
+        uint256 hi = mu.tail;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (mu.t[key(mu, 255, mid)] < x) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+
+    /// The first candidate at an observation after u (all when !set).
+    function firstAfter(Multi storage mu, bool set, uint256 u) internal view returns (uint256) {
+        if (!set) return 0;
+        uint256 lo = 0;
+        uint256 hi = mu.tail;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (mu.k[key(mu, 255, mid)] <= u) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+
+    function code(Val memory v) internal pure returns (uint8) {
+        if (v.k == K_B || v.k == K_N) return v.n != 0 ? X_T : X_F;
+        return X_U;
     }
 }
 
@@ -751,70 +1166,345 @@ library CadlNormsItems {
     }
 }
 
-abstract contract CadlNormsMonitorBase {
-    // states and verdicts of a norm instance
-    uint8 internal constant INACTIVE = 0;
-    uint8 internal constant ACTIVE = 1;
-    uint8 internal constant SUSPENDED = 2;
-    uint8 internal constant FULFILLED = 3;
-    uint8 internal constant VIOLATED = 4;
-    uint8 internal constant DISCHARGED = 5;
-    uint8 internal constant V_PENDING = 0;
-    uint8 internal constant V_FULFILLED = 1;
-    uint8 internal constant V_VIOLATED = 2;
-    uint8 internal constant V_EXCUSED = 3;
+// states and verdicts of a norm instance
+uint8 constant INACTIVE = 0;
+uint8 constant ACTIVE = 1;
+uint8 constant SUSPENDED = 2;
+uint8 constant FULFILLED = 3;
+uint8 constant VIOLATED = 4;
+uint8 constant DISCHARGED = 5;
+uint8 constant V_PENDING = 0;
+uint8 constant V_FULFILLED = 1;
+uint8 constant V_VIOLATED = 2;
+uint8 constant V_EXCUSED = 3;
 
-    // kinds of norms and terms; node operators
-    uint8 internal constant OBLIGATION = 0;
-    uint8 internal constant PERMISSION = 1;
-    uint8 internal constant PROHIBITION = 2;
-    uint8 internal constant POWER = 3;
-    uint8 internal constant T_EVENT = 1;
-    uint8 internal constant T_MESSAGE = 2;
-    uint8 internal constant T_PREDICATE = 3;
-    uint8 internal constant T_ERROR = 4;
+// kinds of norms and terms
+uint8 constant OBLIGATION = 0;
+uint8 constant PERMISSION = 1;
+uint8 constant PROHIBITION = 2;
+uint8 constant POWER = 3;
+uint8 constant T_EVENT = 1;
+uint8 constant T_MESSAGE = 2;
+uint8 constant T_PREDICATE = 3;
+uint8 constant T_ERROR = 4;
 
+struct Pat { string name; uint8 ik; string idx; bool hasRange; int256 lo; int256 hi; }
+struct Term { uint8 kind; string text; uint256 root; Pat sender; Pat receiver; string msgName; bool hasArgs; uint256[] args; }
+struct NormDef {
+    string id; uint8 kind; bool frozen; int256 trigger; int256 until; int256 content;
+    bool hasDeadline; int256 deadline; bool target; bool hasBearer; Pat bearer;
+    string severity; bool hasSanction; string sanction; int256 reparation;
+    bool hasReparationId; string reparationId; bool hasTransition; string transition;
+    uint256[] activate; uint256[] suspend; uint256[] resume; uint256[] discharge;
+    // a content with one temporal operator (1, see `temporals`), two (2,
+    // see `multis`), or none (0)
+    uint8 tmode;
+}
+struct Rule { string creates; bool broken; int256 when; int256 cond; }
+struct ActorDecl { bool declared; bool isIndexed; bool hasLo; int256 lo; bool hasHi; int256 hi; }
+struct NormRec {
+    uint8 state; uint8 verdict; bool hasAt; int256 activatedAt; int256 act; bool hasSince;
+    int256 since; int256 before; uint256 from;
+}
+struct Ev { string name; bool hasPerformer; string performer; string source; }
+struct Act { string content; string performer; string desc; }
 
-    struct Pat { string name; uint8 ik; string idx; bool hasRange; int256 lo; int256 hi; }
-    struct Term { uint8 kind; string text; uint256 root; Pat sender; Pat receiver; string msgName; bool hasArgs; uint256[] args; }
-    struct NormDef {
-        string id; uint8 kind; bool frozen; int256 trigger; int256 until; int256 content;
-        bool hasDeadline; int256 deadline; bool target; bool hasBearer; Pat bearer;
-        string severity; bool hasSanction; string sanction; int256 reparation;
-        bool hasReparationId; string reparationId; bool hasTransition; string transition;
-        uint256[] activate; uint256[] suspend; uint256[] resume; uint256[] discharge;
-        // a content with a temporal operator (see `temporals`), else 0
-        uint8 tmode;
-    }
-    struct Rule { string creates; bool broken; int256 when; int256 cond; }
-    struct ActorDecl { bool declared; bool isIndexed; bool hasLo; int256 lo; bool hasHi; int256 hi; }
-
-    struct NormRec {
-        uint8 state; uint8 verdict; bool hasAt; int256 activatedAt; int256 act; bool hasSince;
-        int256 since; int256 before; uint256 from;
-    }
-    struct Ev { string name; bool hasPerformer; string performer; string source; }
-    struct Act { string content; string performer; string desc; }
-
-    // --- the model (filled by the constructor of the generated contract) -----------
-    string public contractId;
-    EvalData internal data;
-    Term[] internal terms;
-    NormDef[] internal normDefs;
-    Rule[] internal rules;
-    Item[] internal assumeItems;
-    Item[] internal guaranteeItems;
-    mapping(bytes32 => ActorDecl) internal actors;
-    string internal lcInitial;
-    mapping(bytes32 => bool) internal lcStates;
-    mapping(bytes32 => bool) internal lcTerminal;
+// The model of the CADL contract (filled by the constructor of the
+// generated contract) and the state of the contract instance, in one
+// struct, so that the libraries below can read and change them.
+struct Monitor {
+    // --- the model
+    EvalData data;
+    Term[] terms;
+    NormDef[] normDefs;
+    Rule[] rules;
+    Item[] assumeItems;
+    Item[] guaranteeItems;
+    mapping(bytes32 => ActorDecl) actors;
+    string lcInitial;
+    mapping(bytes32 => bool) lcStates;
+    mapping(bytes32 => bool) lcTerminal;
     // the bare names read inside a temporal operator (see makeKnown)
-    mapping(bytes32 => bool) internal temporalName;
+    mapping(bytes32 => bool) temporalName;
     // by norm, for a content with a temporal operator: the operator, and
     // the candidates that are true with it and those that are never true
-    mapping(uint256 => Temporal) internal temporals;
-    mapping(uint256 => Window) internal windows;
-    mapping(uint256 => Window) internal deadWindows;
+    mapping(uint256 => Temporal) temporals;
+    mapping(uint256 => Windows) windows;
+    // by norm, for a content with two temporal operators
+    mapping(uint256 => Multi) multis;
+    // --- the state of the contract instance
+    uint256 observations;      // observations of the instance so far
+    int256 lastT;
+    bool hasLastT;
+    bool ended;
+    uint256 ignored;           // observations after the end
+    bool begun;
+    string lc;                 // lifecycle state after the last observation
+    NormRec[] recs;
+    ItemRec[] assumeRecs;
+    ItemRec[] guaranteeRecs;
+    bool failed;               // an assumption has failed
+    int256 failedAt;
+}
+
+// What every part of the monitor shares (free functions: the code is part of
+// each contract and library that uses them).
+function setSt(Monitor storage m, uint256 i, uint8 st, uint256 n, int256 t) {
+    NormRec storage r = m.recs[i];
+    if (r.state == ACTIVE && r.hasSince) r.before += t - r.since;
+    r.state = st;
+    if (st == ACTIVE) {
+        r.since = t;
+        r.hasSince = true;
+        if (!r.hasAt) { r.hasAt = true; r.activatedAt = t; r.act = int256(n); }
+    }
+    if (st == VIOLATED) r.verdict = m.failed ? V_EXCUSED : V_VIOLATED;
+    else if (st == FULFILLED || st == DISCHARGED) r.verdict = V_FULFILLED;
+    if (st >= FULFILLED) {
+        CadlNormsWindows.clear(m.windows[i]);
+        CadlNormsMulti.clear(m.multis[i]);
+    }
+}
+
+function elapsed(Monitor storage m, uint256 i, int256 t) view returns (int256) {
+    NormRec storage r = m.recs[i];
+    if (r.state == ACTIVE && r.hasSince) return r.before + (t - r.since);
+    return r.before;
+}
+
+function truthOf(Val memory v) pure returns (Val memory) {
+    if (v.k == K_U || v.k == K_D || v.k == K_B) return v;
+    if (v.k == K_N) return Val(K_B, v.n != 0 ? int256(1) : int256(0), "");
+    return Val(K_U, 0, "");
+}
+
+function evalTruth(Monitor storage m, uint256 root, uint256 p, uint256 n) returns (Val memory) {
+    return truthOf(CadlNormsEval.evaluate(m.data, root, p, n));
+}
+
+// Events, messages, actors, counts-as rules and powers (F.3, F.5 steps 1
+// to 3), in a library of their own.
+library CadlNormsActs {
+    event InstitutionalEvent(string name, string performer, string source, int256 t);
+    event PowerExercised(string power, string performer, string act, int256 t);
+    event Unauthorised(string act, string performer, int256 t);
+
+    /// Steps 1 to 3 of an observation: the counts-as rules, the powers
+    /// and the triggers. Returns the institutional events created.
+    function acts(Monitor storage m, uint256 n, int256 t, Msg[] calldata msgs) public returns (Ev[] memory created) {
+        created = countsAs(m, n, t, msgs);
+        powers(m, n, t, msgs, created);
+        for (uint256 i = 0; i < m.normDefs.length; i++) {
+            NormDef storage d = m.normDefs[i];
+            if (d.frozen || d.trigger < 0 || !occurs(m, uint256(d.trigger), n, msgs, created)) continue;
+            if (m.recs[i].state == INACTIVE) setSt(m, i, ACTIVE, n, t);
+        }
+    }
+
+    function countsAs(Monitor storage m, uint256 n, int256 t, Msg[] calldata msgs) internal returns (Ev[] memory created) {
+        Ev[] memory buf = new Ev[](m.rules.length * (msgs.length + 1));
+        uint256 c = 0;
+        Ev[] memory none = new Ev[](0);
+        for (uint256 i = 0; i < m.rules.length; i++) {
+            Rule storage r = m.rules[i];
+            if (r.broken) continue;
+            if (r.cond >= 0) {
+                Val memory cv = evalTruth(m, m.terms[uint256(r.cond)].root, n, n);
+                if (!(cv.k == K_B && cv.n == 1)) continue;
+            }
+            Term storage w = m.terms[uint256(r.when)];
+            if (w.kind == T_MESSAGE) {
+                for (uint256 j = 0; j < msgs.length; j++) {
+                    if (!msgMatches(m, w, msgs[j], n)) continue;
+                    buf[c++] = Ev(r.creates, true, msgs[j].from, desc(msgs[j]));
+                }
+            } else if (occurs(m, uint256(r.when), n, msgs, none)) {
+                buf[c++] = Ev(r.creates, false, "", w.text);
+            }
+        }
+        created = new Ev[](c);
+        for (uint256 i = 0; i < c; i++) {
+            created[i] = buf[i];
+            emit InstitutionalEvent(buf[i].name, buf[i].performer, buf[i].source, t);
+        }
+    }
+
+    function desc(Msg calldata x) internal pure returns (string memory) {
+        return string.concat(x.from, " -> ", x.to, " : ", x.name);
+    }
+
+    function occurs(Monitor storage m, uint256 j, uint256 n, Msg[] calldata msgs, Ev[] memory created) public returns (bool) {
+        Term storage term = m.terms[j];
+        if (term.kind == T_EVENT) {
+            bytes32 h = keccak256(bytes(term.text));
+            for (uint256 e = 0; e < created.length; e++) if (keccak256(bytes(created[e].name)) == h) return true;
+            return false;
+        }
+        if (term.kind == T_MESSAGE) {
+            for (uint256 k = 0; k < msgs.length; k++) if (msgMatches(m, term, msgs[k], n)) return true;
+            return false;
+        }
+        if (term.kind == T_PREDICATE) {
+            Val memory now_ = evalTruth(m, term.root, n, n);
+            if (!(now_.k == K_B && now_.n == 1)) return false;
+            if (n == 0) return true;
+            Val memory prev = evalTruth(m, term.root, n - 1, n - 1);
+            return !(prev.k == K_B && prev.n == 1);
+        }
+        return false;
+    }
+
+    // --- powers (step 2) -------------------------------------------------------------
+
+    function powers(Monitor storage m, uint256 n, int256 t, Msg[] calldata msgs, Ev[] memory created) internal {
+        Act[] memory list = collectActs(m, n, msgs, created);
+        bool[] memory active = new bool[](m.normDefs.length);
+        for (uint256 p = 0; p < m.normDefs.length; p++) active[p] = m.recs[p].state == ACTIVE;
+        for (uint256 a = 0; a < list.length; a++) exercise(m, list[a], active, n, t);
+    }
+
+    function eventUsedByPower(Monitor storage m, string memory name) internal view returns (bool) {
+        bytes32 h = keccak256(bytes(name));
+        for (uint256 p = 0; p < m.normDefs.length; p++) {
+            NormDef storage d = m.normDefs[p];
+            if (d.kind == POWER && !d.frozen && m.terms[uint256(d.content)].kind == T_EVENT
+                && keccak256(bytes(m.terms[uint256(d.content)].text)) == h) return true;
+        }
+        return false;
+    }
+
+    function collectActs(Monitor storage m, uint256 n, Msg[] calldata msgs, Ev[] memory created) internal returns (Act[] memory list) {
+        Act[] memory buf = new Act[](created.length + m.normDefs.length * msgs.length);
+        uint256 c = 0;
+        for (uint256 e = 0; e < created.length; e++) {
+            if (created[e].hasPerformer && eventUsedByPower(m, created[e].name)) {
+                buf[c++] = Act(created[e].name, created[e].performer,
+                               string.concat("institutional event ", created[e].name));
+            }
+        }
+        uint256 firstMsgAct = c;
+        for (uint256 p = 0; p < m.normDefs.length; p++) {
+            NormDef storage d = m.normDefs[p];
+            if (d.kind != POWER || d.frozen || m.terms[uint256(d.content)].kind != T_MESSAGE) continue;
+            for (uint256 k = 0; k < msgs.length; k++) {
+                if (!msgMatches(m, m.terms[uint256(d.content)], msgs[k], n)) continue;
+                Act memory act = Act(m.terms[uint256(d.content)].text, msgs[k].from,
+                                     string.concat("message ", desc(msgs[k])));
+                if (!seenAct(buf, firstMsgAct, c, act)) buf[c++] = act;
+            }
+        }
+        list = new Act[](c);
+        for (uint256 i = 0; i < c; i++) list[i] = buf[i];
+    }
+
+    function seenAct(Act[] memory buf, uint256 from, uint256 to, Act memory act) internal pure returns (bool) {
+        for (uint256 q = from; q < to; q++) {
+            if (keccak256(bytes(buf[q].content)) == keccak256(bytes(act.content))
+                && keccak256(bytes(buf[q].desc)) == keccak256(bytes(act.desc))) return true;
+        }
+        return false;
+    }
+
+    function exercise(Monitor storage m, Act memory act, bool[] memory active, uint256 n, int256 t) internal {
+        bool any = false;
+        bytes32 h = keccak256(bytes(act.content));
+        for (uint256 p = 0; p < m.normDefs.length; p++) {
+            NormDef storage d = m.normDefs[p];
+            if (d.kind != POWER || d.frozen || !active[p]) continue;
+            if (keccak256(bytes(m.terms[uint256(d.content)].text)) != h) continue;
+            if (!isBearer(m, p, act.performer)) continue;
+            any = true;
+            emit PowerExercised(d.id, act.performer, act.desc, t);
+            applyEffects(m, d.activate, INACTIVE, INACTIVE, ACTIVE, n, t);
+            applyEffects(m, d.suspend, ACTIVE, ACTIVE, SUSPENDED, n, t);
+            applyEffects(m, d.resume, SUSPENDED, SUSPENDED, ACTIVE, n, t);
+            applyEffects(m, d.discharge, ACTIVE, SUSPENDED, DISCHARGED, n, t);
+        }
+        if (!any) emit Unauthorised(act.desc, act.performer, t);
+    }
+
+    function applyEffects(Monitor storage m, uint256[] storage targets, uint8 from1, uint8 from2, uint8 to, uint256 n, int256 t) internal {
+        for (uint256 k = 0; k < targets.length; k++) {
+            uint256 x = targets[k];
+            if (m.normDefs[x].frozen) continue;
+            uint8 s = m.recs[x].state;
+            if (s == from1 || s == from2) setSt(m, x, to, n, t);
+        }
+    }
+
+    function isBearer(Monitor storage m, uint256 p, string memory performer) internal view returns (bool) {
+        NormDef storage d = m.normDefs[p];
+        if (!d.hasBearer) return false;
+        (string memory text, bool bound) = actorText(m, d.bearer.name, d.bearer.ik, d.bearer.idx);
+        if (bound) return keccak256(bytes(performer)) == keccak256(bytes(text));
+        (string memory name, bool hasIdx, string memory idx) = CadlNormsValues.splitActor(performer);
+        return keccak256(bytes(name)) == keccak256(bytes(d.bearer.name)) && isMember(m, name, hasIdx, idx);
+    }
+
+    // --- messages and actors -----------------------------------------------------------
+
+    function msgMatches(Monitor storage m, Term storage term, Msg calldata x, uint256 n) internal returns (bool) {
+        if (keccak256(bytes(x.name)) != keccak256(bytes(term.msgName))) return false;
+        if (!actorMatches(m, term.sender, x.from) || !actorMatches(m, term.receiver, x.to)) return false;
+        if (!term.hasArgs) return true;
+        if (term.args.length != x.args.length) return false;
+        for (uint256 a = 0; a < term.args.length; a++) {
+            Val memory w = CadlNormsEval.evaluate(m.data, term.args[a], n, n);
+            if (!eqRaw(w, x.args[a])) return false;
+        }
+        return true;
+    }
+
+    function eqRaw(Val memory w, ValIn calldata a) internal pure returns (bool) {
+        if (w.k == K_U || w.k == K_D || a.k == K_U) return false;
+        if ((w.k == K_B) != (a.k == K_B)) return false;
+        if (w.k == K_T || w.k == K_S) return a.k == K_T && keccak256(bytes(w.s)) == keccak256(bytes(a.s));
+        if (a.k == K_T) return false;
+        return w.n == a.n;
+    }
+
+    function actorMatches(Monitor storage m, Pat storage pat, string calldata actual) internal view returns (bool) {
+        (string memory name, bool hasIdx, string memory idx) = CadlNormsValues.splitActor(actual);
+        if (keccak256(bytes(name)) != keccak256(bytes(pat.name)) || !isMember(m, name, hasIdx, idx)) return false;
+        if (pat.ik == I_ANY) {
+            if (!hasIdx) return false;
+            if (!pat.hasRange) return true;
+            int256 v = CadlNormsValues.parseIndex(idx);
+            return v >= pat.lo && v <= pat.hi;
+        }
+        (string memory text, bool bound) = actorText(m, pat.name, pat.ik, pat.idx);
+        if (bound) return keccak256(bytes(actual)) == keccak256(bytes(text));
+        return true;
+    }
+
+    function isMember(Monitor storage m, string memory name, bool hasIdx, string memory idx) internal view returns (bool) {
+        ActorDecl storage a = m.actors[keccak256(bytes(name))];
+        if (!a.declared) return false;
+        if (!a.isIndexed || !hasIdx) return !a.isIndexed && !hasIdx;
+        if (!CadlNormsValues.isDigits(idx)) return false;
+        int256 v = CadlNormsValues.parseIndex(idx);
+        return (!a.hasLo || a.lo <= v) && (!a.hasHi || v <= a.hi);
+    }
+
+    /// The text of an actor reference with its index bound; bound is false
+    /// for an index name that the instance does not bind.
+    function actorText(Monitor storage m, string memory name, uint8 ik, string memory idx) internal view returns (string memory, bool) {
+        if (ik == I_NONE) return (name, true);
+        if (ik == I_LIT) return (string.concat(name, "[", idx, "]"), true);
+        bytes32 h = keccak256(bytes(idx));
+        if (m.data.hasBinding[h]) {
+            Stored storage b = m.data.bindings[h];
+            string memory text = b.k == K_T ? b.s : CadlNormsValues.intText(b.n / SCALE);
+            return (string.concat(name, "[", text, "]"), true);
+        }
+        return (string.concat(name, "[", idx, "]"), false);
+    }
+}
+
+abstract contract CadlNormsMonitorBase {
+    // --- the model (filled by the constructor of the generated contract) and the state
+    string public contractId;
+    Monitor internal m;
 
     // --- who may record the instance -------------------------------------------------
     /// Only this address may call begin, observe, addQuantities and finish.
@@ -830,20 +1520,6 @@ abstract contract CadlNormsMonitorBase {
         reporter = reporter_ == address(0) ? msg.sender : reporter_;
     }
 
-    // --- the state of the contract instance ----------------------------------------
-    uint256 public observations;      // observations of the instance so far
-    int256 public lastT;
-    bool internal hasLastT;
-    bool public ended;
-    uint256 public ignored;           // observations after the end
-    bool internal begun;
-    string internal lc;               // lifecycle state after the last observation
-    NormRec[] internal recs;
-    ItemRec[] internal assumeRecs;
-    ItemRec[] internal guaranteeRecs;
-    bool internal failed;             // an assumption has failed
-    int256 internal failedAt;
-
     event NormChanged(uint256 index, string id, uint8 state, uint8 verdict, uint8 previousState, uint8 previousVerdict, int256 t);
     event ItemChanged(bool guarantee, uint256 index, uint8 mark, uint8 previous, int256 t);
     event Violation(string norm, string severity, uint8 verdict, string sanction, string reparation, bool reparationActivated, string transition, int256 t);
@@ -855,26 +1531,34 @@ abstract contract CadlNormsMonitorBase {
     // The interface
     // =========================================================================
 
-    /// Bindings, data.request fields (by path, "a.b") and names of quantities,
+    /// Observations of the instance so far.
+    function observations() external view returns (uint256) { return m.observations; }
+    /// The time of the last observation, also of one after the end.
+    function lastT() external view returns (int256) { return m.lastT; }
+    function ended() external view returns (bool) { return m.ended; }
+    /// Observations after the end.
+    function ignored() external view returns (uint256) { return m.ignored; }
+
+    /// Bindings, request fields (by path, "a.b") and names of quantities,
     /// before the first observation. Optional; may be called once.
     function begin(ValIn[] calldata bindings_, ValIn[] calldata request_, string[] calldata quantities) external onlyReporter {
-        require(observations == 0 && !begun && !ended, "begin() comes before the first observation");
-        begun = true;
+        require(m.observations == 0 && !m.begun && !m.ended, "begin() comes before the first observation");
+        m.begun = true;
         CadlNormsValues.checkBegin(bindings_, request_);
         for (uint256 i = 0; i < bindings_.length; i++) {
             ValIn calldata b = bindings_[i];
             bytes32 h = keccak256(bytes(b.name));
-            data.hasBinding[h] = true;
-            data.bindings[h] = Stored(0, b.k, b.n, b.s);
+            m.data.hasBinding[h] = true;
+            m.data.bindings[h] = Stored(0, b.k, b.n, b.s);
         }
         for (uint256 i = 0; i < request_.length; i++) {
             ValIn calldata r = request_[i];
             bytes32 h = keccak256(bytes(r.name));
-            data.hasRequest[h] = true;
-            data.request[h] = Stored(0, r.k, r.n, r.s);
+            m.data.hasRequest[h] = true;
+            m.data.request[h] = Stored(0, r.k, r.n, r.s);
         }
         for (uint256 i = 0; i < quantities.length; i++) {
-            data.known[keccak256(bytes(CadlNormsValues.canon(quantities[i])))] = true;
+            m.data.known[keccak256(bytes(CadlNormsValues.canon(quantities[i])))] = true;
         }
     }
 
@@ -892,10 +1576,10 @@ abstract contract CadlNormsMonitorBase {
     /// given in begin() (or be observed at the first observation): later
     /// the call is refused.
     function makeKnown(bytes32 h) internal {
-        if (data.known[h]) return;
-        require(observations == 0 || !temporalName[h] || data.hasBinding[h],
+        if (m.data.known[h]) return;
+        require(m.observations == 0 || !m.temporalName[h] || m.data.hasBinding[h],
                 "a name used inside a temporal operator becomes a quantity after the first observation; give it in begin()");
-        data.known[h] = true;
+        m.data.known[h] = true;
     }
 
     /// One observation (F.5): its time (seconds * SCALE), the values that
@@ -904,87 +1588,77 @@ abstract contract CadlNormsMonitorBase {
     /// monitor as it was, for an observation that is malformed.
     function observe(int256 t, ValIn[] calldata values, Msg[] calldata msgs,
                      bool hasState, string calldata state, bool end) external onlyReporter {
-        checkInput(t, values, msgs);
-        lastT = t;
-        hasLastT = true;
-        if (ended) {
-            ignored += 1;
+        require(t >= -MAX_T && t <= MAX_T, "'t' must be a finite number of at most 2**53 in absolute value");
+        require(!m.hasLastT || t >= m.lastT, "time is before the previous observation");
+        CadlNormsValues.checkObservation(values, msgs);
+        m.lastT = t;
+        m.hasLastT = true;
+        if (m.ended) {
+            m.ignored += 1;
             return;
         }
         bool endHere = record(t, values, hasState, state, end);
-        runStep(observations - 1, t, msgs, endHere);
-    }
-
-    function checkInput(int256 t, ValIn[] calldata values, Msg[] calldata msgs) internal view {
-        require(t >= -MAX_T && t <= MAX_T, "'t' must be a finite number of at most 2**53 in absolute value");
-        require(!hasLastT || t >= lastT, "time is before the previous observation");
-        CadlNormsValues.checkObservation(values, msgs);
-    }
-
-    function record(int256 t, ValIn[] calldata values, bool hasState, string calldata state, bool end)
-            internal returns (bool) {
-        uint256 n = observations;
-        string memory before = n == 0 ? lcInitial : lc;
-        string memory after_ = hasState ? state : before;
-        if (data.hasLifecycle) {
-            require(lcStates[keccak256(bytes(after_))], "the state is not a state of the lifecycle");
-        }
-        for (uint256 i = 0; i < values.length; i++) {
-            bytes32 h = keccak256(bytes(CadlNormsValues.canon(values[i].name)));
-            makeKnown(h);
-            prune(h);
-            data.history[h].push(Stored(n, values[i].k, values[i].n, values[i].s));
-        }
-        data.obsT.push(t);
-        data.obsSt.push(before);
-        lc = after_;
-        observations = n + 1;
-        return end || (data.hasLifecycle && lcTerminal[keccak256(bytes(after_))]);
+        runStep(m.observations - 1, t, msgs, endHere);
     }
 
     function runStep(uint256 n, int256 t, Msg[] calldata msgs, bool endHere) internal {
         (uint8[] memory ns, uint8[] memory nv, uint8[] memory am, uint8[] memory gm) = marks();
         step(n, t, msgs, endHere);
         emitChanges(ns, nv, am, gm, t);
-        updateKeepFrom(n);
+        // the first observation that a later step can read: this one, and
+        // the first while a temporal item is not decided (the candidates of
+        // a temporal content keep what they need in their window)
+        m.data.keepFrom = n > 0 && CadlNormsItems.pending(m.assumeItems, m.assumeRecs, m.guaranteeItems,
+                                                          m.guaranteeRecs) ? 0 : n;
     }
 
-    /// The first observation that a later step can read: this one, and the
-    /// first while a temporal item is not decided (the candidates of a
-    /// temporal content keep what they need in their window).
-    function updateKeepFrom(uint256 n) internal {
-        uint256 k = n;
-        if (k > 0 && CadlNormsItems.pending(assumeItems, assumeRecs, guaranteeItems, guaranteeRecs)) k = 0;
-        data.keepFrom = k;
+    function record(int256 t, ValIn[] calldata values, bool hasState, string calldata state, bool end)
+            internal returns (bool) {
+        uint256 n = m.observations;
+        string memory before = n == 0 ? m.lcInitial : m.lc;
+        string memory after_ = hasState ? state : before;
+        if (m.data.hasLifecycle) {
+            require(m.lcStates[keccak256(bytes(after_))], "the state is not a state of the lifecycle");
+        }
+        for (uint256 i = 0; i < values.length; i++) {
+            bytes32 h = keccak256(bytes(CadlNormsValues.canon(values[i].name)));
+            makeKnown(h);
+            prune(h);
+            m.data.history[h].push(Stored(n, values[i].k, values[i].n, values[i].s));
+        }
+        m.data.obsT.push(t);
+        m.data.obsSt.push(before);
+        m.lc = after_;
+        m.observations = n + 1;
+        return end || (m.data.hasLifecycle && m.lcTerminal[keccak256(bytes(after_))]);
     }
-
 
     /// Drop values of a quantity that no lookup can read any more: at most
     /// four per new value, so that the cost of an observation stays bounded
     /// when a long window closes (the rest goes with the next values).
     function prune(bytes32 h) internal {
-        Stored[] storage hs = data.history[h];
-        uint256 first = data.head[h];
+        Stored[] storage hs = m.data.history[h];
+        uint256 first = m.data.head[h];
         uint256 stop = first + 4;
-        while (first < stop && first + 1 < hs.length && hs[first + 1].idx <= data.keepFrom) {
+        while (first < stop && first + 1 < hs.length && hs[first + 1].idx <= m.data.keepFrom) {
             delete hs[first];
             first++;
         }
-        data.head[h] = first;
+        m.data.head[h] = first;
     }
 
     /// The end of the contract instance at its last observation (F.5,
     /// item 6), when no observation said so.
     function finish() external onlyReporter {
-        require(observations > 0, "the contract instance has no observation");
-        if (ended) {
+        require(m.observations > 0, "the contract instance has no observation");
+        if (m.ended) {
             return;
         }
         (uint8[] memory ns, uint8[] memory nv, uint8[] memory am, uint8[] memory gm) = marks();
-        uint256 n = observations - 1;
-        settle(n, data.obsT[n]);
-        finishItems(true, data.obsT[n]);
-        emitChanges(ns, nv, am, gm, data.obsT[n]);
+        uint256 n = m.observations - 1;
+        settle(n, m.data.obsT[n]);
+        finishItems(true);
+        emitChanges(ns, nv, am, gm, m.data.obsT[n]);
     }
 
     /// The states and verdicts of the norms (in the order of the contract),
@@ -997,28 +1671,28 @@ abstract contract CadlNormsMonitorBase {
     }
 
     function normIds() external view returns (string[] memory ids) {
-        ids = new string[](normDefs.length);
-        for (uint256 i = 0; i < normDefs.length; i++) ids[i] = normDefs[i].id;
+        ids = new string[](m.normDefs.length);
+        for (uint256 i = 0; i < m.normDefs.length; i++) ids[i] = m.normDefs[i].id;
     }
 
     /// False when a norm or a guarantee is violated.
     function ok() external view returns (bool) {
-        for (uint256 i = 0; i < recs.length; i++) if (recs[i].verdict == V_VIOLATED) return false;
-        for (uint256 i = 0; i < guaranteeRecs.length; i++) if (guaranteeRecs[i].verdict == V_VIOLATED) return false;
+        for (uint256 i = 0; i < m.recs.length; i++) if (m.recs[i].verdict == V_VIOLATED) return false;
+        for (uint256 i = 0; i < m.guaranteeRecs.length; i++) if (m.guaranteeRecs[i].verdict == V_VIOLATED) return false;
         return true;
     }
 
     /// The earliest deadline of an active obligation or prohibition
     /// (seconds * SCALE); has is false when there is none.
     function nextDeadline() external view returns (bool has, int256 due) {
-        if (ended || observations == 0) return (false, 0);
-        for (uint256 i = 0; i < normDefs.length; i++) {
-            NormDef storage d = normDefs[i];
-            NormRec storage r = recs[i];
+        if (m.ended || m.observations == 0) return (false, 0);
+        for (uint256 i = 0; i < m.normDefs.length; i++) {
+            NormDef storage d = m.normDefs[i];
+            NormRec storage r = m.recs[i];
             if (d.frozen || !d.hasDeadline || r.state != ACTIVE || (d.kind != OBLIGATION && d.kind != PROHIBITION)) continue;
-            int256 el = elapsed(i, lastT);
+            int256 el = elapsed(m, i, m.lastT);
             if (el > d.deadline) continue;
-            int256 at_ = lastT + d.deadline - el;
+            int256 at_ = m.lastT + d.deadline - el;
             if (!has || at_ < due) { has = true; due = at_; }
         }
     }
@@ -1029,308 +1703,131 @@ abstract contract CadlNormsMonitorBase {
 
     function step(uint256 n, int256 t, Msg[] calldata msgs, bool endHere) internal {
         if (n == 0) {
-            for (uint256 i = 0; i < normDefs.length; i++) {
-                NormDef storage d = normDefs[i];
-                if (!d.frozen && d.trigger < 0 && !d.target) setSt(i, ACTIVE, n, t);
+            for (uint256 i = 0; i < m.normDefs.length; i++) {
+                NormDef storage d = m.normDefs[i];
+                if (!d.frozen && d.trigger < 0 && !d.target) setSt(m, i, ACTIVE, n, t);
             }
         }
-        contractItems(n, t);
-        Ev[] memory created = countsAs(n, t, msgs);
-        powers(n, t, msgs, created);
-        for (uint256 i = 0; i < normDefs.length; i++) {
-            NormDef storage d = normDefs[i];
-            if (d.frozen || d.trigger < 0 || !occurs(uint256(d.trigger), n, msgs, created)) continue;
-            if (recs[i].state == INACTIVE) setSt(i, ACTIVE, n, t);
+        bool was = m.failed;
+        m.failed = CadlNormsItems.step(m.assumeItems, m.assumeRecs, m.guaranteeItems, m.guaranteeRecs, m.data, n, was);
+        if (m.failed && !was) m.failedAt = t;
+        Ev[] memory created = CadlNormsActs.acts(m, n, t, msgs);
+        for (uint256 i = 0; i < m.normDefs.length; i++) {
+            NormDef storage d = m.normDefs[i];
+            if (d.tmode == 0 || d.frozen) continue;
+            if (d.tmode == 1) CadlNormsWindows.note(m.windows[i], m.data, m.temporals[i], n, t);
+            else CadlNormsMulti.note(m.multis[i], m.data, n, t);
         }
-        noteWindows(n, t);
         uint256[] memory violated = judge(n, t, msgs, created);
         for (uint256 v = 0; v < violated.length; v++) onViolation(violated[v], n, t, true);
         if (endHere) settle(n, t);
-        finishItems(endHere, t);
+        finishItems(endHere);
     }
 
-    function setSt(uint256 i, uint8 st, uint256 n, int256 t) internal {
-        NormRec storage r = recs[i];
-        if (r.state == ACTIVE && r.hasSince) r.before += t - r.since;
-        r.state = st;
-        if (st == ACTIVE) {
-            r.since = t;
-            r.hasSince = true;
-            if (!r.hasAt) { r.hasAt = true; r.activatedAt = t; r.act = int256(n); }
-        }
-        if (st == VIOLATED) r.verdict = failed ? V_EXCUSED : V_VIOLATED;
-        else if (st == FULFILLED || st == DISCHARGED) r.verdict = V_FULFILLED;
-        if (st >= FULFILLED) {
-            windows[i].head = windows[i].tail;
-            deadWindows[i].head = deadWindows[i].tail;
-        }
-    }
-
-    function elapsed(uint256 i, int256 t) internal view returns (int256) {
-        NormRec storage r = recs[i];
-        if (r.state == ACTIVE && r.hasSince) return r.before + (t - r.since);
-        return r.before;
-    }
-
-    function contractItems(uint256 n, int256 t) internal {
-        bool was = failed;
-        failed = CadlNormsItems.step(assumeItems, assumeRecs, guaranteeItems, guaranteeRecs, data, n, was);
-        if (failed && !was) failedAt = t;
-    }
-
-    function finishItems(bool endHere, int256 t) internal {
-        if (endHere) ended = true;
-        CadlNormsItems.finish(assumeItems, assumeRecs, guaranteeItems, guaranteeRecs, endHere);
-        t;
-    }
-
-    // --- counts-as (step 1) ---------------------------------------------------------
-
-    function countsAs(uint256 n, int256 t, Msg[] calldata msgs) internal returns (Ev[] memory created) {
-        Ev[] memory buf = new Ev[](rules.length * (msgs.length + 1));
-        uint256 c = 0;
-        Ev[] memory none = new Ev[](0);
-        for (uint256 i = 0; i < rules.length; i++) {
-            Rule storage r = rules[i];
-            if (r.broken) continue;
-            if (r.cond >= 0) {
-                Val memory cv = evalTruth(terms[uint256(r.cond)].root, n, n);
-                if (!(cv.k == K_B && cv.n == 1)) continue;
-            }
-            Term storage w = terms[uint256(r.when)];
-            if (w.kind == T_MESSAGE) {
-                for (uint256 m = 0; m < msgs.length; m++) {
-                    if (!msgMatches(w, msgs[m], n)) continue;
-                    buf[c++] = Ev(r.creates, true, msgs[m].from, desc(msgs[m]));
-                }
-            } else if (occurs(uint256(r.when), n, msgs, none)) {
-                buf[c++] = Ev(r.creates, false, "", w.text);
-            }
-        }
-        created = new Ev[](c);
-        for (uint256 i = 0; i < c; i++) {
-            created[i] = buf[i];
-            emit InstitutionalEvent(buf[i].name, buf[i].performer, buf[i].source, t);
-        }
-    }
-
-    function desc(Msg calldata m) internal pure returns (string memory) {
-        return string.concat(m.from, " -> ", m.to, " : ", m.name);
-    }
-
-    function occurs(uint256 j, uint256 n, Msg[] calldata msgs, Ev[] memory created) internal returns (bool) {
-        Term storage term = terms[j];
-        if (term.kind == T_EVENT) {
-            bytes32 h = keccak256(bytes(term.text));
-            for (uint256 e = 0; e < created.length; e++) if (keccak256(bytes(created[e].name)) == h) return true;
-            return false;
-        }
-        if (term.kind == T_MESSAGE) {
-            for (uint256 m = 0; m < msgs.length; m++) if (msgMatches(term, msgs[m], n)) return true;
-            return false;
-        }
-        if (term.kind == T_PREDICATE) {
-            Val memory now_ = evalTruth(term.root, n, n);
-            if (!(now_.k == K_B && now_.n == 1)) return false;
-            if (n == 0) return true;
-            Val memory prev = evalTruth(term.root, n - 1, n - 1);
-            return !(prev.k == K_B && prev.n == 1);
-        }
-        return false;
-    }
-
-    // --- powers (step 2) -------------------------------------------------------------
-
-    function powers(uint256 n, int256 t, Msg[] calldata msgs, Ev[] memory created) internal {
-        Act[] memory acts = collectActs(n, msgs, created);
-        bool[] memory active = new bool[](normDefs.length);
-        for (uint256 p = 0; p < normDefs.length; p++) active[p] = recs[p].state == ACTIVE;
-        for (uint256 a = 0; a < acts.length; a++) exercise(acts[a], active, n, t);
-    }
-
-    function eventUsedByPower(string memory name) internal view returns (bool) {
-        bytes32 h = keccak256(bytes(name));
-        for (uint256 p = 0; p < normDefs.length; p++) {
-            NormDef storage d = normDefs[p];
-            if (d.kind == POWER && !d.frozen && terms[uint256(d.content)].kind == T_EVENT
-                && keccak256(bytes(terms[uint256(d.content)].text)) == h) return true;
-        }
-        return false;
-    }
-
-    function collectActs(uint256 n, Msg[] calldata msgs, Ev[] memory created) internal returns (Act[] memory acts) {
-        Act[] memory buf = new Act[](created.length + normDefs.length * msgs.length);
-        uint256 c = 0;
-        for (uint256 e = 0; e < created.length; e++) {
-            if (created[e].hasPerformer && eventUsedByPower(created[e].name)) {
-                buf[c++] = Act(created[e].name, created[e].performer,
-                               string.concat("institutional event ", created[e].name));
-            }
-        }
-        uint256 firstMsgAct = c;
-        for (uint256 p = 0; p < normDefs.length; p++) {
-            NormDef storage d = normDefs[p];
-            if (d.kind != POWER || d.frozen || terms[uint256(d.content)].kind != T_MESSAGE) continue;
-            for (uint256 m = 0; m < msgs.length; m++) {
-                if (!msgMatches(terms[uint256(d.content)], msgs[m], n)) continue;
-                Act memory act = Act(terms[uint256(d.content)].text, msgs[m].from,
-                                     string.concat("message ", desc(msgs[m])));
-                if (!seenAct(buf, firstMsgAct, c, act)) buf[c++] = act;
-            }
-        }
-        acts = new Act[](c);
-        for (uint256 i = 0; i < c; i++) acts[i] = buf[i];
-    }
-
-    function seenAct(Act[] memory buf, uint256 from, uint256 to, Act memory act) internal pure returns (bool) {
-        for (uint256 q = from; q < to; q++) {
-            if (keccak256(bytes(buf[q].content)) == keccak256(bytes(act.content))
-                && keccak256(bytes(buf[q].desc)) == keccak256(bytes(act.desc))) return true;
-        }
-        return false;
-    }
-
-    function exercise(Act memory act, bool[] memory active, uint256 n, int256 t) internal {
-        bool any = false;
-        bytes32 h = keccak256(bytes(act.content));
-        for (uint256 p = 0; p < normDefs.length; p++) {
-            NormDef storage d = normDefs[p];
-            if (d.kind != POWER || d.frozen || !active[p]) continue;
-            if (keccak256(bytes(terms[uint256(d.content)].text)) != h) continue;
-            if (!isBearer(p, act.performer)) continue;
-            any = true;
-            emit PowerExercised(d.id, act.performer, act.desc, t);
-            applyEffects(d.activate, INACTIVE, INACTIVE, ACTIVE, n, t);
-            applyEffects(d.suspend, ACTIVE, ACTIVE, SUSPENDED, n, t);
-            applyEffects(d.resume, SUSPENDED, SUSPENDED, ACTIVE, n, t);
-            applyEffects(d.discharge, ACTIVE, SUSPENDED, DISCHARGED, n, t);
-        }
-        if (!any) emit Unauthorised(act.desc, act.performer, t);
-    }
-
-    function applyEffects(uint256[] storage targets, uint8 from1, uint8 from2, uint8 to, uint256 n, int256 t) internal {
-        for (uint256 k = 0; k < targets.length; k++) {
-            uint256 x = targets[k];
-            if (normDefs[x].frozen) continue;
-            uint8 s = recs[x].state;
-            if (s == from1 || s == from2) setSt(x, to, n, t);
-        }
-    }
-
-    function isBearer(uint256 p, string memory performer) internal view returns (bool) {
-        NormDef storage d = normDefs[p];
-        if (!d.hasBearer) return false;
-        (string memory text, bool bound) = actorText(d.bearer.name, d.bearer.ik, d.bearer.idx);
-        if (bound) return keccak256(bytes(performer)) == keccak256(bytes(text));
-        (string memory name, bool hasIdx, string memory idx) = CadlNormsValues.splitActor(performer);
-        return keccak256(bytes(name)) == keccak256(bytes(d.bearer.name)) && isMember(name, hasIdx, idx);
+    function finishItems(bool endHere) internal {
+        if (endHere) m.ended = true;
+        CadlNormsItems.finish(m.assumeItems, m.assumeRecs, m.guaranteeItems, m.guaranteeRecs, endHere);
     }
 
     // --- contents, deadlines and until (step 4) -----------------------------------------
 
     function judge(uint256 n, int256 t, Msg[] calldata msgs, Ev[] memory created) internal returns (uint256[] memory violated) {
-        uint256[] memory buf = new uint256[](normDefs.length);
+        uint256[] memory buf = new uint256[](m.normDefs.length);
         uint256 c = 0;
-        for (uint256 i = 0; i < normDefs.length; i++) {
-            NormDef storage d = normDefs[i];
-            if (d.frozen || n < recs[i].from) continue;
-            if (recs[i].state == ACTIVE && (d.kind == OBLIGATION || d.kind == PROHIBITION)) {
-                if (d.tmode != 0 ? judgeWindow(i, n, t) : judgeContent(i, n, t, msgs, created)) buf[c++] = i;
-            }
-            uint8 st = recs[i].state;
-            if ((st == ACTIVE || st == SUSPENDED) && d.until >= 0 && occurs(uint256(d.until), n, msgs, created)) {
-                setSt(i, DISCHARGED, n, t);
+        for (uint256 i = 0; i < m.normDefs.length; i++) {
+            NormDef storage d = m.normDefs[i];
+            if (d.frozen || n < m.recs[i].from) continue;
+            if (m.recs[i].state == ACTIVE && (d.kind == OBLIGATION || d.kind == PROHIBITION)
+                && judgeNorm(i, n, t, msgs, created)) buf[c++] = i;
+            uint8 st = m.recs[i].state;
+            if ((st == ACTIVE || st == SUSPENDED) && d.until >= 0
+                && CadlNormsActs.occurs(m, uint256(d.until), n, msgs, created)) {
+                setSt(m, i, DISCHARGED, n, t);
             }
         }
         violated = new uint256[](c);
         for (uint256 i = 0; i < c; i++) violated[i] = buf[i];
     }
 
-    /// true when the norm is violated. The content has no temporal
-    /// operator, so it is decided at this observation.
-    function judgeContent(uint256 i, uint256 n, int256 t, Msg[] calldata msgs, Ev[] memory created) internal returns (bool) {
-        NormDef storage d = normDefs[i];
-        bool open = !d.hasDeadline || elapsed(i, t) <= d.deadline;
-        Val memory v = open ? contentValue(i, n, n, msgs, created) : boolVal(false);
-        return decide(i, n, t, v.k == K_B && v.n == 1, !open);
-    }
-
-    /// A hit fulfils an obligation and violates a prohibition; a closed
-    /// window without one does the opposite. true when violated.
-    function decide(uint256 i, uint256 n, int256 t, bool hit, bool closed) internal returns (bool) {
-        bool obligation = normDefs[i].kind == OBLIGATION;
-        if (hit || closed) setSt(i, hit == obligation ? FULFILLED : VIOLATED, n, t);
-        return (hit || closed) && hit != obligation;
-    }
-
-    /// A content that is one temporal operator (see CadlNormsWindows).
-    function judgeWindow(uint256 i, uint256 n, int256 t) internal returns (bool) {
-        NormDef storage d = normDefs[i];
-        bool open = !d.hasDeadline || elapsed(i, t) <= d.deadline;
-        (bool hit, bool empty) = CadlNormsWindows.judge(windows[i], deadWindows[i], data, temporals[i],
-                                                        n, t, open);
-        return decide(i, n, t, hit, !hit && !open && empty);
-    }
-
-    function noteWindows(uint256 n, int256 t) internal {
-        for (uint256 i = 0; i < normDefs.length; i++) {
-            NormDef storage d = normDefs[i];
-            if (d.tmode == 0 || d.frozen) continue;
-            CadlNormsWindows.note(windows[i], deadWindows[i], data, temporals[i], n, t);
+    /// The content of an active obligation or prohibition at observation
+    /// n: true when the norm is violated.
+    function judgeNorm(uint256 i, uint256 n, int256 t, Msg[] calldata msgs, Ev[] memory created) internal returns (bool) {
+        NormDef storage d = m.normDefs[i];
+        bool open = !d.hasDeadline || elapsed(m, i, t) <= d.deadline;
+        bool hit;
+        bool closed;
+        if (d.tmode != 0) {
+            // a content with a temporal operator (see CadlNormsWindows)
+            (hit, closed) = judgeWindow(i, n, t, open);
+        } else {
+            // the content has no temporal operator: it is decided now
+            hit = open && contentHolds(i, n, msgs, created);
+            closed = !open;
         }
+        // a hit fulfils an obligation and violates a prohibition; a closed
+        // window without one does the opposite
+        bool obligation = d.kind == OBLIGATION;
+        if (!hit && !closed) return false;
+        setSt(m, i, hit == obligation ? FULFILLED : VIOLATED, n, t);
+        return hit != obligation;
     }
 
-    function contentValue(uint256 i, uint256 k, uint256 n, Msg[] calldata msgs, Ev[] memory created) internal returns (Val memory) {
-        Term storage term = terms[uint256(normDefs[i].content)];
-        if (term.kind == T_PREDICATE) {
-            Val memory v = evalTruth(term.root, k, n);
-            if (v.k == K_U) return boolVal(false);
-            return v;
+    function judgeWindow(uint256 i, uint256 n, int256 t, bool open) internal returns (bool hit, bool closed) {
+        bool empty;
+        if (m.normDefs[i].tmode == 1) (hit, empty) = CadlNormsWindows.judge(m.windows[i], m.data, m.temporals[i], n, t, open);
+        else (hit, empty) = CadlNormsMulti.judge(m.multis[i], m.data, n, t, open);
+        closed = !hit && !open && empty;
+    }
+
+    function contentHolds(uint256 i, uint256 n, Msg[] calldata msgs, Ev[] memory created) internal returns (bool) {
+        uint256 j = uint256(m.normDefs[i].content);
+        if (m.terms[j].kind == T_PREDICATE) {
+            Val memory v = evalTruth(m, m.terms[j].root, n, n);
+            return v.k == K_B && v.n == 1;
         }
-        if (k != n) return boolVal(false);
-        return boolVal(occurs(uint256(normDefs[i].content), n, msgs, created));
+        return CadlNormsActs.occurs(m, j, n, msgs, created);
     }
 
     // --- violations (step 5) and the end (step 6) ------------------------------------------
 
     function onViolation(uint256 i, uint256 n, int256 t, bool activate) internal {
-        NormDef storage d = normDefs[i];
+        NormDef storage d = m.normDefs[i];
         bool repActivated = false;
         if (activate && d.reparation >= 0) {
             uint256 rp = uint256(d.reparation);
-            if (!normDefs[rp].frozen && recs[rp].state == INACTIVE) repActivated = true;
+            if (!m.normDefs[rp].frozen && m.recs[rp].state == INACTIVE) repActivated = true;
         }
         string memory transition = "";
-        bool terminal = data.hasLifecycle && lcTerminal[keccak256(bytes(data.obsSt[n]))];
+        bool terminal = m.data.hasLifecycle && m.lcTerminal[keccak256(bytes(m.data.obsSt[n]))];
         if (d.hasTransition && activate && !terminal) transition = d.transition;
-        emit Violation(d.id, d.severity, recs[i].verdict, d.sanction, d.reparationId, repActivated, transition, t);
+        emit Violation(d.id, d.severity, m.recs[i].verdict, d.sanction, d.reparationId, repActivated, transition, t);
         if (repActivated) {
             uint256 rp = uint256(d.reparation);
-            recs[rp].from = n + 1;
-            setSt(rp, ACTIVE, n, t);
+            m.recs[rp].from = n + 1;
+            setSt(m, rp, ACTIVE, n, t);
         }
     }
 
     function settle(uint256 n, int256 t) internal {
-        ended = true;
-        uint256[] memory late = new uint256[](normDefs.length);
+        m.ended = true;
+        uint256[] memory late = new uint256[](m.normDefs.length);
         uint256 c = 0;
-        for (uint256 i = 0; i < normDefs.length; i++) {
-            NormDef storage d = normDefs[i];
-            NormRec storage r = recs[i];
+        for (uint256 i = 0; i < m.normDefs.length; i++) {
+            NormDef storage d = m.normDefs[i];
+            NormRec storage r = m.recs[i];
             if (d.frozen || r.state >= FULFILLED) continue;
             bool inForce = r.state == ACTIVE || r.state == SUSPENDED;
-            if (inForce && r.act == int256(n)) { setSt(i, DISCHARGED, n, t); continue; }
+            if (inForce && r.act == int256(n)) { setSt(m, i, DISCHARGED, n, t); continue; }
             if (inForce && (d.kind == OBLIGATION || d.kind == PROHIBITION)
-                && (windows[i].head < windows[i].tail || deadWindows[i].head < deadWindows[i].tail)) continue;
+                && (CadlNormsWindows.pending(m.windows[i]) || m.multis[i].pend)) continue;
             if (inForce && d.kind == OBLIGATION) {
-                if (!d.hasDeadline) { setSt(i, VIOLATED, n, t); late[c++] = i; }
-                else if (elapsed(i, t) <= d.deadline) setSt(i, DISCHARGED, n, t);
-                else { setSt(i, VIOLATED, n, t); late[c++] = i; }
+                if (!d.hasDeadline) { setSt(m, i, VIOLATED, n, t); late[c++] = i; }
+                else if (elapsed(m, i, t) <= d.deadline) setSt(m, i, DISCHARGED, n, t);
+                else { setSt(m, i, VIOLATED, n, t); late[c++] = i; }
             } else if (inForce && d.kind == PROHIBITION) {
-                setSt(i, FULFILLED, n, t);
+                setSt(m, i, FULFILLED, n, t);
             } else {
-                setSt(i, DISCHARGED, n, t);
+                setSt(m, i, DISCHARGED, n, t);
             }
         }
         for (uint256 i = 0; i < c; i++) onViolation(late[i], n, t, false);
@@ -1344,130 +1841,29 @@ abstract contract CadlNormsMonitorBase {
     }
 
     function marks() internal view returns (uint8[] memory ns, uint8[] memory nv, uint8[] memory am, uint8[] memory gm) {
-        ns = new uint8[](recs.length);
-        nv = new uint8[](recs.length);
-        for (uint256 i = 0; i < recs.length; i++) { ns[i] = recs[i].state; nv[i] = recs[i].verdict; }
-        am = new uint8[](assumeRecs.length);
-        for (uint256 i = 0; i < assumeRecs.length; i++) am[i] = itemMark(assumeRecs[i], false);
-        gm = new uint8[](guaranteeRecs.length);
-        for (uint256 i = 0; i < guaranteeRecs.length; i++) gm[i] = itemMark(guaranteeRecs[i], true);
+        ns = new uint8[](m.recs.length);
+        nv = new uint8[](m.recs.length);
+        for (uint256 i = 0; i < m.recs.length; i++) { ns[i] = m.recs[i].state; nv[i] = m.recs[i].verdict; }
+        am = new uint8[](m.assumeRecs.length);
+        for (uint256 i = 0; i < m.assumeRecs.length; i++) am[i] = itemMark(m.assumeRecs[i], false);
+        gm = new uint8[](m.guaranteeRecs.length);
+        for (uint256 i = 0; i < m.guaranteeRecs.length; i++) gm[i] = itemMark(m.guaranteeRecs[i], true);
     }
 
     function emitChanges(uint8[] memory ns, uint8[] memory nv, uint8[] memory am, uint8[] memory gm, int256 t) internal {
-        for (uint256 i = 0; i < recs.length; i++) {
-            if (recs[i].state != ns[i] || recs[i].verdict != nv[i]) {
-                emit NormChanged(i, normDefs[i].id, recs[i].state, recs[i].verdict, ns[i], nv[i], t);
+        for (uint256 i = 0; i < m.recs.length; i++) {
+            if (m.recs[i].state != ns[i] || m.recs[i].verdict != nv[i]) {
+                emit NormChanged(i, m.normDefs[i].id, m.recs[i].state, m.recs[i].verdict, ns[i], nv[i], t);
             }
         }
-        for (uint256 i = 0; i < assumeRecs.length; i++) {
-            uint8 m = itemMark(assumeRecs[i], false);
-            if (m != am[i]) emit ItemChanged(false, i + 1, m, am[i], t);
+        for (uint256 i = 0; i < m.assumeRecs.length; i++) {
+            uint8 k = itemMark(m.assumeRecs[i], false);
+            if (k != am[i]) emit ItemChanged(false, i + 1, k, am[i], t);
         }
-        for (uint256 i = 0; i < guaranteeRecs.length; i++) {
-            uint8 m = itemMark(guaranteeRecs[i], true);
-            if (m != gm[i]) emit ItemChanged(true, i + 1, m, gm[i], t);
+        for (uint256 i = 0; i < m.guaranteeRecs.length; i++) {
+            uint8 k = itemMark(m.guaranteeRecs[i], true);
+            if (k != gm[i]) emit ItemChanged(true, i + 1, k, gm[i], t);
         }
-    }
-
-    // =========================================================================
-    // Messages and actors
-    // =========================================================================
-
-    function msgMatches(Term storage term, Msg calldata m, uint256 n) internal returns (bool) {
-        if (keccak256(bytes(m.name)) != keccak256(bytes(term.msgName))) return false;
-        if (!actorMatches(term.sender, m.from) || !actorMatches(term.receiver, m.to)) return false;
-        if (!term.hasArgs) return true;
-        if (term.args.length != m.args.length) return false;
-        for (uint256 a = 0; a < term.args.length; a++) {
-            Val memory w = evalAt(term.args[a], n, n);
-            if (!eqRaw(w, m.args[a])) return false;
-        }
-        return true;
-    }
-
-    function eqRaw(Val memory w, ValIn calldata a) internal pure returns (bool) {
-        if (w.k == K_U || w.k == K_D || a.k == K_U) return false;
-        if ((w.k == K_B) != (a.k == K_B)) return false;
-        if (w.k == K_T || w.k == K_S) return a.k == K_T && keccak256(bytes(w.s)) == keccak256(bytes(a.s));
-        if (a.k == K_T) return false;
-        return w.n == a.n;
-    }
-
-    function actorMatches(Pat storage pat, string calldata actual) internal view returns (bool) {
-        (string memory name, bool hasIdx, string memory idx) = CadlNormsValues.splitActor(actual);
-        if (keccak256(bytes(name)) != keccak256(bytes(pat.name)) || !isMember(name, hasIdx, idx)) return false;
-        if (pat.ik == I_ANY) {
-            if (!hasIdx) return false;
-            if (!pat.hasRange) return true;
-            int256 v = CadlNormsValues.parseIndex(idx);
-            return v >= pat.lo && v <= pat.hi;
-        }
-        (string memory text, bool bound) = actorText(pat.name, pat.ik, pat.idx);
-        if (bound) return keccak256(bytes(actual)) == keccak256(bytes(text));
-        return true;
-    }
-
-    function isMember(string memory name, bool hasIdx, string memory idx) internal view returns (bool) {
-        ActorDecl storage a = actors[keccak256(bytes(name))];
-        if (!a.declared) return false;
-        if (!a.isIndexed || !hasIdx) return !a.isIndexed && !hasIdx;
-        if (!CadlNormsValues.isDigits(idx)) return false;
-        int256 v = CadlNormsValues.parseIndex(idx);
-        return (!a.hasLo || a.lo <= v) && (!a.hasHi || v <= a.hi);
-    }
-
-    // --- checks of the input ---------------------------------------------------------------
-
-    // =========================================================================
-    // Values (A.10 with the three-valued reading of F.5)
-    // =========================================================================
-
-    function evalAt(uint256 root, uint256 p, uint256 n) internal returns (Val memory) {
-        return CadlNormsEval.evaluate(data, root, p, n);
-    }
-
-    function evalTruth(uint256 root, uint256 p, uint256 n) internal returns (Val memory) {
-        return truth(CadlNormsEval.evaluate(data, root, p, n));
-    }
-
-    function truth(Val memory v) internal pure returns (Val memory) {
-        if (v.k == K_U || v.k == K_D || v.k == K_B) return v;
-        if (v.k == K_N) return boolVal(v.n != 0);
-        return mark(K_U);
-    }
-
-
-    /// The text of an actor reference with its index bound; bound is false
-    /// for an index name that the instance does not bind.
-    function actorText(string memory name, uint8 ik, string memory idx) internal view returns (string memory, bool) {
-        if (ik == I_NONE) return (name, true);
-        if (ik == I_LIT) return (string.concat(name, "[", idx, "]"), true);
-        bytes32 h = keccak256(bytes(idx));
-        if (data.hasBinding[h]) {
-            Stored storage b = data.bindings[h];
-            string memory text = b.k == K_T ? b.s : CadlNormsValues.intText(b.n / SCALE);
-            return (string.concat(name, "[", text, "]"), true);
-        }
-        return (string.concat(name, "[", idx, "]"), false);
-    }
-
-
-    function boolVal(bool b) internal pure returns (Val memory) {
-        return Val(K_B, b ? int256(1) : int256(0), "");
-    }
-
-    function mark(uint8 k) internal pure returns (Val memory) {
-        return Val(k, 0, "");
-    }
-
-    function isText(Val memory v) internal pure returns (bool) {
-        return v.k == K_T || v.k == K_S;
-    }
-
-    function eqVal(Val memory a, Val memory b) internal pure returns (bool) {
-        if ((a.k == K_B) != (b.k == K_B)) return false;
-        if (isText(a) || isText(b)) return isText(a) && isText(b) && keccak256(bytes(a.s)) == keccak256(bytes(b.s));
-        return a.n == b.n;
     }
 
     // =========================================================================
@@ -1476,14 +1872,14 @@ abstract contract CadlNormsMonitorBase {
 
     function _node(uint8 op, uint8 bop, uint256 a, uint256 b, int256 d, uint8 ik,
                    string memory s1, string memory s2, string memory s3, uint8 lk, int256 ln, string memory ls) internal {
-        Node storage nd = data.nodes.push();
+        Node storage nd = m.data.nodes.push();
         nd.op = op; nd.bop = bop; nd.a = a; nd.b = b; nd.d = d; nd.ik = ik;
         nd.s1 = s1; nd.s2 = s2; nd.s3 = s3;
         nd.lit = Val(lk, ln, ls);
     }
 
     function _item(uint256 i) internal {
-        data.nodes[data.nodes.length - 1].items.push(i);
+        m.data.nodes[m.data.nodes.length - 1].items.push(i);
     }
 
     function _pat(Pat storage p, string memory name, uint8 ik, string memory idx, bool hasRange, int256 lo, int256 hi) internal {
@@ -1491,39 +1887,48 @@ abstract contract CadlNormsMonitorBase {
     }
 
     function _term(uint8 kind, string memory text, uint256 root, string memory msgName, bool hasArgs) internal returns (Term storage t) {
-        t = terms.push();
+        t = m.terms.push();
         t.kind = kind; t.text = text; t.root = root; t.msgName = msgName; t.hasArgs = hasArgs;
     }
 
     function _norm(string memory id, uint8 kind, bool frozen, int256 trigger, int256 until, int256 content,
                    bool hasDeadline, int256 deadline, bool target) internal returns (NormDef storage d) {
-        d = normDefs.push();
+        d = m.normDefs.push();
         d.id = id; d.kind = kind; d.frozen = frozen; d.trigger = trigger; d.until = until; d.content = content;
         d.hasDeadline = hasDeadline; d.deadline = deadline; d.target = target;
         d.reparation = -1;
-        NormRec storage r = recs.push();
+        NormRec storage r = m.recs.push();
         r.act = -1;
     }
 
-    function _temporal(uint8 mode, bool neg, uint256 tp, uint256 tq, int256 td, uint256 node,
-                       uint256 root) internal {
-        uint256 i = normDefs.length - 1;
-        normDefs[i].tmode = mode;
-        temporals[i] = Temporal(mode, neg, tp, tq, td, node, root);
+    function _temporal(uint8 mode, uint256 tp, uint256 tq, int256 td, uint256 node, uint256 root) internal {
+        uint256 i = m.normDefs.length - 1;
+        m.normDefs[i].tmode = 1;
+        m.temporals[i] = Temporal(mode, tp, tq, td, node, root);
+    }
+
+    function _multi(uint256 root, uint8 ma, uint256 pa, uint256 qa, int256 da, uint256 na,
+                    uint8 mb, uint256 pb, uint256 qb, int256 db, uint256 nb) internal {
+        uint256 i = m.normDefs.length - 1;
+        m.normDefs[i].tmode = 2;
+        Multi storage mu = m.multis[i];
+        mu.root = root;
+        mu.a.mode = ma; mu.a.tp = pa; mu.a.tq = qa; mu.a.td = da; mu.a.node = na;
+        mu.b.mode = mb; mu.b.tp = pb; mu.b.tq = qb; mu.b.td = db; mu.b.node = nb;
     }
 
     function _actor(string memory name, bool isIndexed_, bool hasLo, int256 lo, bool hasHi, int256 hi) internal {
-        actors[keccak256(bytes(name))] = ActorDecl(true, isIndexed_, hasLo, lo, hasHi, hi);
+        m.actors[keccak256(bytes(name))] = ActorDecl(true, isIndexed_, hasLo, lo, hasHi, hi);
     }
 
     function _assume(string memory text, bool temporal_, bool broken, bool unsupported, uint256 root) internal {
-        assumeItems.push(Item(text, temporal_, broken, unsupported, root));
-        assumeRecs.push(ItemRec(0, false, V_PENDING));
+        m.assumeItems.push(Item(text, temporal_, broken, unsupported, root));
+        m.assumeRecs.push(ItemRec(0, false, V_PENDING));
     }
 
     function _guarantee(string memory text, bool temporal_, bool broken, bool unsupported, uint256 root) internal {
-        guaranteeItems.push(Item(text, temporal_, broken, unsupported, root));
-        guaranteeRecs.push(ItemRec(0, false, V_PENDING));
+        m.guaranteeItems.push(Item(text, temporal_, broken, unsupported, root));
+        m.guaranteeRecs.push(ItemRec(0, false, V_PENDING));
     }
 }
 // <<< norms-monitor-base
