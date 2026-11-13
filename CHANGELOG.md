@@ -6,6 +6,33 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `cadl norms-check` translates a group of four quantities ordered
+  against each other (F.12). When the classes of a component exceed
+  50,000 combinations, or a group has four or more ordered quantities,
+  each group whose quantities have the same classes takes its
+  valuations by types and patterns: a type for each quantity (no
+  value, true, false, number, text, object, list) and, per type, the
+  literal or gap of each number or text with their order within a gap,
+  which objects are equal, and the pattern of pairwise outcomes of the
+  lists. The patterns of n lists are the partitions into equal lists
+  with a series-parallel order of the classes (1, 4, 29, 331, 5,262 for
+  n = 1..5), realised by series and parallel composition with the
+  prefixes 0, 1 and `"a"`. Four ordered quantities without other
+  literals have 26,035 valuations (built in about 2 s; a contract with
+  four predicates over them: 68 choices, 272 commands, 1,626 states,
+  about 20 s with PRISM), 46,285 with one more numeric literal. Five or
+  more have at least 424,213 valuations and are refused, with the
+  numbers of patterns per type (about 30 s to build without the limit);
+  four or more in a component with linear arithmetic or with a
+  `--domain` are refused too. Tests: every consistent pattern of four
+  lists (331 of 355 are series-parallel), random nested lists of four
+  and five, random JSON values of every type against the choices, the
+  differential test with `cadl norms-eval` and the witnesses, and the
+  valuations by types and patterns against the product of the classes
+  for groups of two and three; 8 of 8 injected errors were detected.
+
 ## [0.3.28] — 2026-11-13
 
 Removes most of the remaining refusals. `cadl norms-check` checks
