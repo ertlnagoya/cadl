@@ -31,7 +31,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   and closes it when the answer does not come within 20 seconds (before,
   the default of 2 hours applied); `grpcio` 1.85 times that answer with
   `grpc.http2.ping_timeout_ms`, not with `grpc.keepalive_timeout_ms`,
-  so both are set. No new dependency.
+  so both are set. The front listener reads the gRPC server on while up
+  to 256 KiB wait for the client, so it sees the server close a
+  connection also when the client reads nothing, and resets the client's
+  side at most 5 seconds later; when more waits, or the server does not
+  take the client's bytes, and nothing goes out for 30 seconds, both
+  sides are reset (`read_timeout`, `grpc stalled`). A connection counts
+  against the caps until its sockets are closed; refusals are recorded
+  by a thread of their own; `localhost` is listened on at 127.0.0.1 and
+  ::1, as gRPC did. No new dependency.
 
 ## [0.3.28] — 2026-11-13
 
