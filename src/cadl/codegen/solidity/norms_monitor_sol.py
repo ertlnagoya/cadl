@@ -55,21 +55,22 @@ SOLC_CHECKED = ("0.8.24", "0.8.37")
 # the constructor). Measured with the versions above, the optimizer with 1
 # and with 200 runs, plus 3 %; tests/test_norms_monitor_targets.py checks
 # them against solc.
-RUNTIME_ESTIMATE = {"monitor": 24410, "CadlNormsValues": 7810, "CadlNormsEval": 8290,
-                    "CadlNormsItems": 2370, "CadlNormsWindows": 4410}
+RUNTIME_ESTIMATE = {"monitor": 16840, "CadlNormsValues": 7810, "CadlNormsEval": 10310,
+                    "CadlNormsItems": 2370, "CadlNormsWindows": 5070, "CadlNormsActs": 12170,
+                    "CadlNormsMulti": 4430}
 
 
 def estimated_initcode(text: str) -> int:
     """An upper estimate of the creation code of the generated contract
     (solc 0.8.24 or later, with the optimizer, 1 or 200 runs): the runtime code and the constructor,
     which grows with its statements and its texts. Fitted to compiled
-    monitors (2.6 to 12 x 10^4 bytes) and kept above each of them."""
+    monitors (1.8 to 3.6 x 10^4 bytes) and kept above each of them."""
     ctor = text.split("is CadlNormsMonitorBase {", 1)[1]
     statements = sum(1 for line in ctor.splitlines() if line.strip().endswith(";"))
     texts = sum(len(h) // 2 for h in re.findall(r'hex"([0-9a-f]*)"', ctor))
     # fitted with --optimize-runs 1; the factor covers the default of 200 runs,
     # whose code is up to 6 % larger (the generated files ask for 1 run)
-    return int(1.08 * (25500 + 72 * statements + 1.3 * texts))
+    return int(1.08 * (17500 + 72 * statements + 1.3 * texts))
 
 
 def monitor_name(contract_id: str) -> str:
@@ -223,41 +224,40 @@ def solidity_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
         if not ops:
             continue
         where = f"norm '{nd['id']}', content"
-        if len(ops) > 1:
-            reasons.append(f"{where}: two temporal operators (the Solidity monitor decides the "
-                           f"candidates of a content from one operator)")
+        if len(ops) > 2:
+            reasons.append(f"{where}: {len(ops)} temporal operators (the Solidity monitor decides "
+                           f"the candidates of a content from at most two)")
             continue
-        path = _path_to(nodes, c["expr"], ops[0])
-        if any(nodes[k]["op"] not in ("and", "or", "not") for k in path[:-1]):
-            reasons.append(f"{where}: a temporal operator inside a comparison or an IN")
-            continue
-        neg = sum(1 for k in path[:-1] if nodes[k]["op"] == "not") % 2 == 1
-        if neg and nodes[ops[0]]["op"] == "until":
-            reasons.append(f"{where}: NOT until(...) (it has no dual among within, throughout "
-                           f"and until)")
-            continue
-        nd["temporal"] = {"node": ops[0], "neg": neg}
+        if len(ops) == 2:
+            nd["multi"] = sorted(ops)
+        else:
+            nd["temporal"] = {"node": ops[0]}
     if reasons:
         raise NormsTargetUnsupported(reasons)
     return ir
 
 
 _WINDOW_MODES = {"within": 1, "throughout": 2, "until": 3}
-_DUAL = {"within": "throughout", "throughout": "within"}
+
+
+def _op_args(ir: dict, k: int) -> str:
+    """mode, p, q, duration and node of a temporal operator."""
+    node = ir["exprs"][k]
+    p, q = (node["p"], node["q"]) if node["op"] == "until" else (node["x"], 0)
+    return (f"{_WINDOW_MODES[node['op']]}, {p}, {q}, {scaled(node['d'], 'a duration')}, {k}")
 
 
 def _window_line(ir: dict, nd: dict) -> str | None:
-    """The temporal operator of the content of a norm (`_temporal`): with
-    an odd number of NOT above it, the dual operator on the negated
-    operand."""
+    """The temporal operators of the content of a norm: one (`_temporal`)
+    or two (`_multi`)."""
+    if nd.get("multi"):
+        root = nd["content"]["expr"]
+        a, b = nd["multi"]
+        return f"        _multi({root}, {_op_args(ir, a)}, {_op_args(ir, b)});"
     tm = nd.get("temporal")
     if tm is None:
         return None
-    node = ir["exprs"][tm["node"]]
-    op = _DUAL[node["op"]] if tm["neg"] else node["op"]
-    p, q = (node["p"], node["q"]) if node["op"] == "until" else (node["x"], 0)
-    return (f"        _temporal({_WINDOW_MODES[op]}, {str(tm['neg']).lower()}, {p}, {q}, "
-            f"{scaled(node['d'], 'a duration')}, {tm['node']}, {nd['content']['expr']});")
+    return f"        _temporal({_op_args(ir, tm['node'])}, {nd['content']['expr']});"
 
 
 def _node_lines(nodes: list[dict], skip: set) -> list[str]:
@@ -327,15 +327,15 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
                     f"{str(hi is not None).lower()}, {int(hi or 0)});")
     lc = ir["lifecycle"]
     if lc is not None:
-        body.append("        data.hasLifecycle = true;")
-        body.append(f"        lcInitial = {_s(lc['initial'] or '')};")
+        body.append("        m.data.hasLifecycle = true;")
+        body.append(f"        m.lcInitial = {_s(lc['initial'] or '')};")
         for s in lc["states"]:
-            body.append(f"        lcStates[keccak256(bytes({_s(s)}))] = true;")
+            body.append(f"        m.lcStates[keccak256(bytes({_s(s)}))] = true;")
         for s in lc["terminal"]:
-            body.append(f"        lcTerminal[keccak256(bytes({_s(s)}))] = true;")
+            body.append(f"        m.lcTerminal[keccak256(bytes({_s(s)}))] = true;")
     body += _node_lines(ir["exprs"], skip)
     for name in temporal_names(ir, skip):
-        body.append(f"        temporalName[keccak256(bytes({_s(name)}))] = true;")
+        body.append(f"        m.temporalName[keccak256(bytes({_s(name)}))] = true;")
 
     terms: list[str] = []
     count = [0]
@@ -399,7 +399,7 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
     for r in ir["rules"]:
         when = -1 if r["error"] else term(r["when"])
         cond = -1 if r["error"] else term(r["if"])
-        rule_lines.append(f"        rules.push(Rule({_s(r['creates'])}, {str(r['error']).lower()}, "
+        rule_lines.append(f"        m.rules.push(Rule({_s(r['creates'])}, {str(r['error']).lower()}, "
                           f"{when}, {cond}));")
     item_lines = []
     for key, fn in (("assume", "_assume"), ("guarantee", "_guarantee")):
@@ -425,8 +425,8 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
         "// specification, norms 0.1). Generated by `cadl codegen -t solidity`. Do not edit.",
         "// Compile with solc 0.8.24 to 0.8.37 and --optimize --optimize-runs 1 (without the",
         "// optimizer the runtime code exceeds the limit of EIP-170); deploy and link the",
-        "// libraries CadlNormsValues, CadlNormsEval, CadlNormsWindows and CadlNormsItems,",
-        "// in this order.",
+        "// libraries CadlNormsValues, CadlNormsEval, CadlNormsWindows, CadlNormsMulti,",
+        "// CadlNormsItems and CadlNormsActs, in this order.",
         f"// Checked with solc {' and '.join(SOLC_CHECKED)}.",
         f"pragma solidity >={SOLC_CHECKED[0]} <={SOLC_CHECKED[1]};",
         "",

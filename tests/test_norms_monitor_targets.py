@@ -233,28 +233,33 @@ class TestGeneration:
         assert temporal_names(solidity_ir(sos, sos.contracts[0])) == ["flag"]
         assert "temporalName[keccak256" in generate_norms_monitor_sol(sos, sos.contracts[0])
 
-    @pytest.mark.parametrize("content,match", [
-        ("within(3s, A.x > 1) OR throughout(2s, A.y == 1)", "two temporal operators"),
-        ("NOT until(A.x > 1, A.y == 1, 3s)", "NOT until"),
-        ("within(3s, A.x > 1) == true", "inside a comparison"),
-    ])
-    def test_solidity_temporal_content_limits(self, content, match):
-        """The Solidity monitor decides the candidates of a content from its
-        one temporal operator (NOT turns within and throughout into their
-        duals); OPA monitors these contents too."""
+    def test_solidity_refuses_three_temporal_operators_in_a_content(self):
+        """The Solidity monitor decides the candidates of a content from at
+        most two temporal operators; OPA monitors such a content too."""
+        content = "within(3s, A.x > 1) OR throughout(2s, A.y == 1) OR within(1s, A.z == 1)"
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
                      f"content: \"{content}\"}}\n")
         generate_norms_monitor_rego(sos, sos.contracts[0])
-        with pytest.raises(NormsTargetUnsupported, match=match):
+        with pytest.raises(NormsTargetUnsupported, match="3 temporal operators"):
             generate_norms_monitor_sol(sos, sos.contracts[0])
 
-    @pytest.mark.parametrize("content", ["within(3s, A.x > 1) OR A.y == 1",
-                                         "NOT throughout(2s, A.x > 1) AND A.ok == true",
-                                         "NOT (within(2s, A.x == 0) OR A.z == 1)"])
-    def test_solidity_reduces_a_content_to_its_operator(self, content):
+    @pytest.mark.parametrize("content,call", [
+        ("within(3s, A.x > 1) OR A.y == 1", "_temporal(1, "),
+        ("NOT throughout(2s, A.x > 1) AND A.ok == true", "_temporal(2, "),
+        ("NOT (within(2s, A.x == 0) OR A.z == 1)", "_temporal(1, "),
+        ("NOT until(A.x > 1, A.y == 1, 3s)", "_temporal(3, "),
+        ("within(3s, A.x > 1) == true", "_temporal(1, "),
+        ("until(A.x > 1, A.y == 1, 3s) <= A.z", "_temporal(3, "),
+        ("within(3s, A.x > 1) OR throughout(2s, A.y == 1)", "_multi("),
+        ("within(3s, A.x > 1) == throughout(2s, A.y == 1)", "_multi("),
+    ])
+    def test_solidity_temporal_contents_it_decides(self, content, call):
+        """One temporal operator anywhere in a content (under NOT, in a
+        comparison) goes to the queues of CadlNormsWindows, two to the
+        segment tree of CadlNormsMulti."""
         sos = _small(f"      norms:\n        - {{id: n, kind: prohibition, bearer: A, "
                      f"content: \"{content}\"}}\n")
-        assert "_temporal(" in generate_norms_monitor_sol(sos, sos.contracts[0])
+        assert call in generate_norms_monitor_sol(sos, sos.contracts[0])
 
     def test_rego_carries_the_contract_as_one_json_text(self):
         """No text of the .cadl file is Rego code: the model is one JSON
@@ -909,6 +914,210 @@ def test_evm_gas_of_a_temporal_content_is_bounded(tmp_path):
     [raw] = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", [run], tmp_path)
     gas = [r["gas"] for r in raw]
     assert max(gas[20:]) < 1.05 * min(gas[20:]) and max(gas) < 500_000, (min(gas), max(gas))
+
+
+# === NOT until, comparisons and two temporal operators (Solidity) ====================
+
+# NOT until(...) is the release on the dual queue; an operator inside a
+# comparison gives each candidate its own queue; two operators in one
+# content share a segment tree of candidates. Reparations, suspension,
+# undefined values and epoch timestamps.
+RELEASE = """\
+      norms:
+        - {id: nu, kind: prohibition, bearer: A, trigger: "B -> A : start",
+           content: "NOT until(A.ok == true, A.done == true, 3s)", deadline: 6s,
+           on_violation: {severity: Major, reparation: rp}}
+        - {id: no, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "NOT until(A.ok == true, A.done == true, 2s) OR A.z == 1", deadline: 5s}
+        - {id: na, kind: obligation, bearer: A,
+           content: "NOT (until(A.ok == true, A.done == true, 2.5s) OR A.z == 1)", deadline: 7s}
+        - {id: rp, kind: obligation, bearer: A, content: "NOT until(A.ok == true, A.y == 0, 1s)",
+           deadline: 3s}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [nu, no, na, rp]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [nu, no, na, rp]}}
+"""
+
+COMPARE = """\
+      norms:
+        - {id: ce, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(3s, A.x > 5) == (A.z == 1)", deadline: 5s,
+           on_violation: {severity: Major, reparation: cr}}
+        - {id: cn, kind: prohibition, bearer: A, content: "throughout(2s, A.x > 2) != true"}
+        - {id: cl, kind: obligation, bearer: A, trigger: "B -> A : start",
+           content: "until(A.ok == true, A.done == true, 3s) <= A.y", deadline: 6s}
+        - {id: ci, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(2s, A.x == 0) IN (A.ok, false)", deadline: 4s}
+        - {id: cr, kind: prohibition, bearer: A, content: "NOT until(A.ok == true, A.done == true, 2s) == A.ok",
+           deadline: 4s}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [ce, cn, cl, ci, cr]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [ce, cn, cl, ci, cr]}}
+"""
+
+TWO = """\
+      norms:
+        - {id: wa, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(3s, A.x > 5) AND throughout(2s, A.ok == true)", deadline: 5s,
+           on_violation: {severity: Major, reparation: tr}}
+        - {id: wo, kind: prohibition, bearer: A,
+           content: "within(1s, A.x == 0) OR NOT until(A.ok == true, A.done == true, 2s)"}
+        - {id: ua, kind: obligation, bearer: A, trigger: "B -> A : start",
+           content: "until(A.ok == true, A.done == true, 3s) AND NOT within(2s, A.x > 8) OR A.z == 1",
+           deadline: 6s}
+        - {id: eq, kind: obligation, bearer: A, trigger: "B -> A : go",
+           content: "within(2s, A.x > 5) == throughout(1s, A.y == 1)", deadline: 4s}
+        - {id: tr, kind: obligation, bearer: A,
+           content: "throughout(1s, A.y == 1) OR within(2s, A.done == true)", deadline: 3s}
+        - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
+           effects: {suspend: [wa, wo, ua, eq, tr]}}
+        - {id: re, kind: power, bearer: B, content: "B -> A : resume",
+           effects: {resume: [wa, wo, ua, eq, tr]}}
+"""
+
+
+def _epoch_trace(rng: random.Random, length: int | None = None) -> list:
+    """Like _window_trace, with values that are often undefined (null),
+    and in half of the traces epoch timestamps with fractions of a second."""
+    epoch = rng.random() < 0.5
+    t = 1767225600 + rng.randint(0, 10 ** 6) / 10 ** 6 if epoch else 0.0
+    lines = []
+    for k in range(length or rng.randint(2, 24)):
+        rec: dict = {"t": t}
+        values = {}
+        for name, choices in (("A.x", [0, 3, 6, 9, 10, None, None]),
+                              ("A.ok", [True, True, False, None, None]),
+                              ("A.done", [False, False, True, None]), ("A.y", [1, 1, 0, None]),
+                              ("A.z", [0, 0, 1, None])):
+            if rng.random() < (0.8 if k == 0 else 0.35):
+                values[name] = rng.choice(choices)
+        if values:
+            rec["values"] = values
+        msgs = [{"from": "B", "to": "A", "name": rng.choice(["go", "start", "pause", "resume"])}
+                for _ in range(rng.choice([0, 0, 0, 1, 1, 2]))]
+        if msgs:
+            rec["messages"] = msgs
+        lines.append(json.dumps(rec))
+        step = rng.choice([0, 0.5, 1, 1, 1.5, 2, 2.5, 3, 4, 7, 0.000001, 0.25])
+        t = round(t + step, 6)
+    if rng.random() < 0.3:
+        rec = json.loads(lines[-1])
+        rec["end"] = False
+        lines[-1] = json.dumps(rec)
+    return lines
+
+
+def _edge(*recs) -> list:
+    return [json.dumps(r) for r in recs]
+
+
+_GO = [{"from": "B", "to": "A", "name": "go"}]
+_START = [{"from": "B", "to": "A", "name": "start"}]
+_PAUSE = [{"from": "B", "to": "A", "name": "pause"}]
+_RESUME = [{"from": "B", "to": "A", "name": "resume"}]
+E0 = 1767225600.25
+
+# Traces at the boundaries of the summaries: p false and q not false at
+# the same observation, a window that ends exactly at an observation, a
+# decision while the norm is suspended, epoch times.
+EDGES = [
+    _edge({"t": 0, "values": {"A.ok": True, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0},
+           "messages": _START + _GO},
+          {"t": 1, "values": {"A.ok": False, "A.done": True}}, {"t": 2}, {"t": 9}),
+    _edge({"t": 0, "values": {"A.ok": True, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0},
+           "messages": _START + _GO},
+          {"t": 1, "values": {"A.ok": False, "A.done": None}}, {"t": 2}, {"t": 9}),
+    _edge({"t": E0, "values": {"A.ok": True, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0},
+           "messages": _START + _GO},
+          {"t": E0 + 1}, {"t": E0 + 2, "values": {"A.ok": False}}, {"t": E0 + 9}),
+    _edge({"t": E0, "values": {"A.ok": True, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0},
+           "messages": _START + _GO},
+          {"t": E0 + 1}, {"t": E0 + 3}, {"t": E0 + 3.000001}, {"t": E0 + 9}),
+    _edge({"t": 0, "values": {"A.ok": True, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0},
+           "messages": _START + _GO},
+          {"t": 0.5, "messages": _PAUSE}, {"t": 1, "values": {"A.ok": False, "A.x": 9}},
+          {"t": 1.5, "values": {"A.done": True, "A.y": 0}},
+          {"t": 2, "messages": _RESUME}, {"t": 9}),
+    _edge({"t": 0, "values": {"A.ok": None, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0},
+           "messages": _START + _GO},
+          {"t": 1, "values": {"A.ok": True, "A.x": 6}}, {"t": 2, "values": {"A.done": True}},
+          {"t": 3, "values": {"A.ok": False, "A.x": None}}, {"t": 9}),
+    _edge({"t": 0, "values": {"A.ok": True, "A.done": False, "A.x": 0, "A.y": 1, "A.z": 0},
+           "messages": _START + _GO},
+          *[{"t": 0.5 * k, "values": {"A.x": [6, 0, 9, 3][k % 4], "A.ok": k % 3 != 0,
+                                      "A.y": k % 2}} for k in range(1, 12)],
+          {"t": 20}),
+    _edge({"t": 0, "values": {"A.ok": None, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0},
+           "messages": _START + _GO},
+          {"t": 0.5, "messages": _PAUSE}, {"t": 1, "values": {"A.ok": True}},
+          {"t": 2, "values": {"A.done": True}},
+          {"t": 2.5, "values": {"A.x": 9}, "messages": _RESUME}, {"t": 9}),
+]
+
+
+TEMPORAL_SETS = [("release", RELEASE, 20261301), ("compare", COMPARE, 20261302),
+                 ("two", TWO, 20261303)]
+
+
+@needs_evm
+@pytest.mark.parametrize("name,blocks,seed", TEMPORAL_SETS, ids=[s[0] for s in TEMPORAL_SETS])
+def test_evm_more_temporal_contents(name, blocks, seed, tmp_path, monkeypatch):
+    """The EVM gives what norms-eval gives, observation by observation."""
+    _memoize_parser(monkeypatch)
+    sos = _small(blocks)
+    rng = random.Random(seed)
+    # and a few long traces (on the EVM only: the OPA driver unrolls 24
+    # steps), so that the tree of two operators has several levels
+    traces = EDGES + [_epoch_trace(rng) for _ in range(_count(16))] \
+        + [_epoch_trace(rng, 70) for _ in range(3)]
+    refs, got = _evm(sos, traces, tmp_path)
+    assert S.compare(refs, got) == []
+
+
+@needs_opa
+@pytest.mark.parametrize("name,blocks,seed", TEMPORAL_SETS, ids=[s[0] for s in TEMPORAL_SETS])
+def test_opa_more_temporal_contents(name, blocks, seed, tmp_path, monkeypatch):
+    """The same contents on the Rego monitor (unchanged), as a reference."""
+    _memoize_parser(monkeypatch)
+    sos = _small(blocks)
+    rng = random.Random(seed)
+    traces = EDGES + [_epoch_trace(rng) for _ in range(_count(150))]
+    refs = [S.reference(sos, l) for l in traces]
+    got = S.run_opa(generate_norms_monitor_rego(sos, sos.contracts[0]), monitor_package("C"),
+                    traces, refs, tmp_path, steps=24)
+    assert S.compare(refs, got) == []
+    seen = _seen(refs)
+    assert {"fulfilled", "violated", "suspended"} <= seen["states"]
+
+
+GAS_CONTENTS = ["NOT until(A.x >= 0, A.x < 0, 1000s)", "throughout(1000s, A.x >= 0) == true",
+                "within(1000s, A.x < 0) OR throughout(1000s, A.x >= 0)",
+                "within(1000s, A.x >= 0) AND throughout(1000s, A.x >= 0)"]
+
+
+@needs_evm
+@pytest.mark.parametrize("content", GAS_CONTENTS)
+def test_evm_gas_of_more_temporal_contents_is_bounded(content, tmp_path):
+    """NOT until, a comparison and two temporal operators (from the
+    second set on): 320 observations at one per second into windows of
+    1000 s, each a candidate that stays undecided. The mean cost of the
+    last 50 observations stays within 15 % of that of observations 20 to
+    70; with two operators the cost grows with the depth of the tree, a
+    step at each power of two of the candidates."""
+    sos = _small("      norms:\n        - {id: p, kind: prohibition, bearer: A, "
+                 f"content: \"{content}\"}}\n")
+    contract = sos.contracts[0]
+    lines = [json.dumps({"t": k, "values": {"A.x": k}}) for k in range(320)]
+    compiled = S.compile_solidity(generate_norms_monitor_sol(sos, contract),
+                                  monitor_name(contract.id), tmp_path)
+    run = S.sol_run(lines, ["A.x"])
+    run["steps"] = [s for s in run["steps"] if "finish" not in s]
+    [raw] = S.run_evm(compiled, f"Monitor.sol:{monitor_name(contract.id)}", [run], tmp_path)
+    gas = [r["gas"] for r in raw]
+    early, late = sum(gas[20:70]) / 50, sum(gas[-50:]) / 50
+    assert late < 1.15 * early and max(gas) < 1_000_000, (early, late, max(gas))
 
 
 # === The range of exact numbers, exact deadlines, runtime size =======================

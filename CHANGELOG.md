@@ -6,6 +6,209 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.28] — 2026-11-13
+
+Removes most of the remaining refusals. `cadl norms-check` checks
+instances that start at different observations (the new default),
+amendments together with several instances, and linear arithmetic
+without `--domain`, exactly (F.12). The Solidity norms monitor accepts
+`NOT until`, two temporal operators in one content, and temporal
+operators inside comparisons, with bounded gas and a large size margin
+(D.5). The A2A gateway adds mutual TLS, the HTTP+JSON binding, push
+notifications behind an allowlist, and gRPC as the optional extra
+`cadl-lang[grpc]` (G.13). Equilibrium maps use coupled bounds of the
+advantages, so the second three-parameter example of I.14 reaches its
+resolution (I.9). Each part was reviewed independently before the
+release.
+
+Known limits: `norms-check` refuses four or more mutually ordered list
+quantities in one group; the Solidity monitor refuses three or more
+temporal operators in one content and nested temporal operators; the
+gRPC listener has no cap on connections per address (G.13); designs
+whose probabilities are not multi-affine do not use the coupled
+bounds.
+
+### Added
+
+- Equilibrium maps (`cadl game-check --certify`) bound the one-step
+  advantages of PD+ and PD− also by a coupled relaxation (I.9), in
+  designs whose probabilities are multi-affine in the open parameters:
+  the play after the deviating command and the play after the profile's
+  command move together, with the same corner of the cell in each step
+  and a joint distribution that keeps them in the same state where it
+  can and otherwise takes corresponding updates together. The largest
+  and least values of this process on pairs bound the advantage at
+  every valuation of the cell. The coupled bounds are computed only for
+  a player that E1, E2, PD+, N and PD− leave open, only for PD+ when the
+  player does not gain more than ε at the centre of the cell and only
+  for PD− otherwise, and only where both plays reach states whose values
+  depend on the valuation. The second three-parameter example of I.14
+  (λ, κ, p_fail, CENTRALIZED, `comply_if_watched`) now reaches the
+  resolution 0.1 within the default budget: 13 853 cells analysed
+  instead of 39 999, 0.100 undecided instead of 0.200, 52 s instead of
+  127 s in the same measurement. The first three-parameter example and
+  the maps of I.12 are unchanged. `games_eval.USE_COUPLING = False`
+  gives the maps of 0.3.27.
+- `tests/games_fuzz.py` checks the coupled bounds directly against the
+  advantages of the independent oracle at sample points, counts the
+  players decided by them, and has three new deliberate soundness bugs
+  (`coupling_swap_sides`, `coupling_drop_first_payoff`,
+  `coupling_drop_later_payoffs`) and the option `--no-direct`;
+  `tests/test_games_coupling.py` tests the coupled bounds.
+
+- `cadl a2a-gateway --client-ca CA.pem`: mutual TLS. A client presents a
+  certificate of the CA whose subject has exactly one common name, an
+  actor of `--client-keys`; the handshake runs before the connection
+  takes a reader slot, within the read deadline and at most
+  `--max-handshakes` (256) at the same time, so peers without a
+  certificate cannot hold the readers of the gateway. The `CADL-HMAC`
+  header stays and has to name the same actor (`certificate_mismatch`),
+  which keeps the nonce replay protection and the binding of a request to
+  its body and run. A failed handshake or a certificate of no actor is
+  recorded as the new host event `handshake_failed`. G.13 states what
+  remains: a handshake that is slow but valid.
+- The HTTP+JSON binding of A2A 1.0.0 (11) at `cadl a2a-gateway`: the
+  routes of 11.3 on the port of the JSON-RPC binding, authenticated with
+  the HTTP method and the request target in the MAC, and decided, held,
+  recorded and replayed as JSON-RPC requests, streams included. Errors
+  are `google.rpc.Status` objects with the HTTP status of 5.4 and an
+  `ErrorInfo`; unknown routes, tenant paths, unknown query parameters and
+  bodies that disagree with the path are refused. `--upstream-binding
+  rest` speaks the binding to the agent. `SubscribeToTask` is taken with
+  `POST` (11.3.2) and `GET` (the `a2a.proto`). New module
+  `cadl.a2a_rest`.
+- Push notifications at `cadl a2a-gateway` with `--push-allow ENTRY`
+  (URL, URL prefix, `HOST[:PORT]`, IP address or network), `--push-url`,
+  `--push-timeout` and `--push-ca`. The agent gets a configuration of
+  the gateway (its URL, secret token and credentials); the gateway relays
+  each notification to the client's URL, only for the task of the
+  configuration and its owner. Callback URLs are `https` unless loopback,
+  resolve only to global unicast addresses unless an IP entry contains
+  them (metadata addresses only when named), and are called at the
+  checked address, without redirects, within the deadline, reading at
+  most 64 KiB. New host events `push_config`, `push_refused`,
+  `push_sent`, `push_failed`, `push_dropped`. Without `--push-allow`
+  push notifications are refused as before. New module `cadl.a2a_push`.
+- The gRPC binding of A2A 1.0.0 (10) at `cadl a2a-gateway
+  --grpc-listen HOST:PORT`, as the optional extra
+  `pip install 'cadl-lang[grpc]'` (`a2a-sdk[grpc]`, whose `a2a_pb2` is
+  generated from the normative `a2a.proto`; Python 3.10 or later). No new
+  required dependency. New module `cadl.a2a_grpc`.
+- Tests: `tests/test_a2a_bindings.py` with the fake agent (which now also
+  speaks the HTTP+JSON binding and sends push notifications) and a test
+  CA made with `openssl`; `tests/test_sdk_interop.py` with `a2a-sdk`
+  1.3.0 over mutual TLS, HTTP+JSON (agent over JSON-RPC and over
+  HTTP+JSON), push notifications of the SDK agent, and gRPC.
+
+- `cadl norms-check` with several instances lets the environment choose
+  the observation at which each instance starts, in any order
+  (`--starts any`, the default); the trace of an instance runs from its
+  start to its end, and the norms active at the start, the rising edges
+  of its predicates and the intervals of its assumptions count from its
+  start (F.12). `--starts together` keeps the earlier model, in which all
+  instances start at the first observation. Conflicts that need
+  instances with different starts are found, such as the one of the new
+  example `examples/norms_check_starts.cadl`. The horizon is shared: an
+  instance that starts at observation s has at most H - s + 1
+  observations, and the report says so.
+- `cadl norms-check` translates amendments together with several
+  instances (`--version` with `--instance` / `--instances`): one
+  amendment applies at the same observation to every instance that runs
+  there, as `cadl norms-eval` applies the `amend` line of each trace; an
+  instance that starts after an amendment is an instance of the new
+  version, and its witness names that file (`files`). Example:
+  `examples/norms_check_amend_v1.cadl` and `norms_check_amend_v2.cadl`.
+- `cadl norms-check` translates linear arithmetic, `sum` and `avg`
+  without `--domain` (F.12): the numbers of the quantities are one finite
+  decimal point in every face of the linear arrangement of the
+  comparisons, found by a cylindrical algebraic decomposition. A point
+  that is not a finite decimal is moved to one of the same face exactly:
+  a unimodular reduction of the equalities of the face decides whether
+  its affine hull holds a finite decimal point, and a rounding whose
+  precision is computed from the margins of the strict inequalities
+  finds one; only a face whose hull holds none is left out. Nonlinear
+  arithmetic without `--domain` gets a domain inferred from the literals
+  of the predicate, which the report states as an assumption
+  (`assumed_domains`); every norm whose answers depend on it carries
+  `assumed_domains` in the JSON and a `*` in the text, and every finding
+  about it says "only under the assumed domain" (also listed in
+  `findings_under_assumed_domains`). Example:
+  `examples/norms_check_linear.cadl`.
+
+- The Solidity norms monitor decides `NOT until(p, q, d)` through the
+  release of ¬p and ¬q (Appendix D, D.5, which proves the duality in
+  Kleene's three-valued logic with undefined values). A norm with one
+  temporal operator keeps three queues of candidates: those that hold
+  when the operator is true, those that hold when it is false (the dual
+  operator on the negated operands), and those that wait for it.
+- The Solidity monitor decides a temporal operator inside a comparison
+  or `IN` (`within(3s, p) == flag`, `until(p, q, 3s) <= A.y`): the content
+  is read at the observation of a candidate with the operator undecided,
+  true and false (`CadlNormsEval.table`), which says which queue the
+  candidate joins.
+- The Solidity monitor decides a content with two temporal operators,
+  also a comparison of the two, with the new library `CadlNormsMulti`:
+  the candidates are the leaves of a segment tree in storage whose nodes
+  record, for each state of the two operators and each future they can
+  reach, whether a candidate holds and whether one is undecided; an
+  observation decides each operator for a few ranges of candidates,
+  propagated lazily, in steps that grow with the logarithm of the number
+  of candidates. At one observation per second into 1000 s windows an
+  observation costs 5.9 × 10^5 gas at the 320th and at the 1000th
+  observation (one operator: 4.4 to 5.2 × 10^5). A content with three or more temporal
+  operators is refused, with the reason.
+- Differential tests of these contents against `cadl norms-eval` on OPA
+  and on the EVM (random traces with suspension, reparations, undefined
+  values and epoch timestamps, traces at the boundaries of the summaries,
+  and long traces), gas tests at 320 observations, and
+  `scripts/norms_monitor_mutations.py`, which runs 14 mutants of the
+  temporal parts of the Solidity monitor against these traces on the EVM
+  (each one gives a verdict that differs from `cadl norms-eval`).
+
+### Changed
+
+- `--starts any` is the default of `cadl norms-check` with several
+  instances. The patterns of starts and ends multiply the commands by up
+  to 4<sup>n</sup> instead of 2<sup>n</sup>, so a run with `--instances`
+  that 0.3.27 accepted may now be refused for too many commands; use
+  `--starts together` to check it as before.
+- The refusal of four or more quantities ordered against each other
+  states why it is kept: even without lists, each quantity of such a
+  group has at least 15 classes, so the group exceeds the limit of
+  50,000 combinations (F.12).
+
+- The Solidity monitor keeps its model and state in one struct in storage
+  (`Monitor`), and the new library `CadlNormsActs` holds the events,
+  messages, counts-as rules and powers. The runtime code of the main
+  contract goes from 23.7 KB to 16.3 KB (estimate 16 840 bytes, more
+  than 7 KB below EIP-170); the gas of an observation of the example of
+  F.8 is unchanged (6.4 × 10^5). The libraries are deployed and linked
+  in the order `CadlNormsValues`, `CadlNormsEval`, `CadlNormsWindows`,
+  `CadlNormsMulti`, `CadlNormsItems`, `CadlNormsActs`.
+
+### Fixed
+
+- Findings of an independent review of the new bindings, each with a
+  regression test: a push configuration given with `SendMessage` is
+  bound to the task of the agent's answer (allow, release, first stream
+  event), notifications before that are dropped and never claim a task;
+  idle gRPC calls no longer hold the workers (header check before the
+  message is awaited, caps on calls not yet authenticated per address,
+  per prefix and in all, read deadline, HTTP/2 limits); gRPC mutual TLS
+  requires exactly one common name, read from the full certificate;
+  callback URLs with dot segments, backslashes or percent-encoded dots,
+  slashes or backslashes are refused; the cap on push configurations is
+  atomic and counts held ones; the help of `--push-allow` says what a
+  network entry allows. Then, from the final review: a configuration
+  whose `SendMessage` failed or got an answer without a task is removed
+  (`push_dropped`, `no_task`); `%25` is refused in callback paths. The
+  gRPC listener does not cap HTTP/2 connections per address, a limit
+  stated in G.13.
+- `cadl a2a-gateway`: closing a stream of one event (a denial, or a
+  submitted task of `returnImmediately`) raised an error that was only
+  logged.
+
+
 ## [0.3.27] — 2026-11-12
 
 Resolves the remaining verification items. The strategic export is run

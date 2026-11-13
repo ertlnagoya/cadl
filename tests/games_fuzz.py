@@ -527,9 +527,87 @@ def check_endpoint_cells(g: dict, model, rng: random.Random, extra: int,
     return points
 
 
+def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
+                             stats: dict) -> int:
+    """The coupled bounds of the advantages of I.9 directly: on the whole
+    region and on random sub-boxes, every bound of `CoupledPlays` is
+    checked against the advantage Q_p(s, c) − V_p(s) that the oracle
+    computes at sample points of the box at which s is in Reach_p.
+    Returns the number of comparisons."""
+    import cadl.games_eval as ge
+    query = next(q for q in model.equilibria if q.id == "on_region")
+    game = ge.prepare_map(model, query, model.designs[0], None)
+    if not game.multi_affine:
+        return 0
+    region = {n: g["region"][n] for n in game.names}
+    boxes = [dict(region)]
+    for _ in range(2):
+        box = {}
+        for n, (lo, hi) in region.items():
+            parts = rng.choice([1, 2, 4])
+            k = rng.randrange(parts)
+            box[n] = (lo + (hi - lo) * F(k, parts), lo + (hi - lo) * F(k + 1, parts))
+        boxes.append(box)
+    compared = 0
+    for box in boxes:
+        cell = tuple(box[n] for n in game.names)
+        try:
+            dists = ge.cell_distributions(game, cell)
+        except ge._Unknown:
+            continue
+        table = ge.CornerTable(game, cell)
+        points = sample_points(box, rng, extra)
+        oracles = []
+        for point in points:
+            v = dict(g["fixed"])
+            v.update(point)
+            oracles.append((point, Oracle(g, v)))
+        for pl in g["players"]:
+            proc = ge.build_process(game, pl, query.profile, dists)
+            if ge.improper_states(proc):
+                continue
+            plays = ge.CoupledPlays(game, proc, table)
+            bounds = {}
+            for i, gi in enumerate(proc.states):
+                if proc.target[i] or not proc.mine[i]:
+                    continue
+                for k, _ in proc.options[i]:
+                    if k is None or k == proc.selected[i]:
+                        continue
+                    loc = game.states[gi][0]
+                    action = game.commands[gi][k].command.action
+                    c = next(c for c, cmd in enumerate(g["states"][loc]["cmds"])
+                             if cmd["action"] == action)
+                    bounds[(loc, c)] = (plays.bound(i, k, False), plays.bound(i, k, True))
+            for point, oracle in oracles:
+                a = oracle.analyse(pl)
+                if not a["admissible"]:
+                    raise Unsound(f"profile not admissible for {pl} at {point} in {box}, "
+                                  f"but the relaxed process is proper")
+                values = a["profile_values"]
+                for (s, c), (lo, hi) in bounds.items():
+                    if s not in a["reach"]:
+                        continue
+                    sigma = g["sigma"][s]
+                    q = {k: oracle.step(pl, s, k) + sum(
+                        (x * (values[j] if j in values else oracle.value(pl, g["sigma"], j))
+                         for j, x in oracle.trans[s][k].items()), F(0))
+                        for k in (c, sigma)}
+                    adv = q[c] - q[sigma]
+                    compared += 1
+                    if not lo <= adv <= hi:
+                        raise Unsound(f"coupled bounds [{lo}, {hi}] of the advantage of "
+                                      f"{pl} for command {c} in state {s} miss {adv} "
+                                      f"at {point} in {box}")
+    stats["advantages_compared"] = stats.get("advantages_compared", 0) + compared
+    return compared
+
+
 def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4,
-                stats: dict | None = None) -> bool:
+                stats: dict | None = None, direct: bool = True) -> bool:
     """Run cadl on the game and check its results against the oracle.
+    With `direct`, the coupled bounds of the advantages are also checked
+    directly (`check_coupled_advantages`).
     Returns False when the file is rejected by the static rules (for
     example, the profile is not admissible)."""
     from cadl.games_eval import EvaluationError, equilibrium_check, equilibrium_map
@@ -589,11 +667,23 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
             result["from_every_state"] != (not any(a["gain_somewhere"] for a in gains)):
         raise Unsound("check at the fixed values: from_every_state is wrong")
     count("checks")
-    # The map.
+    # The map; players decided by PD+ or PD− with the coupled bounds are
+    # counted.
+    import cadl.games_eval as ge
+    original_on = ge.player_on_cell
+
+    def counting(*args, **kwargs):
+        on = original_on(*args, **kwargs)
+        if on is not None and on.coupled:
+            count("players_decided_by_coupling")
+        return on
+    ge.player_on_cell = counting
     try:
         design = equilibrium_map(model, "on_region", max_cells=max_cells)["designs"][0]
     except EvaluationError as e:
         raise Unsound(f"the map raised: {e}") from e
+    finally:
+        ge.player_on_cell = original_on
     total = F(0)
     ends = design.get("endpoints")
     if ends is not None:
@@ -617,6 +707,8 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
         count("points", check_cell(g, cell, g["epsilon"], rng, extra))
     if ends is not None and ends["applicable"]:
         count("points", check_endpoint_cells(g, model, rng, extra, stats))
+    if direct and ge.USE_ADVANTAGES and ge.USE_COUPLING:
+        check_coupled_advantages(g, model, rng, extra, stats)
     region = F(1)
     for lo, hi in g["region"].values():
         region *= hi - lo
@@ -639,8 +731,9 @@ def mutation(name: str | None):
              ("deviation_lower", "improper_states", "one_step_upper", "cell_distributions",
               "reward_bounds", "endpoint_parameter_free_model", "endpoint_affine_weights",
               "endpoint_monotone_states", "certified_reach", "player_on_cell",
-              "USE_ADVANTAGES", "advantage_bounds", "advantage_reward", "poly_bounds")}
-    if name is not None and name not in ADVANTAGE_MUTATIONS:
+              "USE_ADVANTAGES", "advantage_bounds", "advantage_reward", "poly_bounds",
+              "CoupledPlays", "_coupling")}
+    if name is not None and name not in ADVANTAGE_MUTATIONS + COUPLING_MUTATIONS:
         # The other mutants concern N, E1, E2, N_s and the end points: the
         # conditions PD+ and PD− are switched off, so that the cells reach
         # the mutated condition as they did before PD+ and PD− existed.
@@ -697,8 +790,8 @@ def mutation(name: str | None):
         # The conditions of I.9 for the concept nash also for
         # every_reachable_state (E1 at the initial state only, no N_s).
         original_on = saved["player_on_cell"]
-        ge.player_on_cell = lambda game, profile, player, cell, dists, epsilon, every=False: \
-            original_on(game, profile, player, cell, dists, epsilon)
+        ge.player_on_cell = lambda game, profile, player, cell, dists, epsilon, every=False, \
+            **options: original_on(game, profile, player, cell, dists, epsilon, **options)
     elif name == "advantage_drop_successors":
         # A(s, c) bounded by the difference of the step payoffs alone,
         # without the term Σ ΔP(s′) · V(s′).
@@ -719,6 +812,31 @@ def mutation(name: str | None):
             x = ge._p_eval(poly, tuple((a + b) / 2 for a, b in cell)) if poly else F(0)
             return x, x
         ge.poly_bounds = at_centre
+    elif name == "coupling_swap_sides":
+        # The coupled upper bound from the least value, the lower bound
+        # from the largest.
+        class Swapped(saved["CoupledPlays"]):
+            def bound(self, i, k, maximize):
+                return super().bound(i, k, not maximize)
+        ge.CoupledPlays = Swapped
+    elif name == "coupling_drop_first_payoff":
+        # The difference of the step payoffs of c and σ(s) left out.
+        class WithoutFirst(saved["CoupledPlays"]):
+            def options(self, x):
+                opts = super().options(x)
+                if x[0] == "start":
+                    return [(F(0), F(0), d) for _, _, d in opts]
+                return opts
+        ge.CoupledPlays = WithoutFirst
+    elif name == "coupling_drop_later_payoffs":
+        # The step payoffs after the first step left out.
+        class FirstOnly(saved["CoupledPlays"]):
+            def options(self, x):
+                opts = super().options(x)
+                if x[0] != "start":
+                    return [(F(0), F(0), d) for _, _, d in opts]
+                return opts
+        ge.CoupledPlays = FirstOnly
     elif name is not None:
         raise ValueError(name)
     try:
@@ -735,11 +853,13 @@ ENDPOINT_MUTATIONS = ("endpoints_drop_probability", "endpoints_drop_affine",
 EVERY_STATE_MUTATIONS = ("drop_reach_certificate", "every_state_as_nash")
 ADVANTAGE_MUTATIONS = ("advantage_drop_successors", "advantage_swap_sides",
                        "advantage_centre_only")
+COUPLING_MUTATIONS = ("coupling_swap_sides", "coupling_drop_first_payoff",
+                      "coupling_drop_later_payoffs")
 
 
 def run(seed: int, count: int, mutant: str | None = None, max_cells: int = 24,
         extra: int = 4, j14: bool = False, mode: str | None = None,
-        concept: str = "nash") -> dict:
+        concept: str = "nash", direct: bool = True) -> dict:
     """Generate and check `count` accepted models. Returns statistics;
     `stats["failure"]` describes the first violation, if any (also an
     exception raised by a mutant)."""
@@ -752,7 +872,7 @@ def run(seed: int, count: int, mutant: str | None = None, max_cells: int = 24,
             tries += 1
             g = generate(rng, j14, mode, concept)
             try:
-                if check_model(g, rng, max_cells, extra, stats):
+                if check_model(g, rng, max_cells, extra, stats, direct):
                     done += 1
             except Unsound as e:
                 stats["failure"] = f"model {tries} of seed {seed}: {e}"
@@ -774,7 +894,10 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--extra", type=int, default=4)
     parser.add_argument("--mutation", default=None,
                         choices=MUTATIONS + ENDPOINT_MUTATIONS + EVERY_STATE_MUTATIONS
-                        + ADVANTAGE_MUTATIONS)
+                        + ADVANTAGE_MUTATIONS + COUPLING_MUTATIONS)
+    parser.add_argument("--no-direct", action="store_true",
+                        help="do not check the coupled bounds of the advantages directly "
+                             "(only the claims of the maps)")
     parser.add_argument("--j14", action="store_true",
                         help="one-parameter maps over lam in files that declare grounding "
                              "0.1 (the end-point certification of I.9, through J-14)")
@@ -785,7 +908,7 @@ def main(argv: list | None = None) -> int:
     args = parser.parse_args(argv)
     start = time.time()
     stats = run(args.seed, args.count, args.mutation, args.max_cells, args.extra, args.j14,
-                args.mode, args.concept)
+                args.mode, args.concept, not args.no_direct)
     model = stats.pop("failing_model", None)
     print({k: stats[k] for k in sorted(stats)}, f"{time.time() - start:.1f}s")
     if model and args.mutation is None:

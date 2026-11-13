@@ -6,7 +6,8 @@ of `cadl.norms_check`) and `cadl norms-eval` on the same paths of
 environment choices and compare the state of every norm after every
 observation. CADL_NORMS_CHECK_PATHS sets the number of random paths per
 contract and sampling mode (default 20; the long run of the report used
-1000). The tests that need PRISM are skipped when `prism` is not on PATH.
+1000); CADL_NORMS_CHECK_LONG=1 enumerates longer exhaustive paths.
+The tests that need PRISM are skipped when `prism` is not on PATH.
 """
 
 from __future__ import annotations
@@ -36,6 +37,10 @@ from cadl.norms_check import (
     build_model,
     check,
     compare_path,
+    base_file,
+    base_version,
+    ABSENT,
+    instance_span,
     format_text,
     prism_expr,
     questions,
@@ -44,6 +49,9 @@ from cadl.norms_check import (
     trace_lines,
 )
 from cadl.norms_eval import evaluate, load_version, parse_trace
+from fractions import Fraction
+
+from cadl.norms_check import _is_dec
 from cadl.parser import parse
 from cadl.type_checker import type_check
 
@@ -55,6 +63,8 @@ CONFLICT = EXAMPLES / "norms_check_conflict.cadl"
 PRISM = shutil.which("prism")
 needs_prism = pytest.mark.skipif(PRISM is None, reason="PRISM (prism) is not on PATH")
 PATHS = int(os.environ.get("CADL_NORMS_CHECK_PATHS", "20"))
+# CADL_NORMS_CHECK_LONG=1: longer exhaustive enumerations
+LONG = os.environ.get("CADL_NORMS_CHECK_LONG") == "1"
 
 HEAD = """\
 sos:
@@ -304,6 +314,70 @@ norms:
 ARITH_DOMAINS = ["R[1].x=0..2", "R[1].y=0..2", "R[*].load=0..1"]
 
 
+# linear arithmetic without --domain (F.12): the numbers of the regions of
+# the linear arrangement of the predicates; 3 * y == 1 holds for no
+# decimal y, so no trace violates `thirds`
+LINEAR = """\
+norms:
+  - id: sum_ok
+    kind: obligation
+    bearer: D
+    trigger: "D -> R[1] : go"
+    content: "R[1].x + R[1].y > 3"
+    deadline: 1s
+  - id: on_line
+    kind: prohibition
+    bearer: D
+    content: "R[1].x + R[1].y == 3 OR R[1].x == R[1].y"
+  - id: mixed
+    kind: prohibition
+    bearer: D
+    content: "R[1].x * 0.5 - R[2].x / 4 == 1.25"
+  - id: thirds
+    kind: prohibition
+    bearer: D
+    content: "3 * R[1].y == 1"
+  - id: tilted
+    kind: prohibition
+    bearer: D
+    content: "R[1].x + 3 * R[1].y == 1 AND R[1].x > 1.05 AND R[1].x < 1.15"
+  - id: flat
+    kind: prohibition
+    bearer: D
+    content: "NOT (R[1].x - R[2].x) AND R[2].x < R[1].y AND R[2].x > 0.5"
+  - id: load
+    kind: prohibition
+    bearer: D
+    content: "sum(r.load for r in R[1..2]) > 2 AND avg(r.load for r in R[1..2]) < min(r.load for r in R[1..2]) + 1"
+  - id: counted
+    kind: prohibition
+    bearer: D
+    content: "count(r.load > 1.5 for r in R[1..2]) + R[1].load == 2"
+"""
+# faces that few points reach: a count decided by the forms of its
+# elements, and the region below every root
+LINEAR2 = """\
+norms:
+  - id: counted2
+    kind: prohibition
+    bearer: D
+    content: "count(r.u > 2.5 for r in R[1..2]) == 1 AND R[1].u + R[2].u == 2 AND R[1].u > 0"
+  - id: below
+    kind: prohibition
+    bearer: D
+    content: "R[1].z * 2 < -3"
+"""
+# a product of two quantities: a domain assumed from the literals
+NONLINEAR = """\
+norms:
+  - id: area
+    kind: prohibition
+    bearer: D
+    content: "R[1].w * R[1].h > 6"
+"""
+LINEAR_KW = {"members": ["R=2"]}
+
+
 # one bearer, two instances: docking one robot is forbidden while another
 # is docked
 MULTI = """\
@@ -320,7 +394,36 @@ norms:
     trigger: "R[i] -> D : docked"
     content: "D -> R[*] : dock"
 """
-MULTI_KW = {"members": ["R=2"], "instances": [{"i": 1}, {"i": 2}]}
+MULTI_KW = {"members": ["R=2"], "instances": [{"i": 1}, {"i": 2}], "starts": "together"}
+MULTI_ANY = {"members": ["R=2"], "instances": [{"i": 1}, {"i": 2}]}
+
+# instances that start at observations of their own (F.12): a norm active
+# at the start of each instance, a rising edge of a predicate of the
+# instance, and a temporal assumption whose interval begins at the start
+# of the instance
+STAGGER = """\
+assume:
+  - "within(2s, R[i].ok == true)"
+norms:
+  - id: greet
+    kind: obligation
+    bearer: D
+    content: "D -> R[i] : dock"
+    deadline: 1s
+  - id: on_fault
+    kind: obligation
+    bearer: D
+    trigger: "R[i].ok == false"
+    content: "D -> R[i] : dock"
+    deadline: 1s
+  - id: one_at_a_time
+    kind: prohibition
+    bearer: D
+    trigger: "R[i] -> D : docked"
+    content: "D -> R[*] : dock"
+    deadline: 2s
+"""
+STARTS = EXAMPLES / "norms_check_starts.cadl"
 
 
 # two versions of a contract (F.6): carry_over with a shorter deadline
@@ -410,6 +513,60 @@ norms:
     deadline: 1s
 """
 
+# amendments together with several instances (F.12): two versions with a
+# carried-over deadline and reparation, a transform, a new norm without
+# trigger, and an assumption replaced by another one
+AM_MULTI_V1 = """\
+assume:
+  - "throughout(2s, R[i].ok == true)"
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 2s
+    on_violation: {reparation: repair}
+  - id: repair
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 1s
+  - id: start_duty
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 3s
+    on_amendment: {transform: new_duty}
+"""
+AM_MULTI_V2 = """\
+assume:
+  - "within(2s, R[i].ok == true)"
+norms:
+  - id: carry
+    kind: obligation
+    bearer: "R[i]"
+    trigger: "D -> R[i] : go"
+    content: "R[i] -> D : done"
+    deadline: 1s
+    on_violation: {reparation: repair}
+  - id: repair
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 2s
+  - id: new_duty
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 2s
+  - id: fresh
+    kind: obligation
+    bearer: "R[i]"
+    content: "R[i] -> D : done"
+    deadline: 1s
+"""
+
 
 def make_sos(body: str):
     sos = parse(HEAD + textwrap.indent(body, "      "))
@@ -429,7 +586,8 @@ def model_of(name: str, **kw):
         texts = {"TEMPORAL": TEMPORAL, "UNTIL": UNTIL, "CONFLICTS": CONFLICTS, "EVENTS": EVENTS,
                  "DEADLINE_ZERO": DEADLINE_ZERO, "TYPES": TYPES, "QUANT": QUANT,
                  "ARITH": ARITH, "MIXED": MIXED, "LISTS": LISTS,
-                 "MULTI": MULTI}
+                 "MULTI": MULTI, "STAGGER": STAGGER, "LINEAR": LINEAR,
+                 "NONLINEAR": NONLINEAR, "LINEAR2": LINEAR2}
         sos = make_sos(texts[name]) if name in texts else load_version(name)
         m = build_model(sos, **kw)
         _MODELS[key] = (sos, m, PrismModel(m.prism_text(), {"early_end": True}))
@@ -453,6 +611,8 @@ CASES = [
     (str(EXAMPLES / "norms_check_arithmetic.cadl"),
      {"members": ["ROBOT=2"], "domains": ["ROBOT[*].load=0..3", "DEPOT.capacity=2..4"]}),
     (str(EXAMPLES / "norms_check_quantifiers.cadl"), {"members": ["ROBOT=2"]}),
+    ("LINEAR", LINEAR_KW),
+    (str(EXAMPLES / "norms_check_linear.cadl"), {"members": ["ROBOT=2"]}),
 ]
 
 
@@ -507,7 +667,7 @@ norms:
   - id: a
     kind: obligation
     bearer: "R[i]"
-    content: "R[i].x + 1 == R[i].y"
+    content: "R[i].x + 1 == now"
     on_violation: {reparation: b}
   - id: b
     kind: obligation
@@ -516,7 +676,7 @@ norms:
 """)
         tr = build_model(sos, bindings={"i": 1}).tr
         assert tr.by_id["a"].status == "untranslated"
-        assert "--domain" in tr.by_id["a"].reason
+        assert "now" in tr.by_id["a"].reason
         assert tr.by_id["b"].status == "untranslated"
         assert "reparation of a" in tr.by_id["b"].reason
 
@@ -702,15 +862,19 @@ def test_conflict_through_quantifiers():
             assert states[w["keeps"]] != "violated"
 
 
-def test_arithmetic_needs_a_domain():
-    """Arithmetic, sum and avg need --domain; orders and equalities between
-    quantities and orders against texts do not. The report says for which
-    traces the answers hold."""
-    tr = build_model(make_sos(ARITH), bindings={"i": 1}).tr
-    assert tr.by_id["sum_ok"].status == "untranslated"
-    assert "--domain R[1].x=0..10" in tr.by_id["sum_ok"].reason
-    assert tr.by_id["load"].status == "untranslated"
-    assert tr.by_id["order"].status == "model" and tr.by_id["names"].status == "model"
+def test_arithmetic_without_a_domain():
+    """Linear arithmetic, sum and avg need no --domain: the numbers are the
+    points of the faces of the linear arrangement (F.12). Orders and
+    equalities between quantities and orders against texts need none
+    either; with --domain the quantities take the integers of the domain,
+    and the report says for which traces the answers hold."""
+    from cadl.norms_check import Environment
+    sos = make_sos(ARITH)
+    tr = Translator(sos, sos.contracts[0], {"i": 1}, {}, None, None)
+    Environment([tr], None, None)        # the choices, without the commands
+    assert all(n.status == "model" for n in tr.norms)
+    assert tr.quantities["R[1].x"].linear and tr.quantities["R[1].x"].domain is None
+    assert not any("domain" in n for n in tr.notes)
     tr = model_of("ARITH", domains=ARITH_DOMAINS)[1].tr
     assert all(n.status == "model" for n in tr.norms)
     assert tr.quantities["R[1].x"].reps[1:4] == [0, 1, 2]
@@ -740,6 +904,80 @@ def test_several_instances_differential():
     states = run_path(pm, p)
     assert states[0]["k1_ended"] and not states[0]["k2_ended"]
     assert len({s["st_k1_0_dock_when_low"] for s in states}) == 1
+
+
+def test_instances_start_at_observations_of_their_own():
+    """--starts any (the default): the environment chooses the observation
+    at which each instance starts; before it and after its end the
+    instance does not change, its trace begins at its start, and the norms
+    active at the start, rising edges and the intervals of assumptions
+    count from there."""
+    _sos, m, pm = model_of("STAGGER", **MULTI_ANY)
+    tr = m.tr
+    assert m.staggered and m.has("k1_started") and m.has("k2_ob")
+    paths = (random_paths(tr, PATHS * 2, seed=41, instances=2)
+             + random_paths(tr, PATHS, seed=42, p_message=0.15, p_end=0.05, p_start=0.2,
+                            instances=2)
+             + random_paths(tr, PATHS, seed=43, full_length=True, p_keep=0.7, instances=2)
+             + all_paths(tr, 1, instances=2))
+    late = 0
+    for p in paths:
+        assert not compare_path(m, pm, p), p
+        late += any(instance_span(t, p)[0] > 0 for t in m.trs)
+    assert late > PATHS
+    # every order of starts and ends over three observations (four with
+    # CADL_NORMS_CHECK_LONG=1), with the choice without messages and values
+    # and one with a fault of R[2]
+    fault = next(c.index for c in tr.choices if not c.messages
+                 and c.values.get("R[2].ok") is False and c.values.get("R[1].ok") is None)
+    short = all_paths(tr, 4 if LONG else 3, instances=2, choices=[0, fault])
+    assert len(short) > (600 if LONG else 150)
+    for p in short:
+        assert not compare_path(m, pm, p), p
+    # instance 2 starts at observation 2: its trace begins there, at t=2
+    p = [(0, 1 << 2), (0, 0), (fault, 2 << 2), (0, 3)]
+    lines = trace_lines(m.trs[1], p)
+    assert [json.loads(x)["t"] for x in lines] == [2, 3]
+    assert not compare_path(m, pm, p)
+    states = run_path(pm, p)
+    assert states[1]["st_k2_0_greet"] == INACTIVE and states[2]["st_k2_0_greet"] == ACTIVE
+
+
+def test_starts_together_or_any():
+    """--starts together keeps the instances starting at the first
+    observation; the model has fewer commands."""
+    _sos, any_, _pm = model_of("MULTI", **MULTI_ANY)
+    _sos, tog, _pm = model_of("MULTI", **MULTI_KW)
+    assert any_.staggered and not tog.staggered
+    assert len(tog.commands) < len(any_.commands)
+    assert len(any_.commands) == len(any_.tr.choices) * (8 + 16)
+    with pytest.raises(NormsCheckError, match="--starts"):
+        build_model(make_sos(MULTI), members=["R=2"], instances=[{"i": 1}, {"i": 2}],
+                    starts="later")
+
+
+@needs_prism
+def test_conflict_that_needs_staggered_starts():
+    """A reparation of one instance in force while another instance
+    starts: a conflict that only instances with starts of their own have."""
+    sos = load_version(str(STARTS))
+    report = check(build_model(sos, members=["ROBOT=2"], instances=2), PRISM)
+    pairs = {tuple(c["norms"]) for c in report["conflicts"]}
+    assert pairs == {("grant_on_start@1", "lockout@2"), ("lockout@1", "grant_on_start@2")}
+    assert report["unconfirmed"] == []
+    for c in report["conflicts"]:
+        for w in c["witnesses"]:
+            starts = {k: json.loads(lines[0])["t"] for k, lines in w["traces"].items()}
+            assert len(set(starts.values())) == 2           # different starts
+            for k, lines in w["traces"].items():
+                r = evaluate(sos, parse_trace(lines))
+                states = {n["id"]: n["state"] for n in r["norms"]}
+                keep_id, keep_k = w["keeps"].split("@")
+                if keep_k == k:
+                    assert states[keep_id] != "violated"
+    together = check(build_model(sos, members=["ROBOT=2"], instances=2, starts="together"),
+                     PRISM)
+    assert together["conflicts"] == []
 
 
 @needs_prism
@@ -799,9 +1037,97 @@ def test_amendment_refusals():
     other = make_sos(AM_V2.replace("kind: prohibition", "kind: obligation", 1))
     with pytest.raises(NormsCheckError, match="changes its kind"):
         build_model(v1, bindings={"i": 1}, versions=[("o.cadl", other)])
-    with pytest.raises(NormsCheckError, match="not translated together"):
-        build_model(v1, members=["R=2"], instances=[{"i": 1}, {"i": 2}],
-                    versions=[("v2.cadl", make_sos(AM_V2))])
+
+
+
+def _amend_multi_model():
+    key = ("AMEND_MULTI", "")
+    if key not in _MODELS:
+        v1, v2 = make_sos(AM_MULTI_V1), make_sos(AM_MULTI_V2)
+        m = build_model(v1, members=["R=2"], instances=[{"i": 1}, {"i": 2}],
+                        versions=[("v2.cadl", v2)])
+        _MODELS[key] = ((v1, v2), m, PrismModel(m.prism_text(), {"early_end": True}))
+    return _MODELS[key]
+
+
+def test_amendments_of_several_instances_differential():
+    """--version with several instances: one amendment applies to every
+    running instance at the same observation (each trace has the amend
+    line at that observation); an instance that starts after it is an
+    instance of the new version (its trace is evaluated with that file)."""
+    (v1, v2), m, pm = _amend_multi_model()
+    tr = m.tr
+    assert m.versioned and m.staggered
+    assert [n.uid for n in m.norms] == [
+        "carry@1", "repair@1", "start_duty@1", "new_duty@1", "fresh@1",
+        "carry@2", "repair@2", "start_duty@2", "new_duty@2", "fresh@2"]
+    paths = (random_paths(tr, PATHS * 3, seed=51, instances=2, p_amend=0.3)
+             + random_paths(tr, PATHS * 2, seed=52, p_message=0.15, p_end=0.05, instances=2,
+                            p_amend=0.2, p_keep=0.7)
+             + random_paths(tr, PATHS, seed=53, full_length=True, instances=2, p_amend=0.2,
+                            p_start=0.15))
+    late, effects = 0, set()
+    for p in paths:
+        assert not compare_path(m, pm, p), p
+        late += any(base_version(t, p) > 0 for t in m.trs)
+        for t in m.trs:
+            for a in evaluate_path(t, p).get("amendments", []):
+                effects.update((e["norm"], e["effect"]) for e in a["effects"])
+    assert late >= PATHS
+    assert {("carry", "carry_over"), ("start_duty", "transform"), ("new_duty", "activated"),
+            ("fresh", "added")} <= effects
+    # the amendment at observation 1 reaches instance 1 (running) and not
+    # instance 2, which starts at observation 2 as an instance of v2
+    a = len(tr.choices)
+    p = [(0, 1 << 2), (a, 0), (0, 2 << 2), (0, 3)]
+    assert not compare_path(m, pm, p)
+    assert [json.loads(x).get("amend") for x in trace_lines(m.trs[0], p)] == [
+        None, "v2.cadl", None, None]
+    assert all("amend" not in x for x in trace_lines(m.trs[1], p))
+    assert base_file(m.trs[1], p) == "v2.cadl" and base_file(m.trs[0], p) is None
+    states = run_path(pm, p)
+    assert states[2]["st_k2_2_start_duty"] == ABSENT          # not a norm of v2
+    assert states[2]["st_k2_4_fresh"] == ACTIVE               # active at the start
+
+
+def test_three_versions_of_several_instances():
+    """A sequence of amendments with two instances: an instance that
+    starts after the first amendment is an instance of version 2, and
+    its trace names only the later amendment."""
+    v1 = load_version(str(EXAMPLES / "norms_check_amend_v1.cadl"))
+    v2 = load_version(str(EXAMPLES / "norms_check_amend_v2.cadl"))
+    m = build_model(v1, members=["ROBOT=2"], instances=2,
+                    versions=[("v2.cadl", v2), ("v3.cadl", v1)])
+    pm = PrismModel(m.prism_text(), {"early_end": True})
+    tr = m.tr
+    paths = (random_paths(tr, PATHS * 2, seed=61, instances=2, p_amend=0.35)
+             + random_paths(tr, PATHS, seed=62, instances=2, p_amend=0.25, p_start=0.15,
+                            p_end=0.05))
+    late = 0
+    for p in paths:
+        assert not compare_path(m, pm, p), p
+        late += any(base_version(t, p) == 1 and any(
+            "amend" in x for x in trace_lines(t, p)) for t in m.trs)
+    assert late >= 2
+
+@needs_prism
+def test_conflicts_after_one_amendment_of_several_instances():
+    v1 = load_version(str(EXAMPLES / "norms_check_amend_v1.cadl"))
+    v2 = str(EXAMPLES / "norms_check_amend_v2.cadl")
+    m = build_model(v1, members=["ROBOT=2"], instances=2, versions=[v2])
+    report = check(m, PRISM)
+    assert report["unconfirmed"] == []
+    pairs = {tuple(c["norms"]) for c in report["conflicts"]}
+    assert {("serve@1", "curfew@2"), ("curfew@1", "serve@2")} <= pairs
+    for c in report["conflicts"]:
+        for w in c["witnesses"]:
+            assert w["confirmed"]
+            amends = {k: [json.loads(x).get("amend") for x in lines]
+                      for k, lines in w["traces"].items()}
+            # the instances running at the amendment are amended at the same time
+            times = {k: [json.loads(x)["t"] for x, a in zip(w["traces"][k], v) if a]
+                     for k, v in amends.items()}
+            assert len({tuple(t) for t in times.values() if t}) == 1
 
 
 AM_SMALL_V1 = """\
@@ -1155,16 +1481,16 @@ def test_deadline_zero_obligations_can_be_kept_when_triggered():
 
 @needs_prism
 @pytest.mark.parametrize("body", [
-    "norms:\n  - id: o\n    kind: obligation\n    bearer: D\n    content: \"D.a + 1 > 2\"\n",
+    "norms:\n  - id: o\n    kind: obligation\n    bearer: D\n    content: \"D.a > now\"\n",
     "norms:\n  - id: pw\n    kind: power\n    bearer: D\n    content: \"D -> R[1] : cancel\"\n"
     "    effects: {discharge: [o]}\n  - id: o\n    kind: obligation\n    bearer: D\n"
-    "    content: \"D.a + 1 > 2\"\n",
+    "    content: \"D.a > now\"\n",
 ], ids=["nothing", "power only"])
 def test_nothing_or_only_powers_translated(body):
     m = build_model(make_sos(body), bindings={"i": 1})
     report = check(m, PRISM)
     assert report["checked"] and report["unconfirmed"] == []
-    assert "arithmetic" in {n["id"]: n for n in report["norms"]}["o"]["reason"]
+    assert "now" in {n["id"]: n for n in report["norms"]}["o"]["reason"]
     if "pw" in body:
         assert [r["reading"] for r in report["runs"]] == ["any end"]
         assert {n["id"]: n for n in report["norms"]}["pw"]["exercisable"]["answer"]
@@ -1545,3 +1871,286 @@ def test_cli_refusal():
     p = cli(str(ROBOT), "--step", "3s")
     assert p.returncode == 2
     assert "does not divide" in p.stderr
+
+
+def _grid_value(rng, pool):
+    """A number of a decimal grid (many of them on the hyperplanes of the
+    forms) or a value of another JSON type."""
+    if rng.random() < 0.15:
+        return rng.choice(pool)
+    return rng.choice([rng.randint(-6, 6), rng.randint(-24, 24) / 4, rng.randint(-60, 60) / 10])
+
+
+def test_linear_arithmetic_covers_every_value():
+    """Exactness of the linear arrangement (F.12): values on a decimal grid,
+    which often lie on the hyperplanes (x + y == 3, x == y, 0.5 x - x2 / 4
+    == 1.25), and of every JSON type, give the predicates the values of one
+    of the choices; 3 * y == 1 holds for no decimal y, so no choice makes
+    it true."""
+    import random as _random
+    _sos, m, _pm = model_of("LINEAR", **LINEAR_KW)
+    tr = m.tr
+    assert all(n.status == "model" for n in tr.norms)
+    assert not any(q.domain for q in tr.quantities.values())
+    thirds = tr.by_id["thirds"].content.pred
+    assert all(ch.vector[thirds] != "T" for ch in tr.choices)
+    load = tr.by_id["load"].content.pred
+    assert {ch.vector[load] for ch in tr.choices} == {"T", "F", "U"}
+    rng = _random.Random(7)
+    pool = [None, True, False, "", "a", [], [0], {}, {"a": 1}]
+    for ids, vecs in tr.components:
+        keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+        exprs = [tr.preds[i].expr for i in ids]
+        known = {v for v, _vals in vecs}
+        for _ in range(1500):
+            vals = {k: _grid_value(rng, pool) for k in keys}
+            assert tuple(tr._oracle(exprs, vals)) in known, vals
+    # points of faces that only some points of the arrangement reach: a
+    # decimal point of a face whose sample is not decimal (y = -0.02), a
+    # count decided by the forms of its elements, an order against true
+    # (compared as 1), and the region below every root
+    special = [{"R[1].x": 1.06, "R[1].y": -0.02, "R[2].x": None},
+               {"R[1].x": 0.75, "R[2].x": 0.75, "R[1].y": True},
+               {"R[1].u": 3, "R[2].u": -1}, {"R[1].z": -5}]
+    tr2 = model_of("LINEAR2", **LINEAR_KW)[1].tr
+    for vals in special:
+        hits = 0
+        for t in (tr, tr2):
+            for ids, vecs in t.components:
+                keys = set().union(*(t.preds[i].keys for i in ids))
+                if keys <= set(vals):
+                    got = tuple(t._oracle([t.preds[i].expr for i in ids], vals))
+                    assert "T" in got and got in {v for v, _vals in vecs}, vals
+                    hits += 1
+        assert hits, vals
+    # every point of a grid of the two loads (a face of each kind)
+    ids, vecs = next(c for c in tr.components if load in c[0])
+    known = {v for v, _vals in vecs}
+    exprs = [tr.preds[i].expr for i in ids]
+    for a in range(-12, 13):
+        for b in range(-12, 13):
+            vals = {"R[1].load": a / 4, "R[2].load": b / 4}
+            assert tuple(tr._oracle(exprs, vals)) in known, vals
+
+
+def test_nonlinear_arithmetic_assumes_a_domain():
+    """A product of two quantities is not linear: without --domain they get
+    the integers around the literals of the predicate, and the report
+    states this domain as an assumption."""
+    _sos, m, _pm = model_of("NONLINEAR")
+    tr = m.tr
+    assert tr.by_id["area"].status == "model"
+    assert tr.quantities["R[1].w"].domain == (-1, 7) and tr.quantities["R[1].w"].assumed
+    assert any("assumed from the literals" in n and "R[1].w" in n for n in tr.notes)
+    from cadl.norms_check import _report_head
+    head = _report_head(m)
+    assert head["instance"]["assumed_domains"] == {"R[1].h": [-1, 7], "R[1].w": [-1, 7]}
+    m2 = build_model(make_sos(NONLINEAR), domains=["R[1].w=0..2", "R[1].h=0..2"])
+    assert not m2.tr.quantities["R[1].w"].assumed
+
+
+@needs_prism
+def test_linear_arithmetic_answers():
+    sos = make_sos(LINEAR)
+    m = build_model(sos, horizon=2, **LINEAR_KW)       # small: the answers need no more
+    report = check(m, PRISM)
+    assert report["unconfirmed"] == []
+    norms = {n["id"]: n for n in report["norms"]}
+    assert not norms["thirds"]["violable"]["answer"]
+    assert all(norms[k]["violable"]["answer"] for k in ("load", "mixed", "tilted", "flat"))
+    w = norms["load"]["violable"]["witness"]
+    r = evaluate(sos, parse_trace(w["trace"]))
+    assert {n["id"]: n for n in r["norms"]}["load"]["state"] == "violated"
+
+
+def test_four_ordered_quantities_are_refused_with_the_reason():
+    """Four quantities ordered against each other: even without lists,
+    each has at least 15 classes, so the group exceeds the limit of
+    50 000 combinations (F.12); the refusal gives the numbers."""
+    body = """\
+norms:
+  - id: chain
+    kind: prohibition
+    bearer: D
+    content: "R[1].a < R[1].b AND R[1].b < R[1].c AND R[1].c < R[1].d"
+"""
+    with pytest.raises(NormsCheckError) as e:
+        build_model(make_sos(body))
+    text = str(e.value)
+    m = re.search(r"besides lists, (\d+) classes .*at least \d+\^4 = (\d+) combinations", text)
+    assert m, text
+    assert int(m.group(1)) >= 15 and int(m.group(2)) > 50000
+
+
+# === Finite decimal points of the faces (F.12) ==============================
+
+DEC_HEAD = """\
+sos:
+  name: T
+  extensions:
+    - norms: 0.1
+  actors:
+    - {id: D, role: d}
+    - {id: R, role: r}
+  contracts:
+    - id: C
+      parties: [D, R]
+      norms:
+"""
+
+
+def _dec_model(*contents):
+    body = "".join(f"        - id: p{i}\n          kind: prohibition\n          bearer: D\n"
+                   f"          content: \"{c}\"\n" for i, c in enumerate(contents))
+    sos = parse(DEC_HEAD + body)
+    assert type_check(sos).ok
+    return build_model(sos)
+
+
+@pytest.mark.parametrize("content, point", [
+    # large coefficients: the hull holds decimal points only on a coarse
+    # lattice (a = 0.12, b = -1.34, c = 4.6 violates it)
+    ("R.a * 67 + R.b * 6 == 0 AND R.b < 0 AND R.c * 3 + R.b * 3 > R.a",
+     {"R.a": Fraction("0.12"), "R.b": Fraction("-1.34"), "R.c": Fraction("4.6")}),
+    ("R.a * 4099 + R.c * 67 + R.b * 66 == 0 AND R.b > 140 AND R.b < 142",
+     {"R.a": Fraction("-1.65"), "R.b": Fraction(141), "R.c": Fraction("-37.95")}),
+], ids=["lin4", "lin3"])
+def test_faces_with_coarse_decimal_lattices(content, point):
+    """A face whose decimal points form a coarse lattice in its hull is
+    kept: the prohibition is violable (review reproducers lin3, lin4)."""
+    m = _dec_model(content)
+    tr = m.tr
+    (ids, vecs), = tr.components
+    assert any(v == ("T",) for v, _vals in vecs)
+    for v, vals in vecs:
+        if v == ("T",):
+            assert all(type(x) in (int, float) or hasattr(x, "text") for x in vals.values())
+    assert tuple(tr._oracle([tr.preds[0].expr], point)) == ("T",)
+
+
+def _check_face_point(forms, p, variables):
+    from cadl.norms_check import _decimal_in_face, _leval, _lnorm, _sign
+    forms = [_lnorm(f) for f in forms]
+    q = _decimal_in_face(forms, p, variables)
+    assert q is not None
+    assert all(_is_dec(q[v]) for v in variables)
+    assert [_sign(_leval(f, q)) for f in forms] == [_sign(_leval(f, p)) for f in forms]
+    return q
+
+
+def test_decimal_points_with_non_unit_pivots():
+    """Equalities whose coefficients are not units of the finite decimals
+    (3, 7, 67, ...): over two and three free variables of the hull, a
+    decimal point of the face is found from a point that is not one, and a
+    hull without decimal points gives none."""
+    from cadl.norms_check import _decimal_in_face, _lnorm
+    F_ = Fraction
+    # one equality in 3 variables: 2 free variables, a thin open slab
+    forms = [({"a": F_(6), "b": F_(21), "c": F_(35)}, F_(-1)),
+             ({"a": F_(1)}, F_(-1, 3)), ({"b": F_(1)}, F_(3, 7)),
+             ({"a": F_(1), "c": F_(-1)}, F_(1, 1000))]
+    p = {"a": F_(1, 2), "b": F_(-1, 3), "c": None}
+    p["c"] = (1 - 6 * p["a"] - 21 * p["b"]) / 35
+    q = _check_face_point(forms, p, ["a", "b", "c"])
+    assert 6 * q["a"] + 21 * q["b"] + 35 * q["c"] == 1
+    # one equality in 4 variables: 3 free variables
+    forms = [({"a": F_(67), "b": F_(6), "c": F_(9), "d": F_(15)}, F_(-1)),
+             ({"a": F_(1)}, F_(-1, 7)), ({"d": F_(1)}, F_(1, 3)),
+             ({"b": F_(1), "c": F_(1)}, F_(0))]
+    p = {"a": F_(1, 6), "b": F_(1, 3), "c": F_(-1, 3), "d": None}
+    p["d"] = (1 - 67 * p["a"]) / 15
+    _check_face_point(forms, p, ["a", "b", "c", "d"])
+    # two equalities: 3 a + 6 b = 1 has no decimal point
+    forms = [_lnorm(({"a": F_(3), "b": F_(6)}, F_(-1))), _lnorm(({"c": F_(7)}, F_(-1)))]
+    p = {"a": F_(1, 3), "b": F_(0), "c": F_(1, 7)}
+    assert _decimal_in_face(forms, p, ["a", "b", "c"]) is None
+    # a vertex: 7 a = 14, 3 b = 0.3
+    forms = [_lnorm(({"a": F_(7)}, F_(-14))), _lnorm(({"b": F_(3)}, F_(-3, 10)))]
+    assert _decimal_in_face(forms, {"a": F_(2), "b": F_(1, 10)}, ["a", "b"]) == {
+        "a": F_(2), "b": F_(1, 10)}
+
+
+def test_random_linear_faces_against_decimal_points():
+    """Random linear predicates with large and non-unit coefficients: every
+    decimal point found by brute force (random points and points solved
+    onto the equalities) gives the predicates the values of a choice of
+    the model. CADL_NORMS_CHECK_LONG=1 runs more trials."""
+    import random as _random
+    rng = _random.Random(5)
+    variables = ["a", "b", "c"]
+
+    def dec():
+        return Fraction(rng.randint(-300, 300), rng.choice([1, 10, 100]))
+
+    def text(x):
+        return str(x.numerator) if x.denominator == 1 else str(float(x))
+
+    trials = 0
+    for _ in range(150 if LONG else 30):
+        preds = []
+        for _k in range(rng.randint(1, 3)):
+            vs = rng.sample(variables, rng.randint(1, 3))
+            coefs = {v: rng.choice([1, 2, 3, 7, 67, 97, 4099, -1, -3]) for v in vs}
+            op = rng.choice(["==", "<", ">", "<=", "!="])
+            rhs = dec()
+            preds.append((coefs, op, rhs))
+        texts = [" + ".join(f"R.{v} * {c}" for v, c in co.items()) + f" {op} {text(rhs)}"
+                 for co, op, rhs in preds]
+        try:
+            m = _dec_model(*texts)
+        except NormsCheckError:
+            continue
+        tr = m.tr
+        trials += 1
+        for ids, vecs in tr.components:
+            have = {v for v, _vals in vecs}
+            keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+            for _n in range(150):
+                pt = {k: dec() for k in keys}
+                co, op, rhs = rng.choice(preds)
+                v = rng.choice(list(co))
+                if f"R.{v}" in pt:
+                    rest = sum(c * pt[f"R.{w}"] for w, c in co.items()
+                               if w != v and f"R.{w}" in pt)
+                    val = (rhs - rest) / co[v]
+                    if _is_dec(val):
+                        pt[f"R.{v}"] = val
+                vec = tuple(tr._oracle([tr.preds[i].expr for i in ids], pt))
+                assert vec in have, (texts, pt)
+    assert trials >= 20
+
+
+@needs_prism
+def test_findings_under_an_assumed_domain_are_marked():
+    """A product equal to 0.5 never holds for integers of the assumed
+    domain, while a trace with p = 0.5 and q = 1 activates the norm: the
+    finding is marked as holding only under the assumed domain, in the
+    JSON and the text."""
+    sos = make_sos("""\
+norms:
+  - id: half
+    kind: obligation
+    bearer: D
+    trigger: "R[1].p * R[1].q == 0.5"
+    content: "D -> R[1] : go"
+    deadline: 1s
+""")
+    m = build_model(sos)
+    report = check(m, PRISM)
+    norms = {n["id"]: n for n in report["norms"]}
+    assert norms["half"]["assumed_domains"] == ["R[1].p", "R[1].q"]
+    assert report["findings"] == [
+        "half is never activated (only under the assumed domains R[1].p=-1..2, "
+        "R[1].q=-1..2)"]
+    assert report["findings_under_assumed_domains"] == report["findings"]
+    text = format_text(report)
+    assert "half*" in text and "only under the assumed domains" in text
+    r = evaluate(sos, parse_trace(['{"t": 0, "values": {"R[1].p": 0.5, "R[1].q": 1}}',
+                                   '{"t": 1, "end": true}']))
+    assert {n["id"]: n for n in r["norms"]}["half"]["activated_at"] is not None
+
+
+def test_late_starts_have_fewer_observations_noted():
+    _sos, m, _pm = model_of("MULTI", **MULTI_ANY)
+    from cadl.norms_check import _report_head
+    assert any("starts at observation s has at most" in n for n in _report_head(m)["notes"])

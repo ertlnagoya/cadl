@@ -200,18 +200,30 @@ class A2AGateway:
     subprocess, and an `a2a-sdk` client whose httpx client adds the
     CADL-HMAC header."""
 
-    def __init__(self, tmp_path: Path, extra=()):
+    def __init__(self, tmp_path: Path, extra=(), pki=None, cert: str | None = "planner",
+                 binding: str = "JSONRPC", push: bool = False, grpc: bool = False):
         from google.protobuf import json_format
 
         from cadl.a2a_gateway import EXTENSION_URI
         from tests.sdk_a2a_agent import Agent, agent_card, free_port
         self.dir = tmp_path
         self.ext = EXTENSION_URI
-        self.agent = Agent(EXTENSION_URI)
+        self.agent = Agent(EXTENSION_URI, push=push)
         port = free_port()
-        self.url = f"http://127.0.0.1:{port}/"
+        self.pki, self.cert = pki, cert
+        self.url = f"{'https' if pki else 'http'}://127.0.0.1:{port}/"
         card = tmp_path / "card.json"
-        card.write_text(json_format.MessageToJson(agent_card(self.url, EXTENSION_URI)))
+        if grpc:
+            # The card names the gRPC listener of the gateway (A2A 1.0.0, 8.3.1).
+            self.grpc_port = free_port()
+            extra = (*extra, "--grpc-listen", f"127.0.0.1:{self.grpc_port}")
+            card.write_text(json_format.MessageToJson(agent_card(
+                f"127.0.0.1:{self.grpc_port}", EXTENSION_URI, binding="GRPC", push=push)))
+        else:
+            card.write_text(json_format.MessageToJson(agent_card(self.url, EXTENSION_URI,
+                                                                 binding=binding, push=push)))
+        if pki is not None:
+            extra = (*pki.gateway_args(), *extra)
         clients = keyring(tmp_path, "PLANNER", CLIENT_KEY, "client")
         approvers = keyring(tmp_path, "OPERATOR", APPROVER_KEY, "approver")
         self.audit = tmp_path / "audit.jsonl"
@@ -234,11 +246,15 @@ class A2AGateway:
         from cadl.a2a_gateway import authorization
 
         async def sign(request):
-            if request.method == "POST":
+            # Every request but the agent card, with its method and its
+            # request target (path and query).
+            if request.url.path != "/.well-known/agent-card.json":
                 body = request.read()
                 request.headers["Authorization"] = authorization(
-                    CLIENT_KEY, "PLANNER", self.run_id, body, path=request.url.path)
-        return httpx.AsyncClient(event_hooks={"request": [sign]}, timeout=60)
+                    CLIENT_KEY, "PLANNER", self.run_id, body,
+                    path=request.url.raw_path.decode("ascii"), method=request.method)
+        verify = self.pki.context(self.cert) if self.pki is not None else True
+        return httpx.AsyncClient(event_hooks={"request": [sign]}, timeout=60, verify=verify)
 
     def message(self, name: str | None, text: str = "hello", **fields):
         from a2a.types import Message, Part, Role
@@ -395,5 +411,321 @@ def test_a2a_sdk_streaming(tmp_path, a2a_sdk):
         ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
         ("publish", "allow", "approved"), ("publish", "escalate", "prohibition"),
         ("reject", "allow", "permission"), ("publish", "deny", "rejected"),
+        ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
+        ("publish", "allow", "approved")]
+
+
+def test_a2a_sdk_mutual_tls(tmp_path, a2a_sdk):
+    """The `a2a-sdk` client over HTTPS with a client certificate (mutual
+    TLS, --client-ca): allowed and denied messages pass as without it; a
+    client without a certificate gets no answer."""
+    import asyncio
+
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.types import SendMessageRequest
+
+    from tests.a2a_certs import PKI
+    pki = PKI(tmp_path / "pki", clients={"planner": "PLANNER"}, foreign={})
+    gw = A2AGateway(tmp_path, pki=pki)
+    out: dict = {}
+
+    async def run():
+        async with gw.httpx_client() as hc:
+            client = await ClientFactory(ClientConfig(httpx_client=hc, streaming=False)) \
+                .create_from_url(gw.url)
+            out["allow"] = [_dict(ev) async for ev in client.send_message(
+                SendMessageRequest(message=gw.message("summarize", "one")))]
+            out["deny"] = [_dict(ev) async for ev in client.send_message(
+                SendMessageRequest(message=gw.message("translate")))]
+        gw.cert = None
+        async with gw.httpx_client() as hc:
+            try:
+                await ClientFactory(ClientConfig(httpx_client=hc)).create_from_url(gw.url)
+                out["nocert"] = "answered"
+            except Exception as e:      # noqa: BLE001 - the client's error type
+                out["nocert"] = type(e).__name__
+
+    asyncio.run(run())
+    err = gw.stop()
+    assert out["allow"][0]["task"]["status"]["state"] == "TASK_STATE_COMPLETED", err
+    assert out["deny"][0]["task"]["status"]["state"] == "TASK_STATE_REJECTED"
+    assert out["nocert"] != "answered"
+    assert gw.agent.executor.seen == ["one"]
+    assert any(r.get("event") == "handshake_failed" for r in read_records(gw.audit))
+    assert replay_equal(A2A_FILE, gw.trace, gw.audit) == [
+        ("summarize", "allow", "permission"), ("translate", "deny", "default")]
+
+
+@pytest.mark.parametrize("upstream", ["jsonrpc", "rest"])
+def test_a2a_sdk_rest_binding(tmp_path, a2a_sdk, upstream):
+    """The `a2a-sdk` client over the HTTP+JSON binding (A2A 1.0.0, 11), with
+    and without streaming, in front of the SDK agent spoken to over JSON-RPC
+    or over the HTTP+JSON binding (--upstream-binding): allow, deny, holds
+    approved and rejected, returnImmediately with GetTask and CancelTask,
+    a stream, and a subscription to a held task."""
+    import asyncio
+
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.types import (
+        CancelTaskRequest,
+        GetTaskRequest,
+        SendMessageConfiguration,
+        SendMessageRequest,
+        SubscribeToTaskRequest,
+    )
+    extra = ("--upstream-binding", "rest") if upstream == "rest" else ()
+    gw = A2AGateway(tmp_path, extra=extra, binding="HTTP+JSON")
+    out: dict = {}
+
+    async def send(client, msg, **conf):
+        req = SendMessageRequest(message=msg)
+        if conf:
+            req.configuration.CopyFrom(SendMessageConfiguration(**conf))
+        return [_dict(ev) async for ev in client.send_message(req)]
+
+    async def run():
+        async with gw.httpx_client() as hc:
+            factory = ClientFactory(ClientConfig(httpx_client=hc, streaming=False,
+                                                 supported_protocol_bindings=["HTTP+JSON"]))
+            client = await factory.create_from_url(gw.url)
+            out["allow"] = await send(client, gw.message("summarize", "one"))
+            out["deny"] = await send(client, gw.message("translate"))
+            held = asyncio.create_task(send(client, gw.message("publish", "two")))
+            await asyncio.to_thread(approve_when_published, gw.inbox, "h-1", "approve",
+                                    tmp_path / "approver.key")
+            out["approved"] = await held
+            held = asyncio.create_task(send(client, gw.message("publish", "three")))
+            await asyncio.to_thread(approve_when_published, gw.inbox, "h-2", "reject",
+                                    tmp_path / "approver.key")
+            out["rejected"] = await held
+            sub = await send(client, gw.message("publish", "four"), return_immediately=True)
+            gw_id = sub[0]["task"]["id"]
+            out["get"] = _dict(await client.get_task(GetTaskRequest(id=gw_id,
+                                                                    history_length=1)))
+            out["cancel"] = _dict(await client.cancel_task(CancelTaskRequest(id=gw_id)))
+            up_id = out["allow"][0]["task"]["id"]
+            out["get_up"] = _dict(await client.get_task(GetTaskRequest(id=up_id)))
+            factory = ClientFactory(ClientConfig(httpx_client=hc, streaming=True,
+                                                 supported_protocol_bindings=["HTTP+JSON"]))
+            streaming = await factory.create_from_url(gw.url)
+            out["stream"] = await send(streaming, gw.message("summarize", "five"))
+            sub = await send(streaming, gw.message("publish", "wait"), return_immediately=True)
+            gw_id = out["sub_id"] = sub[0]["task"]["id"]
+
+            async def follow():
+                events = []
+                async for ev in streaming.subscribe(SubscribeToTaskRequest(id=gw_id)):
+                    events.append(_dict(ev))
+                    gw.agent.executor.release.set()
+                return events
+            following = asyncio.create_task(follow())
+            await asyncio.to_thread(approve_when_published, gw.inbox, "h-4", "approve",
+                                    tmp_path / "approver.key")
+            out["subscribed"] = await following
+
+    asyncio.run(run())
+    err = gw.stop()
+    assert out["allow"][0]["task"]["status"]["state"] == "TASK_STATE_COMPLETED", err
+    assert out["deny"][0]["task"]["status"]["state"] == "TASK_STATE_REJECTED"
+    assert out["approved"][0]["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert out["rejected"][0]["task"]["status"]["state"] == "TASK_STATE_REJECTED"
+    assert out["get"]["status"]["state"] == "TASK_STATE_SUBMITTED"
+    assert out["cancel"]["status"]["state"] == "TASK_STATE_CANCELED"
+    assert out["get_up"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    kinds = [next(iter(ev)) for ev in out["stream"]]
+    assert kinds[0] == "task" and "artifactUpdate" in kinds, kinds
+    assert out["stream"][-1]["statusUpdate"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    ids = {ev.get("task", {}).get("id") or ev.get("statusUpdate", ev.get("artifactUpdate",
+                                                                        {})).get("taskId")
+           for ev in out["subscribed"]}
+    assert ids == {out["sub_id"]}         # the gateway's task, not the agent's
+    assert gw.agent.executor.seen == ["one", "two", "five", "wait"]
+    assert replay_equal(A2A_FILE, gw.trace, gw.audit) == [
+        ("summarize", "allow", "permission"), ("translate", "deny", "default"),
+        ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
+        ("publish", "allow", "approved"), ("publish", "escalate", "prohibition"),
+        ("reject", "allow", "permission"), ("publish", "deny", "rejected"),
+        ("publish", "escalate", "prohibition"), ("publish", "deny", "withdrawn"),
+        ("summarize", "allow", "permission"),
+        ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
+        ("publish", "allow", "approved")]
+
+
+
+@pytest.mark.parametrize("binding", ["JSONRPC", "HTTP+JSON"])
+def test_a2a_sdk_push_notifications(tmp_path, a2a_sdk, binding):
+    """Push notifications (--push-allow) with the push sender of the SDK
+    agent and the `a2a-sdk` client: a configuration given with a SendMessage
+    with returnImmediately, and one created for the running task. A
+    configuration is bound to the task that the agent's answer names; the
+    gateway drops the notifications that come before that answer (the SDK
+    agent sends some while it creates the task) and relays the later ones
+    to the client's webhook, with the client's token and credentials."""
+    import asyncio
+
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.types import (
+        AuthenticationInfo,
+        ListTaskPushNotificationConfigsRequest,
+        SendMessageConfiguration,
+        SendMessageRequest,
+        TaskPushNotificationConfig,
+    )
+
+    from tests.test_a2a_bindings import Hook
+    hook = Hook()
+    gw = A2AGateway(tmp_path, extra=("--push-allow", f"{hook.url}/hooks/"), binding=binding,
+                    push=True)
+    out: dict = {}
+
+    def config(path: str, **kw) -> TaskPushNotificationConfig:
+        return TaskPushNotificationConfig(
+            url=f"{hook.url}/hooks/{path}", token=f"token-{path}",
+            authentication=AuthenticationInfo(scheme="Bearer", credentials=f"cred-{path}"),
+            **kw)
+
+    def completed(path: str) -> bool:
+        return any(g["path"] == path and g["body"].get("statusUpdate", {}).get(
+            "status", {}).get("state") == "TASK_STATE_COMPLETED" for g in hook.got)
+
+    async def run():
+        async with gw.httpx_client() as hc:
+            client = await ClientFactory(ClientConfig(
+                httpx_client=hc, streaming=False,
+                supported_protocol_bindings=[binding])).create_from_url(gw.url)
+            req = SendMessageRequest(message=gw.message("summarize", "wait"))
+            req.configuration.CopyFrom(SendMessageConfiguration(
+                return_immediately=True, task_push_notification_config=config("a", id="a1")))
+            sent = [_dict(ev) async for ev in client.send_message(req)]
+            tid = out["tid"] = sent[0]["task"]["id"]
+            out["made"] = _dict(await client.create_task_push_notification_config(
+                config("b", task_id=tid, id="b1")))
+            out["list"] = _dict(await client.list_task_push_notification_configs(
+                ListTaskPushNotificationConfigsRequest(task_id=tid)))
+            gw.agent.executor.release.set()
+            await asyncio.to_thread(wait_for, lambda: completed("/hooks/a")
+                                    and completed("/hooks/b"), "the notifications of completion")
+
+    asyncio.run(run())
+    err = gw.stop()
+    hook.close()
+    a = [g for g in hook.got if g["path"] == "/hooks/a"]
+    b = [g for g in hook.got if g["path"] == "/hooks/b"]
+    assert a and b, (hook.got, err)
+    assert all(g["headers"]["X-A2A-Notification-Token"] == "token-a"
+               and g["headers"]["Authorization"] == "Bearer cred-a" for g in a)
+    assert all(g["headers"]["Authorization"] == "Bearer cred-b" for g in b)
+    tasks = {g["body"].get("task", {}).get("id") or next(iter(g["body"].values())).get("taskId")
+             for g in hook.got}
+    assert tasks == {out["tid"]}
+    assert out["made"]["id"] == "b1" and out["made"]["url"].endswith("/hooks/b")
+    assert sorted(c["id"] for c in out["list"]["configs"]) == ["a1", "b1"]
+    records = read_records(gw.audit)
+    events = [r.get("event") for r in records]
+    assert events.count("push_config") == 2
+    assert events.count("push_sent") == len(hook.got)
+    assert "push_failed" not in events
+    assert all((r["reason"] or "").startswith("unbound ") for r in records
+               if r.get("event") == "push_dropped")
+    assert replay_equal(A2A_FILE, gw.trace, gw.audit) == [("summarize", "allow", "permission")]
+
+
+
+def test_a2a_sdk_grpc_binding(tmp_path, a2a_sdk):
+    """The `a2a-sdk` client over the gRPC binding (A2A 1.0.0, 10) of the
+    gateway (--grpc-listen, the extra cadl-lang[grpc]), with an interceptor
+    of grpc.aio that adds the CADL-HMAC metadata over the serialized
+    request: allow, deny, a hold approved, GetTask, a stream, and a
+    subscription to a held task; the agent behind it speaks JSON-RPC."""
+    import asyncio
+
+    grpc = pytest.importorskip("grpc")
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.types import (
+        GetTaskRequest,
+        SendMessageConfiguration,
+        SendMessageRequest,
+        SubscribeToTaskRequest,
+    )
+
+    from cadl.a2a_gateway import authorization
+    gw = A2AGateway(tmp_path, grpc=True)
+    out: dict = {}
+
+    class Sign:
+        def _details(self, details, request):
+            method = details.method.decode() if isinstance(details.method, bytes) \
+                else details.method
+            md = grpc.aio.Metadata(*list(details.metadata or ()))
+            md.add("authorization", authorization(CLIENT_KEY, "PLANNER", gw.run_id,
+                                                  request.SerializeToString(), path=method))
+            return grpc.aio.ClientCallDetails(details.method, details.timeout, md,
+                                              details.credentials, details.wait_for_ready)
+
+    # grpc.aio takes an interceptor as one kind only, so one of each.
+    class SignUnary(Sign, grpc.aio.UnaryUnaryClientInterceptor):
+        async def intercept_unary_unary(self, continuation, details, request):
+            return await continuation(self._details(details, request), request)
+
+    class SignStream(Sign, grpc.aio.UnaryStreamClientInterceptor):
+        async def intercept_unary_stream(self, continuation, details, request):
+            return await continuation(self._details(details, request), request)
+
+    async def send(client, msg, **conf):
+        req = SendMessageRequest(message=msg)
+        if conf:
+            req.configuration.CopyFrom(SendMessageConfiguration(**conf))
+        return [_dict(ev) async for ev in client.send_message(req)]
+
+    async def run():
+        async with gw.httpx_client() as hc:
+            def channel(url):
+                return grpc.aio.insecure_channel(url, interceptors=[SignUnary(), SignStream()])
+            client = await ClientFactory(ClientConfig(
+                httpx_client=hc, streaming=False, grpc_channel_factory=channel,
+                supported_protocol_bindings=["GRPC"])).create_from_url(gw.url)
+            out["allow"] = await send(client, gw.message("summarize", "one"))
+            out["deny"] = await send(client, gw.message("translate"))
+            held = asyncio.create_task(send(client, gw.message("publish", "two")))
+            await asyncio.to_thread(approve_when_published, gw.inbox, "h-1", "approve",
+                                    tmp_path / "approver.key")
+            out["approved"] = await held
+            up_id = out["allow"][0]["task"]["id"]
+            out["get"] = _dict(await client.get_task(GetTaskRequest(id=up_id)))
+            streaming = await ClientFactory(ClientConfig(
+                httpx_client=hc, streaming=True, grpc_channel_factory=channel,
+                supported_protocol_bindings=["GRPC"])).create_from_url(gw.url)
+            out["stream"] = await send(streaming, gw.message("summarize", "three"))
+            sub = await send(streaming, gw.message("publish", "wait"), return_immediately=True)
+            gw_id = out["sub_id"] = sub[0]["task"]["id"]
+
+            async def follow():
+                events = []
+                async for ev in streaming.subscribe(SubscribeToTaskRequest(id=gw_id)):
+                    events.append(_dict(ev))
+                    gw.agent.executor.release.set()
+                return events
+            following = asyncio.create_task(follow())
+            await asyncio.to_thread(approve_when_published, gw.inbox, "h-2", "approve",
+                                    tmp_path / "approver.key")
+            out["subscribed"] = await following
+
+    asyncio.run(run())
+    err = gw.stop()
+    assert out["allow"][0]["task"]["status"]["state"] == "TASK_STATE_COMPLETED", err
+    assert out["deny"][0]["task"]["status"]["state"] == "TASK_STATE_REJECTED"
+    assert out["approved"][0]["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert out["get"]["status"]["state"] == "TASK_STATE_COMPLETED"
+    kinds = [next(iter(ev)) for ev in out["stream"]]
+    assert kinds[0] == "task" and "artifactUpdate" in kinds, kinds
+    ids = {ev.get("task", {}).get("id") or ev.get("statusUpdate", ev.get("artifactUpdate",
+                                                                        {})).get("taskId")
+           for ev in out["subscribed"]}
+    assert ids == {out["sub_id"]}
+    assert gw.agent.executor.seen == ["one", "two", "three", "wait"]
+    assert replay_equal(A2A_FILE, gw.trace, gw.audit) == [
+        ("summarize", "allow", "permission"), ("translate", "deny", "default"),
+        ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
+        ("publish", "allow", "approved"), ("summarize", "allow", "permission"),
         ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
         ("publish", "allow", "approved")]

@@ -1,0 +1,50 @@
+# Norms Extension Demo: Amendments of Several Contract Instances (F.12), version 1
+#
+# One access contract per robot (index i): the gate must grant a robot
+# access within 2 s of its request. Version 2 (norms_check_amend_v2.cadl)
+# adds a curfew: from the amendment on, the gate must not grant access to
+# any robot for 2 s. One amendment applies to every running instance at
+# the same observation, so a request of one robot pending at the
+# amendment conflicts with the curfew of the other robot's instance, and
+# an instance that starts after the amendment is an instance of version 2:
+#
+#   cadl norms-check examples/norms_check_amend_v1.cadl --members ROBOT=2 --instances 2 \
+#       --version examples/norms_check_amend_v2.cadl
+
+sos:
+  name: "GateAccess"
+  type: Acknowledged
+  version: "1.0.0"
+  description: "Access to one gate shared by the robots of a fleet (version 1)."
+  extensions:
+    - norms: 0.1
+
+  actors:
+    - id: GATE
+      role: "access_control"
+      autonomy: low
+      capabilities: [grant_access]
+      interface:
+        input:  [request]
+        output: [grant]
+
+    - id: "ROBOT[1..N]"
+      role: "delivery_agent"
+      autonomy: high
+      capabilities: [deliver]
+      interface:
+        input:  [grant]
+        output: [request]
+
+  contracts:
+    - id: ACCESS
+      parties: [GATE, "ROBOT[*]"]
+
+      norms:
+        - id: serve
+          kind: obligation
+          bearer: GATE
+          counterparty: "ROBOT[i]"
+          trigger: "ROBOT[i] -> GATE : request"
+          content: "GATE -> ROBOT[i] : grant"
+          deadline: 2s
