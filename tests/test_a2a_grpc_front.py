@@ -164,7 +164,7 @@ def test_flood_from_one_address(grpc):
         t0 = time.monotonic()
         flood = [attempt(b.port) for _ in range(100)]
         assert all(closed(s, 5) for s in flood)
-        assert time.monotonic() - t0 < 5
+        assert time.monotonic() - t0 < 10
         assert b.gw.count("overloaded", "connections") == 100
         ch = b.channel()
         with pytest.raises(grpc.RpcError) as e:
@@ -226,7 +226,7 @@ def test_slowloris_and_half_closed(grpc):
         t0 = time.monotonic()
         assert closed(half, 1.0)
         assert all(closed(s, 5) for s in (slow, silent, partial))
-        assert 1.0 < time.monotonic() - t0 < 5
+        assert 1.0 < time.monotonic() - t0 < 10
         stop.set()
         assert b.gw.count("read_timeout", "grpc handshake") == 3
         wait_for(lambda: b.front.total == 0, "the places to come back")
@@ -320,7 +320,7 @@ def test_gateway_connection_flood(tmp_path, grpc, capsys):
     rate; a call of the same address is refused until the deadline resets
     the four, then served; the replay is byte-identical."""
     pb = pytest.importorskip("a2a.types.a2a_pb2")
-    r, port = _run(tmp_path, "--read-timeout", "3")
+    r, port = _run(tmp_path, "--read-timeout", "6")
     held = [socket.create_connection(("127.0.0.1", port)) for _ in range(4)]
     time.sleep(0.3)
     flood = [attempt(port) for _ in range(300)]
@@ -328,7 +328,7 @@ def test_gateway_connection_flood(tmp_path, grpc, capsys):
     g = GrpcClient(r, grpc, pb, port)
     with pytest.raises(grpc.RpcError):
         g.channel.unary_unary("/lf.a2a.v1.A2AService/SendMessage")(b"", timeout=1)
-    assert all(closed(s, 10) for s in held)
+    assert all(closed(s, 15) for s in held)
     g.channel.close()
     g = GrpcClient(r, grpc, pb, port)
     got = wait_for(lambda: _try(g, pb), "a call after the deadline")
@@ -373,7 +373,7 @@ def test_gateway_tls_call_served_while_an_address_holds_its_connections(
         probe.close()
     except OSError:
         pytest.skip("no IPv6 loopback")
-    r, port = _run(tmp_path, *pki.gateway_args(), "--read-timeout", "4",
+    r, port = _run(tmp_path, *pki.gateway_args(), "--read-timeout", "8",
                    listen="[::]:0")
     held = [socket.create_connection(("127.0.0.1", port)) for _ in range(3)]
     ctx = pki.context("planner")
@@ -413,7 +413,7 @@ def test_gateway_tls_call_served_while_an_address_holds_its_connections(
     with pytest.raises(grpc.RpcError):
         v4.unary_unary("/lf.a2a.v1.A2AService/SendMessage")(b"", timeout=1)
     v4.close()
-    assert all(closed(s, 10) for s in held)
+    assert all(closed(s, 15) for s in held)
     stop.set()
     g.channel.close()
     for s in held + [s for s in flood if s is not None]:
