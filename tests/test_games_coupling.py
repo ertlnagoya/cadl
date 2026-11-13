@@ -347,11 +347,10 @@ class TestLifting:
                 except ge._Unknown:
                     continue
                 table = CornerTable(game, cell)
-                ranges = tuple(ge._p_interval(r, cell) for r in table.lifting.functions)
                 for _ in range(2):
                     x = tuple(a + (b - a) * F(rng.randint(0, 16), 16) for a, b in cell)
                     u = x + tuple(ge._p_eval(r, x) for r in table.lifting.functions)
-                    w = multilinear_weights(cell + ranges, u)
+                    w = multilinear_weights(table.box, u)
                     assert len(w) == len(table.corners) and sum(w) == 1
                     assert all(y >= 0 for y in w)
                     for gi, cmds in enumerate(game.commands):
@@ -372,6 +371,36 @@ class TestLifting:
                                 {j: p for j, p in exact.items() if p}
                             checked += 1
         assert checked > 100
+
+    def test_the_bernstein_enclosure(self):
+        # It contains the values on the box, and it is within the
+        # enclosure by interval arithmetic for (1 − p)² on small boxes.
+        rng = random.Random(25)
+        for _ in range(400):
+            n = rng.randint(1, 3)
+            poly: dict = {}
+            for _ in range(rng.randint(1, 5)):
+                e = tuple(rng.randint(0, 3) for _ in range(n))
+                poly[e] = poly.get(e, F(0)) + F(rng.randint(-5, 5), rng.randint(1, 4))
+            poly = tuple(sorted((e, c) for e, c in poly.items() if c))
+            if not poly:
+                continue
+            cell = []
+            for _ in range(n):
+                a = F(rng.randint(-8, 8), 8)
+                cell.append((a, a + F(rng.randint(1, 8), 8)))
+            cell = tuple(cell)
+            lo, hi = ge.bernstein_interval(poly, cell)
+            a, b = ge.lifted_interval(poly, cell)
+            assert max(lo, ge._p_interval(poly, cell)[0]) == a
+            for x in itertools.product(*[(a_, (a_ + b_) / 2, b_) for a_, b_ in cell]):
+                assert lo <= ge._p_eval(poly, x) <= hi
+        square = (((0,), F(1)), ((1,), F(-2)), ((2,), F(1)))        # (1 − p)²
+        cell = ((F(1, 4), F(5, 16)),)
+        lo, hi = ge.bernstein_interval(square, cell)
+        a, b = ge._p_interval(square, cell)
+        assert a < lo and hi < b
+        assert (lo, hi) == (F(11, 16) ** 2, F(3, 4) ** 2)
 
     def test_a_corner_outside_the_relaxed_process_is_not_used(self, monkeypatch):
         model, query, game = squared_game()

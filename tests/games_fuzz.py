@@ -899,8 +899,8 @@ def mutation(name: str | None):
                     lo, hi = ge._p_interval(r, cell)
                     x = ge._p_eval(r, centre)
                     ranges.append((x, x) if name == "lift_centre_range" else (lo, (lo + hi) / 2))
-                self.corners = list(itertools.product(
-                    *[sorted({a, b}) for a, b in tuple(cell) + tuple(ranges)]))
+                self.box = tuple(cell) + tuple(ranges)
+                self.corners = list(itertools.product(*[sorted({a, b}) for a, b in self.box]))
         ge.CornerTable = Narrow
     elif name is not None:
         raise ValueError(name)

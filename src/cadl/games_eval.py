@@ -1135,6 +1135,9 @@ LIFT_LIMIT = 10
 # coupled bounds through the lifting of I.9 (False gives the maps of cadl
 # 0.3.28).
 USE_LIFTING = True
+# Whether the interval of a lifted coordinate is narrowed by the Bernstein
+# coefficients (`lifted_interval`).
+LIFT_BERNSTEIN = True
 
 
 class CouplingUnavailable(Exception):
@@ -1254,6 +1257,61 @@ def lift_game(game: Game) -> "Lifting | None":
     return game._lifting
 
 
+def bernstein_interval(poly: tuple, cell: tuple) -> tuple:
+    """An exact enclosure of a polynomial on a box from its Bernstein
+    coefficients: with x_k = lo_k + (hi_k − lo_k) · t_k, the polynomial
+    in t on [0, 1]^n is Σ_I b_I · Π_k B(d_k, i_k, t_k), the Bernstein
+    basis functions are not negative and sum to 1, so every value lies
+    between the least and the largest b_I."""
+    n = len(cell)
+    degrees = [max((e[k] for e, _ in poly), default=0) for k in range(n)]
+    # The coefficients in t: expand c · Π (lo + w t)^e by the binomial theorem.
+    coeffs: dict = {}
+    for e, c in poly:
+        terms = {(): c}
+        for k in range(n):
+            lo, hi = cell[k]
+            w = hi - lo
+            out: dict = {}
+            for j in range(e[k] + 1):
+                f = Fraction(_binomial(e[k], j)) * lo ** (e[k] - j) * w ** j
+                if f:
+                    for idx, x in terms.items():
+                        out[idx + (j,)] = out.get(idx + (j,), ZERO) + x * f
+            terms = out
+        for idx, x in terms.items():
+            coeffs[idx] = coeffs.get(idx, ZERO) + x
+    values = []
+    for index in itertools.product(*[range(d + 1) for d in degrees]):
+        b = ZERO
+        for j, a in coeffs.items():
+            if all(jk <= ik for jk, ik in zip(j, index)):
+                f = a
+                for jk, ik, d in zip(j, index, degrees):
+                    f *= Fraction(_binomial(ik, jk), _binomial(d, jk))
+                b += f
+        values.append(b)
+    return min(values), max(values)
+
+
+def _binomial(n: int, k: int) -> int:
+    out = 1
+    for i in range(k):
+        out = out * (n - i) // (i + 1)
+    return out
+
+
+def lifted_interval(poly: tuple, cell: tuple) -> tuple:
+    """The interval of a lifted coordinate (I.9): the intersection of the
+    enclosure by interval arithmetic (that of the relaxation) and that of
+    the Bernstein coefficients. Both contain the values on the cell."""
+    a, b = _p_interval(poly, cell)
+    if not LIFT_BERNSTEIN:
+        return a, b
+    c, d = bernstein_interval(poly, cell)
+    return max(a, c), min(b, d)
+
+
 def coupling_applies(game: Game) -> bool:
     """Whether the coupled bounds of I.9 can be computed for the game: its
     probabilities are multi-affine in the open parameters, or the lifted
@@ -1282,9 +1340,10 @@ class CornerTable:
         self.game = game
         self.cell = cell
         self.lifting = lifting
-        ranges = tuple(_p_interval(r, cell) for r in lifting.functions)
-        # A lifted function whose enclosure is a point adds no corners.
-        self.corners = list(itertools.product(*[sorted({a, b}) for a, b in cell + ranges]))
+        # The lifted cell B; a lifted function whose interval is a point
+        # adds no corners.
+        self.box = tuple(cell) + tuple(lifted_interval(r, cell) for r in lifting.functions)
+        self.corners = list(itertools.product(*[sorted({a, b}) for a, b in self.box]))
         self._rows: dict = {}
         self._rho: dict = {}
         self._checked: dict = {}
