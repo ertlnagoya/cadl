@@ -450,9 +450,13 @@ class TestLifting:
                     assert all(gains[p] > 0 for p in cell.deviators)
 
 
-# Seeds on which each lifting bug makes a wrong claim of a map within 150
-# models (found by running the mutants).
-LIFTING_MAP_SEEDS = {"lift_corners_only": 2, "lift_centre_range": 2, "lift_lower_range": 2}
+# The lifting bugs that narrow the interval of a lifted coordinate make
+# wrong claims of maps and wrong bounds on the squared example;
+# `lift_corners_only` (no lifting) is found only by the direct comparison
+# of the bounds with the advantages (no wrong claim of a map in 4 500
+# models of mode="nonaffine", none on the squared example, whose
+# probability (1 − p_fail)² is monotone and convex on the region).
+LIFTING_RANGE_MUTATIONS = ("lift_centre_range", "lift_lower_range")
 
 
 def assert_sound(stats: dict) -> None:
@@ -494,11 +498,32 @@ class TestFuzz:
         stats = games_fuzz.run(2, 100, name, mode="nonaffine")
         assert "failure" in stats, f"the mutant {name} survived {stats}"
 
-    @pytest.mark.parametrize("name", games_fuzz.LIFTING_MUTATIONS)
+    @pytest.mark.parametrize("name", LIFTING_RANGE_MUTATIONS)
     def test_a_lifting_bug_is_detected_by_the_maps(self, name):
-        stats = games_fuzz.run(LIFTING_MAP_SEEDS[name], 150, name, mode="nonaffine",
-                               direct=False)
+        stats = games_fuzz.run(2, 150, name, mode="nonaffine", direct=False)
         assert "failure" in stats, f"the mutant {name} survived {stats}"
+
+    @pytest.mark.parametrize("name", LIFTING_RANGE_MUTATIONS)
+    def test_a_lifting_bug_is_detected_on_the_squared_example(self, name):
+        model, query, game = squared_game()
+        with games_fuzz.mutation(name):
+            wrong = False
+            rng = random.Random(6)
+            for cell in (CELL_D_OPEN, CELL_D_DECIDED):
+                dists = cell_distributions(game, cell)
+                for player in ("R", "D"):
+                    proc = build_process(game, player, query.profile, dists)
+                    plays = ge.CoupledPlays(game, proc, ge.CornerTable(game, cell))
+                    keys = [(i, k) for i in range(len(proc.states))
+                            if proc.mine[i] and not proc.target[i]
+                            for k, _ in proc.options[i]
+                            if k is not None and k != proc.selected[i]]
+                    for point in points_of(cell, rng, 2):
+                        exact = exact_advantages(game, player, point)
+                        wrong |= any(
+                            not plays.bound(i, k, False) <= exact[(proc.states[i], k)]
+                            <= plays.bound(i, k, True) for i, k in keys)
+        assert wrong
 
     @pytest.mark.parametrize("name", games_fuzz.COUPLING_MUTATIONS)
     def test_a_soundness_bug_is_detected_on_the_example(self, name):
