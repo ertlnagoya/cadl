@@ -32,9 +32,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   observations, and they are fed to the outer operator in the order of
   the observations, at most three runs per observation. D.5 proves this
   equal to F.5 with undefined values and window ends.
-  `within(1000s, throughout(500s, …))` costs 5.0 and 5.1 × 10^5 gas at
+  `within(1000s, throughout(500s, …))` costs 4.9 and 5.0 × 10^5 gas at
   the 320th and 1000th observation, `throughout(1000s, within(500s, …))`
-  5.1 and 6.6 × 10^5 (at most 8.3 × 10^5). `until` in a
+  5.1 and 6.5 × 10^5 (at most 8.3 × 10^5). `until` in a
   nesting, other operands with a temporal operator inside, three levels,
   and nested operators outside the content of a norm are refused with
   the reason (D.5 gives a trace on which feeding in order would decide
@@ -44,7 +44,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   traces with suspension, reparations, undefined values and epoch
   timestamps, boundary traces, long traces), gas tests at 320
   observations, and 18 new mutants in
-  `scripts/norms_monitor_mutations.py` (MUT_RESULT).
+  `scripts/norms_monitor_mutations.py` (each of the 31 mutants of the temporal parts is killed; two further
+  mutants proved equivalent and were dropped: the decision of window
+  ends before each run, which the previous observation already made, and
+  the reset of the inner summary at the first candidate).
 
 ### Changed
 
