@@ -216,23 +216,6 @@ def fuzz_games(seed: int, count: int, **options) -> list:
 
 
 class TestCoupledProcess:
-    def test_not_for_probabilities_that_are_not_multi_affine(self):
-        for g, model in fuzz_games(13, 40):
-            query = next(q for q in model.equilibria if q.id == "on_region")
-            game = prepare_map(model, query, model.designs[0], None)
-            if game.multi_affine:
-                continue
-            cell = tuple(g["region"][n] for n in game.names)
-            with pytest.raises(ValueError):
-                CornerTable(game, cell)
-            table = CornerTable(GAME, tuple(tuple(QUERY.over[n]) for n in GAME.names))
-            proc = build_process(game, g["players"][0], "sigma",
-                                 point_distributions(game, tuple(lo for lo, _ in cell)))
-            with pytest.raises(ValueError):
-                CoupledPlays(game, proc, table)
-            return
-        pytest.fail("no game with a probability that is not multi-affine")
-
     def test_backward_induction_and_policy_iteration_agree(self):
         # The fuzzed games have cycles; on the pairs of an acyclic part
         # both ways must give the same value.
@@ -293,6 +276,185 @@ class TestCoupledProcess:
         assert more > 0
 
 
+def multilinear_weights(box: tuple, point: tuple) -> list:
+    """w_e(point) for the corners e of a box, in the order of
+    `itertools.product` (a point coordinate of a degenerate interval
+    gets the single corner)."""
+    weights = [F(1)]
+    for (lo, hi), x in zip(box, point):
+        if lo == hi:
+            continue
+        t = (x - lo) / (hi - lo)
+        weights = [w * f for w in weights for f in (1 - t, t)]
+    return weights
+
+
+SQUARED = TWO.read_text(encoding="utf-8").replace("(1 - p_fail)", "(1 - p_fail) * (1 - p_fail)")
+
+
+def squared_game():
+    model = checked_model(parse(SQUARED + THREE))
+    query = next(q for q in model.equilibria if q.id == "three")
+    return model, query, prepare_map(model, query, model.design("CENTRALIZED"), None)
+
+
+class TestLifting:
+    """Probabilities that are not multi-affine: the lifted cell of I.9."""
+
+    def test_the_lifted_rows(self):
+        # L(x, R(x)) = P(x), the lifted polynomials are multi-affine, and
+        # the polynomials of a row sum to 1 identically.
+        rng = random.Random(21)
+        checked = 0
+        for g, model in fuzz_games(13, 60, mode="nonaffine"):
+            query = next(q for q in model.equilibria if q.id == "on_region")
+            game = prepare_map(model, query, model.designs[0], None)
+            lifting = ge.lift_game(game)
+            if game.multi_affine or lifting is None:
+                continue
+            n = len(game.names)
+            m = lifting.dimension(n)
+            rows = {id(c.row): c.row for cmds in game.commands for c in cmds}
+            for key, row in rows.items():
+                lifted = lifting.rows[key]
+                assert all(ge._multi_affine(p) for p in lifted)
+                total: dict = {}
+                for p in lifted:
+                    total = ge._p_add(total, dict(p))
+                assert ge._canonical(total) == (((0,) * m, F(1)),)
+                for _ in range(3):
+                    x = tuple(F(rng.randint(0, 40), 40) for _ in range(n))
+                    u = x + tuple(ge._p_eval(r, x) for r in lifting.functions)
+                    assert [ge._p_eval(p, u) for p in lifted] == \
+                        [ge._p_eval(p, x) for p in row.polys]
+                checked += 1
+        assert checked > 50
+
+    def test_every_distribution_is_a_mixture_of_the_corners(self):
+        # P(·, v) = Σ_e w_e(v, R(v)) · D_e with the same weights for every
+        # command, and every D_e is a distribution of the relaxed process.
+        rng = random.Random(22)
+        checked = 0
+        for g, model in fuzz_games(14, 40, mode="nonaffine"):
+            query = next(q for q in model.equilibria if q.id == "on_region")
+            game = prepare_map(model, query, model.designs[0], None)
+            if game.multi_affine or not ge.coupling_applies(game):
+                continue
+            for box in random_cells(rng, g["region"], 2):
+                cell = tuple(box[n] for n in game.names)
+                try:
+                    cell_distributions(game, cell)
+                except ge._Unknown:
+                    continue
+                table = CornerTable(game, cell)
+                ranges = tuple(ge._p_interval(r, cell) for r in table.lifting.functions)
+                for _ in range(2):
+                    x = tuple(a + (b - a) * F(rng.randint(0, 16), 16) for a, b in cell)
+                    u = x + tuple(ge._p_eval(r, x) for r in table.lifting.functions)
+                    w = multilinear_weights(cell + ranges, u)
+                    assert len(w) == len(table.corners) and sum(w) == 1
+                    assert all(y >= 0 for y in w)
+                    for gi, cmds in enumerate(game.commands):
+                        for k, c in enumerate(cmds):
+                            try:
+                                corner = [table.distribution(gi, k, e)
+                                          for e in range(len(table.corners))]
+                            except ge.CouplingUnavailable:
+                                continue
+                            mixed: dict = {}
+                            for we, d in zip(w, corner):
+                                for j, p in d.items():
+                                    mixed[j] = mixed.get(j, F(0)) + we * p
+                            exact: dict = {}
+                            for j, p in zip(c.targets, c.row.polys):
+                                exact[j] = exact.get(j, F(0)) + ge._p_eval(p, x)
+                            assert {j: p for j, p in mixed.items() if p} == \
+                                {j: p for j, p in exact.items() if p}
+                            checked += 1
+        assert checked > 100
+
+    def test_a_corner_outside_the_relaxed_process_is_not_used(self, monkeypatch):
+        model, query, game = squared_game()
+        cell = ((F(0), F(1, 10)), (F(1, 10), F(1, 5)), (F(0), F(1, 8)))
+        dists = cell_distributions(game, cell)
+        proc = build_process(game, "D", query.profile, dists)
+        table = CornerTable(game, cell)
+        # Intervals of the relaxed process that exclude the corners.
+        monkeypatch.setattr(CornerTable, "_relaxed",
+                            lambda self, row: [(F(0), F(0))] * len(row.polys))
+        plays = CoupledPlays(game, proc, table)
+        keys = [(i, k) for i in range(len(proc.states))
+                if proc.mine[i] and not proc.target[i]
+                for k, _ in proc.options[i] if k is not None and k != proc.selected[i]]
+        assert keys
+        with pytest.raises(ge.CouplingUnavailable):
+            plays.bound(*keys[0], maximize=True)
+        assert ge._coupled_bound(plays, keys[0], True) is None
+
+    def test_too_many_coordinates(self, monkeypatch):
+        _, _, game = squared_game()
+        monkeypatch.setattr(ge, "LIFT_LIMIT", len(game.names))
+        game._lifting = False
+        try:
+            assert not ge.coupling_applies(game)
+            with pytest.raises(ValueError):
+                CornerTable(game, tuple(tuple(QUERY.over[n]) for n in game.names))
+        finally:
+            game._lifting = False
+
+    def test_the_bounds_on_the_squared_example(self):
+        # The second example with (1 − p_fail)²: the coupled bounds of the
+        # dispatcher are narrower than those from l_p and u_p, and hold
+        # at points of the cell.
+        model, query, game = squared_game()
+        assert not game.multi_affine and ge.coupling_applies(game)
+        rng = random.Random(23)
+        for cell in (CELL_D_OPEN, CELL_D_DECIDED):
+            dists = cell_distributions(game, cell)
+            for player in ("R", "D"):
+                proc = build_process(game, player, query.profile, dists)
+                lo, hi = reward_bounds(game, proc, cell)
+                lower = optimal_values(proc, lambda i: [proc.selected[i]], lo, maximize=False)
+                upper = optimal_values(proc, lambda i: [proc.selected[i]], hi, maximize=True)
+                separate = advantage_bounds(game, proc, cell, lower, upper)
+                plays = CoupledPlays(game, proc, CornerTable(game, cell))
+                for key, (a, b) in separate.items():
+                    c, d = plays.bound(*key, maximize=False), plays.bound(*key, maximize=True)
+                    if player == "D":
+                        assert a < c and d < b
+                    for point in points_of(cell, rng, 2):
+                        exact = exact_advantages(game, player, point)
+                        assert c <= exact[(proc.states[key[0]], key[1])] <= d
+
+    def test_the_map_of_the_squared_example(self):
+        _, query, game = squared_game()
+        with_lifting = ge.design_map(game, query, max_cells=300)
+        saved = ge.USE_LIFTING
+        ge.USE_LIFTING = False
+        try:
+            without = ge.design_map(game, query, max_cells=300)
+        finally:
+            ge.USE_LIFTING = saved
+        assert with_lifting["undecided_fraction"] < without["undecided_fraction"]
+        rng = random.Random(24)
+        for cell in with_lifting["cells"]:
+            if cell.status == "undecided":
+                continue
+            box = tuple(cell.box[n] for n in game.names)
+            for point in points_of(box, rng, 1):
+                gains = {p: player_at_point(game, query.profile, p, point).gain
+                         for p in ("R", "D")}
+                if cell.status == "equilibrium":
+                    assert all(g == 0 for g in gains.values())
+                else:
+                    assert all(gains[p] > 0 for p in cell.deviators)
+
+
+# Seeds on which each lifting bug makes a wrong claim of a map within 150
+# models (found by running the mutants).
+LIFTING_MAP_SEEDS = {"lift_corners_only": 2, "lift_centre_range": 2, "lift_lower_range": 2}
+
+
 def assert_sound(stats: dict) -> None:
     assert "failure" not in stats, stats["failure"] + "\n" + stats.get("failing_model", "")
 
@@ -319,6 +481,23 @@ class TestFuzz:
     @pytest.mark.parametrize("name", games_fuzz.COUPLING_MUTATIONS)
     def test_a_soundness_bug_is_detected_by_the_direct_check(self, name):
         stats = games_fuzz.run(2, 20, name)
+        assert "failure" in stats, f"the mutant {name} survived {stats}"
+
+    def test_probabilities_that_are_not_multi_affine(self):
+        stats = games_fuzz.run(33, 30, mode="nonaffine")
+        assert_sound(stats)
+        assert stats["players_decided_by_coupling_lifted"] > 0
+        assert stats["advantages_compared_lifted"] > 0
+
+    @pytest.mark.parametrize("name", games_fuzz.LIFTING_MUTATIONS)
+    def test_a_lifting_bug_is_detected_by_the_direct_check(self, name):
+        stats = games_fuzz.run(2, 100, name, mode="nonaffine")
+        assert "failure" in stats, f"the mutant {name} survived {stats}"
+
+    @pytest.mark.parametrize("name", games_fuzz.LIFTING_MUTATIONS)
+    def test_a_lifting_bug_is_detected_by_the_maps(self, name):
+        stats = games_fuzz.run(LIFTING_MAP_SEEDS[name], 150, name, mode="nonaffine",
+                               direct=False)
         assert "failure" in stats, f"the mutant {name} survived {stats}"
 
     @pytest.mark.parametrize("name", games_fuzz.COUPLING_MUTATIONS)
