@@ -1951,12 +1951,13 @@ def test_nonlinear_arithmetic_assumes_a_domain():
 
 @needs_prism
 def test_linear_arithmetic_answers():
-    sos, m, _pm = model_of("LINEAR", **LINEAR_KW)
+    sos = make_sos(LINEAR)
+    m = build_model(sos, horizon=2, **LINEAR_KW)       # small: the answers need no more
     report = check(m, PRISM)
     assert report["unconfirmed"] == []
     norms = {n["id"]: n for n in report["norms"]}
     assert not norms["thirds"]["violable"]["answer"]
-    assert norms["load"]["violable"]["answer"] and norms["mixed"]["violable"]["answer"]
+    assert all(norms[k]["violable"]["answer"] for k in ("load", "mixed", "tilted", "flat"))
     w = norms["load"]["violable"]["witness"]
     r = evaluate(sos, parse_trace(w["trace"]))
     assert {n["id"]: n for n in r["norms"]}["load"]["state"] == "violated"
