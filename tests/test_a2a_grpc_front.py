@@ -96,8 +96,18 @@ class Backend:
         self.front.cleanup()
 
 
-def closed(s: socket.socket, timeout: float = 10.0) -> bool:
+def attempt(port: int) -> socket.socket | None:
+    """A connection beyond a cap: None when the reset came during connect."""
+    try:
+        return socket.create_connection(("127.0.0.1", port), timeout=10)
+    except (ConnectionResetError, ConnectionRefusedError):
+        return None
+
+
+def closed(s: socket.socket | None, timeout: float = 10.0) -> bool:
     """Whether the gateway closes or resets `s` within `timeout`."""
+    if s is None:
+        return True
     s.settimeout(timeout)
     try:
         while True:
@@ -152,7 +162,7 @@ def test_flood_from_one_address(grpc):
         held = [b.raw() for _ in range(4)]
         wait_for(lambda: b.front.total == 4, "the four connections")
         t0 = time.monotonic()
-        flood = [b.raw() for _ in range(100)]
+        flood = [attempt(b.port) for _ in range(100)]
         assert all(closed(s, 5) for s in flood)
         assert time.monotonic() - t0 < 5
         assert b.gw.count("overloaded", "connections") == 100
@@ -165,7 +175,7 @@ def test_flood_from_one_address(grpc):
         assert b.gw.count("read_timeout", "grpc handshake") == 4
         wait_for(lambda: b.front.total == 0, "the places to come back")
         assert b.who(b.channel()) == "127.0.0.1"
-        for s in held + flood:
+        for s in held + [s for s in flood if s is not None]:
             s.close()
         ch.close()
     finally:
@@ -181,11 +191,11 @@ def test_caps_per_prefix_and_in_all(grpc):
         try:
             held = [b.raw() for _ in range(n)]
             wait_for(lambda: b.front.total == n, "the connections")
-            extra = [b.raw() for _ in range(10)]
+            extra = [attempt(b.port) for _ in range(10)]
             assert all(closed(s, 5) for s in extra)
             assert b.front.total == n
             assert b.gw.count("overloaded", "connections") == 10
-            for s in held + extra:
+            for s in held + [s for s in extra if s is not None]:
                 s.close()
         finally:
             b.close()
@@ -313,7 +323,7 @@ def test_gateway_connection_flood(tmp_path, grpc, capsys):
     r, port = _run(tmp_path, "--read-timeout", "3")
     held = [socket.create_connection(("127.0.0.1", port)) for _ in range(4)]
     time.sleep(0.3)
-    flood = [socket.create_connection(("127.0.0.1", port)) for _ in range(300)]
+    flood = [attempt(port) for _ in range(300)]
     assert all(closed(s, 5) for s in flood)
     g = GrpcClient(r, grpc, pb, port)
     with pytest.raises(grpc.RpcError):
@@ -324,7 +334,7 @@ def test_gateway_connection_flood(tmp_path, grpc, capsys):
     got = wait_for(lambda: _try(g, pb), "a call after the deadline")
     assert got.task.id == "up-task-1"
     g.channel.close()
-    for s in held + flood:
+    for s in held + [s for s in flood if s is not None]:
         s.close()
     r.stop()
     refused = [why for _, why in events(r.audit, "overloaded")]
@@ -382,7 +392,7 @@ def test_gateway_tls_call_served_while_an_address_holds_its_connections(
             except OSError:
                 return
     threading.Thread(target=drip, daemon=True).start()
-    flood = [socket.create_connection(("127.0.0.1", port)) for _ in range(20)]
+    flood = [attempt(port) for _ in range(20)]
     assert all(closed(s, 5) for s in flood)
     key = (pki.dir / "planner.key").read_bytes()
     chain = (pki.dir / "planner.pem").read_bytes()
@@ -406,7 +416,7 @@ def test_gateway_tls_call_served_while_an_address_holds_its_connections(
     assert all(closed(s, 10) for s in held)
     stop.set()
     g.channel.close()
-    for s in held + flood:
+    for s in held + [s for s in flood if s is not None]:
         s.close()
     r.stop()
     assert [why for _, why in events(r.audit, "read_timeout")] == ["grpc handshake"] * 4
