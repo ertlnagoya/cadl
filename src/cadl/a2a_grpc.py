@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from . import a2a_rest as A2ARest
+from .a2a_grpc_front import Front, peer_key, prefix_key
 from .gateway_core import INVALID_PARAMS, GatewayError
 
 SERVICE = "lf.a2a.v1.A2AService"
@@ -59,6 +60,7 @@ METHODS = {
                                          "Empty", False),
 }
 MAX_MESSAGE = 1 << 20
+MAX_STREAMS = 16           # grpc.max_concurrent_streams: calls of one connection
 EXTRA = "pip install 'cadl-lang[grpc]'"
 
 
@@ -114,6 +116,7 @@ class GrpcBinding:
         self.readers = 0
         self.address_count: dict = {}
         self.prefix_count: dict = {}
+        self.front = None       # the listener in front (`a2a_grpc_front.Front`)
 
     def _class(self, name: str):
         return self.empty.Empty if name == "Empty" else getattr(self.pb, name)
@@ -188,19 +191,28 @@ class GrpcBinding:
         actor = certificate_actor({"subject": ((("commonName", names[0]),),)})
         return actor if actor is not None and actor in self.gw.cert_actors() else ""
 
-    def _receive(self, requests, context) -> bytes:
+    def _client(self, context) -> str:
+        """The address of the client of a call: that of the connection the
+        front listener accepted, which has now carried a call. A call
+        whose peer is not one of its connections is refused."""
+        if self.front is None:
+            return peer_host(context.peer())
+        conn = self.front.client(context.peer())
+        if conn is None:
+            self._abort(context, None, "not a connection of the gateway", "UNAVAILABLE")
+        return conn.host
+
+    def _receive(self, requests, context, host: str) -> bytes:
         """The one request message of a call, received within the read
         deadline, while the call takes one of the places of calls not yet
         authenticated: at most `max_readers_per_address` of one peer
-        address (from the peer string of gRPC, counted as at the HTTP
-        listener), `max_readers_per_prefix` of one IPv4 /24 or IPv6 /48, and
+        address (the address of the client that the front listener
+        accepted, counted as at the HTTP listener), `max_readers_per_prefix` of one IPv4 /24 or IPv6 /48, and
         `max_readers` in all. Beyond them the call is refused at once
         (`overloaded`); a call whose message has not arrived at the deadline
         is cancelled (`read_timeout`)."""
-        from .a2a_gateway import _Server
         gw = self.gw
-        host = peer_host(context.peer())
-        key, prefix = _Server.peer_key((host,)), _Server.prefix_key((host,))
+        key, prefix = peer_key(host), prefix_key(host)
         with self.lock:
             if self.address_count.get(key, 0) >= self.max_readers_per_address:
                 full = "grpc address"
@@ -257,6 +269,7 @@ class GrpcBinding:
         gw = self.gw
         if gw.stopped:
             self._abort(context, None, "the gateway has stopped", "UNAVAILABLE")
+        host = self._client(context)
         peer = self._peer(context)
         if peer == "":
             gw.refused("handshake_failed", "unknown_certificate")
@@ -270,7 +283,7 @@ class GrpcBinding:
             with gw.lock:
                 gw._unauthenticated(why)
             self._abort(context, None, "Unauthorized", "UNAUTHENTICATED")
-        raw = self._receive(requests, context)
+        raw = self._receive(requests, context, host)
         actor, why = gw._authenticate(self._metadata(context, "authorization"),
                                       f"/{SERVICE}/{name}", raw, peer, "POST")
         if actor is None:
@@ -407,45 +420,85 @@ def common_names(pem: bytes) -> list[str] | None:
         return None
 
 
+class Listener:
+    """The gRPC server of a gateway and its front listener."""
+
+    def __init__(self, server, front: Front) -> None:
+        self.server, self.front = server, front
+
+    def stop(self, grace: float = 1.0, timeout: float = 5.0) -> None:
+        self.front.stop()
+        self.server.stop(grace=grace).wait(timeout)
+        self.front.cleanup()
+
+
 def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | None,
           client_ca: Path | None, max_handlers: int, read_timeout: float = 10.0,
           max_readers: int = 64, max_readers_per_address: int = 4,
-          max_readers_per_prefix: int = 16):
-    """Start the gRPC service of `gw` on `listen`: (server, port). Its
-    workers are enough for `max_readers` calls not yet authenticated next
-    to `max_handlers` + 16 authenticated ones, so that the former cannot
-    take the places of the latter."""
+          max_readers_per_prefix: int = 16, max_connections: int = 64,
+          max_connections_per_address: int = 4, max_connections_per_prefix: int = 16,
+          unix: bool | None = None):
+    """Start the gRPC service of `gw` on `listen`: (Listener, port). The
+    connections are accepted by a front listener (`a2a_grpc_front`) under
+    the caps `max_connections*` and the deadline `read_timeout` to the
+    first call, and spliced to the gRPC server on a Unix socket (or on
+    loopback), which does TLS. Its workers are enough for `max_readers`
+    calls not yet authenticated next to `max_handlers` + 16 authenticated
+    ones, so that the former cannot take the places of the latter."""
     grpc = modules()[0]
     binding = GrpcBinding(gw, mtls=client_ca is not None, read_timeout=read_timeout,
                           max_readers=max_readers,
                           max_readers_per_address=max_readers_per_address,
                           max_readers_per_prefix=max_readers_per_prefix)
+    host, port = listen
+    address = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    try:
+        front = Front(gw, listen, deadline=read_timeout, max_connections=max_connections,
+                      max_per_address=max_connections_per_address,
+                      max_per_prefix=max_connections_per_prefix, unix=unix)
+    except (OSError, ValueError) as e:
+        raise GatewayError(f"--grpc-listen: cannot listen on {address}: {e}") from None
+    binding.front = front
     workers = max_handlers + 16 + max_readers
     server = grpc.server(
         ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cadl-grpc"),
         handlers=[binding.handler()], maximum_concurrent_rpcs=workers,
         options=[("grpc.max_receive_message_length", MAX_MESSAGE),
                  ("grpc.max_send_message_length", 16 << 20),
-                 ("grpc.max_concurrent_streams", 16),
+                 ("grpc.max_concurrent_streams", MAX_STREAMS),
                  ("grpc.max_metadata_size", 16 << 10),
                  ("grpc.http2.min_ping_interval_without_data_ms", 10_000),
                  ("grpc.http2.max_ping_strikes", 2),
                  ("grpc.max_connection_idle_ms", 120_000),
+                 # A peer that does not answer a ping within 20 s (gone
+                 # without closing) loses its connection.
+                 ("grpc.keepalive_time_ms", 60_000),
+                 ("grpc.keepalive_timeout_ms", 20_000),
+                 ("grpc.server_handshake_timeout_ms", int(read_timeout * 1000)),
                  ("grpc.so_reuseport", 0)])
-    host, port = listen
-    address = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
-    if tls_cert is not None:
-        try:
-            creds = grpc.ssl_server_credentials(
-                [(Path(tls_key).read_bytes(), Path(tls_cert).read_bytes())],
-                root_certificates=Path(client_ca).read_bytes() if client_ca else None,
-                require_client_auth=client_ca is not None)
-        except OSError as e:
-            raise GatewayError(f"--grpc-listen: cannot read the TLS files: {e}") from None
-        actual = server.add_secure_port(address, creds)
-    else:
-        actual = server.add_insecure_port(address)
-    if not actual:
-        raise GatewayError(f"--grpc-listen: cannot listen on {address}")
-    server.start()
-    return server, actual
+    try:
+        if tls_cert is not None:
+            try:
+                creds = grpc.ssl_server_credentials(
+                    [(Path(tls_key).read_bytes(), Path(tls_cert).read_bytes())],
+                    root_certificates=Path(client_ca).read_bytes() if client_ca else None,
+                    require_client_auth=client_ca is not None)
+            except OSError as e:
+                raise GatewayError(f"--grpc-listen: cannot read the TLS files: {e}") \
+                    from None
+            actual = server.add_secure_port(front.backend, creds)
+        else:
+            actual = server.add_insecure_port(front.backend)
+        if not actual:
+            raise GatewayError(f"--grpc-listen: cannot start the gRPC server on "
+                               f"{front.backend}")
+        if not front.unix:
+            front.set_backend_port(actual)
+        server.start()
+        front.start()
+    except BaseException:
+        front.stop()
+        server.stop(None)
+        front.cleanup()
+        raise
+    return Listener(server, front), front.port

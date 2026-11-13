@@ -263,6 +263,18 @@ def main(argv: list[str] | None = None) -> int:
                               "the extra: pip install 'cadl-lang[grpc]'")
     a2a_cmd.add_argument("--grpc-port-file", type=Path, default=None, metavar="FILE",
                          help="Write the port of --grpc-listen to FILE")
+    a2a_cmd.add_argument("--max-grpc-connections", type=int, default=64, metavar="N",
+                         help="Open connections of --grpc-listen (default 64); beyond that "
+                              "a new connection is reset at once. A connection that has "
+                              "carried no call within --read-timeout is reset")
+    a2a_cmd.add_argument("--max-grpc-connections-per-address", type=int, default=4,
+                         metavar="N",
+                         help="Of those, connections of one remote address, IPv4 address "
+                              "or IPv6 /64 (default 4)")
+    a2a_cmd.add_argument("--max-grpc-connections-per-prefix", type=int, default=16,
+                         metavar="N",
+                         help="Of those, connections of one IPv4 /24 or IPv6 /48 "
+                              "(default 16)")
     a2a_cmd.add_argument("--push-allow", action="append", default=None,
                          metavar="ENTRY",
                          help="Allow push notifications to callback URLs that match "
