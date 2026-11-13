@@ -6,6 +6,57 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- The Solidity norms monitor decides up to four temporal operators in
+  the content of a norm (Appendix D, D.5). `CadlNormsMulti` gives each
+  operator a state, decided or undecided with one of four future values,
+  and a node of its segment tree records two bits for each of the 5^m
+  combinations of states: one storage word up to three operators, five
+  words for four (the state of the fourth operator selects the word);
+  the values of decided operators are no longer kept in the node.
+  `CadlNormsEval.table` reads a content for the 4^m combinations of
+  operator values in one word, which bounds m by four; a content with
+  five or more is refused with that reason (`MAX_TEMPORAL` in
+  `norms_monitor_sol.py`). At one observation per second into 1000 s
+  windows an observation costs, at the 320th and at the 1000th
+  observation, 6.1 and 6.2 × 10^5 gas with two operators, 8.4 and
+  8.5 × 10^5 with three (at most 1.1 × 10^6) and 1.8 and 1.9 × 10^6
+  with four (at most 2.6 × 10^6): factors of about 1.4 and 3.0 over two.
+- The Solidity monitor decides a `within` or `throughout` whose operand
+  is another `within` or `throughout`, or its negation, over an operand
+  without a temporal operator (`within(5s, throughout(2s, p))`): the
+  inner operator is decided per observation with a summary of its own
+  (the first observation not decided and the last one with an undefined
+  operand), the decided values are always those of the first
+  observations, and they are fed to the outer operator in the order of
+  the observations, at most three runs per observation. D.5 proves this
+  equal to F.5 with undefined values and window ends.
+  `within(1000s, throughout(500s, …))` costs 5.0 and 5.1 × 10^5 gas at
+  the 320th and 1000th observation, `throughout(1000s, within(500s, …))`
+  5.1 and 6.6 × 10^5 (at most 8.3 × 10^5). `until` in a
+  nesting, other operands with a temporal operator inside, three levels,
+  and nested operators outside the content of a norm are refused with
+  the reason (D.5 gives a trace on which feeding in order would decide
+  later than F.5).
+- Differential tests of three and four operators and of nested
+  operators against `cadl norms-eval` on OPA and on the EVM (random
+  traces with suspension, reparations, undefined values and epoch
+  timestamps, boundary traces, long traces), gas tests at 320
+  observations, and 18 new mutants in
+  `scripts/norms_monitor_mutations.py` (MUT_RESULT).
+
+### Changed
+
+- Runtime estimates of `CadlNormsEval` (10 410 bytes), `CadlNormsWindows`
+  (5 230) and `CadlNormsMulti` (7 490); the main contract stays at
+  16 840.
+
+### Fixed
+
+- Tests: contents of the test sets with fractional durations (`2.5s`)
+  are not parsed and froze their norms; the new sets use whole seconds.
+
 ## [0.3.28] — 2026-11-13
 
 Removes most of the remaining refusals. `cadl norms-check` checks
