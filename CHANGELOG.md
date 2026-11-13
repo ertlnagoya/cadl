@@ -78,6 +78,53 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   1.3.0 over mutual TLS, HTTP+JSON (agent over JSON-RPC and over
   HTTP+JSON), push notifications of the SDK agent, and gRPC.
 
+- `cadl norms-check` with several instances lets the environment choose
+  the observation at which each instance starts, in any order
+  (`--starts any`, the default); the trace of an instance runs from its
+  start to its end, and the norms active at the start, the rising edges
+  of its predicates and the intervals of its assumptions count from its
+  start (F.12). `--starts together` keeps the earlier model, in which all
+  instances start at the first observation. Conflicts that need
+  instances with different starts are found, such as the one of the new
+  example `examples/norms_check_starts.cadl`. The horizon is shared: an
+  instance that starts at observation s has at most H - s + 1
+  observations, and the report says so.
+- `cadl norms-check` translates amendments together with several
+  instances (`--version` with `--instance` / `--instances`): one
+  amendment applies at the same observation to every instance that runs
+  there, as `cadl norms-eval` applies the `amend` line of each trace; an
+  instance that starts after an amendment is an instance of the new
+  version, and its witness names that file (`files`). Example:
+  `examples/norms_check_amend_v1.cadl` and `norms_check_amend_v2.cadl`.
+- `cadl norms-check` translates linear arithmetic, `sum` and `avg`
+  without `--domain` (F.12): the numbers of the quantities are one finite
+  decimal point in every face of the linear arrangement of the
+  comparisons, found by a cylindrical algebraic decomposition. A point
+  that is not a finite decimal is moved to one of the same face exactly:
+  a unimodular reduction of the equalities of the face decides whether
+  its affine hull holds a finite decimal point, and a rounding whose
+  precision is computed from the margins of the strict inequalities
+  finds one; only a face whose hull holds none is left out. Nonlinear
+  arithmetic without `--domain` gets a domain inferred from the literals
+  of the predicate, which the report states as an assumption
+  (`assumed_domains`); every norm whose answers depend on it carries
+  `assumed_domains` in the JSON and a `*` in the text, and every finding
+  about it says "only under the assumed domain" (also listed in
+  `findings_under_assumed_domains`). Example:
+  `examples/norms_check_linear.cadl`.
+
+### Changed
+
+- `--starts any` is the default of `cadl norms-check` with several
+  instances. The patterns of starts and ends multiply the commands by up
+  to 4<sup>n</sup> instead of 2<sup>n</sup>, so a run with `--instances`
+  that 0.3.27 accepted may now be refused for too many commands; use
+  `--starts together` to check it as before.
+- The refusal of four or more quantities ordered against each other
+  states why it is kept: even without lists, each quantity of such a
+  group has at least 15 classes, so the group exceeds the limit of
+  50,000 combinations (F.12).
+
 ### Fixed
 
 - Findings of an independent review of the new bindings, each with a

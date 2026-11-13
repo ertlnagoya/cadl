@@ -443,6 +443,10 @@ def main(argv: list[str] | None = None) -> int:
     nchk_cmd.add_argument("--instances", type=int, default=None, metavar="N",
                           help="Check N instances together, which bind the one open index to "
                                "the first N members of its set")
+    nchk_cmd.add_argument("--starts", choices=["any", "together"], default="any",
+                          help="With several instances: each starts at an observation the "
+                               "environment chooses, in any order (any, the default), or all "
+                               "start at the first observation (together, fewer commands)")
     nchk_cmd.add_argument("--version", dest="versions", action="append", default=[],
                           type=Path, metavar="FILE",
                           help="A later version of the file: the environment may amend the "
@@ -451,7 +455,9 @@ def main(argv: list[str] | None = None) -> int:
     nchk_cmd.add_argument("--domain", action="append", default=[], metavar="Q=lo..hi",
                           help="Integer domain of a quantity used in arithmetic, sum or avg "
                                "(ROBOT[*].load=0..5); the answers then hold for traces whose "
-                               "numbers for it are such integers; may be repeated")
+                               "numbers for it are such integers. Linear arithmetic needs none; "
+                               "for other arithmetic without it a domain is assumed from the "
+                               "literals and reported; may be repeated")
     nchk_cmd.add_argument("--timeout", type=float, default=600, metavar="SECONDS",
                           help="Time for all runs of the model checker together; exit status 2 "
                                "when it is exceeded (default: 600)")
@@ -1287,7 +1293,7 @@ def _norms_check_run(args: argparse.Namespace) -> int:
                             args.step, args.horizon, args.export, timeout=args.timeout,
                             domains=args.domain,
                             instances=args.instance or args.instances,
-                            versions=args.versions)
+                            versions=args.versions, starts=args.starts)
     except NormsEvalError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
