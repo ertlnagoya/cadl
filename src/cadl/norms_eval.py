@@ -127,10 +127,15 @@ _FRACTIONAL_DURATION_RE = re.compile(
 _LOWER_KEYWORD_RE = re.compile(r"(?<![\w.])(and|or|not)(?![\w(])")
 
 
+def _outside_strings(text: str) -> str:
+    """The text with the contents of its string literals left out."""
+    return re.sub(r'"[^"]*"', '""', text)
+
+
 def duration_hint(text: str) -> str:
     """How to write a fractional duration such as `2.5s` as a duration
     literal (an integer followed by a unit, A.1), or ''."""
-    m = _FRACTIONAL_DURATION_RE.search(text)
+    m = _FRACTIONAL_DURATION_RE.search(_outside_strings(text))
     if m is None:
         return ""
     value = Fraction(Decimal(m.group(1))) * _UNIT_SECONDS[m.group(2)]
@@ -147,6 +152,7 @@ def syntax_hint(text: str) -> str:
     """Why a text is probably not a predicate of A.10, for the forms that
     are often written by mistake, or ''."""
     hints = []
+    text = _outside_strings(text)
     d = duration_hint(text)
     if d:
         hints.append(d)
@@ -409,6 +415,33 @@ def declared_actors(sos: SoSDefinition) -> dict[str, tuple]:
                 symbolic = index.end
         out[a.id.name] = (index is not None, lo, hi, symbolic)
     return out
+
+
+def _is_set(name: str, actors: dict) -> bool:
+    """`name` is declared as a set of actors (`A[lo..hi]`)."""
+    decl = actors.get(name)
+    return decl is not None and decl[0]
+
+
+def _not_a_set(name: str, actors: dict) -> str:
+    what = "a single actor" if name in actors else "not declared"
+    return (f"'{name}' is {what}; a quantifier, an aggregate, a wildcard, a range or "
+            f"an index variable needs a set declared as {name}[lo..hi] (F.5)")
+
+
+def _uses_variable(index: Any, bound: dict) -> bool:
+    """The index expression refers to a variable of an enclosing
+    quantifier or comprehension."""
+    if isinstance(index, str):
+        return index in bound
+    if isinstance(index, ActorRef):
+        return (index.index is None and index.name in bound) or \
+            _uses_variable(index.index, bound)
+    if isinstance(index, BinaryOp):
+        return _uses_variable(index.left, bound) or _uses_variable(index.right, bound)
+    if isinstance(index, UnaryOp):
+        return _uses_variable(index.operand, bound)
+    return False
 
 
 # `A[i]` written in a norm or a counts-as rule: with a binding of `i` to v,
@@ -1021,10 +1054,13 @@ class _Evaluator:
     # --- static -----------------------------------------------------------
 
     @staticmethod
-    def unsupported(expr: Any, temporal: bool, bound: dict | None = None) -> str | None:
+    def unsupported(expr: Any, temporal: bool, bound: dict | None = None,
+                    actors: dict | None = None) -> str | None:
         """Why an expression cannot be evaluated, or None. `bound` maps the
         variables of the enclosing quantifiers and comprehensions to their
-        set (None for a range of integers)."""
+        set (None for a range of integers). With `actors` (`declared_actors`),
+        the domain of a quantifier or comprehension and an actor indexed by
+        such a variable must name a declared set."""
         bound = bound or {}
         if isinstance(expr, (IntLiteral, FloatLiteral)) and not _literal_in_range(expr):
             return f"the number is outside the range of exact numbers ({_RANGE_TEXT})"
@@ -1033,28 +1069,39 @@ class _Evaluator:
         if isinstance(expr, ActorRef):
             if expr.index == "*" or isinstance(expr.index, RangeExpr):
                 return "a wildcard or range actor reference is not evaluable"
+            if actors is not None and expr.index is not None \
+                    and _uses_variable(expr.index, bound) and not _is_set(expr.name, actors):
+                return _not_a_set(expr.name, actors)
             if expr.index is not None and not isinstance(expr.index, (str, int)):
-                return _Evaluator.unsupported(expr.index, False, bound)
+                return _Evaluator.unsupported(expr.index, False, bound, actors)
             return None
         if isinstance(expr, MemberAccess):
             obj = expr.obj
             if obj.index is None and obj.name in bound and bound[obj.name] is None:
                 return (f"'{obj.name}' ranges over integers, not over the members of a "
                         f"set, so '{obj.name}.{expr.member}' is not evaluable")
-            return _Evaluator.unsupported(obj, False, bound)
+            return _Evaluator.unsupported(obj, False, bound, actors)
         if isinstance(expr, UnaryOp):
-            return _Evaluator.unsupported(expr.operand, temporal, bound)
+            return _Evaluator.unsupported(expr.operand, temporal, bound, actors)
         if isinstance(expr, BinaryOp):
-            return (_Evaluator.unsupported(expr.left, temporal, bound)
-                    or _Evaluator.unsupported(expr.right, temporal, bound))
+            if expr.op in ("+", "-", "*", "/") and any(
+                    isinstance(x, (StringLiteral, BoolLiteral)) for x in (expr.left, expr.right)):
+                return (f"'{expr.op}' on a text or a truth value is not defined (F.5), "
+                        f"so the expression never has a value")
+            if expr.op == "/" and isinstance(expr.right, (IntLiteral, FloatLiteral)) \
+                    and expr.right.value == 0:
+                return "a division by the literal 0 never has a value (F.5)"
+            return (_Evaluator.unsupported(expr.left, temporal, bound, actors)
+                    or _Evaluator.unsupported(expr.right, temporal, bound, actors))
         if isinstance(expr, QuantifiedExpr):
-            return (_Evaluator._domain_error(expr.domain, False)
+            return (_Evaluator._domain_error(expr.domain, False, actors)
                     or _Evaluator.unsupported(expr.predicate, temporal,
-                                        {**bound, expr.variable: expr.domain.name}))
+                                              {**bound, expr.variable: expr.domain.name},
+                                              actors))
         if isinstance(expr, FunctionCall):
             if expr.name == "__in__":
                 for a in expr.args:
-                    r = _Evaluator.unsupported(a, False, bound)
+                    r = _Evaluator.unsupported(a, False, bound, actors)
                     if r:
                         return r
                 return None
@@ -1066,7 +1113,7 @@ class _Evaluator:
                     return f"{expr.name}() does not have the arguments of F.4"
                 for i, a in enumerate(expr.args):
                     if i != dpos:
-                        r = _Evaluator.unsupported(a, True, bound)
+                        r = _Evaluator.unsupported(a, True, bound, actors)
                         if r:
                             return r
                 return None
@@ -1074,10 +1121,11 @@ class _Evaluator:
                     and isinstance(expr.args[0], Comprehension)):
                 comp = expr.args[0]
                 dom = comp.domain
-                return (_Evaluator._domain_error(dom, True)
+                return (_Evaluator._domain_error(dom, True, actors)
                         or _Evaluator.unsupported(comp.element, False, {
                             **bound,
-                            comp.variable: None if isinstance(dom, RangeExpr) else dom.name}))
+                            comp.variable: None if isinstance(dom, RangeExpr) else dom.name},
+                            actors))
             if _is_aggregate_shorthand(expr):
                 keys: list = []
                 _wildcards(expr.args[0], keys, False)
@@ -1091,14 +1139,17 @@ class _Evaluator:
         return f"{type(expr).__name__} is not evaluable"
 
     @staticmethod
-    def _domain_error(dom: Any, comprehension: bool) -> str | None:
+    def _domain_error(dom: Any, comprehension: bool, actors: dict | None = None) -> str | None:
         """Why the domain of a quantifier or comprehension is not one the
         engine evaluates (a set `A`, `A[*]` or `A[lo..hi]`, or for a
-        comprehension also a range `lo..hi`), or None."""
+        comprehension also a range `lo..hi`), or None. With `actors`, `A`
+        must be a declared set."""
         if comprehension and isinstance(dom, RangeExpr):
             return None
         if isinstance(dom, ActorRef) and (dom.index is None or dom.index == "*"
                                           or isinstance(dom.index, RangeExpr)):
+            if actors is not None and not _is_set(dom.name, actors):
+                return _not_a_set(dom.name, actors)
             return None
         return ("the domain of a quantifier or a comprehension must be a set of actors "
                 "(A, A[*] or A[lo..hi]), or for a comprehension a range lo..hi")
@@ -1680,7 +1731,12 @@ class _Term:
                 self.msg_name = msg.name
                 self.msg_args = msg.args or None
                 for a in msg.args:
-                    self.error = self.error or ev.unsupported(a, False)
+                    self.error = self.error or ev.unsupported(a, False, None, ev.actors)
+            elif not (isinstance(msg, ActorRef) and msg.index is None):
+                # not a name or a call (E.3): it would never occur (N-16)
+                hint = syntax_hint(self.msg_name)
+                self.error = ("the message is not a name or a call name(args) (E.3)"
+                              + (f": {hint}" if hint else ""))
             # A range with integer bounds matches its members only; one with
             # a symbolic bound matches every member of the set.
             self._ranges: dict[int, tuple[int, int]] = {}
@@ -1698,7 +1754,7 @@ class _Term:
                 self.error = ("it is not a predicate (Appendix A.10)"
                               + (f": {hint}" if hint else ""))
             else:
-                self.error = ev.unsupported(self.expr, temporal)
+                self.error = ev.unsupported(self.expr, temporal, None, ev.actors)
 
     # --- messages ---------------------------------------------------------
 

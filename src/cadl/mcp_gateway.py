@@ -61,7 +61,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -91,6 +90,8 @@ from .gateway_core import (  # noqa: F401 - the names of this module before 0.3.
     _Held,
     _id_key,
     _read_published,
+    install_stop_handlers,
+    restore_handlers,
     _Refused,
     _secure_dir,
     _valid_id,
@@ -430,9 +431,12 @@ def _strip_line_end(raw: bytes) -> bytes:
 
 
 def serve(gw_args: dict, server_cmd: list[str], poll: float = 0.05,
-          stdin=None, stdout=None) -> int:
+          stdin=None, stdout=None, restore_signals: bool = True) -> int:
     """Run the gateway between this process's stdin/stdout (the client)
-    and a server subprocess. Returns the exit status."""
+    and a server subprocess. Returns the exit status. With
+    `restore_signals` false (the command line), the stop handlers stay
+    installed after the return, so that a second SIGTERM during the exit
+    of the process is ignored instead of killing it."""
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout.buffer
     out_lock = threading.Lock()
@@ -462,20 +466,21 @@ def serve(gw_args: dict, server_cmd: list[str], poll: float = 0.05,
             status["code"] = code
             done.set()
 
-    # The handler is installed before the gateway creates its logs and
+    # The handlers are installed before the gateway creates its logs and
     # before the server starts: a SIGTERM sent as soon as the trace appears
     # or the client sees an answer stops the gateway in order (status 0)
     # instead of killing it (-15).
-    main = threading.current_thread() is threading.main_thread()
-    if main:
-        previous = signal.signal(signal.SIGTERM, lambda *_: finish(0))
+    previous = install_stop_handlers(lambda: finish(0))
     try:
         # The gateway checks the file and creates the logs before the server runs.
         gw = Gateway(to_client=to_client, to_server=to_server, **gw_args)
+        if done.is_set():           # stopped while the gateway was being built
+            gw.stop()
+            return status["code"] if gw.failed is None else 1
         return _serve(gw, server, server_cmd, stdin, done, finish, status, out_lock, poll)
     finally:
-        if main:
-            signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+        if restore_signals:
+            restore_handlers(previous)
 
 
 def _serve(gw, server: dict, server_cmd: list[str], stdin, done: threading.Event,
@@ -586,7 +591,7 @@ def cli_gateway(args) -> int:
                        hold_key=read_key(args.hold_key) if args.hold_key else None,
                        insecure_approvals=args.insecure_approvals,
                        allow_methods=tuple(args.allow_method))
-        code = serve(gw_args, server, poll=args.poll)
+        code = serve(gw_args, server, poll=args.poll, restore_signals=False)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

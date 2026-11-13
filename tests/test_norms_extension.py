@@ -662,7 +662,12 @@ class TestRules:
         errors = with_rule(res.errors, "N-16") + [
             e for e in with_rule(res.errors, "N-10, N-16")]
         assert errors, res.errors + res.warnings
-        assert hint in " ".join(errors)
+        if hint:
+            assert hint in " ".join(errors)
+        else:
+            assert "is not a predicate" in " ".join(errors) or \
+                "is not a message event, an institutional event or a predicate" in \
+                " ".join(errors)
         assert not [w for w in res.warnings if "kept as text" in str(w)]
 
     @pytest.mark.parametrize("content, why", [
@@ -722,7 +727,37 @@ class TestRules:
     def test_n4_fractional_deadline_hint(self, deadline, hint):
         res = check(norms(norm(id="a", kind="obligation", bearer="D", content='"D.x > 0"',
                                deadline=deadline)))
-        assert any(hint in e for e in with_rule(res.errors, "N-4")), res.errors
+        (error,) = with_rule(res.errors, "N-4")
+        assert hint in error
+        # the advice is given once
+        assert error.count("integer followed by ms, s, min or h") == 1, error
+
+    def test_n4_other_deadline(self):
+        res = check(norms(norm(id="a", kind="obligation", bearer="D", content='"D.x > 0"',
+                               deadline="soon")))
+        (error,) = with_rule(res.errors, "N-4")
+        assert "write an integer followed by ms, s, min or h (for example 5s)" in error
+
+    def test_lifecycle_deadline_hint(self):
+        res = check("""
+        lifecycle:
+          states: [Open, Done]
+          initial: Open
+          terminal: [Done]
+          transitions:
+            - { id: finish, from: Open, to: Done, on: "D.x > 0", deadline: 2.5s }
+        """)
+        assert any("deadline '2.5s'" in str(e) and "write 2.5s as 2500ms" in str(e)
+                   for e in res.errors), res.errors
+
+    @pytest.mark.parametrize("content", ['D.k == "rock and roll"', 'D.k == "it\'s"',
+                                         'D.k == "2.5s"'])
+    def test_no_hint_from_the_contents_of_a_string(self, content):
+        from cadl.norms_eval import syntax_hint
+        assert syntax_hint(content + " AND") == ""
+        res = check(norms(norm(id="a", kind="prohibition", bearer="D",
+                               content=json.dumps(content))))
+        assert res.ok, res.errors
 
 
 # --- Verifier (F.7) --------------------------------------------------------

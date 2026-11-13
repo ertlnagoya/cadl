@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import textwrap
@@ -1700,11 +1701,67 @@ class TestNeverSilentlyFrozen:
     @pytest.mark.parametrize("target", ["python", "opa", "solidity"])
     def test_monitors_are_not_generated(self, target, tmp_path):
         from cadl.codegen import generate, norms_monitors
+        from cadl.codegen.norms_monitor_gen import NormsMonitorError
         sos = make_sos('norms:\n  - {id: p, kind: prohibition, bearer: D, '
                        'content: "within(2.5s, D.x > 1)"}\n', check=False)
-        with pytest.raises(Exception, match="cannot be judged"):
-            norms_monitors(sos, target) if target != "python" else \
+        if target == "python":
+            with pytest.raises(NormsMonitorError, match="cannot be judged"):
                 generate(sos, tmp_path / "out", target="python")
+            assert not (tmp_path / "out").exists()
+        else:
+            with pytest.raises(NormsEvalError, match="cannot be judged"):
+                norms_monitors(sos, target)
+
+    @pytest.mark.parametrize("message", ["go(", "go[1]", "'stop'", "42", "go now",
+                                         "go(R[*].x)"])
+    def test_malformed_message(self, message):
+        """A message event whose message is not a name or a call never
+        occurs; up to 0.3.29 the engine accepted it silently."""
+        sos = make_sos('norms:\n  - {id: p, kind: prohibition, bearer: D, '
+                       'trigger: %s, content: "D.x > 0"}\n'
+                       % json.dumps("X -> D : " + message), check=False)
+        assert any("N-16" in str(e) for e in type_check(sos).errors)
+        with pytest.raises(NormsEvalError, match=r"norm 'p' cannot be judged .*trigger"):
+            NE.evaluate(sos, NE.parse_trace(['{"t": 0}']))
+
+    @pytest.mark.parametrize("content", [
+        "for all r in Q: r.v > 0", "count(r for r in X) > 0", "X[*].v > 0",
+        "X[1..2].v > 0", "Q[*].v > 0", "exists j in R: Q[j].v > 0",
+        "count(Q[k].v > 0 for k in 1..3) > 0", "sum(R[j].v for j in X) > 0"])
+    def test_domain_that_is_not_a_declared_set(self, content):
+        """Q is not declared and X is a single actor: a quantifier,
+        aggregate, wildcard, range or index variable over them has no
+        members, so the norm could never be judged (N-16). Up to 0.3.29
+        `cadl check` accepted it and the predicate was always undefined."""
+        sos = make_sos('norms:\n  - {id: p, kind: prohibition, bearer: D, content: %s}\n'
+                       % json.dumps(content), check=False)
+        name = "Q" if "Q" in content else "X"
+        what = "not declared" if name == "Q" else "a single actor"
+        assert any(f"'{name}' is {what}" in str(e) and "N-16" in str(e)
+                   for e in type_check(sos).errors), type_check(sos).errors
+        with pytest.raises(NormsEvalError, match=f"'{name}' is {what}"):
+            NE.evaluate(sos, NE.parse_trace(['{"t": 0, "values": {"X.v": 5}}']))
+
+    @pytest.mark.parametrize("content", [
+        "R[1].x > 0", "R[*].x > 0", "R[1..2].x > 0", "exists j in R: R[j].x > 0",
+        "X.x > 0", "Z.x > 0", "X[1].x > 0", "sum(R[j].x for j in 1..3) > 0"])
+    def test_declared_sets_and_constant_indices_are_evaluated(self, content):
+        # a constant index reads the value of that name; Z is a quantity name
+        sos = make_sos('norms:\n  - {id: p, kind: prohibition, bearer: D, content: %s}\n'
+                       % json.dumps(content))
+        NE.evaluate(sos, NE.parse_trace(['{"t": 0}']))
+
+    @pytest.mark.parametrize("content, why", [
+        ('D.x == "a" + "b"', "'+' on a text"), ('"a" * 2 > 1', "'*' on a text"),
+        ("D.x + true > 1", "'+' on a text or a truth value"),
+        ('-"a" > 0', "'-' on a text"), ("D.x / 0 > 1", "division by the literal 0"),
+        ("D.x / 0.0 > 1", "division by the literal 0")])
+    def test_arithmetic_known_to_have_no_value(self, content, why):
+        sos = make_sos('norms:\n  - {id: p, kind: prohibition, bearer: D, content: %s}\n'
+                       % json.dumps(content), check=False)
+        assert any(why in str(e) and "N-16" in str(e) for e in type_check(sos).errors)
+        with pytest.raises(NormsEvalError, match=re.escape(why)):
+            NE.evaluate(sos, NE.parse_trace(['{"t": 0}']))
 
     def test_cli_reports_the_check_error(self, tmp_path):
         import re

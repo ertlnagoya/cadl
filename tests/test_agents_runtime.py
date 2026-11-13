@@ -3222,3 +3222,26 @@ class TestMissingDataThroughAnEvent:
         given = replay(src, trace((0, None, {"values": {"T.load": 9}}),
                                   (20, m("AG", "T", "read")), (21, None, {"end": False})))
         assert decisions(given)[0][2:5] == ("deny", "prohibition", ["lock"])
+
+
+class TestDelegationUntilNotEvaluable:
+    """N-16 for the `until:` of a delegation (G-12): an error of `cadl
+    check`, and the runtime refuses it in a file that was not checked; up
+    to 0.3.29 it warned and the delegated permission never ended
+    (fail-open)."""
+
+    BAD = DELEG.replace("{ norm: p_write, to: [AG], grant: grant_write }",
+                        "{ norm: p_write, to: [AG], grant: grant_write, "
+                        "until: \"OP.k == 'k'\" }")
+
+    def test_check(self):
+        assert self.BAD != DELEG
+        errors = [str(e) for e in type_check(parse(self.BAD)).errors]
+        assert any("'until' of the" in e and "(N-16)" in e and "double quotes" in e
+                   for e in errors), errors
+
+    def test_runtime_refuses(self):
+        with pytest.raises(NormsEvalError, match="until of the delegation of 'p_write' "
+                                                 "cannot be evaluated: .*N-16"):
+            run_unchecked(parse(self.BAD), parse_run_trace(trace(
+                (0, m("OP", "AG", "grant_write")), (1, m("AG", "T", "write")))))

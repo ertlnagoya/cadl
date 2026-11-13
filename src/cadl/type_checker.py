@@ -501,8 +501,7 @@ class TypeChecker:
             if tr.invalid_deadline is not None:
                 self.result.add_error(
                     f"The {where} has deadline '{tr.invalid_deadline}', which is "
-                    f"not a duration: write an integer followed by ms, s, min or h "
-                    f"(for example 5s)",
+                    f"not a duration: {self._how_to_write(tr.invalid_deadline)}",
                     tr.loc,
                 )
 
@@ -584,8 +583,9 @@ class TypeChecker:
                 self.result.add_error(
                     f"The {where} has sampling '{mon.sampling.invalid}', which is "
                     f"neither 'event' nor 'periodic(<duration>)' (for example "
-                    f"periodic(500ms)); the mapping form needs "
-                    f"{{kind: periodic, period_ms: <non-negative integer>}}",
+                    f"periodic(500ms)){self._deadline_hint(mon.sampling.invalid)}; the "
+                    f"mapping form needs {{kind: periodic, period_ms: <non-negative "
+                    f"integer>}}",
                     mon.loc,
                 )
 
@@ -698,6 +698,19 @@ class TypeChecker:
         if len(self.result.errors) == before:
             self._check_evaluable(expr, text, where, loc, temporal=True)
 
+    def _declared_actors(self) -> dict | None:
+        from .norms_eval import declared_actors
+        sos = getattr(self, "_norms_sos", None)
+        return declared_actors(sos) if sos is not None else None
+
+    @staticmethod
+    def _how_to_write(text) -> str:
+        """The advice for a duration field that is not a duration: the same
+        for every field (deadlines, timeouts, periods)."""
+        from .norms_eval import duration_hint
+        return duration_hint(str(text)) or (
+            "write an integer followed by ms, s, min or h (for example 5s)")
+
     @staticmethod
     def _deadline_hint(text) -> str:
         from .norms_eval import duration_hint
@@ -723,7 +736,8 @@ class TypeChecker:
         argument that refers to one set, numbers in the exact range."""
         from .norms_eval import _Evaluator, desugar_wildcards
         try:
-            reason = _Evaluator.unsupported(desugar_wildcards(expr), temporal)
+            reason = _Evaluator.unsupported(desugar_wildcards(expr), temporal, None,
+                                            self._declared_actors())
         except Exception as e:     # pragma: no cover - an error of the checker
             reason = f"{type(e).__name__}: {e}"
         if reason:
@@ -877,7 +891,7 @@ class TypeChecker:
             )
         else:
             for arg in getattr(msg, "args", None) or []:
-                reason = _Evaluator.unsupported(arg, False)
+                reason = _Evaluator.unsupported(arg, False, None, self._declared_actors())
                 if reason:
                     self.result.add_error(
                         f"An argument of the message of {where} cannot be "
@@ -1028,9 +1042,8 @@ class TypeChecker:
             if norm.invalid_deadline is not None:
                 self.result.add_error(
                     f"The {where} has deadline '{norm.invalid_deadline}', which is "
-                    f"not a duration: write an integer followed by ms, s, min or h "
-                    f"(for example 5s){self._deadline_hint(norm.invalid_deadline)} "
-                    f"(N-4)", norm.loc,
+                    f"not a duration: {self._how_to_write(norm.invalid_deadline)} (N-4)",
+                    norm.loc,
                 )
             if kind in ("permission", "power"):
                 if norm.deadline_ms is not None or norm.invalid_deadline is not None:
@@ -1523,8 +1536,8 @@ class TypeChecker:
             if od.invalid_timeout is not None:
                 self.result.add_error(
                     f"on_denied.timeout of the {where} is '{od.invalid_timeout}', "
-                    f"which is not a duration: write a number with a unit ms, s, "
-                    f"min or h (for example 10min) (G-7)", norm.loc,
+                    f"which is not a duration: {self._how_to_write(od.invalid_timeout)} "
+                    f"(G-7)", norm.loc,
                 )
             elif od.timeout_ms == 0:
                 self.result.add_error(

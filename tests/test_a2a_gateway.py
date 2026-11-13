@@ -61,6 +61,18 @@ g.os = _Os()
 from cadl.cli import main
 sys.exit(main(sys.argv[1:]))
 """
+# ... and while it builds the gateway, before anything is announced.
+BOOT_TERM_IN_INIT = """
+import os, signal, sys
+import cadl.a2a_gateway as g
+_init = g.A2AGateway.__init__
+def _term_init(self, *args, **kwargs):
+    os.kill(os.getpid(), signal.SIGTERM)
+    _init(self, *args, **kwargs)
+g.A2AGateway.__init__ = _term_init
+from cadl.cli import main
+sys.exit(main(sys.argv[1:]))
+"""
 KEY = b"a2a-gateway-test-key-0123456789"
 CLIENT_KEYS = {"PLANNER": b"planner-client-key-0123456789",
                "OPERATOR": b"operator-client-key-0123456789"}
@@ -292,6 +304,19 @@ class TestScenarios:
             r.agent.close()
         assert code == 0, err
         assert r.port_file.exists() and "listening on" in err
+
+    def test_sigterm_while_the_gateway_is_built(self, tmp_path):
+        """A SIGTERM while the gateway reads the file and publishes run.json
+        stops it in order (status 0) before it announces anything: no port
+        file and no "listening on"."""
+        r = Run(tmp_path, boot=BOOT_TERM_IN_INIT, wait=False)
+        try:
+            code = r.proc.wait(timeout=60)
+            err = r.proc.stderr.read().decode()
+        finally:
+            r.agent.close()
+        assert code == 0, err
+        assert not r.port_file.exists() and "listening on" not in err
 
     def test_allow_deny_and_own_tasks(self, tmp_path, capsys):
         r = Run(tmp_path, key=True)
@@ -1844,3 +1869,25 @@ class TestSixthReview:
         out = capsys.readouterr().out
         assert "\u202e" not in out and "\\u202ecod.exe" in out
         loc.stop_and_replay()
+
+
+def test_stop_handlers_are_restored():
+    """`restore_handlers` puts back what `install_stop_handlers` replaced; a
+    handler that Python did not install (None) becomes the default, which
+    is the KeyboardInterrupt of Python for SIGINT."""
+    from cadl.gateway_core import install_stop_handlers, restore_handlers
+    before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        stopped = []
+        previous = install_stop_handlers(lambda: stopped.append(1))
+        assert set(previous) == set(before)
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        assert stopped == [1]
+        restore_handlers(previous)
+        assert {s: signal.getsignal(s) for s in before} == before
+        restore_handlers({signal.SIGINT: None, signal.SIGTERM: None})
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+    finally:
+        for s, h in before.items():
+            signal.signal(s, h)

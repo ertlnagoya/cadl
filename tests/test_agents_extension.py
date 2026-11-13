@@ -343,6 +343,13 @@ class TestOnDenied:
     def test_g7_negative(self, extra):
         assert with_rule(self.n(extra).errors, "G-7")
 
+    def test_g7_fractional_timeout_hint(self):
+        # the same advice as for every duration (N-4, lifecycle deadlines);
+        # up to 0.3.29 it said "a number with a unit", which 2.5s is
+        (error,) = with_rule(self.n("on_denied: { escalate_to: OP, timeout: 2.5s }").errors,
+                             "G-7")
+        assert "write 2.5s as 2500ms" in error
+
     def test_g7_only_on_a_prohibition(self):
         assert with_rule(self.n(ESCALATE, kind=perm, content="AG -> T : read").errors, "G-7")
 

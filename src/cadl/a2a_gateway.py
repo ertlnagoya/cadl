@@ -84,7 +84,6 @@ import os
 import queue
 import re
 import secrets
-import signal
 import socket
 import ssl
 import sys
@@ -115,6 +114,8 @@ from .gateway_core import (
     _Held,
     _valid_id,
     denial_text,
+    install_stop_handlers,
+    restore_handlers,
     parse_json,
     read_keyring,
     wire,
@@ -2593,8 +2594,11 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
           client_ca: Path | None = None, max_handshakes: int = MAX_HANDSHAKES,
           grpc_listen: str | None = None, grpc_port_file: Path | None = None,
           max_grpc_connections: int = 64, max_grpc_connections_per_address: int = 4,
-          max_grpc_connections_per_prefix: int = 16) -> int:
-    """Run the gateway until SIGTERM or SIGINT. Returns the exit status."""
+          max_grpc_connections_per_prefix: int = 16, restore_signals: bool = True) -> int:
+    """Run the gateway until SIGTERM or SIGINT. Returns the exit status.
+    With `restore_signals` false (the command line), the stop handlers stay
+    installed after the return, so that a second SIGTERM during the exit
+    of the process is ignored instead of killing it."""
     host, port = parse_listen(listen)
     if not _is_loopback(host) and tls_cert is None:
         raise GatewayError(f"--listen {listen} is not a loopback address; give --tls-cert "
@@ -2676,28 +2680,20 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
                                       max_connections_per_prefix=(
                                           max_grpc_connections_per_prefix)))
     finally:
-        restore_handlers(previous)
-
-
-def install_stop_handlers(stop) -> dict | None:
-    """Make SIGTERM and SIGINT call `stop()`. Returns the handlers they
-    replace, for `restore_handlers`; None outside the main thread, where
-    Python cannot install handlers."""
-    if threading.current_thread() is not threading.main_thread():
-        return None
-    return {sig: signal.signal(sig, lambda *_: stop())
-            for sig in (signal.SIGTERM, signal.SIGINT)}
-
-
-def restore_handlers(previous: dict | None) -> None:
-    for sig, handler in (previous or {}).items():
-        signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
+        if restore_signals:
+            restore_handlers(previous)
 
 
 def _serve_until_done(gw, server, done: threading.Event, grpc_address, grpc_port_file,
                       port_file, actual: int, url: str, poll: float, grpc: dict) -> int:
-    """Announce the gateway (the port files) and serve until `done`."""
+    """Announce the gateway (the port files) and serve until `done`. A stop
+    requested while the gateway was being built is honoured before
+    anything is announced."""
     grpc_server = None
+    if done.is_set():
+        gw.stop()
+        server.server_close()
+        return 1 if gw.failed is not None else 0
     if grpc_address is not None:
         from .a2a_grpc import start
         try:
@@ -2708,6 +2704,13 @@ def _serve_until_done(gw, server, done: threading.Event, grpc_address, grpc_port
             gw.stop()
             server.server_close()
             raise
+    if done.is_set():
+        gw.stop()
+        if grpc_server is not None:
+            grpc_server.stop(grace=1, timeout=5)
+        server.server_close()
+        return 1 if gw.failed is not None else 0
+    if grpc_server is not None:
         _log(f"gRPC on {grpc_address[0]}:{grpc_port} (A2A 1.0.0, 10)")
         if grpc_port_file is not None:
             tmp = Path(str(grpc_port_file) + f".{secrets.token_hex(4)}.tmp")
@@ -2811,7 +2814,8 @@ def cli_gateway(args) -> int:
                      grpc_listen=args.grpc_listen, grpc_port_file=args.grpc_port_file,
                      max_grpc_connections=args.max_grpc_connections,
                      max_grpc_connections_per_address=args.max_grpc_connections_per_address,
-                     max_grpc_connections_per_prefix=args.max_grpc_connections_per_prefix)
+                     max_grpc_connections_per_prefix=args.max_grpc_connections_per_prefix,
+                     restore_signals=False)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

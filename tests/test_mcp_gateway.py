@@ -44,6 +44,18 @@ g.subprocess = _Subprocess()
 from cadl.cli import main
 sys.exit(main(sys.argv[1:]))
 """
+# ... and while it builds the gateway, before the server starts.
+BOOT_TERM_IN_INIT = """
+import os, signal, sys
+import cadl.mcp_gateway as g
+_init = g.Gateway.__init__
+def _term_init(self, *args, **kwargs):
+    os.kill(os.getpid(), signal.SIGTERM)
+    _init(self, *args, **kwargs)
+g.Gateway.__init__ = _term_init
+from cadl.cli import main
+sys.exit(main(sys.argv[1:]))
+"""
 KEY = b"gateway-test-key-0123456789"
 APPROVER_KEYS = {"OPERATOR": b"operator-key-0123456789abcdef",
                  "PLANNER": b"planner-key-0123456789abcdef"}
@@ -205,6 +217,8 @@ def decisions(result) -> list[tuple]:
 
 
 class TestScenarios:
+    """The scenarios of examples/agents_tool_governance.cadl through the
+    gateway, each replayed through agents-run."""
 
     def test_sigterm_while_the_server_starts(self, tmp_path):
         """The handler of SIGTERM is installed before the gateway writes its
@@ -215,8 +229,15 @@ class TestScenarios:
         err = r.proc.stderr.read().decode()
         assert code == 0, err
         assert r.trace.exists()
-    """The scenarios of examples/agents_tool_governance.cadl through the
-    gateway, each replayed through agents-run."""
+
+    def test_sigterm_while_the_gateway_is_built(self, tmp_path):
+        """A SIGTERM while the gateway reads the file and creates its logs:
+        it stops in order (status 0) and does not start the MCP server."""
+        r = Run(tmp_path, boot=BOOT_TERM_IN_INIT, wait=False)
+        code = r.proc.wait(timeout=60)
+        err = r.proc.stderr.read().decode()
+        assert code == 0, err
+        assert not r.server_log.exists()
 
     def test_allow_deny_undeclared(self, tmp_path, capsys):
         r = Run(tmp_path, agent="PLANNER", server="TICKETS")

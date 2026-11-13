@@ -997,15 +997,16 @@ _PAYLOADS = [
 
 
 def _hostile_sos(payload: str):
-    """A file whose ids, events, predicates, message names and states carry
+    """A file whose ids, events, predicates, message arguments and states carry
     `payload`. It does not pass `cadl check`; `evaluate` and the generator
     of the monitor accept it. In the predicates of norms and counts-as
     rules the payload stands in a string literal (without `"`, which a
     string of A.1 cannot contain): from 0.3.30 a norm or rule whose text
     is not a predicate is refused (N-16) instead of never being judged."""
     lit = payload.replace('"', "")
-    # a message event is one line
-    one_line = " ".join(payload.splitlines()) or payload
+    # A message event is one line, and its message a name or a call
+    # (N-16): the payload is the string argument of a call.
+    arg = '("' + " ".join(lit.splitlines()) + '")'
     doc = {"sos": {
         "name": "Hostile",
         "extensions": [{"norms": 0.1}],
@@ -1018,13 +1019,13 @@ def _hostile_sos(payload: str):
                           "within(1s, " + payload + ")"],
             "lifecycle": {"states": ["S", payload], "initial": "S", "terminal": [payload]},
             "counts_as": [
-                {"when": "A -> B : " + one_line, "creates": payload},
+                {"when": "A -> B : m" + arg, "creates": payload},
                 {"when": "A -> B : go", "creates": "going", "if": f'A.name != "{lit}"'},
                 {"when": f'A.name == "{lit}"', "creates": "ev"},
             ],
             "norms": [
                 {"id": payload, "kind": "obligation", "bearer": "A",
-                 "trigger": "A -> B : m" + one_line, "content": "B -> A : " + one_line,
+                 "trigger": "A -> B : m" + arg, "content": "B -> A : r" + arg,
                  "deadline": "5s",
                  "on_violation": {"severity": "Major", "sanction": payload, "reparation": "r"}},
                 {"id": "r", "kind": "obligation", "bearer": payload,
@@ -1119,8 +1120,10 @@ print(json.dumps({"model": nm.MODEL, "result": result}))
                                        "message"])
     def test_each_norms_field_is_checked(self, where, tmp_path):
         bad = 'x" + __import__("os").system("true") + "'
-        # a predicate keeps it in a string literal, with ' for " (N-16)
-        quoted = 'A.name == "' + bad.replace('"', "'") + '"'
+        # a predicate or a message keeps it in a string literal, with ' for "
+        # (N-16)
+        literal = '"' + bad.replace('"', "'") + '"'
+        quoted = "A.name == " + literal
         norm = {"id": "n", "kind": "obligation", "bearer": "A", "content": "A.ok == true",
                 "trigger": "A -> B : go", "on_violation": {"sanction": "s"}}
         rule = {"when": "A -> B : go", "creates": "going"}
@@ -1135,7 +1138,7 @@ print(json.dumps({"model": nm.MODEL, "result": result}))
         elif where == "sanction":
             norm["on_violation"]["sanction"] = bad
         else:
-            rule["when"] = "A -> B : " + bad
+            rule["when"] = "A -> B : go(" + literal + ")"
         doc = {"sos": {"name": "H", "extensions": [{"norms": 0.1}],
                        "actors": [{"id": "A", "role": "a"}, {"id": "B", "role": "b"}],
                        "contracts": [{"id": "C", "parties": ["A", "B"], "norms": [norm],
@@ -1146,7 +1149,7 @@ print(json.dumps({"model": nm.MODEL, "result": result}))
         assert not (tmp_path / "out").exists()
         # and when it is embedded, it is data
         source = generate_norms_monitor_module(sos)
-        needle = quoted if where in ("content", "trigger") else bad
+        needle = {"content": quoted, "trigger": quoted, "message": literal}.get(where, bad)
         assert any(needle in text for text in _strings(build_model(sos)))
         _write_package(tmp_path, "h", source)
         proc = _isolated(_NO_CADL + "from h.norms_monitor import NormsMonitor, MODEL\n"
