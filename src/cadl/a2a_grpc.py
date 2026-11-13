@@ -470,10 +470,14 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
                  ("grpc.http2.min_ping_interval_without_data_ms", 10_000),
                  ("grpc.http2.max_ping_strikes", 2),
                  ("grpc.max_connection_idle_ms", 120_000),
-                 # A peer that does not answer a ping within 20 s (gone
-                 # without closing) loses its connection.
+                 # A connection with a call open is pinged after 60 s
+                 # without data; a peer that does not answer within 20 s
+                 # (gone without closing) loses it. grpcio 1.85 times the
+                 # answer with ping_timeout_ms, earlier ones with
+                 # keepalive_timeout_ms.
                  ("grpc.keepalive_time_ms", 60_000),
                  ("grpc.keepalive_timeout_ms", 20_000),
+                 ("grpc.http2.ping_timeout_ms", 20_000),
                  ("grpc.server_handshake_timeout_ms", int(read_timeout * 1000)),
                  ("grpc.so_reuseport", 0)])
     try:
