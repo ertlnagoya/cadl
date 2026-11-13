@@ -2117,3 +2117,39 @@ def test_random_linear_faces_against_decimal_points():
                 vec = tuple(tr._oracle([tr.preds[i].expr for i in ids], pt))
                 assert vec in have, (texts, pt)
     assert trials >= 20
+
+
+@needs_prism
+def test_findings_under_an_assumed_domain_are_marked():
+    """A product equal to 0.5 never holds for integers of the assumed
+    domain, while a trace with p = 0.5 and q = 1 activates the norm: the
+    finding is marked as holding only under the assumed domain, in the
+    JSON and the text."""
+    sos = make_sos("""\
+norms:
+  - id: half
+    kind: obligation
+    bearer: D
+    trigger: "R[1].p * R[1].q == 0.5"
+    content: "D -> R[1] : go"
+    deadline: 1s
+""")
+    m = build_model(sos)
+    report = check(m, PRISM)
+    norms = {n["id"]: n for n in report["norms"]}
+    assert norms["half"]["assumed_domains"] == ["R[1].p", "R[1].q"]
+    assert report["findings"] == [
+        "half is never activated (only under the assumed domains R[1].p=-1..2, "
+        "R[1].q=-1..2)"]
+    assert report["findings_under_assumed_domains"] == report["findings"]
+    text = format_text(report)
+    assert "half*" in text and "only under the assumed domains" in text
+    r = evaluate(sos, parse_trace(['{"t": 0, "values": {"R[1].p": 0.5, "R[1].q": 1}}',
+                                   '{"t": 1, "end": true}']))
+    assert {n["id"]: n for n in r["norms"]}["half"]["activated_at"] is not None
+
+
+def test_late_starts_have_fewer_observations_noted():
+    _sos, m, _pm = model_of("MULTI", **MULTI_ANY)
+    from cadl.norms_check import _report_head
+    assert any("starts at observation s has at most" in n for n in _report_head(m)["notes"])

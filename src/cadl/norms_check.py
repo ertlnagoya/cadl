@@ -4499,6 +4499,58 @@ class _Budget:
         return left
 
 
+def _assumed_dependence(model: NormsModel) -> dict:
+    """uid -> the quantities with an assumed domain (F.12) on whose values
+    the answers about the norm may depend: those read by its trigger,
+    until: and content, by the counts-as rules of the events these use,
+    and, transitively, by the norms whose violation activates it as a
+    reparation and the powers whose effects change it."""
+    assumed = {k for k, q in model.tr.quantities.items() if q.assumed and q.domain is not None}
+    if not assumed:
+        return {}
+    out: dict = {}
+    for k, vts in enumerate(model.vt):
+        direct: dict = {}
+        links: dict = {}
+        for t in vts:
+            def keys_of(term: Any) -> set:
+                if term is None:
+                    return set()
+                ids = ([term.pred] if term.kind == "pred" else list(term.preds)
+                       if term.kind == "temporal" else [])
+                got = set().union(*(t.preds[i].keys for i in ids)) if ids else set()
+                if term.kind == "event":
+                    for rule in t.rules:
+                        if rule.creates == term.event and rule.status == "model":
+                            got |= keys_of(rule.when)
+                            if rule.cond is not None:
+                                got |= t.preds[rule.cond].keys
+                return got & assumed
+
+            for n in t.model_norms():
+                d = direct.setdefault(n.id, set())
+                for term in (n.trigger, n.until, n.content):
+                    d |= keys_of(term)
+                if n.reparation:
+                    links.setdefault(n.reparation, set()).add(n.id)
+                for names, _src, _tgt in n.effects:
+                    for name in names:
+                        links.setdefault(name, set()).add(n.id)
+        dep = {nid: set(v) for nid, v in direct.items()}
+        changed = True
+        while changed:
+            changed = False
+            for nid, srcs in links.items():
+                for src in srcs:
+                    if nid in dep and not dep[src] <= dep[nid]:
+                        dep[nid] |= dep[src]
+                        changed = True
+        for n in model.norms:
+            if n.inst == k and dep.get(n.id):
+                out[n.uid] = sorted(dep[n.id])
+    return out
+
+
 def _report_head(model: NormsModel) -> dict:
     tr = model.tr
     norms = []
@@ -4516,6 +4568,16 @@ def _report_head(model: NormsModel) -> dict:
             if model.multi:
                 entry["instance"] = t.inst + 1
             norms.append(entry)
+    # findings that hold only under an assumed domain (F.12)
+    dependence = _assumed_dependence(model)
+    for entry in norms:
+        if entry["id"] in dependence:
+            entry["assumed_domains"] = dependence[entry["id"]]
+    late = []
+    if model.staggered:
+        late = [f"an instance that starts at observation s has at most {model.H} - s + 1 "
+                f"observations (the horizon {model.H} is shared): a later start leaves a "
+                f"shorter instance, and a larger --horizon covers longer ones"]
     return {
         "contract": tr.contract.id,
         "norms_check_version": NORMS_CHECK_VERSION,
@@ -4559,7 +4621,7 @@ def _report_head(model: NormsModel) -> dict:
                 f"(--starts together) and share the observations, the message events and the "
                 f"quantities; each ends at an observation of its own (traces whose instances "
                 f"start at different observations are not covered)"]
-               if model.multi else []))),
+               if model.multi else []) + late)),
         "conflicts": [],
         "checked": True,
     }
@@ -4573,9 +4635,22 @@ def _summary(report: dict) -> None:
         if w and not w.get("confirmed", True):
             unconfirmed.append(what)
 
+    def under(*ids: str) -> str:
+        keys = sorted({k for n in report["norms"] if n["id"] in ids
+                       for k in n.get("assumed_domains", [])})
+        if not keys:
+            return ""
+        doms = report["instance"].get("assumed_domains", {})
+        return (" (only under the assumed domain"
+                + ("s" if len(keys) > 1 else "") + " "
+                + ", ".join(f"{k}={doms[k][0]}..{doms[k][1]}" if k in doms else k
+                            for k in keys) + ")")
+
+    marked: list = []
     for n in report["norms"]:
         if n["status"] != "model":
             continue
+        start = len(findings)
         for key in ("activatable", "violable", "fulfillable", "exercisable", "reparation",
                     "keepable", "unavoidable"):
             if key in n:
@@ -4589,11 +4664,21 @@ def _summary(report: dict) -> None:
                             f"continuation violates it")
         if "exercisable" in n and not n["exercisable"]["answer"]:
             findings.append(f"the power {n['id']} is never exercised")
+        if under(n["id"]):
+            findings[start:] = [f + under(n["id"]) for f in findings[start:]]
+            marked += findings[start:]
     for c in report["conflicts"]:
-        findings.append(f"{c['norms'][0]} and {c['norms'][1]} are in conflict")
+        findings.append(f"{c['norms'][0]} and {c['norms'][1]} are in conflict"
+                        + under(*c["norms"]))
+        if under(*c["norms"]):
+            c["assumed_domains"] = sorted({k for n in report["norms"] if n["id"] in c["norms"]
+                                           for k in n.get("assumed_domains", [])})
+            marked.append(findings[-1])
         if not c.get("confirmed", False):
             unconfirmed.append(f"conflict {c['norms'][0]} / {c['norms'][1]}")
     report["findings"] = findings
+    # the findings that hold only under a domain assumed from the literals
+    report["findings_under_assumed_domains"] = marked
     report["unconfirmed"] = unconfirmed
 
 
@@ -4729,13 +4814,17 @@ def format_text(report: dict) -> str:
         for n in report["norms"]:
             if n["status"] != "model":
                 continue
-            rows.append([n["id"], n["kind"], _yn(n.get("activatable")), _yn(n.get("violable")),
+            rows.append([n["id"] + ("*" if n.get("assumed_domains") else ""), n["kind"],
+                         _yn(n.get("activatable")), _yn(n.get("violable")),
                          _yn(n.get("fulfillable")), _yn(n.get("keepable")),
                          _yn(n.get("unavoidable")), _yn(n.get("exercisable")),
                          _yn(n.get("reparation"))])
         widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
         for r in rows:
             lines.append("  " + "  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
+        if any(n.get("assumed_domains") for n in report["norms"]):
+            lines.append("  * the answers hold only for traces within the domains assumed from the "
+                         "literals (see the notes)")
         lines.append("")
         lines.append("Conflicts (full)")
         if not report["conflicts"]:
