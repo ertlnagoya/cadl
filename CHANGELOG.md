@@ -6,6 +6,28 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.28] — 2026-11-13
+
+Removes most of the remaining refusals. `cadl norms-check` checks
+instances that start at different observations (the new default),
+amendments together with several instances, and linear arithmetic
+without `--domain`, exactly (F.12). The Solidity norms monitor accepts
+`NOT until`, two temporal operators in one content, and temporal
+operators inside comparisons, with bounded gas and a large size margin
+(D.5). The A2A gateway adds mutual TLS, the HTTP+JSON binding, push
+notifications behind an allowlist, and gRPC as the optional extra
+`cadl-lang[grpc]` (G.13). Equilibrium maps use coupled bounds of the
+advantages, so the second three-parameter example of I.14 reaches its
+resolution (I.9). Each part was reviewed independently before the
+release.
+
+Known limits: `norms-check` refuses four or more mutually ordered list
+quantities in one group; the Solidity monitor refuses three or more
+temporal operators in one content and nested temporal operators; the
+gRPC listener has no cap on connections per address (G.13); designs
+whose probabilities are not multi-affine do not use the coupled
+bounds.
+
 ### Added
 
 - Equilibrium maps (`cadl game-check --certify`) bound the one-step
