@@ -11,7 +11,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - `cadl norms-check` translates a group of four quantities ordered
   against each other (F.12). When the classes of a component exceed
   50,000 combinations, or a group has four or more ordered quantities,
-  each group whose quantities have the same classes takes its
+  each group whose quantities have the same classes apart from lists
+  takes its
   valuations by types and patterns: a type for each quantity (no
   value, true, false, number, text, object, list) and, per type, the
   literal or gap of each number or text with their order within a gap,
