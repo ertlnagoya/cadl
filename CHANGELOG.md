@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.29] — 2026-11-13
+
 ### Added
 
 - The Solidity norms monitor decides up to four temporal operators in
