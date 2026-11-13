@@ -48,6 +48,7 @@ import threading
 from typing import Any
 
 CHUNK = 1 << 16
+CLOSE_GRACE = 5.0          # seconds to flush a closed connection
 _PLAIN = re.compile(r"[A-Za-z0-9/._-]+")
 
 
@@ -327,7 +328,11 @@ class Front:
             if name is not None:
                 with self.lock:
                     self.peers.pop(name, None)
+            loop = asyncio.get_running_loop()
             for w in (conn.client, conn.backend):
                 if w is not None and not w.transport.is_closing():
-                    w.close()       # after what has been written
+                    w.close()       # after what has been written,
+                    # or at once a little later for a peer that reads
+                    # nothing, so that its socket does not outlive its place
+                    loop.call_later(CLOSE_GRACE, w.transport.abort)
             self._release(key, prefix)
