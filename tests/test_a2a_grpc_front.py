@@ -120,6 +120,44 @@ def closed(s: socket.socket | None, timeout: float = 10.0) -> bool:
         return False
 
 
+def full(port: int) -> bool:
+    """Whether a further connection of 127.0.0.1 is refused."""
+    s = attempt(port)
+    if closed(s, 0.5):
+        return True
+    s.close()
+    return False
+
+
+def h2_call(port: int, rcvbuf: int = 0) -> socket.socket:
+    """A raw HTTP/2 client that sends one call of /t.T/Who with large
+    windows (a small receive buffer when `rcvbuf`) and reads nothing."""
+    import struct
+
+    def frame(t, fl, sid, payload=b""):
+        return struct.pack(">I", len(payload))[1:] + bytes([t, fl]) \
+            + struct.pack(">I", sid) + payload
+
+    def lit(n, v):
+        n, v = n.encode(), v.encode()
+        return b"\x00" + bytes([len(n)]) + n + bytes([len(v)]) + v
+    hdr = b"".join(lit(*kv) for kv in [
+        (":method", "POST"), (":scheme", "http"), (":path", "/t.T/Who"),
+        (":authority", "x"), ("content-type", "application/grpc"), ("te", "trailers")])
+    s = socket.socket()
+    if rcvbuf:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+    s.connect(("127.0.0.1", port))
+    s.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+              + frame(4, 0, 0, struct.pack(">HI", 4, 2**31 - 1))
+              + frame(8, 0, 0, struct.pack(">I", 2**31 - 2**16 - 1))
+              + frame(1, 4, 1, hdr) + frame(0, 1, 1, b"\x00" * 5))
+    return s
+
+
+SETTINGS = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"     # an empty SETTINGS frame
+
+
 def test_keys():
     assert peer_key("192.0.2.7") == "192.0.2.7"
     assert peer_key("::ffff:192.0.2.7") == "192.0.2.7"
@@ -165,14 +203,14 @@ def test_flood_from_one_address(grpc):
         flood = [attempt(b.port) for _ in range(100)]
         assert all(closed(s, 5) for s in flood)
         assert time.monotonic() - t0 < 10
-        assert b.gw.count("overloaded", "connections") == 100
+        wait_for(lambda: b.gw.count("overloaded", "connections") == 100, "the records")
         ch = b.channel()
         with pytest.raises(grpc.RpcError) as e:
             ch.unary_unary("/t.T/Who")(b"", timeout=1)
         assert e.value.code() in (grpc.StatusCode.UNAVAILABLE,
                                   grpc.StatusCode.DEADLINE_EXCEEDED)
         assert all(closed(s, 10) for s in held)
-        assert b.gw.count("read_timeout", "grpc handshake") == 4
+        wait_for(lambda: b.gw.count("read_timeout", "grpc handshake") == 4, "the records")
         wait_for(lambda: b.front.total == 0, "the places to come back")
         assert b.who(b.channel()) == "127.0.0.1"
         for s in held + [s for s in flood if s is not None]:
@@ -194,7 +232,7 @@ def test_caps_per_prefix_and_in_all(grpc):
             extra = [attempt(b.port) for _ in range(10)]
             assert all(closed(s, 5) for s in extra)
             assert b.front.total == n
-            assert b.gw.count("overloaded", "connections") == 10
+            wait_for(lambda: b.gw.count("overloaded", "connections") == 10, "the records")
             for s in held + [s for s in extra if s is not None]:
                 s.close()
         finally:
@@ -228,7 +266,7 @@ def test_slowloris_and_half_closed(grpc):
         assert all(closed(s, 5) for s in (slow, silent, partial))
         assert 1.0 < time.monotonic() - t0 < 10
         stop.set()
-        assert b.gw.count("read_timeout", "grpc handshake") == 3
+        wait_for(lambda: b.gw.count("read_timeout", "grpc handshake") == 3, "the records")
         wait_for(lambda: b.front.total == 0, "the places to come back")
         for s in (slow, silent, partial, half):
             s.close()
@@ -305,6 +343,89 @@ def test_half_open_after_a_call(grpc, streaming):
         b.close()
 
 
+def test_client_that_stops_reading_floods_settings(grpc):
+    """Review H1: after one call, a client sends empty SETTINGS frames and
+    reads none of the ACKs. The bytes for it pile up; once more than
+    PENDING wait and none goes out within the drain deadline (here 2 s),
+    both sides are reset and recorded (`grpc stalled`), and the place
+    comes back."""
+    b = Backend(grpc, deadline=30.0, max_per_address=1, drain_timeout=2.0)
+    try:
+        s = h2_call(b.port, rcvbuf=2048)
+        wait_for(lambda: any(c.called for c in list(b.front.peers.values())), "the call")
+        s.setblocking(False)
+        blob = SETTINGS * 1000
+        t0 = time.monotonic()
+        while b.front.total and time.monotonic() - t0 < 20:
+            try:
+                s.send(blob)
+            except BlockingIOError:
+                time.sleep(0.02)
+            except OSError:
+                break
+        wait_for(lambda: b.front.total == 0, "the place to come back", timeout=20)
+        wait_for(lambda: b.gw.count("read_timeout", "grpc stalled") == 1, "the record")
+        assert b.who(b.channel()) == "127.0.0.1"
+        s.close()
+    finally:
+        b.close()
+
+
+def test_server_close_seen_while_client_does_not_read(grpc):
+    """Review H1: a client that stops reading after its call, with less
+    than PENDING bytes waiting for it: when the gRPC server closes the idle connection (here
+    after 1 s), the Front sees it while the client still reads nothing,
+    and resets the client's side after CLOSE_GRACE."""
+    from cadl.a2a_grpc_front import CLOSE_GRACE
+    b = Backend(grpc, deadline=30.0, options=[("grpc.max_connection_idle_ms", 1000)])
+    try:
+        s = h2_call(b.port, rcvbuf=2048)
+        wait_for(lambda: any(c.called for c in list(b.front.peers.values())), "the call")
+        # About 140 KiB of SETTINGS ACKs: more than the transport keeps
+        # before it waits for the client, less than PENDING.
+        s.sendall(SETTINGS * 16000)
+        t0 = time.monotonic()
+        wait_for(lambda: b.front.total == 0, "the place to come back",
+                 timeout=CLOSE_GRACE + 15)
+        assert time.monotonic() - t0 < CLOSE_GRACE + 10
+        assert not b.front.peers
+        assert closed(s, 5)
+        s.close()
+    finally:
+        b.close()
+
+
+def test_start_failure_is_raised(monkeypatch):
+    """Review L2: a front listener that cannot start says so at once."""
+    import asyncio
+
+    async def broken(*a, **k):
+        raise OSError("no server")
+    monkeypatch.setattr(asyncio, "start_server", broken)
+    f = Front(Recorder(), ("127.0.0.1", 0))
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(OSError, match="no server"):
+            f.start()
+        assert time.monotonic() - t0 < 5
+    finally:
+        f.stop()
+        f.cleanup()
+
+
+def test_localhost_binds_every_address(grpc):
+    """Review L6: `localhost` is listened on at each of its addresses, on
+    one port, as gRPC did."""
+    infos = {i[4][0] for i in socket.getaddrinfo("localhost", 0, type=socket.SOCK_STREAM)}
+    f = Front(Recorder(), ("localhost", 0))
+    try:
+        assert {s.getsockname()[0] for s in f.socks} == infos
+        assert {s.getsockname()[1] for s in f.socks} == {f.port}
+    finally:
+        f.stop()
+        f.cleanup()
+
+
 # === Through the gateway ===========================================================
 
 def _run(tmp_path, *extra, listen="127.0.0.1:0"):
@@ -322,7 +443,7 @@ def test_gateway_connection_flood(tmp_path, grpc, capsys):
     pb = pytest.importorskip("a2a.types.a2a_pb2")
     r, port = _run(tmp_path, "--read-timeout", "6")
     held = [socket.create_connection(("127.0.0.1", port)) for _ in range(4)]
-    time.sleep(0.3)
+    wait_for(lambda: full(port), "the four connections to be counted")
     flood = [attempt(port) for _ in range(300)]
     assert all(closed(s, 5) for s in flood)
     g = GrpcClient(r, grpc, pb, port)

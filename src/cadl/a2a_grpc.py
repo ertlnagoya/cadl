@@ -207,7 +207,8 @@ class GrpcBinding:
         deadline, while the call takes one of the places of calls not yet
         authenticated: at most `max_readers_per_address` of one peer
         address (the address of the client that the front listener
-        accepted, counted as at the HTTP listener), `max_readers_per_prefix` of one IPv4 /24 or IPv6 /48, and
+        accepted, counted as at the HTTP listener),
+        `max_readers_per_prefix` of one IPv4 /24 or IPv6 /48, and
         `max_readers` in all. Beyond them the call is refused at once
         (`overloaded`); a call whose message has not arrived at the deadline
         is cancelled (`read_timeout`)."""
@@ -427,8 +428,12 @@ class Listener:
         self.server, self.front = server, front
 
     def stop(self, grace: float = 1.0, timeout: float = 5.0) -> None:
-        self.front.stop()
+        """Stop accepting, let gRPC end its calls within `grace` seconds
+        (its GOAWAY and answers still pass the front listener), then
+        reset what is left."""
+        self.front.stop_accepting()
         self.server.stop(grace=grace).wait(timeout)
+        self.front.stop()
         self.front.cleanup()
 
 
@@ -460,29 +465,30 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
         raise GatewayError(f"--grpc-listen: cannot listen on {address}: {e}") from None
     binding.front = front
     workers = max_handlers + 16 + max_readers
-    server = grpc.server(
-        ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cadl-grpc"),
-        handlers=[binding.handler()], maximum_concurrent_rpcs=workers,
-        options=[("grpc.max_receive_message_length", MAX_MESSAGE),
-                 ("grpc.max_send_message_length", 16 << 20),
-                 ("grpc.max_concurrent_streams", MAX_STREAMS),
-                 ("grpc.max_metadata_size", 16 << 10),
-                 ("grpc.http2.min_ping_interval_without_data_ms", 10_000),
-                 ("grpc.http2.max_ping_strikes", 2),
-                 ("grpc.max_connection_idle_ms", 120_000),
-                 # A connection with a call open is pinged after 60 s
-                 # without data; a peer that does not answer within 20 s
-                 # (gone without closing) loses it. grpcio 1.85 times the
-                 # answer with ping_timeout_ms, not keepalive_timeout_ms,
-                 # so both are set.
-                 ("grpc.keepalive_time_ms", 60_000),
-                 ("grpc.keepalive_timeout_ms", 20_000),
-                 ("grpc.http2.ping_timeout_ms", 20_000),
-                 # The front listener resets a connection without a call at
-                 # read_timeout (and records it); this is only a backstop.
-                 ("grpc.server_handshake_timeout_ms", int(read_timeout * 2000) + 1000),
-                 ("grpc.so_reuseport", 0)])
+    server = None
     try:
+        server = grpc.server(
+            ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cadl-grpc"),
+            handlers=[binding.handler()], maximum_concurrent_rpcs=workers,
+            options=[("grpc.max_receive_message_length", MAX_MESSAGE),
+                     ("grpc.max_send_message_length", 16 << 20),
+                     ("grpc.max_concurrent_streams", MAX_STREAMS),
+                     ("grpc.max_metadata_size", 16 << 10),
+                     ("grpc.http2.min_ping_interval_without_data_ms", 10_000),
+                     ("grpc.http2.max_ping_strikes", 2),
+                     ("grpc.max_connection_idle_ms", 120_000),
+                     # A connection with a call open is pinged after 60 s
+                     # without data; a peer that does not answer within
+                     # 20 s (gone without closing) loses it. grpcio 1.85
+                     # times the answer with ping_timeout_ms, not
+                     # keepalive_timeout_ms, so both are set.
+                     ("grpc.keepalive_time_ms", 60_000),
+                     ("grpc.keepalive_timeout_ms", 20_000),
+                     ("grpc.http2.ping_timeout_ms", 20_000),
+                     # The front listener resets a connection without a call
+                     # at read_timeout (and records it); this is a backstop.
+                     ("grpc.server_handshake_timeout_ms", int(read_timeout * 2000) + 1000),
+                     ("grpc.so_reuseport", 0)])
         if tls_cert is not None:
             try:
                 creds = grpc.ssl_server_credentials(
@@ -501,10 +507,15 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
         if not front.unix:
             front.set_backend_port(actual)
         server.start()
-        front.start()
+        try:
+            front.start()
+        except OSError as e:
+            raise GatewayError(f"--grpc-listen: the front listener did not start: {e}") \
+                from None
     except BaseException:
         front.stop()
-        server.stop(None)
+        if server is not None:
+            server.stop(None)
         front.cleanup()
         raise
     return Listener(server, front), front.port
