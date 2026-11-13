@@ -98,6 +98,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from . import a2a_rest as A2ARest
+from .a2a_grpc_front import peer_key, prefix_key
 from .a2a_push import PushError, PushPolicy, check_auth, deliver
 from . import agents as G
 from .audit_log import AuditKeyError, canonical, loads_unique, read_key
@@ -2525,30 +2526,13 @@ class _Server(ThreadingHTTPServer):
         address, or the /64 prefix of an IPv6 address (a single host
         usually owns a whole /64). An IPv4-mapped IPv6 address counts as
         its IPv4 address."""
-        host = client_address[0]
-        try:
-            ip = ipaddress.ip_address(str(host).split("%", 1)[0])
-        except ValueError:
-            return host
-        if ip.version == 6:
-            if ip.ipv4_mapped is not None:
-                return str(ip.ipv4_mapped)
-            return str(ipaddress.ip_network(f"{ip}/64", strict=False))
-        return str(ip)
+        return peer_key(client_address[0])
 
     @staticmethod
     def prefix_key(client_address) -> Any:
         """The network that the cap per prefix counts: the /24 of an IPv4
         address (also IPv4-mapped), the /48 of an IPv6 address."""
-        host = client_address[0]
-        try:
-            ip = ipaddress.ip_address(str(host).split("%", 1)[0])
-        except ValueError:
-            return host
-        if ip.version == 6 and ip.ipv4_mapped is not None:
-            ip = ip.ipv4_mapped
-        bits = 24 if ip.version == 4 else 48
-        return str(ipaddress.ip_network(f"{ip}/{bits}", strict=False))
+        return prefix_key(client_address[0])
 
     def server_close(self):
         self.deadlines.stop()
@@ -2607,7 +2591,9 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
           max_readers_per_address: int = MAX_READERS_PER_ADDRESS,
           max_readers_per_prefix: int = MAX_READERS_PER_PREFIX,
           client_ca: Path | None = None, max_handshakes: int = MAX_HANDSHAKES,
-          grpc_listen: str | None = None, grpc_port_file: Path | None = None) -> int:
+          grpc_listen: str | None = None, grpc_port_file: Path | None = None,
+          max_grpc_connections: int = 64, max_grpc_connections_per_address: int = 4,
+          max_grpc_connections_per_prefix: int = 16) -> int:
     """Run the gateway until SIGTERM or SIGINT. Returns the exit status."""
     host, port = parse_listen(listen)
     if not _is_loopback(host) and tls_cert is None:
@@ -2678,7 +2664,12 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
                                            read_timeout=read_timeout,
                                            max_readers=max_readers,
                                            max_readers_per_address=max_readers_per_address,
-                                           max_readers_per_prefix=max_readers_per_prefix)
+                                           max_readers_per_prefix=max_readers_per_prefix,
+                                           max_connections=max_grpc_connections,
+                                           max_connections_per_address=(
+                                               max_grpc_connections_per_address),
+                                           max_connections_per_prefix=(
+                                               max_grpc_connections_per_prefix))
         except GatewayError:
             gw.stop()
             server.server_close()
@@ -2717,7 +2708,7 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
     done.set()
     gw.stop()
     if grpc_server is not None:
-        grpc_server.stop(grace=1).wait(5)
+        grpc_server.stop(grace=1, timeout=5)
     server.shutdown()
     server.server_close()
     return 1 if gw.failed is not None else 0
@@ -2757,7 +2748,9 @@ def cli_gateway(args) -> int:
         if args.poll <= 0 or args.upstream_timeout <= 0 or args.read_timeout <= 0 \
                 or min(args.max_handlers, args.max_readers, args.max_readers_per_address,
                        args.max_readers_per_prefix, args.max_handshakes,
-                       args.max_handlers_per_actor, args.max_holds_per_actor) < 1:
+                       args.max_handlers_per_actor, args.max_holds_per_actor,
+                       args.max_grpc_connections, args.max_grpc_connections_per_address,
+                       args.max_grpc_connections_per_prefix) < 1:
             raise GatewayError("--poll, --upstream-timeout, --read-timeout and the --max-* "
                                "options must be positive")
         push_tls = None
@@ -2785,7 +2778,10 @@ def cli_gateway(args) -> int:
                      max_readers_per_address=args.max_readers_per_address,
                      max_readers_per_prefix=args.max_readers_per_prefix,
                      client_ca=args.client_ca, max_handshakes=args.max_handshakes,
-                     grpc_listen=args.grpc_listen, grpc_port_file=args.grpc_port_file)
+                     grpc_listen=args.grpc_listen, grpc_port_file=args.grpc_port_file,
+                     max_grpc_connections=args.max_grpc_connections,
+                     max_grpc_connections_per_address=args.max_grpc_connections_per_address,
+                     max_grpc_connections_per_prefix=args.max_grpc_connections_per_prefix)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

@@ -6,6 +6,169 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.29] — 2026-11-13
+
+### Added
+
+- The Solidity norms monitor decides up to four temporal operators in
+  the content of a norm (Appendix D, D.5). `CadlNormsMulti` gives each
+  operator a state, decided or undecided with one of four future values,
+  and a node of its segment tree records two bits for each of the 5^m
+  combinations of states: one storage word up to three operators, five
+  words for four (the state of the fourth operator selects the word);
+  the values of decided operators are no longer kept in the node.
+  `CadlNormsEval.table` reads a content for the 4^m combinations of
+  operator values in one word, which bounds m by four; a content with
+  five or more is refused with that reason (`MAX_TEMPORAL` in
+  `norms_monitor_sol.py`). At one observation per second into 1000 s
+  windows an observation costs, at the 320th and at the 1000th
+  observation, 6.1 and 6.2 × 10^5 gas with two operators, 8.4 and
+  8.5 × 10^5 with three (at most 1.1 × 10^6) and 1.8 and 1.9 × 10^6
+  with four (at most 2.6 × 10^6): factors of about 1.4 and 3.0 over two.
+- The Solidity monitor decides a `within` or `throughout` whose operand
+  is another `within` or `throughout`, or its negation, over an operand
+  without a temporal operator (`within(5s, throughout(2s, p))`): the
+  inner operator is decided per observation with a summary of its own
+  (the first observation not decided and the last one with an undefined
+  operand), the decided values are always those of the first
+  observations, and they are fed to the outer operator in the order of
+  the observations, at most three runs per observation. D.5 proves this
+  equal to F.5 with undefined values and window ends.
+  `within(1000s, throughout(500s, …))` costs 4.9 and 5.0 × 10^5 gas at
+  the 320th and 1000th observation, `throughout(1000s, within(10s, …))`
+  6.0 and 6.3 × 10^5 (at most 8.3 × 10^5). `until` in a
+  nesting, other operands with a temporal operator inside, three levels,
+  and nested operators outside the content of a norm are refused with
+  the reason (D.5 gives a trace on which feeding in order would decide
+  later than F.5).
+- Differential tests of three and four operators and of nested
+  operators against `cadl norms-eval` on OPA and on the EVM (random
+  traces with suspension, reparations, undefined values and epoch
+  timestamps, boundary traces, long traces), gas tests at 320
+  observations, and 18 new mutants in
+  `scripts/norms_monitor_mutations.py` (each of the 31 mutants of the temporal parts is killed; two further
+  mutants proved equivalent and were dropped: the decision of window
+  ends before each run, which the previous observation already made, and
+  the reset of the inner summary at the first candidate).
+
+- `cadl a2a-gateway --grpc-listen` accepts its connections in a front
+  listener of its own (new module `cadl.a2a_grpc_front`, standard
+  library only, one asyncio thread) and passes the bytes of each one
+  unchanged to the gRPC server, which now listens on a Unix socket in a
+  directory of mode 0700 (on 127.0.0.1 with a port of the system where
+  there are no Unix sockets). TLS and mutual TLS still end in gRPC, so
+  certificates and identities are unchanged. New options
+  `--max-grpc-connections` (64), `--max-grpc-connections-per-address`
+  (4, an IPv4 address or an IPv6 /64) and
+  `--max-grpc-connections-per-prefix` (16, an IPv4 /24 or IPv6 /48); a
+  connection beyond them is reset at once and recorded at the capped
+  rate (`overloaded`, `connections`). A connection that has carried no
+  call within `--read-timeout` of its accept is reset and recorded
+  (`read_timeout`, `grpc handshake`). Each connection to the gRPC server
+  comes from an address of its own, which the gateway maps back to the
+  accepted connection, so the caps on calls not yet authenticated still
+  count the real client address; a call that does not come through the
+  front listener is refused (`UNAVAILABLE`). One address thus has at
+  most 4 connections and 64 concurrent calls (G.13). The gRPC server
+  now pings a connection with a call open after 60 seconds without data
+  and closes it when the answer does not come within 20 seconds (before,
+  the default of 2 hours applied); `grpcio` 1.85 times that answer with
+  `grpc.http2.ping_timeout_ms`, not with `grpc.keepalive_timeout_ms`,
+  so both are set. The front listener reads the gRPC server on while up
+  to 256 KiB wait for the client, so it sees the server close a
+  connection also when the client reads nothing, and resets the client's
+  side at most 5 seconds later; when more waits, or the server does not
+  take the client's bytes, and the backlog does not drain within 30
+  seconds, both sides are reset (`read_timeout`, `grpc stalled`). A connection counts
+  against the caps until its sockets are closed; refusals are recorded
+  by a thread of their own; `localhost` is listened on at 127.0.0.1 and
+  ::1, as gRPC did. No new dependency.
+
+- Equilibrium maps (`cadl game-check --certify`) use the coupled bounds
+  of the advantages (I.9) also in designs whose probabilities are not
+  multi-affine in the open parameters (`p * p`, `4 * p * (1 - p)`,
+  `p * q * (1 - q)`). Each such probability a + b · R(x) is lifted: R
+  becomes a new coordinate with the interval of an exact enclosure on
+  the cell (interval arithmetic intersected with the Bernstein
+  coefficients of R), and the two plays draw a corner of this lifted
+  cell in each step. Every probability is multi-affine in the lifted
+  coordinates and equals the original at (x, R(x)), so the distribution
+  at a valuation is a mixture of the distributions at the lifted
+  corners with weights common to all commands; a corner is used only
+  where its distribution is one of the relaxed process (I.9 gives the
+  proof). The lifted cell has at most 10 coordinates. On the second
+  three-parameter example of I.14 with (1 − p_fail)² the undecided
+  fraction after 39 999 cells falls from 0.673 to 0.174, with
+  1 − 4 · p_fail · (1 − p_fail) from 0.891 to 0.431, and with
+  1 − p_fail · q_local · (1 − q_local) (over λ, p_fail, q_local) the map
+  reaches the resolution 0.1 after 32 083 cells instead of leaving 0.180
+  undecided after 39 999. A cell costs more (wall-clock, measured two
+  at a time: 161 s and 237 s, 148 s and 237 s, 142 s and 146 s
+  without and with the lifting). The Bernstein coefficients are
+  computed per variable and only up to 4 096 of them, and the lifted
+  cell only on cells where a coupled bound is computed. The first example with (1 − p_fail)²
+  is unchanged. `games_eval.USE_LIFTING = False` gives the maps of
+  0.3.28, `games_eval.LIFT_BERNSTEIN = False` the lifting with interval
+  arithmetic only.
+- `tests/games_fuzz.py --mode nonaffine` generates games with mostly
+  probabilities that are not multi-affine, compares the coupled bounds
+  of these games directly with the advantages of the oracle, and has
+  three new deliberate soundness bugs of the lifting
+  (`lift_corners_only`, `lift_centre_range`, `lift_lower_range`); it
+  also generates commands with several lifted functions, λ in
+  probabilities and degrees up to 6;
+  3 800 games with the final code (90 372 exact point evaluations,
+  147 959 direct comparisons in games that are not multi-affine) gave
+  no wrong claim and no bound that misses an advantage.
+
+### Changed
+
+- Runtime estimates of `CadlNormsEval` (10 410 bytes), `CadlNormsWindows`
+  (5 230) and `CadlNormsMulti` (7 490); the main contract stays at
+  16 840.
+
+- `cadl norms-check` translates a group of four quantities ordered
+  against each other (F.12). When the classes of a component exceed
+  50,000 combinations, or a group has four or more ordered quantities,
+  each group whose quantities have the same classes apart from lists
+  takes its
+  valuations by types and patterns: a type for each quantity (no
+  value, true, false, number, text, object, list) and, per type, the
+  literal or gap of each number or text with their order within a gap,
+  which objects are equal, and the pattern of pairwise outcomes of the
+  lists. The patterns of n lists are the partitions into equal lists
+  with a series-parallel order of the classes (1, 4, 29, 331, 5,262 for
+  n = 1..5), realised by series and parallel composition with the
+  prefixes 0, 1 and `"a"`. Four ordered quantities without other
+  literals have 26,035 valuations (built in about 2 s; a contract with
+  four predicates over them: 68 choices, 272 commands, 1,626 states,
+  about 20 s with PRISM), 46,285 with one more numeric literal. A group
+  of five or more quantities compared with each other, ordered or only
+  tested for equality, has at least 424,213 valuations and is refused,
+  with the numbers of patterns per type and the hint about `--members`
+  (about 30 s to build without the limit). The number of valuations is
+  computed from the sizes of the gaps before any is built, so such a
+  refusal takes less than a second and the building checks
+  `--timeout`. Four or more ordered quantities in a component with
+  linear arithmetic or with a domain (given or assumed) are refused
+  too, with the reason. Tests: every consistent pattern of four lists
+  (331 of 355 are series-parallel), random nested lists of four and
+  five, random JSON values of every type against the choices, every
+  4-tuple of dense values of each type and of a small pool of every
+  type for four quantities with number and text literals, the
+  differential test with `cadl norms-eval` and the witnesses, the
+  valuations by types and patterns against the product of the classes
+  for groups of two and three, and the time to refuse large groups.
+  Of 14 injected errors, 13 were detected; the 14th (at most two
+  different objects) gives the same choices, since lists that are
+  pairwise not comparable behave as different objects do.
+
+### Fixed
+
+- Tests: contents of the test sets with fractional durations (`2.5s`)
+  are not parsed and froze their norms; the new sets use whole seconds.
+
+
 ## [0.3.28] — 2026-11-13
 
 Removes most of the remaining refusals. `cadl norms-check` checks
