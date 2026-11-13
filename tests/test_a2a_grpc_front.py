@@ -329,9 +329,11 @@ def test_gateway_connection_flood(tmp_path, grpc, capsys):
     r.stop()
     refused = [why for _, why in events(r.audit, "overloaded")]
     assert refused and all(w.split(";")[0] == "connections" for w in refused)
-    # At most 20 records a second; the next record counts those left out.
+    # At most 20 records a second; the next record counts those left out
+    # (of the 300 and the attempts of the refused channel; those of the
+    # last second stay uncounted).
     left_out = sum(int(w.split("=")[1]) for w in refused if ";" in w)
-    assert len(refused) < 300 and len(refused) + left_out <= 302
+    assert 20 <= len(refused) < 100 and len(refused) + left_out <= 320
     assert [why for _, why in events(r.audit, "read_timeout")] == ["grpc handshake"] * 4
     assert r.agent.sent() == ["summarize"]
     r.replay_check()

@@ -40,6 +40,7 @@ import asyncio
 import ipaddress
 import itertools
 import os
+import re
 import shutil
 import socket
 import tempfile
@@ -47,6 +48,7 @@ import threading
 from typing import Any
 
 CHUNK = 1 << 16
+_PLAIN = re.compile(r"[A-Za-z0-9/._-]+")
 
 
 def peer_key(host: str) -> str:
@@ -134,8 +136,10 @@ class Front:
         self.port = sock.getsockname()[1]
         if self.unix:
             self.dir = tempfile.mkdtemp(prefix="cadl-grpc-")    # mode 0700
-            if len(self.dir) > 80 and os.path.isdir("/tmp"):
-                # sun_path holds about 100 bytes.
+            if (len(self.dir) > 80 or not _PLAIN.fullmatch(self.dir)) \
+                    and os.path.isdir("/tmp"):
+                # sun_path holds about 100 bytes, and gRPC reports the peer
+                # as "unix:" and the path, which has to compare as it is.
                 os.rmdir(self.dir)
                 self.dir = tempfile.mkdtemp(prefix="cadl-grpc-", dir="/tmp")
             self.path = os.path.join(self.dir, "grpc")
