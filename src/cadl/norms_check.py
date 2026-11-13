@@ -564,6 +564,8 @@ class Quantity:
     linear: bool = False   # used in linear arithmetic without a domain
     order: int = 1         # quantities compared with each other in its group
     list_order: int = 1    # quantities ordered (<, <=, >, >=) against each other
+    num_lits: frozenset = frozenset()   # the numbers and texts that cut its classes
+    text_lits: frozenset = frozenset()
 
 
 class _Name(str):
@@ -593,13 +595,65 @@ _LIST_VALUES = {2: [[], [0], ["a"]],
                 3: [[], [0], [1], ["a"], ["b"], [{"d": 0}], [0, 0], [0, "a"]]}
 
 
+# For more lists (F.12): the patterns of n lists are the partitions into
+# equal lists with a series-parallel order of the classes (no four classes
+# with a < c, b < c, b < d and a, b, d and c, d not comparable). Each such
+# pattern with two classes or more is the series composition (every list
+# of one part below every list of the other) or the parallel composition
+# (not comparable) of two smaller ones, and the lists of one part prefixed
+# with 0 and of the other with 1 (series) or "a" (parallel) realise it:
+# 1, 4, 29, 331 and 5262 patterns for n = 1, ..., 5.
+_LIST_TUPLES: dict = {}
+
+
+def _list_outcome(a: Any, b: Any) -> str:
+    if a == b:
+        return "eq"
+    try:
+        return "lt" if a < b else "gt"
+    except TypeError:
+        return "inc"
+
+
+def _list_pattern(vs: Any) -> tuple:
+    return tuple(_list_outcome(vs[i], vs[j]) for i in range(len(vs))
+                 for j in range(i + 1, len(vs)))
+
+
+def _list_tuples(n: int) -> tuple:
+    """n lists for each pattern of pairwise outcomes that n lists of a trace
+    can have, one tuple per pattern."""
+    if n in _LIST_TUPLES:
+        return _LIST_TUPLES[n]
+    out = {_list_pattern(([],) * n): tuple([] for _ in range(n))}
+    for mask in range(1, 2 ** n - 1):
+        a = [i for i in range(n) if mask >> i & 1]
+        b = [i for i in range(n) if not mask >> i & 1]
+        for ta in _list_tuples(len(a)):
+            for tb in _list_tuples(len(b)):
+                for head in (1, "a"):          # b above a, or not comparable
+                    v: list = [None] * n
+                    for i, x in zip(a, ta):
+                        v[i] = [0] + x
+                    for i, x in zip(b, tb):
+                        v[i] = [head] + x
+                    out.setdefault(_list_pattern(v), tuple(v))
+    _LIST_TUPLES[n] = tuple(out.values())
+    return _LIST_TUPLES[n]
+
+
 def _list_values(q: Any) -> list:
-    if q.list_order not in _LIST_VALUES:
-        raise NormsCheckError(
-            f"{q.key} is ordered (<, <=, >, >=) against {q.list_order - 1} other quantities; "
-            f"norms-check translates such orders of at most 3 quantities, since a trace may "
-            f"give them lists, which are not always comparable")
-    return [list(v) for v in _LIST_VALUES[q.list_order]]
+    if q.list_order in _LIST_VALUES:
+        return [list(v) for v in _LIST_VALUES[q.list_order]]
+    # more lists: the lists of the patterns of four, for the report; the
+    # valuations of such a group are built pattern by pattern
+    # (Environment._group_valuations)
+    seen: list = []
+    for t in _list_tuples(4):
+        for v in t:
+            if v not in seen:
+                seen.append(v)
+    return sorted(seen, key=lambda v: (len(v), repr(v)))
 
 
 # Numbers of the classes of values (F.12) are exact decimals: norms-eval
@@ -1737,19 +1791,7 @@ class Translator:
                 while other in texts:
                     other += "_"
                 others.append(other)
-        if q.list_order > len(_LIST_VALUES) + 1:
-            # F.12: even without lists, every quantity of such a group has
-            # this many classes, and the group exceeds the limit on the
-            # combinations of classes
-            other = 1 + len(numbers) + len(texts) + len(others) + 2 + k
-            raise NormsCheckError(
-                f"{q.key} is ordered (<, <=, >, >=) against {q.list_order - 1} other quantities; "
-                f"norms-check translates such orders of at most 3 quantities. Each quantity of "
-                f"this group has, besides lists, {other} classes (no value, {len(numbers)} "
-                f"numbers, {len(texts) + len(others)} texts, true, false and {k} objects), so "
-                f"the {q.list_order} quantities have at least {other}^{q.list_order} = "
-                f"{other ** q.list_order} combinations of classes, more than the limit of "
-                f"{MAX_VALUATIONS}")
+        q.num_lits, q.text_lits = frozenset(nums), frozenset(lits)
         # lists are ordered among themselves, objects only equal or not
         objects = (_list_values(q) if q.list_order > 1
                    else [[]] if k == 1 else [[j] for j in range(k)])
@@ -1881,7 +1923,7 @@ class Environment:
         self._choices()
         for tr in trs:
             for name in ("atoms", "preds", "quantities", "components", "constant_preds",
-                         "choices", "step_ms", "horizon"):
+                         "choices", "step_ms", "horizon", "link_groups"):
                 setattr(tr, name, getattr(self, name))
             for note in self.notes:
                 tr._note(note)
@@ -1900,6 +1942,220 @@ class Environment:
             f"{MAX_VALUATIONS}. Use fewer --members"
             + (f" ({', '.join(sets)})" if sets else "")
             + " or, for quantities used in arithmetic, a smaller --domain")
+
+    # --- groups of quantities compared with each other (F.12) -------------------
+    #
+    # The quantities of a group take the same classes. A comparison of two
+    # values of different types is decided by the types alone (true and
+    # false are ordered as 1 and 0, literals of every group), so a valuation
+    # of the group is a type for each quantity and, for each type, a pattern
+    # of the quantities of that type: for numbers and texts, the literal each
+    # one equals or the gap it lies in, and the order of those in one gap
+    # (the first grid values of the gap, in order); for objects, which are
+    # equal; for lists, the pattern of pairwise outcomes (_list_tuples).
+    # Every valuation of a trace maps to one of these with the same values
+    # of every comparison, so every predicate has the same value on it.
+
+    _TYPES = ("none", "number", "text", True, False, "object", "list")
+
+    @staticmethod
+    def _weak_orders(s: int, blocks: int) -> list:
+        """The ranks of s positions with ranks 0..r-1 all used, r <= blocks."""
+        out = []
+        for ranks in itertools.product(range(min(s, blocks)), repeat=s):
+            if set(ranks) == set(range(max(ranks) + 1 if ranks else 0)):
+                out.append(ranks)
+        return out
+
+    @classmethod
+    def _located(cls, values: list, lits: frozenset, key: Any, j: int) -> list:
+        """The tuples of j values (numbers or texts) of the grid that are
+        literals or the first grid values of their gaps, in order."""
+        fixed = [v for v in values if key(v) in lits]
+        gaps: dict = {}
+        for v in values:
+            if key(v) not in lits:
+                gaps.setdefault(sum(1 for c in lits if c < key(v)), []).append(v)
+        for g in gaps.values():
+            g.sort(key=key)
+        locs = [("lit", v) for v in fixed] + [("gap", g) for g in gaps.values()]
+        out = []
+        for assign in itertools.product(range(len(locs)), repeat=j):
+            in_gap: dict = {}
+            for pos, li in enumerate(assign):
+                if locs[li][0] == "gap":
+                    in_gap.setdefault(li, []).append(pos)
+            base = [locs[li][1] if locs[li][0] == "lit" else None for li in assign]
+            options = [[(poss, locs[li][1], r) for r in cls._weak_orders(len(poss), len(locs[li][1]))]
+                       for li, poss in in_gap.items()]
+            for combo in itertools.product(*options):
+                vals = list(base)
+                for poss, grid, ranks in combo:
+                    for pos, r in zip(poss, ranks):
+                        vals[pos] = grid[r]
+                out.append(tuple(vals))
+        return out
+
+    def _group_parts(self, keys: list) -> dict | None:
+        """For each type of the classes of a group, the tuples of values of
+        j quantities of that type, one per pattern (a function of j); None
+        when the group does not have the same classes for every quantity
+        (a --domain)."""
+        qs = [self.quantities[k] for k in keys]
+        ref = qs[0]
+        if any(q.domain is not None or not q.raw or q.num_lits != ref.num_lits
+               or q.text_lits != ref.text_lits or repr(q.reps) != repr(ref.reps) for q in qs):
+            return None
+        reps = ref.reps
+
+        def number(v: Any) -> bool:
+            return isinstance(v, (int, float, Fraction)) and not isinstance(v, bool)
+
+        nums = [v for v in reps if number(v)]
+        texts = [v for v in reps if isinstance(v, str)]
+        objects = [v for v in reps if isinstance(v, dict)]
+        parts: dict = {}
+        if any(v is None for v in reps):
+            parts["none"] = lambda j: [(None,) * j]
+        for b in (True, False):
+            if any(v is b for v in reps):
+                parts[b] = lambda j, b=b: [(b,) * j]
+        if nums:
+            parts["number"] = lambda j: self._located(nums, ref.num_lits, exact_value, j)
+        if texts:
+            parts["text"] = lambda j: self._located(texts, ref.text_lits, str, j)
+        if objects:
+            parts["object"] = lambda j: [tuple(objects[r] for r in ranks)
+                                         for ranks in self._set_partitions(j, len(objects))]
+        if any(isinstance(v, list) for v in reps):
+            parts["list"] = lambda j: [tuple(list(x) for x in t) for t in _list_tuples(j)]
+        return parts
+
+    @staticmethod
+    def _set_partitions(j: int, blocks: int) -> list:
+        """Restricted growth strings of j positions with at most `blocks` blocks."""
+        out = [()]
+        for _ in range(j):
+            out = [r + (b,) for r in out for b in range(min(blocks, max(r, default=-1) + 2))]
+        return out
+
+    @staticmethod
+    def _group_count(parts: dict, n: int, sizes: dict) -> tuple:
+        """The number of valuations of a group of n quantities: the sum over
+        the types of the quantities of the products of the numbers of
+        patterns. `sizes` gives these numbers per type and size; for lists
+        of more than five quantities the number of set partitions, a lower
+        bound, stands for them (the count is then a lower bound)."""
+        dp = [1] + [0] * n
+        exact = True
+        for t in parts:
+            new = [0] * (n + 1)
+            for m in range(n + 1):
+                for i in range(m + 1):
+                    if dp[m - i]:
+                        new[m] += math.comb(m, i) * dp[m - i] * sizes[t][i]
+            dp = new
+        if "list" in parts and n > 5:
+            exact = False
+        return dp[n], exact
+
+    def _group_valuations(self, keys: list, parts: dict) -> list:
+        n = len(keys)
+        cache: dict = {}
+
+        def tuples(t: Any, j: int) -> list:
+            if (t, j) not in cache:
+                cache[(t, j)] = parts[t](j)
+            return cache[(t, j)]
+
+        types = [t for t in self._TYPES if t in parts]
+        out = []
+        for assign in itertools.product(types, repeat=n):
+            _generation_time()
+            positions: dict = {}
+            for pos, t in enumerate(assign):
+                positions.setdefault(t, []).append(pos)
+            order = list(positions.items())
+            for combo in itertools.product(*(tuples(t, len(ps)) for t, ps in order)):
+                vals: dict = {}
+                for (t, ps), tup in zip(order, combo):
+                    for pos, v in zip(ps, tup):
+                        vals[keys[pos]] = v
+                out.append(vals)
+        return out
+
+    def _reduced_valuations(self, ids: list, keys: list, size: int) -> list:
+        """The valuations of a component whose product of classes exceeds the
+        limit or that has a group of more than three quantities ordered
+        against each other: per group, the valuations by types and patterns;
+        the other quantities take their classes."""
+        groups, rest, counts = [], list(keys), []
+        for g in self.link_groups:
+            if len(g) < 2 or not set(g) <= set(keys):
+                continue
+            parts = self._group_parts(g)
+            many = max(self.quantities[k].list_order for k in g) > len(_LIST_VALUES) + 1
+            if parts is None:
+                if many:
+                    raise NormsCheckError(
+                        f"the quantities {', '.join(g)} are ordered (<, <=, >, >=) against each "
+                        f"other and do not all have the same classes of values (a --domain); "
+                        f"norms-check translates such a group of more than 3 quantities only "
+                        f"when they have the same classes (F.12)")
+                continue
+            sizes: dict = {}
+            for t, f in parts.items():
+                if t == "list":
+                    sizes[t] = [len(_list_tuples(j)) if j <= 5 else
+                                len(self._set_partitions(j, j)) for j in range(len(g) + 1)]
+                elif t == "number" or t == "text":
+                    sizes[t] = [len(f(j)) for j in range(len(g) + 1)]
+                elif t == "object":
+                    sizes[t] = [len(f(j)) for j in range(len(g) + 1)]
+                else:
+                    sizes[t] = [1] * (len(g) + 1)
+            count, exact = self._group_count(parts, len(g), sizes)
+            groups.append((g, parts))
+            counts.append((g, count, exact, sizes))
+            rest = [k for k in rest if k not in g]
+        total = 1
+        for _g, c, _e, _s in counts:
+            total *= c
+        for k in rest:
+            total *= len(self.quantities[k].reps)
+        if total > MAX_VALUATIONS:
+            detail = "; ".join(
+                f"the {len(g)} quantities {', '.join(g)} compared with each other have "
+                f"{'at least ' if not e else ''}{c} valuations by types and patterns "
+                f"(patterns of numbers {s.get('number', [0])[1:]}, texts "
+                f"{s.get('text', [0])[1:]}, objects {s.get('object', [0])[1:]} and lists "
+                f"{s.get('list', [0])[1:]} for 1, 2, ... quantities of that type)"
+                for g, c, e, s in counts)
+            raise NormsCheckError(
+                f"the predicates {', '.join(repr(self.preds[i].text) for i in ids)} read "
+                f"{len(keys)} quantities with {size} combinations of classes; {detail}"
+                + (f", and the other quantities {', '.join(rest)} their classes" if rest else "")
+                + f": {total} valuations together, and norms-check refuses more than "
+                f"{MAX_VALUATIONS} (F.12)")
+        options = [self._group_valuations(g, parts) for g, parts in groups]
+        options += [[{k: v} for v in self.quantities[k].reps] for k in rest]
+        owners: dict = {}
+        for i in ids:
+            owners.setdefault(id(self.preds[i].owner), (self.preds[i].owner, []))[1].append(i)
+        seen: dict = {}
+        for count_, combo in enumerate(itertools.product(*options)):
+            if count_ % 512 == 0:
+                _generation_time()
+            vals: dict = {}
+            for part in combo:
+                vals.update(part)
+            got: dict = {}
+            for owner, pids in owners.values():
+                got.update(zip(pids, owner._oracle([self.preds[i].expr for i in pids], vals)))
+            vec = tuple(got[i] for i in ids)
+            if vec not in seen:
+                seen[vec] = {k: vals[k] for k in keys}
+        return list(seen.items())
 
     def _linear_valuations(self, ids: list, keys: list) -> list:
         """The valuations of a component with linear arithmetic (F.12): each
@@ -2090,6 +2346,7 @@ class Environment:
         groups: dict = {}
         for k in parent:
             groups.setdefault(root(k), []).append(k)
+        self.link_groups = [sorted(keys) for keys in groups.values()]
         for keys in groups.values():
             # every quantity of the group gets the literals of all of them, so
             # that its values cover every literal comparison of the others
@@ -2151,14 +2408,24 @@ class Environment:
                 for i in ids:
                     self.constant_preds[i] = self._value(i, {})
                 continue
+            many = [k for k in keys if self.quantities[k].list_order > len(_LIST_VALUES) + 1]
             if min(ids) in linear_ids:
+                if many:
+                    raise NormsCheckError(
+                        f"{many[0]} is ordered (<, <=, >, >=) against "
+                        f"{self.quantities[many[0]].list_order - 1} other quantities in "
+                        f"predicates with linear arithmetic; norms-check translates such "
+                        f"orders of at most 3 quantities there (F.12)")
                 self.components.append((ids, self._linear_valuations(ids, keys)))
                 continue
             size = 1
             for k in keys:
                 size *= len(self.quantities[k].reps)
-            if size > MAX_VALUATIONS:
-                self._too_many(ids, keys, size)
+            if size > MAX_VALUATIONS or many:
+                # the valuations of the groups of quantities compared with
+                # each other, by types and patterns (F.12)
+                self.components.append((ids, self._reduced_valuations(ids, keys, size)))
+                continue
             seen: dict = {}
             for count_, combo in enumerate(
                     itertools.product(*(self.quantities[k].reps for k in keys))):
