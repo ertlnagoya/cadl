@@ -431,6 +431,41 @@ class TestLifting:
         finally:
             game._lifting = False
 
+    def test_a_multi_affine_game_needs_no_lifted_coordinates(self, monkeypatch):
+        # More open parameters than LIFT_LIMIT and nothing to lift: the
+        # lifted cell is the cell, and the coupled bounds are computed.
+        monkeypatch.setattr(ge, "LIFT_LIMIT", len(GAME.names) - 1)
+        GAME._lifting = False
+        try:
+            assert ge.coupling_applies(GAME)
+            assert ge.lift_game(GAME).functions == []
+            table = CornerTable(GAME, CELL_D_OPEN)
+            assert len(table.corners) == 2 ** len(GAME.names)
+        finally:
+            GAME._lifting = False
+
+    def test_the_box_is_computed_when_first_needed(self, monkeypatch):
+        _, _, game = squared_game()
+        calls = []
+        original = ge.lifted_interval
+        monkeypatch.setattr(ge, "lifted_interval",
+                            lambda poly, cell: calls.append(1) or original(poly, cell))
+        table = CornerTable(game, CELL_D_OPEN)
+        assert not calls
+        assert len(table.corners) == 2 ** 4 and calls
+
+    def test_rows_with_several_lifted_functions_and_unusable_corners(self):
+        # The sets of probabilities of `--mode nonaffine` with several
+        # lifted functions in one command: one lifted polynomial is 1 minus
+        # the others, some corners fail the check against the relaxation
+        # (`CouplingUnavailable`, without any patch), and every claim and
+        # every coupled bound that is computed holds.
+        stats = games_fuzz.run(1, 60, mode="nonaffine")
+        assert_sound(stats)
+        assert stats["lifted_rows_replaced"] > 0
+        assert stats["advantages_unavailable"] > 0
+        assert stats["advantages_compared_lifted"] > 0
+
     def test_the_bounds_on_the_squared_example(self):
         # The second example with (1 − p_fail)²: the coupled bounds of the
         # dispatcher are narrower than those from l_p and u_p, and hold

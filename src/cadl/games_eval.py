@@ -1183,8 +1183,9 @@ def _lifted_form(poly: tuple, n: int) -> tuple:
 
 def lift_game(game: Game) -> "Lifting | None":
     """The lifting of the probabilities of the game (`Lifting`), computed
-    once; None when the lifted cell would have more than LIFT_LIMIT
-    coordinates."""
+    once; None when there are lifted functions and the lifted cell would
+    have more than LIFT_LIMIT coordinates (never for a game whose
+    probabilities are multi-affine)."""
     if game._lifting is not False:
         return game._lifting
     n = len(game.names)
@@ -1219,7 +1220,8 @@ def lift_game(game: Game) -> "Lifting | None":
         for x_part, y_part in form:
             if y_part is not None and y_part[1] not in keys:
                 keys[y_part[1]] = len(keys)
-    if n + len(keys) > LIFT_LIMIT:
+    if keys and n + len(keys) > LIFT_LIMIT:
+        # Without lifted functions the lifted cell is the cell, whatever n.
         game._lifting = None
         return None
     m = n + len(keys)
@@ -1257,41 +1259,64 @@ def lift_game(game: Game) -> "Lifting | None":
     return game._lifting
 
 
+# The largest number of Bernstein coefficients (the product of the degrees
+# plus one over the variables) that `lifted_interval` computes; above it,
+# the enclosure by interval arithmetic alone is used.
+BERNSTEIN_LIMIT = 4096
+
+
 def bernstein_interval(poly: tuple, cell: tuple) -> tuple:
     """An exact enclosure of a polynomial on a box from its Bernstein
     coefficients: with x_k = lo_k + (hi_k − lo_k) · t_k, the polynomial
     in t on [0, 1]^n is Σ_I b_I · Π_k B(d_k, i_k, t_k), the Bernstein
     basis functions are not negative and sum to 1, so every value lies
-    between the least and the largest b_I."""
+    between the least and the largest b_I. The coefficients are computed
+    one variable at a time on the dense array of N = Π_k (d_k + 1)
+    coefficients: the substitution x_k = lo_k + w_k · t_k, then the change
+    to the Bernstein basis of degree d_k, each in O(N · d_k)."""
     n = len(cell)
     degrees = [max((e[k] for e, _ in poly), default=0) for k in range(n)]
-    # The coefficients in t: expand c · Π (lo + w t)^e by the binomial theorem.
-    coeffs: dict = {}
+    shape = [d + 1 for d in degrees]
+    strides = [1] * n
+    for k in range(n - 2, -1, -1):
+        strides[k] = strides[k + 1] * shape[k + 1]
+    size = strides[0] * shape[0] if n else 1
+    coeffs = [ZERO] * size
     for e, c in poly:
-        terms = {(): c}
-        for k in range(n):
-            lo, hi = cell[k]
-            w = hi - lo
-            out: dict = {}
-            for j in range(e[k] + 1):
-                f = Fraction(_binomial(e[k], j)) * lo ** (e[k] - j) * w ** j
-                if f:
-                    for idx, x in terms.items():
-                        out[idx + (j,)] = out.get(idx + (j,), ZERO) + x * f
-            terms = out
-        for idx, x in terms.items():
-            coeffs[idx] = coeffs.get(idx, ZERO) + x
-    values = []
-    for index in itertools.product(*[range(d + 1) for d in degrees]):
-        b = ZERO
-        for j, a in coeffs.items():
-            if all(jk <= ik for jk, ik in zip(j, index)):
-                f = a
-                for jk, ik, d in zip(j, index, degrees):
-                    f *= Fraction(_binomial(ik, jk), _binomial(d, jk))
-                b += f
-        values.append(b)
-    return min(values), max(values)
+        coeffs[sum(x * st for x, st in zip(e, strides))] += c
+    for k in range(n):
+        d = degrees[k]
+        if d == 0:
+            continue
+        lo, hi = cell[k]
+        w = hi - lo
+        st = strides[k]
+        # Binomial tables of the two steps along axis k.
+        shift = [[Fraction(_binomial(i, j)) * lo ** (i - j) * w ** j if i >= j else ZERO
+                  for i in range(d + 1)] for j in range(d + 1)]
+        change = [[Fraction(_binomial(i, j), _binomial(d, j)) for j in range(d + 1)]
+                  for i in range(d + 1)]
+        for base in range(size):
+            if (base // st) % shape[k]:
+                continue                       # not the start of a line along axis k
+            line = [coeffs[base + i * st] for i in range(d + 1)]
+            # a'_j = Σ_{i ≥ j} C(i, j) lo^(i−j) w^j a_i
+            line = [sum((shift[j][i] * line[i] for i in range(j, d + 1) if line[i]), ZERO)
+                    for j in range(d + 1)]
+            # b_i = Σ_{j ≤ i} C(i, j) / C(d, j) a'_j
+            line = [sum((change[i][j] * line[j] for j in range(i + 1) if line[j]), ZERO)
+                    for i in range(d + 1)]
+            for i in range(d + 1):
+                coeffs[base + i * st] = line[i]
+    return min(coeffs), max(coeffs)
+
+
+def bernstein_size(poly: tuple, n: int) -> int:
+    """The number of Bernstein coefficients of a polynomial in n variables."""
+    size = 1
+    for k in range(n):
+        size *= max((e[k] for e, _ in poly), default=0) + 1
+    return size
 
 
 def _binomial(n: int, k: int) -> int:
@@ -1304,9 +1329,11 @@ def _binomial(n: int, k: int) -> int:
 def lifted_interval(poly: tuple, cell: tuple) -> tuple:
     """The interval of a lifted coordinate (I.9): the intersection of the
     enclosure by interval arithmetic (that of the relaxation) and that of
-    the Bernstein coefficients. Both contain the values on the cell."""
+    the Bernstein coefficients, or the first alone when there would be
+    more than BERNSTEIN_LIMIT coefficients. Both contain the values on
+    the cell."""
     a, b = _p_interval(poly, cell)
-    if not LIFT_BERNSTEIN:
+    if not LIFT_BERNSTEIN or bernstein_size(poly, len(cell)) > BERNSTEIN_LIMIT:
         return a, b
     c, d = bernstein_interval(poly, cell)
     return max(a, c), min(b, d)
@@ -1314,9 +1341,11 @@ def lifted_interval(poly: tuple, cell: tuple) -> tuple:
 
 def coupling_applies(game: Game) -> bool:
     """Whether the coupled bounds of I.9 can be computed for the game: its
-    probabilities are multi-affine in the open parameters, or the lifted
-    cell has at most LIFT_LIMIT coordinates."""
-    return game.multi_affine or (USE_LIFTING and lift_game(game) is not None)
+    probabilities are multi-affine in the open parameters, or lifting is
+    on and the lifted cell has at most LIFT_LIMIT coordinates."""
+    if game.multi_affine:
+        return True
+    return USE_LIFTING and lift_game(game) is not None
 
 
 class CornerTable:
@@ -1340,13 +1369,33 @@ class CornerTable:
         self.game = game
         self.cell = cell
         self.lifting = lifting
-        # The lifted cell B; a lifted function whose interval is a point
-        # adds no corners.
-        self.box = tuple(cell) + tuple(lifted_interval(r, cell) for r in lifting.functions)
-        self.corners = list(itertools.product(*[sorted({a, b}) for a, b in self.box]))
+        # The lifted cell and its corners are computed when first needed,
+        # so a cell that the other conditions decide does not pay for them.
+        self._box: tuple | None = None
+        self._corners: list | None = None
         self._rows: dict = {}
         self._rho: dict = {}
         self._checked: dict = {}
+
+    def lifted_box(self) -> tuple:
+        """The lifted cell B: the cell and the interval of each lifted
+        coordinate (`lifted_interval`)."""
+        return tuple(self.cell) + tuple(lifted_interval(r, self.cell)
+                                        for r in self.lifting.functions)
+
+    @property
+    def box(self) -> tuple:
+        if self._box is None:
+            self._box = self.lifted_box()
+        return self._box
+
+    @property
+    def corners(self) -> list:
+        """The corners of B; a lifted coordinate whose interval is a point
+        adds none."""
+        if self._corners is None:
+            self._corners = list(itertools.product(*[sorted({a, b}) for a, b in self.box]))
+        return self._corners
 
     def _relaxed(self, row: Row) -> list:
         """The intervals of the relaxed process for the probabilities of a
@@ -1629,7 +1678,10 @@ def coupled_advantage_bounds(game: Game, proc: Process, table: CornerTable,
     coupled relaxation (`CoupledPlays`), for the pairs `(i, k)` of a local
     state i of the player and a command position k other than the
     profile's: `{(i, k): (lower, upper)}`. With `sides` (0 lower, 1
-    upper) only these bounds are computed; the other is None."""
+    upper) only these bounds are computed; the other is None. Raises
+    `CouplingUnavailable` when a bound needs a corner of the lifted cell
+    whose distribution is not one of the relaxed process (only for a game
+    whose probabilities are not multi-affine)."""
     plays = plays or CoupledPlays(game, proc, table)
     return {(i, k): tuple(plays.bound(i, k, side == 1) if side in sides else None
                           for side in (0, 1))
@@ -1953,7 +2005,7 @@ def bound_verdict(game: Game, query: EquilibriumQuery, cell: EqCell) -> None:
     every = query.concept == "every_reachable_state"
     try:
         dists = cell_distributions(game, box)
-        table = CornerTable(game, box) if coupling_applies(game) else None
+        table = CornerTable(game, box) if USE_COUPLING and coupling_applies(game) else None
         players = []
         for p in game.model.players:
             on = player_on_cell(game, query.profile, p.id, box, dists, query.epsilon, every,

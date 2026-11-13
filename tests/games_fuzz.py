@@ -83,6 +83,34 @@ PROBS_NONAFFINE = [
     ("(1 - p) * (1 - p)", lambda v: (1 - v["p"]) ** 2),
     ("0.5 + 0.5 * p * (1 - q) * q", lambda v: F(1, 2) + v["p"] * (1 - v["q"]) * v["q"] / 2),
 ]
+# mode="nonaffine": sets of probabilities of one command (the rest goes to
+# another successor) with several different lifted functions, so that the
+# lifted polynomials of the command do not sum to 1 and one of them is
+# replaced by 1 minus the others (I.9); also λ in a probability, R up to
+# sign and scale, and higher degrees. Each set sums to at most 1 for p, q
+# in [0, 1] and lam in [0, 2].
+PROB_SETS = [
+    [("0.25 * p * p", lambda v: v["p"] ** 2 / 4),
+     ("0.25 * p * q * q", lambda v: v["p"] * v["q"] ** 2 / 4),
+     ("p * (1 - p)", lambda v: v["p"] * (1 - v["p"]))],
+    [("0.5 * p * p", lambda v: v["p"] ** 2 / 2),
+     ("0.5 - 0.5 * p * p", lambda v: F(1, 2) - v["p"] ** 2 / 2)],
+    [("8 * p * p * (1 - p) * (1 - p)", lambda v: 8 * v["p"] ** 2 * (1 - v["p"]) ** 2),
+     ("0.5 * p * p * p", lambda v: v["p"] ** 3 / 2)],
+    [("0.3 * (2 * p - 1) * (2 * p - 1)", lambda v: F(3, 10) * (2 * v["p"] - 1) ** 2),
+     ("0.3 * q * q", lambda v: F(3, 10) * v["q"] ** 2),
+     ("0.3 * p * q * q", lambda v: F(3, 10) * v["p"] * v["q"] ** 2)],
+    [("0.5 * p * p * q * q", lambda v: v["p"] ** 2 * v["q"] ** 2 / 2)],
+    [("0.9 * p * p * p * p * p * p", lambda v: F(9, 10) * v["p"] ** 6)],
+    [("0.2", lambda v: F(1, 5)), ("0.4 * p * p", lambda v: F(2, 5) * v["p"] ** 2),
+     ("0.4 * q * q", lambda v: F(2, 5) * v["q"] ** 2)],
+    [("0.2 * lam * lam", lambda v: v["lam"] ** 2 / 5),
+     ("0.1 * p * lam", lambda v: v["p"] * v["lam"] / 10)],
+    [("0.4 * p * p - 0.4 * p * p * q", lambda v: F(2, 5) * v["p"] ** 2 * (1 - v["q"])),
+     ("0.4 * p * p * q", lambda v: F(2, 5) * v["p"] ** 2 * v["q"])],
+    [("0.6 - 0.6 * p + 0.6 * p * p", lambda v: F(3, 5) * (1 - v["p"] + v["p"] ** 2)),
+     ("0.3 * p - 0.3 * p * p", lambda v: F(3, 10) * (v["p"] - v["p"] ** 2))],
+]
 # J-14 mode: λ (`lam`, in [0, 2]) in a probability (violates condition 2)
 PROBS_LAM = [
     ("0.5 * lam", lambda v: v["lam"] / 2),
@@ -165,6 +193,10 @@ def generate(rng: random.Random, j14: bool = False, mode: str | None = None,
                 # 0.2 + e <= 1 needs e <= 0.8: halve the second probability.
                 text, fn = updates[1][0]
                 updates[1] = ((f"0.5 * ({text})", lambda v, fn=fn: fn(v) / 2), updates[1][1])
+            if nonaffine and rng.random() < 0.25:
+                updates = [(prob, rng.randrange(0, n + 1)) for prob in rng.choice(PROB_SETS)]
+                updates.append((None, forward))
+                rng.shuffle(updates)
             if nonaffine and k > 0 and rng.random() < 0.5:
                 # The probabilities of the first command of the state, with
                 # other successors (as the attempts with and without care).
@@ -564,6 +596,13 @@ def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
     game = ge.prepare_map(model, query, model.designs[0], None)
     if not ge.coupling_applies(game):
         return 0
+    if not game.multi_affine:
+        # Rows of which one lifted polynomial is 1 minus the others (I.9).
+        n = len(game.names)
+        stats["lifted_rows_replaced"] = stats.get("lifted_rows_replaced", 0) + sum(
+            1 for key, polys in ge.lift_game(game).rows.items()
+            if sum(1 for p in polys if any(any(e[n:]) for e, _ in p)) > 1
+            and any(sum(1 for e, _ in p if any(e[n:])) > 1 for p in polys))
     region = {n: g["region"][n] for n in game.names}
     boxes = [dict(region)]
     for _ in range(2):
@@ -891,16 +930,15 @@ def mutation(name: str | None):
         # function at the centre of the cell, or the lower half of its
         # enclosure, instead of the whole enclosure.
         class Narrow(saved["CornerTable"]):
-            def __init__(self, game, cell):
-                super().__init__(game, cell)
+            def lifted_box(self):
+                cell = self.cell
                 centre = tuple((a + b) / 2 for a, b in cell)
                 ranges = []
                 for r in self.lifting.functions:
                     lo, hi = ge._p_interval(r, cell)
                     x = ge._p_eval(r, centre)
                     ranges.append((x, x) if name == "lift_centre_range" else (lo, (lo + hi) / 2))
-                self.box = tuple(cell) + tuple(ranges)
-                self.corners = list(itertools.product(*[sorted({a, b}) for a, b in self.box]))
+                return tuple(cell) + tuple(ranges)
         ge.CornerTable = Narrow
     elif name is not None:
         raise ValueError(name)
