@@ -1012,6 +1012,8 @@ def test_push_url_cannot_leave_a_path_prefix():
                 "https://hooks.example/tenant-a/..%2Fadmin",
                 "https://hooks.example/tenant-a/x%2fy",
                 "https://hooks.example/tenant-a/x%5cy",
+                "https://hooks.example/tenant-a/%252e%252e/admin",
+                "https://hooks.example/tenant-a/x%25y",
                 "https://hooks.example/tenant-a/x\\..\\y",
                 "https://hooks.example/tenant-a/.."):
         with pytest.raises(PushError, match="dot segment"):
@@ -1214,3 +1216,28 @@ class TestGrpcReview:
         r.stop()
         r.replay_check()
         capsys.readouterr()
+
+
+def test_push_config_of_an_answer_without_task_goes(tmp_path, capsys):
+    """A configuration given with a SendMessage whose answer fails or names
+    no task is discarded (`push_dropped`, `no_task`): it could never be
+    listed or deleted, and it would count against the cap."""
+    hook = Hook()
+    r = Run(tmp_path, extra=("--push-allow", f"{hook.url}/hooks/"))
+    for text in ("error", "reply-with-message", "garbage"):
+        r.call("PLANNER", "SendMessage", params(
+            "summarize", text, taskPushNotificationConfig=push_cfg(f"{hook.url}/hooks/x")))
+    _, _, (_, evs) = rest(r, "PLANNER", "POST", "/message:stream", params(
+        "summarize", "stream-json-bad",
+        taskPushNotificationConfig=push_cfg(f"{hook.url}/hooks/y")))
+    body = r.call("PLANNER", "SendMessage", params(
+        "summarize", taskPushNotificationConfig=push_cfg(f"{hook.url}/hooks/z", id="kept")))
+    task = body["result"]["task"]["id"]
+    assert [c["id"] for c in r.call("PLANNER", "ListTaskPushNotificationConfigs",
+                                    {"taskId": task})["result"]["configs"]] == ["kept"]
+    r.stop()
+    hook.close()
+    assert [why.split()[0] for _, why in events(r.audit, "push_dropped")] == ["no_task"] * 4
+    assert [e for e, _ in events(r.audit, "push_config")] == ["push_config"] * 5
+    r.replay_check()
+    capsys.readouterr()

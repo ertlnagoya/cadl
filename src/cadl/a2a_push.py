@@ -45,7 +45,7 @@ METADATA = {ipaddress.ip_address(a) for a in (
     "192.0.0.192", "fd00:ec2::254", "fd00:ec2::23")}
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 _HOST_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*")
-_ENCODED_RE = re.compile(r"%(2e|2f|5c)", re.IGNORECASE)
+_ENCODED_RE = re.compile(r"%(2e|2f|5c|25)", re.IGNORECASE)
 _TOKEN_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}")      # RFC 9110 token
 _VALUE_RE = re.compile(r"[\x21-\x7e]{1,4096}")
 
@@ -133,12 +133,12 @@ def parse_url(url: Any) -> _Url:
     raw = parts.path or "/"
     # The path is compared with the entries as it is sent, so nothing in it
     # may change its meaning on the way: no dot segments, no backslash, and
-    # no percent-encoded dot, slash or backslash, which a server could
-    # decode into one of them.
+    # no percent-encoded dot, slash, backslash or percent sign, which a
+    # server could decode, once or twice, into one of them.
     if "\\" in raw or _ENCODED_RE.search(raw) \
             or any(seg in (".", "..") for seg in raw.split("/")):
         raise PushError("the path of the URL has a dot segment, a backslash, or a "
-                        "percent-encoded dot, slash or backslash")
+                        "percent-encoded dot, slash, backslash or percent sign")
     path = raw + (f"?{parts.query}" if parts.query else "")
     return _Url(parts.scheme, host, port, path)
 

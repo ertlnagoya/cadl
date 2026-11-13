@@ -1321,6 +1321,17 @@ class A2AGateway(EnforcementPoint):
                own: str | None = None, upstream_task: str | None = None,
                closed: Callable[[], bool] = lambda: False,
                push: "_PushConfig | None" = None):
+        """`_relay_events`; a configuration of the request that no event
+        bound to a task goes when the stream ends."""
+        try:
+            yield from self._relay_events(actor, id_, text, upstream_id, m, own,
+                                          upstream_task, closed, push)
+        finally:
+            self._push_no_task(push)
+
+    def _relay_events(self, actor: str, id_: Any, text: str, upstream_id: int,
+                      m: dict | None, own: str | None, upstream_task: str | None,
+                      closed: Callable[[], bool], push: "_PushConfig | None"):
         """The stream of the agent for an allowed or released request (or a
         subscription to a task of the client), event by event: every event
         is parsed strictly, has to be a response to this request, has to
@@ -1706,7 +1717,15 @@ class A2AGateway(EnforcementPoint):
     def _forward(self, actor: str, id_: Any, text: str, upstream_id: int,
                  m: dict, push: "_PushConfig | None" = None) -> Reply:
         """Pass on an allowed or released SendMessage; the answer of the
-        agent goes to the client with the client's id."""
+        agent goes to the client with the client's id. A configuration of
+        the request that the answer did not bind to a task goes."""
+        try:
+            return self._forward_answer(actor, id_, text, upstream_id, m, push)
+        finally:
+            self._push_no_task(push)
+
+    def _forward_answer(self, actor: str, id_: Any, text: str, upstream_id: int,
+                        m: dict, push: "_PushConfig | None") -> Reply:
         obj, failed = self._call_agent(upstream_id, text, m)
         if failed is not None:
             failed.body["id"] = id_
@@ -1886,6 +1905,20 @@ class A2AGateway(EnforcementPoint):
         with self.lock:
             if not push.active and (held or not push.held):
                 self.push.pop(push.gid, None)
+
+    def _push_no_task(self, push: "_PushConfig | None") -> None:
+        """A configuration given with a SendMessage whose answer failed or
+        named no task: it could never be bound, listed or deleted, so it
+        goes, recorded as `push_dropped` with the reason `no_task`."""
+        if push is None:
+            return
+        with self.lock:
+            if push.upstream_task is not None or self.push.get(push.gid) is not push:
+                return
+            push.active = False
+            self.push.pop(push.gid, None)
+            if not self.stopped:
+                self._host_event("push_dropped", reason=f"no_task {push.gid}")
 
     def _push_bind(self, push: "_PushConfig | None", task_id: Any) -> None:
         """Bind a configuration given with a SendMessage to the task that the

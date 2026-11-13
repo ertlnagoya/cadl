@@ -65,7 +65,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   callback URLs with dot segments, backslashes or percent-encoded dots,
   slashes or backslashes are refused; the cap on push configurations is
   atomic and counts held ones; the help of `--push-allow` says what a
-  network entry allows.
+  network entry allows. Then, from the final review: a configuration
+  whose `SendMessage` failed or got an answer without a task is removed
+  (`push_dropped`, `no_task`); `%25` is refused in callback paths. The
+  gRPC listener does not cap HTTP/2 connections per address, a limit
+  stated in G.13.
 - `cadl a2a-gateway`: closing a stream of one event (a denial, or a
   submitted task of `returnImmediately`) raised an error that was only
   logged.
