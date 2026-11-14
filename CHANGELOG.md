@@ -6,6 +6,58 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `cadl fit FILE --contract ID [--source SRC --map OLD=NEW ...]` checks
+  whether a contract fits a destination description: (F1) its role
+  references resolve, (F2) its assumptions and guarantees are jointly
+  satisfiable, and (F3) it is jointly satisfiable with the destination
+  contracts in its neighbourhood, those that share a party or a variable
+  with it. Unlike `cadl verify`, which checks pairs of contracts that share
+  a party, (F3) is checked over the whole neighbourhood at once, so a
+  conflict that several contracts create together, or that two contracts
+  without a common party create on a shared attribute, is found. A failure
+  is classified as vacuous (the destination's guarantees exclude the
+  rule's assumption), guarantee conflict, or exclusion (assumptions that
+  exclude each other; reported as a warning), with the contracts of a
+  minimal unsatisfiable core. With `--source`, the contract is copied from
+  the source and its actor names are renamed by `--map`; `--output` writes
+  the result. Names in unresolved positions (monitor rules, guards,
+  violation strings, incentive rules) that are not declared actors,
+  predicates that cannot be translated, and quantifiers reduced to their
+  bodies are reported as warnings; a pass over such an abstraction is
+  reported as unknown. Destination contracts whose assumptions exclude the
+  rule's are set aside, and the rule is checked against every maximal set
+  of destination contracts that can be in force together with it, so
+  contracts for different operating modes, in the rule or in the
+  destination, are an exclusion, not a guarantee conflict.
+  Every minimal conflict is reported in one run, also when conflicts share
+  contracts (the search branches on removing each contract of a minimal
+  core), each classified by its own contracts. The search is bounded:
+  when it stops (16 minimal conflicts, or 1024 sets examined), a warning
+  says that the list is not complete; the verdict stays a misfit.
+  Neighbours missing from some set that can be in force with the rule are
+  reported as an exclusion, independent of the order of the sets. When the
+  rule fits, the assumptions that the guarantees of some such set do not
+  imply are named, since consistent is not established.
+  A rule whose guarantees exclude the assumption of destination contracts
+  is reported as `disabling` (the rule applies, the destination contracts do
+  not), separately from a vacuous rule (the destination excludes the rule's
+  assumption). The sets of destination contracts that can be in force
+  together are enumerated as maximal satisfiable sets (a solver call finds a
+  set not contained in those found, which is then grown), so many exclusive
+  modes are handled; more than 64 sets give unknown (the subset search
+  stopped at 14 neighbours).
+  The neighbourhood is the connected component of the rule: the contracts
+  linked to it through any chain of shared parties or variables, so a
+  conflict through an intermediate contract is found; contracts outside it
+  share no variable with it. `--reach direct` keeps only the contracts
+  linked to the rule itself. A minimal conflict that disappears when
+  reduced quantifiers and terms indexed by a variable, `*`, or a range are
+  left out is marked as possibly spurious.
+  `--map` renames attribute names as well as actors. Exit code 0 (fits),
+  1 (misfit), 2 (unknown).
+
 ## [0.3.31] — 2026-11-14
 
 ### Added
