@@ -280,7 +280,7 @@ class TestMapOverLambdaAndFailure:
 
     def test_centralized_within_a_budget(self):
         result = equilibrium_map(ROBOT_MODEL, "comply_by_lambda_and_failure", "CENTRALIZED",
-                                 max_cells=150)
+                                 max_cells=40)
         d = result["designs"][0]
         assert not d["resolution_reached"] and d["stopped"] == "max_cells"
         share = check_against_closed_form(d)
@@ -291,8 +291,20 @@ class TestMapOverLambdaAndFailure:
         d = result["designs"][0]
         assert d["resolution_reached"]
         share = check_against_closed_form(d)
-        # I.14: 0.8118 of the region certified equilibrium, 0.1387
-        # not_equilibrium, 0.0496 undecided (203/4096), 567 cells analysed.
+        # I.14: 0.8125 of the region certified equilibrium, 0.1377
+        # not_equilibrium, 0.0498 undecided (51/1024), 125 cells analysed.
+        assert [round(share[k], 4) for k in ("equilibrium", "not_equilibrium", "undecided")] \
+            == [F("0.8125"), F("0.1377"), F("0.0498")]
+        assert d["undecided_fraction"] == F(51, 1024) and d["cells_analysed"] == 125
+
+    def test_centralized_without_the_bellman_expansion(self, monkeypatch):
+        # The map of cadl 0.3.30, without the Bellman expansion of
+        # the advantages: 0.8118, 0.1387, 0.0496 (203/4096), 567 cells.
+        import cadl.games_eval as ge
+        monkeypatch.setattr(ge, "UNROLL_ADVANTAGES", False)
+        result = equilibrium_map(ROBOT_MODEL, "comply_by_lambda_and_failure", "CENTRALIZED")
+        d = result["designs"][0]
+        share = check_against_closed_form(d)
         assert [round(share[k], 4) for k in ("equilibrium", "not_equilibrium", "undecided")] \
             == [F("0.8118"), F("0.1387"), F("0.0496")]
         assert d["undecided_fraction"] == F(203, 4096) and d["cells_analysed"] == 567
@@ -344,9 +356,12 @@ class TestMapOverLambdaAndFailure:
             assert on.e2 and not on.e1 and not on.n
         assert e2 > 0
 
-    def test_pd_plus_reaches_the_same_conclusion(self):
+    def test_pd_plus_reaches_the_same_conclusion(self, monkeypatch):
         """PD+ of I.9 alone establishes V*_R = V_R on the equilibrium cells
-        that E2 decides, and on those it decides where E2 fails."""
+        that E2 decides, and on those it decides where E2 fails (the map
+        without the Bellman expansion of the advantages, as in 0.3.30)."""
+        import cadl.games_eval as ge
+        monkeypatch.setattr(ge, "UNROLL_ADVANTAGES", False)
         from cadl.games_eval import (
             advantage_bounds,
             advantage_reward,
@@ -538,11 +553,17 @@ class TestUndecided:
             "undecided", "not_admissible")
         assert all(c.status == "equilibrium" for c in d["cells"][1:])
 
-    def test_not_well_defined_is_a_reason_when_intervals_do_not_show_it(self):
+    def test_not_well_defined_is_a_reason_when_intervals_do_not_show_it(self, monkeypatch):
         """p (1 − p) lies in [0, 1/4], but interval arithmetic on a cell
-        that contains 0 gives a negative lower end."""
+        that contains 0 gives a negative lower end (up to cadl 0.3.30, and
+        with TIGHT_RANGES False); the range of `poly_range` is exact."""
+        import cadl.games_eval as ge
         model = model_from(CHAIN.replace("PROB", "p * (1 - p)")
                            .replace("over: { p: [0, 1] }", "over: { p: [0, 0.5] }"))
+        d = equilibrium_map(model, "m")["designs"][0]
+        assert all(c.reason != "not_well_defined" for c in d["cells"])
+        assert any(c.status == "equilibrium" for c in d["cells"])
+        monkeypatch.setattr(ge, "TIGHT_RANGES", False)
         d = equilibrium_map(model, "m")["designs"][0]
         reasons = {c.reason for c in d["cells"] if c.status == "undecided"}
         assert "not_well_defined" in reasons

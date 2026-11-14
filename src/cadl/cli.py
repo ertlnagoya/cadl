@@ -286,8 +286,9 @@ def main(argv: list[str] | None = None) -> int:
                          help="Write the port of --grpc-listen to FILE")
     a2a_cmd.add_argument("--max-grpc-connections", type=int, default=64, metavar="N",
                          help="Open connections of --grpc-listen (default 64); beyond that "
-                              "a new connection is reset at once. A connection that has "
-                              "carried no call within --read-timeout is reset")
+                              "a new connection waits (--grpc-connection-wait) or is reset. "
+                              "A connection that has carried no call within --read-timeout "
+                              "is reset")
     a2a_cmd.add_argument("--max-grpc-connections-per-address", type=int, default=4,
                          metavar="N",
                          help="Of those, connections of one remote address, IPv4 address "
@@ -296,6 +297,26 @@ def main(argv: list[str] | None = None) -> int:
                          metavar="N",
                          help="Of those, connections of one IPv4 /24 or IPv6 /48 "
                               "(default 16)")
+    a2a_cmd.add_argument("--grpc-max-connection-age", type=float, default=300.0,
+                         metavar="SECONDS",
+                         help="gRPC sends GOAWAY to a connection of --grpc-listen after "
+                              "SECONDS (default 300, at least 1, with a jitter of 10%%): "
+                              "it takes no new call, the client opens a new connection for "
+                              "its next calls, and it closes when its calls under way have "
+                              "ended")
+    a2a_cmd.add_argument("--grpc-max-connection-age-grace", type=float, default=None,
+                         metavar="SECONDS",
+                         help="Close a connection at most SECONDS after its GOAWAY, cutting "
+                              "the calls still under way (UNAVAILABLE; a blocking request "
+                              "held for approval is withdrawn), and reset it if it is still "
+                              "open later. Default: none, the calls under way end on their "
+                              "own")
+    a2a_cmd.add_argument("--grpc-connection-wait", type=float, default=10.0,
+                         metavar="SECONDS",
+                         help="A connection that finds all --max-grpc-connections taken "
+                              "waits up to SECONDS (default 10; 0: reset at once) for a "
+                              "place; a place goes to the waiting connection whose address "
+                              "and prefix hold the fewest connections")
     a2a_cmd.add_argument("--push-allow", action="append", default=None,
                          metavar="ENTRY",
                          help="Allow push notifications to callback URLs that match "

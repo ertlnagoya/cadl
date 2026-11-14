@@ -586,9 +586,10 @@ def check_endpoint_cells(g: dict, model, rng: random.Random, extra: int,
 
 def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
                              stats: dict) -> int:
-    """The coupled bounds of the advantages of I.9 directly: on the whole
-    region and on random sub-boxes, every bound of `CoupledPlays` is
-    checked against the advantage Q_p(s, c) − V_p(s) that the oracle
+    """The bounds of the advantages of I.9 directly: on the whole region
+    and on random sub-boxes, every bound of `CoupledPlays` and of
+    `advantage_bounds` (with the Bellman expansion of
+    `unrolled_advantage`) is checked against the advantage Q_p(s, c) − V_p(s) that the oracle
     computes at sample points of the box at which s is in Reach_p.
     Returns the number of comparisons."""
     import cadl.games_eval as ge
@@ -631,7 +632,14 @@ def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
             if ge.improper_states(proc):
                 continue
             plays = ge.CoupledPlays(game, proc, table)
+            lo_r, hi_r = ge.reward_bounds(game, proc, cell)
+            follow = ge._profile(proc)
+            lower = ge.optimal_values(proc, follow, lo_r, maximize=False)
+            upper = ge.optimal_values(proc, follow, hi_r, maximize=True)
+            plain = ge.advantage_bounds(game, proc, cell, lower, upper) or {}
             bounds = {}
+            others = {}
+            unrolled = {}
             for i, gi in enumerate(proc.states):
                 if proc.target[i] or not proc.mine[i]:
                     continue
@@ -642,6 +650,12 @@ def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
                     action = game.commands[gi][k].command.action
                     c = next(c for c, cmd in enumerate(g["states"][loc]["cmds"])
                              if cmd["action"] == action)
+                    if (i, k) in plain:
+                        others[(loc, c)] = plain[(i, k)]
+                    if ge.UNROLL_ADVANTAGES:
+                        u = ge.unrolled_advantage(game, proc, cell, i, k, lower, upper)
+                        if u is not None:
+                            unrolled[(loc, c)] = u
                     try:
                         bounds[(loc, c)] = (plays.bound(i, k, False), plays.bound(i, k, True))
                     except ge.CouplingUnavailable:
@@ -653,7 +667,10 @@ def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
                     raise Unsound(f"profile not admissible for {pl} at {point} in {box}, "
                                   f"but the relaxed process is proper")
                 values = a["profile_values"]
-                for (s, c), (lo, hi) in bounds.items():
+                checks = [("coupled", key, b) for key, b in bounds.items()] + \
+                    [("advantage_bounds", key, b) for key, b in others.items()] + \
+                    [("unrolled_advantage", key, b) for key, b in unrolled.items()]
+                for kind, (s, c), (lo, hi) in checks:
                     if s not in a["reach"]:
                         continue
                     sigma = g["sigma"][s]
@@ -666,7 +683,7 @@ def check_coupled_advantages(g: dict, model, rng: random.Random, extra: int,
                     if not game.multi_affine:
                         lifted += 1
                     if not lo <= adv <= hi:
-                        raise Unsound(f"coupled bounds [{lo}, {hi}] of the advantage of "
+                        raise Unsound(f"{kind} [{lo}, {hi}] of the advantage of "
                                       f"{pl} for command {c} in state {s} miss {adv} "
                                       f"at {point} in {box}")
     stats["advantages_compared"] = stats.get("advantages_compared", 0) + compared
@@ -738,8 +755,8 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
             result["from_every_state"] != (not any(a["gain_somewhere"] for a in gains)):
         raise Unsound("check at the fixed values: from_every_state is wrong")
     count("checks")
-    # The map; players decided by PD+ or PD− with the coupled bounds are
-    # counted.
+    # The map; players decided by PD+ or PD− with the coupled bounds or
+    # with the bounds of the Bellman expansion are counted.
     import cadl.games_eval as ge
     original_on = ge.player_on_cell
 
@@ -749,6 +766,8 @@ def check_model(g: dict, rng: random.Random, max_cells: int = 24, extra: int = 4
             count("players_decided_by_coupling")
             if not args[0].multi_affine:
                 count("players_decided_by_coupling_lifted")
+        if on is not None and on.unrolled:
+            count("players_decided_by_unrolled")
         return on
     ge.player_on_cell = counting
     try:
@@ -805,13 +824,18 @@ def mutation(name: str | None):
               "reward_bounds", "endpoint_parameter_free_model", "endpoint_affine_weights",
               "endpoint_monotone_states", "certified_reach", "player_on_cell",
               "USE_ADVANTAGES", "advantage_bounds", "advantage_reward", "poly_bounds",
-              "CoupledPlays", "_coupling", "CornerTable")}
+              "CoupledPlays", "_coupling", "CornerTable", "unrolled_advantage",
+              "_range_upper", "TIGHT_RANGES")}
+    ge._RANGE_CACHE.clear()
     if name is not None and name not in ADVANTAGE_MUTATIONS + COUPLING_MUTATIONS \
-            + LIFTING_MUTATIONS:
+            + LIFTING_MUTATIONS + RANGE_MUTATIONS:
         # The other mutants concern N, E1, E2, N_s and the end points: the
-        # conditions PD+ and PD− are switched off, so that the cells reach
-        # the mutated condition as they did before PD+ and PD− existed.
+        # conditions PD+ and PD− are switched off, and polynomials that are
+        # not multi-affine are bounded by interval arithmetic, so that the
+        # cells reach the mutated condition as they did before PD+, PD−
+        # and the exact ranges (cadl 0.3.31) existed.
         ge.USE_ADVANTAGES = False
+        ge.TIGHT_RANGES = False
     if name == "swap_bound_direction":
         # d(τ): the best case over the cell instead of the worst case.
         ge.deviation_lower = lambda proc, tau, lo: ge.optimal_values(
@@ -935,11 +959,26 @@ def mutation(name: str | None):
                 centre = tuple((a + b) / 2 for a, b in cell)
                 ranges = []
                 for r in self.lifting.functions:
-                    lo, hi = ge._p_interval(r, cell)
+                    lo, hi = ge.lifted_interval(r, cell)
                     x = ge._p_eval(r, centre)
                     ranges.append((x, x) if name == "lift_centre_range" else (lo, (lo + hi) / 2))
                 return tuple(cell) + tuple(ranges)
         ge.CornerTable = Narrow
+    elif name == "unroll_drop_remainder":
+        # The values left after the Bellman expansion taken at the middle
+        # of their bounds, as if they were exact (no expansion at all).
+        original_ua = saved["unrolled_advantage"]
+
+        def middles(game, proc, cell, i, k, lower, upper, **options):
+            mid = [(a + b) / 2 for a, b in zip(lower, upper)]
+            return original_ua(game, proc, cell, i, k, mid, mid, **options)
+        ge.unrolled_advantage = middles
+    elif name == "range_corners_only":
+        # The range of a polynomial that is not multi-affine from its values
+        # at the corners of the cell, as if it were multi-affine.
+        def corners_only(poly, cell, bisections):
+            return max(ge._p_eval(poly, c) for c in itertools.product(*cell))
+        ge._range_upper = corners_only
     elif name is not None:
         raise ValueError(name)
     try:
@@ -947,6 +986,7 @@ def mutation(name: str | None):
     finally:
         for k, v in saved.items():
             setattr(ge, k, v)
+        ge._RANGE_CACHE.clear()
 
 
 MUTATIONS = ("swap_bound_direction", "drop_admissibility", "profile_command_for_deviator",
@@ -961,6 +1001,9 @@ COUPLING_MUTATIONS = ("coupling_swap_sides", "coupling_drop_first_payoff",
 # Bugs of the lifting of probabilities that are not multi-affine (I.9);
 # they are found with mode="nonaffine".
 LIFTING_MUTATIONS = ("lift_corners_only", "lift_centre_range", "lift_lower_range")
+# Bugs of the exact ranges of polynomials that are not multi-affine and of
+# the Bellman expansion of the advantages (I.9).
+RANGE_MUTATIONS = ("range_corners_only", "unroll_drop_remainder")
 
 
 def run(seed: int, count: int, mutant: str | None = None, max_cells: int = 24,
@@ -1000,7 +1043,8 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--extra", type=int, default=4)
     parser.add_argument("--mutation", default=None,
                         choices=MUTATIONS + ENDPOINT_MUTATIONS + EVERY_STATE_MUTATIONS
-                        + ADVANTAGE_MUTATIONS + COUPLING_MUTATIONS + LIFTING_MUTATIONS)
+                        + ADVANTAGE_MUTATIONS + COUPLING_MUTATIONS + LIFTING_MUTATIONS
+                        + RANGE_MUTATIONS)
     parser.add_argument("--no-direct", action="store_true",
                         help="do not check the coupled bounds of the advantages directly "
                              "(only the claims of the maps)")

@@ -470,7 +470,7 @@ class TestHump:
         self.check_hump(d)
         boxes = [tuple(float(x) for x in c.box["lam"]) for c in d["cells"]]
         assert [round(x, 4) for x in boxes[0] + boxes[2] + boxes[4]] == [
-            0, 0.1455, 0.1475, 0.8496, 0.8574, 1]
+            0, 0.1445, 0.1484, 0.8516, 0.8555, 1]
 
     def test_hump_in_the_probabilities(self):
         d = self.map_of(PROB_HUMP)

@@ -2594,7 +2594,10 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
           client_ca: Path | None = None, max_handshakes: int = MAX_HANDSHAKES,
           grpc_listen: str | None = None, grpc_port_file: Path | None = None,
           max_grpc_connections: int = 64, max_grpc_connections_per_address: int = 4,
-          max_grpc_connections_per_prefix: int = 16, restore_signals: bool = True) -> int:
+          max_grpc_connections_per_prefix: int = 16, grpc_max_connection_age: float = 300.0,
+          grpc_max_connection_age_grace: float | None = None,
+          grpc_connection_wait: float = 10.0,
+          restore_signals: bool = True) -> int:
     """Run the gateway until SIGTERM or SIGINT. Returns the exit status.
     With `restore_signals` false (the command line), the stop handlers stay
     installed after the return, so that a second SIGTERM during the exit
@@ -2678,7 +2681,11 @@ def serve(gw_args: dict, listen: str = "127.0.0.1:8470", port_file: Path | None 
                                       max_connections_per_address=(
                                           max_grpc_connections_per_address),
                                       max_connections_per_prefix=(
-                                          max_grpc_connections_per_prefix)))
+                                          max_grpc_connections_per_prefix),
+                                      max_connection_age=grpc_max_connection_age,
+                                      max_connection_age_grace=(
+                                          grpc_max_connection_age_grace),
+                                      connection_wait=grpc_connection_wait))
     finally:
         if restore_signals:
             restore_handlers(previous)
@@ -2786,6 +2793,13 @@ def cli_gateway(args) -> int:
                        args.max_grpc_connections_per_prefix) < 1:
             raise GatewayError("--poll, --upstream-timeout, --read-timeout and the --max-* "
                                "options must be positive")
+        if not 1 <= args.grpc_max_connection_age <= 86400 \
+                or not (args.grpc_max_connection_age_grace is None
+                        or 0 <= args.grpc_max_connection_age_grace <= 86400) \
+                or not 0 <= args.grpc_connection_wait <= 3600:
+            raise GatewayError("--grpc-max-connection-age must be at least 1 second and "
+                               "--grpc-max-connection-age-grace and --grpc-connection-wait "
+                               "not negative (at most a day, and an hour for the wait)")
         push_tls = None
         if args.push_ca is not None:
             push_tls = ssl.create_default_context(cafile=str(args.push_ca))
@@ -2815,6 +2829,9 @@ def cli_gateway(args) -> int:
                      max_grpc_connections=args.max_grpc_connections,
                      max_grpc_connections_per_address=args.max_grpc_connections_per_address,
                      max_grpc_connections_per_prefix=args.max_grpc_connections_per_prefix,
+                     grpc_max_connection_age=args.grpc_max_connection_age,
+                     grpc_max_connection_age_grace=args.grpc_max_connection_age_grace,
+                     grpc_connection_wait=args.grpc_connection_wait,
                      restore_signals=False)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)

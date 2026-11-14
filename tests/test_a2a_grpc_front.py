@@ -15,6 +15,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import cadl.a2a_grpc_front as F
+from cadl.a2a_grpc import hook_rejections
 from cadl.a2a_grpc_front import Front, peer_key, prefix_key
 
 from .a2a_certs import PKI
@@ -53,17 +55,20 @@ class Backend:
     address that the Front reports for the peer of the call."""
 
     def __init__(self, grpc, unix: bool = True, deadline: float = 1.5, options=(),
-                 **caps) -> None:
+                 listen: str = "127.0.0.1", max_rpcs: int | None = None, **caps) -> None:
         self.grpc = grpc
         self.gw = Recorder()
-        self.front = Front(self.gw, ("127.0.0.1", 0), deadline=deadline, unix=unix, **caps)
+        self.front = Front(self.gw, (listen, 0), deadline=deadline, unix=unix, **caps)
+        assert hook_rejections(self.front)
 
         def who(request, context):
             conn = self.front.client(context.peer())
             return (conn.host if conn is not None else "unknown").encode()
 
         def hang(request, context):
+            # As an authenticated call of the gateway.
             self.front.client(context.peer())
+            self.front.keyed(context.peer())
             yield b"started"
             while context.is_active():
                 time.sleep(0.05)
@@ -71,7 +76,7 @@ class Backend:
             grpc.method_handlers_generic_handler(
                 "t.T", {"Who": grpc.unary_unary_rpc_method_handler(who),
                         "Hang": grpc.unary_stream_rpc_method_handler(hang)})],
-            options=list(options))
+            options=list(options), maximum_concurrent_rpcs=max_rpcs)
         actual = self.server.add_insecure_port(self.front.backend)
         assert actual
         if not unix:
@@ -523,6 +528,210 @@ def test_unbindable_address_is_left_out(monkeypatch, capsys):
         F._listen_sockets("localhost", 0)
 
 
+def test_calls_refused_by_grpc_count(grpc):
+    """A call that gRPC refuses before a handler runs, for an unknown
+    method (UNIMPLEMENTED) or beyond its limit of concurrent calls
+    (RESOURCE_EXHAUSTED), counts as a call of its connection: the
+    connection is not reset at the deadline. A connection without a call
+    still is."""
+    b = Backend(grpc, deadline=1.5, max_rpcs=1)
+    try:
+        silent = b.raw()
+        unknown = b.channel()
+        with pytest.raises(grpc.RpcError) as e:
+            unknown.unary_unary("/t.T/Nope")(b"", timeout=10)
+        assert e.value.code() == grpc.StatusCode.UNIMPLEMENTED
+        holder = b.channel()
+        stream = holder.unary_stream("/t.T/Hang")(b"", timeout=30)
+        assert next(stream) == b"started"
+        busy = b.channel()
+        with pytest.raises(grpc.RpcError) as e:
+            busy.unary_unary("/t.T/Who")(b"", timeout=10)
+        assert e.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+        assert closed(silent, 15)
+        time.sleep(1.5)
+        assert b.front.total == 3
+        assert b.gw.got == [("read_timeout", "grpc handshake")]
+        stream.cancel()
+
+        def served():
+            try:
+                return b.who(busy)
+            except grpc.RpcError:       # the stream's worker is not free yet
+                return None
+        assert wait_for(served, "the worker") == "127.0.0.1" and b.front.total == 3
+        for c in (unknown, holder, busy):
+            c.close()
+        silent.close()
+    finally:
+        b.close()
+
+
+def test_connection_age(grpc):
+    """With a finite grace: gRPC sends GOAWAY at the age of a connection
+    (here 1 s, with a jitter of 10 %) and closes it after the grace (1 s):
+    a stream that
+    lasts longer ends with UNAVAILABLE, a unary call under way ends
+    normally, the Front closes its side and the place comes back; the
+    client's next call goes on a new connection. Nothing is recorded."""
+    b = Backend(grpc, deadline=5.0, max_age=1.0, age_grace=1.0,
+                options=[("grpc.max_connection_age_ms", 1000),
+                         ("grpc.max_connection_age_grace_ms", 1000)])
+    try:
+        ch = b.channel()
+        t0 = time.monotonic()
+        assert b.who(ch) == "127.0.0.1"
+        stream = ch.unary_stream("/t.T/Hang")(b"", timeout=60)
+        assert next(stream) == b"started"
+        with pytest.raises(grpc.RpcError) as e:
+            for _ in stream:
+                pass
+        assert e.value.code() == grpc.StatusCode.UNAVAILABLE
+        assert time.monotonic() - t0 < 15
+        wait_for(lambda: b.front.total == 0, "the place to come back")
+        assert b.who(ch) == "127.0.0.1"
+        assert b.front.total == 1
+        ch.close()
+        assert b.gw.got == []
+    finally:
+        b.close()
+
+
+def test_connection_age_without_grace(grpc):
+    """Without a grace (the default of the gateway), a call under way is
+    not cut at the age: after the GOAWAY (1 s here) the connection takes
+    no new call, the client's next calls go on a new connection, and the
+    old one closes when its stream ends. Nothing is recorded."""
+    b = Backend(grpc, deadline=5.0, max_age=1.0, age_grace=None,
+                options=[("grpc.max_connection_age_ms", 1000)])
+    try:
+        assert b.front.lifetime(True) is None
+        ch = b.channel()
+        stream = ch.unary_stream("/t.T/Hang")(b"", timeout=60)
+        assert next(stream) == b"started"
+        time.sleep(4.0)
+        assert stream.is_active()
+        assert b.who(ch) == "127.0.0.1"
+        assert b.front.total == 2               # the old one holds the stream
+        stream.cancel()
+        wait_for(lambda: b.front.total == 1, "the old connection to close")
+        ch.close()
+        assert b.gw.got == []
+    finally:
+        b.close()
+
+
+def test_connection_kept_past_its_age_is_reset(grpc, monkeypatch):
+    """When gRPC keeps a connection past its age and a finite grace (here
+    a gRPC server without the age), the Front resets it at
+    `Front.lifetime` and records it (`read_timeout`, `grpc age`), also
+    with an authenticated call under way."""
+    monkeypatch.setattr(F, "AGE_MARGIN", 0.5)
+    b = Backend(grpc, deadline=1.0, max_age=1.0, age_grace=0.5, ping_timeout=0.5)
+    try:
+        assert b.front.lifetime(True) == pytest.approx(1.0 + 1.1 + 0.5 + 0.5 + 0.5)
+        ch = b.channel()
+        assert b.who(ch) == "127.0.0.1"
+        stream = ch.unary_stream("/t.T/Hang")(b"", timeout=60)
+        assert next(stream) == b"started"
+        with pytest.raises(grpc.RpcError) as e:
+            for _ in stream:
+                pass
+        assert e.value.code() == grpc.StatusCode.UNAVAILABLE
+        wait_for(lambda: b.gw.count("read_timeout", "grpc age") == 1, "the record")
+        ch.close()
+    finally:
+        b.close()
+
+
+def test_without_grace_only_connections_without_a_key_are_reset(grpc, monkeypatch):
+    """Without a grace, the Front resets a connection on which no
+    authenticated call has run once its calls without a key must have
+    ended (deadline + 1.1 × age + ping timeout + deadline + margin; here
+    1 + 1.1 + 0.5 + 1 + 0.5 s, with a gRPC server that keeps it, as a
+    client that reads slowly can make it do), and records it; a
+    connection with an authenticated call (here the stream) is not
+    reset, so its call goes on."""
+    monkeypatch.setattr(F, "AGE_MARGIN", 0.5)
+    b = Backend(grpc, deadline=1.0, max_age=1.0, age_grace=None, ping_timeout=0.5)
+    try:
+        assert b.front.lifetime(False) == pytest.approx(1.0 + 1.1 + 0.5 + 1.0 + 0.5)
+        assert b.front.lifetime(True) is None
+        keyless, keyed = b.channel(), b.channel()
+        assert b.who(keyless) == "127.0.0.1"
+        stream = keyed.unary_stream("/t.T/Hang")(b"", timeout=60)
+        assert next(stream) == b"started"
+        assert b.front.total == 2
+        wait_for(lambda: b.gw.count("read_timeout", "grpc age") == 1, "the reset")
+        wait_for(lambda: b.front.total == 1, "the place of the keyless connection")
+        time.sleep(3.0)
+        assert stream.is_active() and b.front.total == 1
+        assert b.gw.count("read_timeout", "grpc age") == 1
+        stream.cancel()
+        for c in (keyless, keyed):
+            c.close()
+    finally:
+        b.close()
+
+
+def test_waiting_place_goes_to_the_fewest(grpc):
+    """With every place taken (3 here, all of 127.0.0.1), a further
+    connection waits; when a place comes back it goes to the waiting
+    connection of ::1, which holds none, before the one of 127.0.0.1
+    that came first; that one is reset at the end of its wait and
+    recorded. A waiting connection counts against the cap of its
+    address."""
+    try:
+        probe = socket.socket(socket.AF_INET6)
+        probe.bind(("::1", 0))
+        probe.close()
+    except OSError:
+        pytest.skip("no IPv6 loopback")
+    b = Backend(grpc, deadline=30.0, listen="::", max_connections=3, max_per_address=4,
+                wait=4.0)
+    try:
+        held = [b.raw() for _ in range(3)]
+        wait_for(lambda: b.front.total == 3, "the three connections")
+        v4 = b.raw()
+        wait_for(lambda: len(b.front.waiters) == 1, "the first to wait")
+        beyond = attempt(b.port)              # 3 held + 1 waiting: the address is full
+        assert closed(beyond, 5)
+        v6 = socket.create_connection(("::1", b.port), timeout=10)
+        wait_for(lambda: len(b.front.waiters) == 2, "the second to wait")
+        held[0].close()
+        wait_for(lambda: b.front.address_count.get("::/64") == 1, "::1 to get the place")
+        assert b.front.address_count["127.0.0.1"] == 2
+        t0 = time.monotonic()
+        assert closed(v4, 15)
+        assert time.monotonic() - t0 < 10
+        wait_for(lambda: b.gw.count("overloaded", "connections") == 2, "the records")
+        assert not b.front.waiters and b.front.total == 3
+        for s in held + [v4, v6] + ([beyond] if beyond is not None else []):
+            s.close()
+    finally:
+        b.close()
+
+
+def test_waiting_connection_called_after_its_place(grpc):
+    """A gRPC client that waits for a place is served once it has one;
+    its deadline to the first call starts then."""
+    b = Backend(grpc, deadline=2.0, max_connections=1, max_per_address=4, wait=8.0)
+    try:
+        held = b.raw()
+        wait_for(lambda: b.front.total == 1, "the connection")
+        got: list = []
+        t = threading.Thread(target=lambda: got.append(b.who(b.channel())), daemon=True)
+        t.start()
+        wait_for(lambda: len(b.front.waiters) == 1, "the client to wait")
+        assert closed(held, 10)                 # reset at its deadline
+        t.join(15)
+        assert got == ["127.0.0.1"]
+        assert b.gw.got == [("read_timeout", "grpc handshake")]
+        held.close()
+    finally:
+        b.close()
+
+
 # === Through the gateway ===========================================================
 
 def _run(tmp_path, *extra, listen="127.0.0.1:0"):
@@ -644,6 +853,79 @@ def test_gateway_tls_call_served_while_an_address_holds_its_connections(
     capsys.readouterr()
 
 
+def _states(channel) -> list:
+    """The connectivity states of `channel`, as they come."""
+    got: list = []
+    channel.subscribe(got.append, try_to_connect=False)
+    return got
+
+
+def test_gateway_tls_unknown_method_keeps_its_connection(tmp_path, grpc, pki, capsys):
+    """Mutual TLS through the gateway: a connection whose only call is of
+    an unknown method (refused by gRPC itself with UNIMPLEMENTED, before
+    the gateway sees it) is not reset at the deadline (3 s): the channel
+    stays READY past it, nothing is recorded as `read_timeout`, and the
+    next call goes on the same connection. Without `hook_rejections` the
+    connection would be reset at 3 s (`grpc handshake`)."""
+    pb = pytest.importorskip("a2a.types.a2a_pb2")
+    r, port = _run(tmp_path, *pki.gateway_args(), "--read-timeout", "3")
+    key = (pki.dir / "planner.key").read_bytes()
+    chain = (pki.dir / "planner.pem").read_bytes()
+    creds = grpc.ssl_channel_credentials(pki.ca.read_bytes(), key, chain)
+    g = GrpcClient(r, grpc, pb, port)
+    g.channel.close()
+    g.channel = grpc.secure_channel(f"127.0.0.1:{port}", creds, options=[
+        ("grpc.ssl_target_name_override", "localhost"),
+        ("grpc.use_local_subchannel_pool", 1)])
+    states = _states(g.channel)
+    with pytest.raises(grpc.RpcError) as e:
+        g.channel.unary_unary("/lf.a2a.v1.A2AService/Nope")(b"", timeout=10)
+    assert e.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    wait_for(lambda: states and states[-1] == grpc.ChannelConnectivity.READY, "READY")
+    seen = len(states)
+    time.sleep(6.0)
+    assert states[seen - 1:] == [grpc.ChannelConnectivity.READY]
+    got = g.call("PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                 pb.SendMessageResponse)
+    assert got.task.id == "up-task-1"
+    assert states[seen - 1:] == [grpc.ChannelConnectivity.READY]
+    g.channel.close()
+    r.stop()
+    assert events(r.audit, "read_timeout") == []
+    r.replay_check()
+    capsys.readouterr()
+
+
+def test_gateway_age_without_grace(tmp_path, grpc, pki, capsys):
+    """Through the gateway with an age of 1 s and no grace (the default):
+    a client keeps calling across the ends of its connections, and
+    nothing is recorded as `read_timeout`."""
+    pb = pytest.importorskip("a2a.types.a2a_pb2")
+    r, port = _run(tmp_path, *pki.gateway_args(), "--read-timeout", "3",
+                   "--grpc-max-connection-age", "1")
+    key = (pki.dir / "planner.key").read_bytes()
+    chain = (pki.dir / "planner.pem").read_bytes()
+    creds = grpc.ssl_channel_credentials(pki.ca.read_bytes(), key, chain)
+    g = GrpcClient(r, grpc, pb, port)
+    g.channel.close()
+    g.channel = grpc.secure_channel(f"127.0.0.1:{port}", creds, options=[
+        ("grpc.ssl_target_name_override", "localhost")])
+    states = _states(g.channel)
+    for i in range(3):
+        got = g.call("PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                     pb.SendMessageResponse)
+        assert got.task.id == f"up-task-{i + 1}"
+        time.sleep(2.0)
+    # The channel saw its connections end (GOAWAY at the age).
+    assert grpc.ChannelConnectivity.IDLE in states
+    g.channel.close()
+    r.stop()
+    assert events(r.audit, "read_timeout") == []
+    assert r.agent.sent() == ["summarize"] * 3
+    r.replay_check()
+    capsys.readouterr()
+
+
 def test_gateway_options_must_be_positive(tmp_path, capsys):
     from cadl.cli import main
 
@@ -655,3 +937,42 @@ def test_gateway_options_must_be_positive(tmp_path, capsys):
                  "--grpc-listen", "127.0.0.1:0", "--max-grpc-connections-per-address",
                  "0"]) == 2
     assert "must be positive" in capsys.readouterr().err
+    for option, value in (("--grpc-max-connection-age", "0"),
+                          ("--grpc-max-connection-age", "0.0004"),
+                          ("--grpc-max-connection-age-grace", "-1"),
+                          ("--grpc-connection-wait", "-1")):
+        assert main(["a2a-gateway", str(CADL), "--agent-actor", "SUMMARIZER", "--upstream",
+                     "http://127.0.0.1:9", "--client-keys",
+                     str(tmp_path / "clients.json"), "--audit", str(tmp_path / "a.jsonl"),
+                     "--grpc-listen", "127.0.0.1:0", option, value]) == 2
+        assert "--grpc-max-connection-age must be at least 1 second"             in capsys.readouterr().err
+
+
+def test_gateway_held_blocking_call_keeps_its_connection(tmp_path, grpc, monkeypatch,
+                                                          capsys):
+    """Through the gateway (age 1 s, no grace): an authenticated blocking
+    SendMessage held for approval marks its connection, so the front
+    listener does not reset it at the reset of connections without an
+    authenticated call (here 2 + 1.1 + 1 + 2 + 10 = 16.1 s, with the ping
+    timeout shortened to 1 s by the test-only environment variable); the
+    call is answered after the approval and nothing is recorded as
+    `read_timeout`."""
+    pb = pytest.importorskip("a2a.types.a2a_pb2")
+    monkeypatch.setenv("CADL_TEST_GRPC_PING_TIMEOUT_MS", "1000")
+    r, port = _run(tmp_path, "--read-timeout", "2", "--grpc-max-connection-age", "1")
+    g = GrpcClient(r, grpc, pb, port)
+    data = grpc_message(pb, "publish", "report").SerializeToString()
+    md = g._md("PLANNER", "SendMessage", data)
+    fn = g.channel.unary_unary("/lf.a2a.v1.A2AService/SendMessage")
+    with ThreadPoolExecutor(1) as pool:
+        fut = pool.submit(lambda: fn(data, metadata=md, timeout=120))
+        r.wait_hold("h-1")
+        time.sleep(20.0)
+        assert not fut.done(), fut.exception()
+        r.approve("h-1")
+        got = pb.SendMessageResponse.FromString(fut.result(timeout=30))
+    assert got.task.id == "up-task-1"
+    g.channel.close()
+    r.stop()
+    assert events(r.audit, "read_timeout") == []
+    capsys.readouterr()

@@ -21,6 +21,7 @@ states at every observation with those of `norms_eval`.
 
 from __future__ import annotations
 
+import copy
 import itertools
 import json
 import os
@@ -112,6 +113,14 @@ AGGREGATES = ("sum", "count", "min", "max", "avg")
 
 class NormsCheckError(NormsEvalError):
     """The request cannot be translated (a usage error or a refusal)."""
+
+
+class _TooManyValuations(NormsCheckError):
+    """More valuations of a component than the limit (`why` says how many)."""
+
+    def __init__(self, why: str, text: str) -> None:
+        super().__init__(text)
+        self.why = why
 
 
 class NormsCheckTimeout(NormsCheckError):
@@ -683,6 +692,10 @@ def _list_values(q: Any) -> list:
 # class is written into a witness with the digits of its exact value, and
 # the evaluator of norms-eval reads it back as the same value.
 
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float, Fraction)) and not isinstance(v, bool)
+
+
 def _is_decimal(f: Fraction) -> bool:
     d = f.denominator
     for p in (2, 5):
@@ -895,6 +908,7 @@ class Translator:
         self.domain_patterns = dict(domains or {})     # pattern -> (lo, hi)
         self.links: list = []                           # keys compared with each other
         self.order_links: list = []                     # ... by <, <=, >, >=
+        self.ordered_links: list = []   # ... by an order, also of min or max
         self.notes: list[str] = []
         self.actors = declared_actors(sos)
         self.bindings = dict(bindings)
@@ -1350,6 +1364,8 @@ class Translator:
                     # an order or equality between quantities: exact with
                     # enough values between the literals (F.12)
                     info["links"].append(frozenset(x[1]) | frozenset(y[1]))
+                    if o in ("<", "<=", ">", ">=") or "minmax" in (x[0], y[0]):
+                        info["ordered_links"].append(frozenset(x[1]) | frozenset(y[1]))
                     if o in ("<", "<=", ">", ">=") and x[0] == y[0] == "qty":
                         # lists of a trace are ordered too, and not always
                         # comparable: see _list_values
@@ -1369,12 +1385,13 @@ class Translator:
         if key in self._pred_index:
             return self._pred_index[key]
         info: dict = {"consts": {}, "domain": set(), "keys": set(), "atoms": {}, "raw": set(),
-                      "links": [], "order_links": []}
+                      "links": [], "order_links": [], "ordered_links": []}
         self._cond(expr, {}, info)
         if info["domain"]:
             self._arith(expr, info["domain"])
         self.links += info["links"]
         self.order_links += info["order_links"]
+        self.ordered_links += info["ordered_links"]
         for k, cs in info["consts"].items():
             self._quantity(k).consts.update(c for c in cs if c is not None)
         for k, atoms in info["atoms"].items():
@@ -1883,6 +1900,28 @@ class Translator:
                 name="__in__", args=[self._lit_node(v) for v in atom[1]]))
         return BinaryOp(op=atom[0], left=q, right=self._lit_node(atom[1]))
 
+    def _evaluator(self, values: dict) -> Any:
+        """An evaluator of norms-eval on one valuation of the quantities."""
+        from .norms_eval import _Evaluator, _exact
+        obs = Observation(t=0.0, values={k: _exact(values.get(k)) for k in self.quantities},
+                          messages=[], state=None, state_after=None)
+        trace = Trace(observations=[obs], bindings=self.bindings)
+        ev = _Evaluator(trace, self.contract.lifecycle is not None, [])
+        ev.actors = self.actors
+        ev.bound_refs = _bound_refs(self.contract)
+        return ev
+
+    def _scoped_value(self, expr: Any, scope: dict, values: dict) -> str:
+        """The value (T, F, U) of a part of a predicate with the variables
+        of its quantifiers bound (scope: variable -> (set, index)), as the
+        evaluator of norms-eval computes it inside the quantifiers."""
+        from .norms_eval import UNKNOWN
+        ev = self._evaluator(values)
+        ev._scope = dict(scope)
+        v = ev.holds(expr, 0, 0)
+        assert v is True or v is False or v is UNKNOWN, v
+        return "T" if v is True else "F" if v is False else "U"
+
     def _oracle(self, exprs: list, values: dict, keys=None) -> list:
         """The values (T, F, U) of state predicates for one valuation of the
         quantities, computed by the evaluator of norms-eval."""
@@ -1926,9 +1965,11 @@ class Environment:
         self.quantities: dict = {}
         self.links: list = []
         self.order_links: list = []
+        self.ordered_links: list = []
         for tr in trs:
             self.links += tr.links
             self.order_links += tr.order_links
+            self.ordered_links += tr.ordered_links
             for key, q in tr.quantities.items():
                 g = self.quantities.setdefault(key, Quantity(key))
                 g.consts |= q.consts
@@ -1953,10 +1994,10 @@ class Environment:
 
     def _too_many(self, ids: list, keys: list, size: int) -> None:
         sizes = ", ".join(f"{k} ({len(self.quantities[k].reps)} classes)" for k in keys)
-        raise NormsCheckError(
-            f"the predicates {', '.join(repr(self.preds[i].text) for i in ids)} read "
-            f"{sizes}: {size} combinations together, and norms-check refuses more than "
-            f"{MAX_VALUATIONS}" + self._fewer(keys))
+        why = (f"the predicates {', '.join(repr(self.preds[i].text) for i in ids)} read "
+               f"{sizes}: {size} combinations together")
+        raise _TooManyValuations(why, f"{why}, and norms-check refuses more than "
+                                      f"{MAX_VALUATIONS}" + self._fewer(keys))
 
     # --- groups of quantities compared with each other (F.12) -------------------
     #
@@ -2157,11 +2198,10 @@ class Environment:
             many = max(self.quantities[k].list_order for k in g) > len(_LIST_VALUES) + 1
             if parts is None:
                 if many:
-                    raise NormsCheckError(
-                        f"the quantities {', '.join(g)} are ordered (<, <=, >, >=) against each "
-                        f"other, and {why}; norms-check translates a group of more than 3 "
-                        f"quantities ordered against each other only when they all have the "
-                        f"same classes of values (F.12)")
+                    # valuations by types and patterns need the same classes
+                    return self._eliminated(
+                        ids, keys, f"the quantities {', '.join(g)} are ordered (<, <=, >, >=) "
+                        f"against each other, and {why}")
                 continue
             count, exact = self._group_count(parts, len(g))
             groups.append((g, parts))
@@ -2190,12 +2230,12 @@ class Environment:
                 f"{seq(p, 'list', len(g))} for 1, 2, ... quantities of that type)"
                 for g, c, e, p in counts] + ([
                 f"the other quantities {', '.join(rest)} take their classes"] if rest else []))
-            raise NormsCheckError(
+            return self._eliminated(
+                ids, keys,
                 f"the predicates {', '.join(repr(self.preds[i].text) for i in ids)} read "
                 f"{len(keys)} quantities with {size} combinations of classes; {detail}"
                 f": {'at least ' if any(not e for _g, _c, e, _p in counts) else ''}"
-                f"{total} valuations together, and norms-check refuses more than "
-                f"{MAX_VALUATIONS} (F.12)" + self._fewer(keys))
+                f"{total} valuations together, more than {MAX_VALUATIONS}")
         options = [self._group_valuations(g, parts) for g, parts in groups]
         options += [[{k: v} for v in self.quantities[k].reps] for k in rest]
         owners: dict = {}
@@ -2215,6 +2255,21 @@ class Environment:
             if vec not in seen:
                 seen[vec] = {k: vals[k] for k in keys}
         return list(seen.items())
+
+    def _eliminated(self, ids: list, keys: list, why: str, linear: bool = False) -> list:
+        """The vectors of a component with too many valuations by types and
+        patterns, found by elimination of its quantities (F.12)."""
+        el = _Elimination(self, ids, keys, linear)
+        got = el.run(MAX_VALUATIONS)
+        if got is None:
+            what = (f"the leaves that read numbers of the linear arrangement needed more than "
+                    f"{MAX_VALUATIONS} points of its faces" if el.exceeded == "points" else
+                    f"more than {MAX_VALUATIONS} patterns of the quantities that the remaining "
+                    f"comparisons still read had to be kept at one step")
+            raise NormsCheckError(
+                f"{why}; adding the quantities one at a time (F.12), {what}, and norms-check "
+                f"refuses more" + self._fewer(keys))
+        return got
 
     def _linear_valuations(self, ids: list, keys: list) -> list:
         """The valuations of a component with linear arithmetic (F.12): each
@@ -2470,12 +2525,18 @@ class Environment:
             many = [k for k in keys if self.quantities[k].list_order > len(_LIST_VALUES) + 1]
             if min(ids) in linear_ids:
                 if many:
-                    raise NormsCheckError(
-                        f"{many[0]} is ordered (<, <=, >, >=) against "
-                        f"{self.quantities[many[0]].list_order - 1} other quantities in "
-                        f"predicates with linear arithmetic; norms-check translates such "
-                        f"orders of at most 3 quantities there (F.12)")
-                self.components.append((ids, self._linear_valuations(ids, keys)))
+                    # the lists of more than 3 ordered quantities are
+                    # patterns, which the product of classes does not give
+                    why = (f"{many[0]} is ordered (<, <=, >, >=) against "
+                           f"{self.quantities[many[0]].list_order - 1} other quantities in "
+                           f"predicates with linear arithmetic")
+                    self.components.append((ids, self._eliminated(ids, keys, why, True)))
+                    continue
+                try:
+                    found = self._linear_valuations(ids, keys)
+                except _TooManyValuations as e:
+                    found = self._eliminated(ids, keys, e.why, True)
+                self.components.append((ids, found))
                 continue
             size = 1
             for k in keys:
@@ -2517,6 +2578,749 @@ class Environment:
 
 
 
+
+
+# === Elimination of the quantities of a component (F.12) ===================
+#
+# A group of quantities compared with each other whose valuations by types
+# and patterns exceed the limit: the vectors of predicate values are found
+# without building every valuation. Each predicate is a Kleene combination
+# (AND, OR, NOT, exists and for all over their members) of leaves, and a
+# leaf (a comparison, a quantity as a condition, IN, an aggregate) reads a
+# few quantities; its value, computed by the evaluator of norms-eval on
+# values of the classes, depends only on the pattern of these quantities:
+# for each one its type and the literal it equals or the gap it lies in,
+# and for two quantities of one group with values of the same kind their
+# relation (the order of two numbers or texts in one gap, the equality of
+# two objects, the outcome of two lists; only equality when the group has
+# no order). The quantities are added one at a time; a state is the
+# remaining Kleene expression of every predicate (leaves whose quantities
+# are all added are replaced by their values) and the pattern of the added
+# quantities that a remaining leaf still reads (the frontier); states with
+# the same remaining expressions and frontier pattern are merged. Every
+# pattern of all quantities passes through a state at every step, so every
+# vector of a trace is found. Each state keeps one pattern of all added
+# quantities that leads to it (a new quantity is placed against the others
+# as the frontier says and anywhere consistent against the rest), so every
+# vector comes with a valuation, and every vector is checked on it with
+# the evaluator of norms-eval.
+
+_OUTCOME_FLIP = {"lt": "gt", "gt": "lt", "eq": "eq", "inc": "inc", "ne": "ne"}
+
+
+def _list_realise(classes: list, rel: Any) -> dict | None:
+    """Lists for classes of lists with the pairwise outcomes rel(a, b) (lt,
+    gt, inc): series and parallel composition as in _list_tuples; None when
+    the outcomes are not those of lists."""
+    if len(classes) == 1:
+        return {classes[0]: []}
+
+    def components(edge: Any) -> list:
+        out, left = [], list(classes)
+        while left:
+            stack, comp = [left.pop(0)], []
+            while stack:
+                a = stack.pop()
+                comp.append(a)
+                for b in [b for b in left if edge(a, b)]:
+                    left.remove(b)
+                    stack.append(b)
+            out.append(comp)
+        return out
+
+    comps = components(lambda a, b: rel(a, b) != "inc")
+    if len(comps) > 1:
+        parts = ((comps[0], 0), ([c for d in comps[1:] for c in d], "a"))
+    else:
+        comps = components(lambda a, b: rel(a, b) == "inc")
+        low = [c for c in comps if all(rel(c[0], d[0]) == "lt" for d in comps if d is not c)]
+        if len(comps) == 1 or not low:
+            return None
+        parts = ((low[0], 0), ([c for d in comps if d is not low[0] for c in d], 1))
+    out: dict = {}
+    for part, head in parts:
+        sub = _list_realise(part, rel)
+        if sub is None:
+            return None
+        out.update({c: [head] + v for c, v in sub.items()})
+    return out
+
+
+class _NoAmalgam(Exception):
+    pass
+
+
+class _Elimination:
+    """The vectors of predicate values of one component, by elimination of
+    its quantities (see above)."""
+
+    def __init__(self, env: Any, ids: list, keys: list, linear: bool = False) -> None:
+        self.env, self.ids, self.keys = env, ids, keys
+        # with linear arithmetic, a quantity without a domain is a number of
+        # the arrangement (the kind ("n",)): the leaves that read it are
+        # evaluated at the end, at one point of every face (F.12)
+        self.linear = linear
+        self.index = {k: i for i, k in enumerate(keys)}
+        self.calls = 0
+        # groups of quantities compared with each other, and their spaces
+        self.group: dict = {}
+        self.groups: list = []
+        for g in env.link_groups:
+            if len(g) > 1 and set(g) <= set(keys):
+                gi = len(self.groups)
+                ordered = any(set(link) <= set(g) for link in env.ordered_links)
+                self.groups.append(self._group_classes(g, ordered))
+                for k in g:
+                    self.group[k] = gi
+        # per quantity: its unary values and its kinds
+        self.unary: dict = {}
+        self.kinds: dict = {}
+        for k in keys:
+            q = env.quantities[k]
+            gi = self.group.get(k)
+            num = [("n",)] if linear and q.domain is None else []
+            if gi is None:
+                vals = [v for v in q.reps if not (num and _is_number(v))]
+                self.unary[k] = vals
+                self.kinds[k] = [("u", i) for i in range(len(vals))] + num
+                continue
+            G = self.groups[gi]
+            vals: list = [None, True, False]
+            if q.domain is not None:
+                vals += [v for v in range(q.domain[0], q.domain[1] + 1)]
+                spaces = []
+            elif num:
+                spaces = []
+            else:
+                vals += [_num(c) for c in G["nums"] if _is_decimal(c)]
+                spaces = [("num", j) for j in G["num_grid"]]
+            vals += list(G["texts"])
+            spaces += [("text", j) for j in G["text_grid"]] + ["obj", "list"]
+            self.unary[k] = vals
+            self.kinds[k] = ([("u", i) for i in range(len(vals))] + [("s", s) for s in spaces]
+                             + num)
+        self.leaves: list = []          # (owner, expr, scope, keys)
+        self.leaf_pairs: list = []
+        self._leaf_ids: dict = {}
+        self.memo: dict = {}
+
+    # --- classes of a group ----------------------------------------------------
+
+    def _group_classes(self, g: list, ordered: bool) -> dict:
+        qs = [self.env.quantities[k] for k in g]
+        n = len(g)
+        nums = set()
+        texts = set()
+        for q in qs:
+            nums |= set(q.num_lits)
+            texts |= set(q.text_lits)
+            if q.domain is not None:
+                nums.update(Fraction(v) for v in range(q.domain[0], q.domain[1] + 1))
+        nums.add(Fraction(0))
+        nums = sorted(nums)
+        texts = sorted(texts)
+        if any("\x00" in t for t in texts):
+            raise NormsCheckError(
+                f"{g[0]} is compared with a text with the character U+0000, which is not "
+                f"translated")
+        num_grid = {0: [math.floor(nums[0]) - j for j in range(n, 0, -1)],
+                    len(nums): [math.ceil(nums[-1]) + j for j in range(1, n + 1)]}
+        for j in range(1, len(nums)):
+            num_grid[j] = _decimals_between(nums[j - 1], nums[j], n)
+        text_grid: dict = {}
+        for j in range(len(texts) + 1):
+            lo = "" if j == 0 else texts[j - 1]
+            cands = (["\x00" * i for i in range(n)] if j == 0
+                     else [lo + "\x00" * i for i in range(1, n + 1)])
+            vals = [t for t in cands if (j == 0 or t > lo)
+                    and (j == len(texts) or t < texts[j])]
+            if vals:
+                text_grid[j] = vals
+        return {"keys": g, "ordered": ordered, "nums": nums, "texts": texts,
+                "num_grid": num_grid, "text_grid": text_grid,
+                "obj": [{}] + [{"k": j} for j in range(1, n)],
+                "list_eq": [[j] for j in range(n)]}
+
+    def _space_type(self, gi: int, s: Any) -> str:
+        G = self.groups[gi]
+        if s == "obj" or not G["ordered"]:
+            return "part"
+        return "lists" if s == "list" else "order"
+
+    # --- leaves and the Kleene expressions of the predicates -------------------
+
+    def _leaf(self, tr: Any, e: Any, scope: dict) -> tuple:
+        key = (id(tr), repr(e), tuple(sorted(scope.items(), key=repr)))
+        lid = self._leaf_ids.get(key)
+        if lid is None:
+            info: dict = {"consts": {}, "domain": set(), "keys": set(), "atoms": {},
+                          "raw": set(), "links": [], "order_links": [], "ordered_links": []}
+            tscope = {v: (g, [i]) for v, (g, i) in scope.items()}
+            saved, notes = tr.quantities, list(tr.notes)
+            tr.quantities = dict(saved)
+            try:
+                tr._shape(e, tscope, info)
+            finally:
+                tr.quantities, tr.notes = saved, notes
+            # members beyond --members have no value in the model
+            keys = frozenset(k for k in info["keys"] if k in saved)
+            if not keys <= set(self.keys):
+                raise NormsCheckError(f"internal: a leaf reads {sorted(keys - set(self.keys))}")
+            lid = self._leaf_ids[key] = len(self.leaves)
+            ks = tuple(sorted(keys, key=self.index.get))
+            self.leaves.append((tr, e, dict(scope), ks))
+            self.leaf_pairs.append(tuple((a, b) for i, a in enumerate(ks) for b in ks[i + 1:]))
+        return ("leaf", lid)
+
+    def _skeleton(self, tr: Any, e: Any, scope: dict, ev: Any) -> Any:
+        from .ast_nodes import QuantifiedExpr
+        from .norms_eval import UNKNOWN
+        if isinstance(e, BinaryOp) and e.op in ("AND", "OR"):
+            kind = e.op.lower()
+            kids: list = []
+            for side in (e.left, e.right):
+                s = self._skeleton(tr, side, scope, ev)
+                kids += list(s[2]) if s[0] == kind and not s[1] else [s]
+            return (kind, False, tuple(kids))
+        if isinstance(e, UnaryOp) and e.op == "NOT":
+            return ("not", self._skeleton(tr, e.operand, scope, ev))
+        if isinstance(e, QuantifiedExpr):
+            ev._scope = dict(scope)
+            try:
+                dom = ev.domain(e.domain, 0)
+            finally:
+                ev._scope = {}
+            if dom is not UNKNOWN:
+                group, members, closed = dom
+                kids = tuple(self._skeleton(tr, e.predicate, {**scope, e.variable: (group, i)}, ev)
+                             for i in members)
+                return ("or" if e.quantifier == "exists" else "and", not closed, kids)
+        return self._leaf(tr, e, scope)
+
+    @classmethod
+    def _simp(cls, node: Any, vals: dict) -> Any:
+        if isinstance(node, str):
+            return node
+        if node[0] == "leaf":
+            return vals.get(node[1], node)
+        if node[0] == "not":
+            s = cls._simp(node[1], vals)
+            return {"T": "F", "F": "T", "U": "U"}.get(s, ("not", s)) if isinstance(s, str) \
+                else ("not", s)
+        stop, unit = ("F", "T") if node[0] == "and" else ("T", "F")
+        u, kids = node[1], []
+        for c in node[2]:
+            s = cls._simp(c, vals)
+            if s == stop:
+                return stop
+            if s == unit:
+                continue
+            if s == "U":
+                u = True
+                continue
+            kids.append(s)
+        if not kids:
+            return "U" if u else unit
+        if len(kids) == 1 and not u:
+            return kids[0]
+        return (node[0], u, tuple(kids))
+
+    @classmethod
+    def _pending(cls, node: Any, out: set) -> set:
+        if isinstance(node, str):
+            return out
+        if node[0] == "leaf":
+            out.add(node[1])
+        elif node[0] == "not":
+            cls._pending(node[1], out)
+        else:
+            for c in node[2]:
+                cls._pending(c, out)
+        return out
+
+    # --- patterns ----------------------------------------------------------------
+    #
+    # A pattern: kinds {key: ("u", i) | ("s", space)} and outcomes {(a, b):
+    # outcome} for a before b (in the order of the keys) of the same group
+    # and space.
+
+    def _space(self, k: str, kind: tuple) -> Any:
+        return None if kind[0] != "s" else (self.group[k], kind[1])
+
+    def _pair(self, a: str, b: str) -> tuple:
+        return (a, b) if self.index[a] < self.index[b] else (b, a)
+
+    def _out(self, R: dict, a: str, b: str) -> str:
+        if a == b:
+            return "eq"
+        o = R[self._pair(a, b)]
+        return o if self.index[a] < self.index[b] else _OUTCOME_FLIP[o]
+
+    def _canon(self, P: dict, R: dict, keys: Any) -> tuple:
+        ks = sorted(keys, key=self.index.get)
+        return (tuple(P[k] for k in ks),
+                tuple(R[(a, b)] for i, a in enumerate(ks) for b in ks[i + 1:] if (a, b) in R))
+
+    @staticmethod
+    def _restrict(P: dict, R: dict, keys: Any) -> tuple:
+        keys = set(keys)
+        return ({k: v for k, v in P.items() if k in keys},
+                {p: o for p, o in R.items() if p[0] in keys and p[1] in keys})
+
+    def _classes(self, R: dict, members: list) -> list:
+        """The classes (lists of members equal to each other) of members."""
+        out: list = []
+        for m in members:
+            for c in out:
+                if self._out(R, c[0], m) == "eq":
+                    c.append(m)
+                    break
+            else:
+                out.append([m])
+        return out
+
+    def _ranked(self, R: dict, members: list) -> list:
+        """The classes of members of an order space, from the lowest."""
+        cls_ = self._classes(R, members)
+        return sorted(cls_, key=lambda c: sum(1 for d in cls_ if self._out(R, d[0], c[0]) == "lt"))
+
+    def _lists_ok(self, R: dict, members: list) -> dict | None:
+        """Lists realising the outcomes of members of a list space, or None."""
+        cls_ = self._classes(R, members)
+        got = _list_realise([c[0] for c in cls_], lambda a, b: self._out(R, a, b))
+        if got is None:
+            return None
+        vals = {m: got[c[0]] for c in cls_ for m in c}
+        for i, a in enumerate(members):
+            for b in members[i + 1:]:
+                if _list_outcome(vals[a], vals[b]) != self._out(R, a, b):
+                    return None
+        return vals
+
+    def _extensions(self, P: dict, R: dict, x: str) -> list:
+        """The patterns of the frontier and x that extend (P, R): (kind of
+        x, outcomes of x against the members of its space)."""
+        out = []
+        for kind in self.kinds[x]:
+            sp = self._space(x, kind)
+            if sp is None:
+                out.append((kind, {}))
+                continue
+            members = [k for k in P if self._space(k, P[k]) == sp]
+            t = self._space_type(*sp)
+            if t == "order":
+                ranked = self._ranked(R, members)
+                for i, c in enumerate(ranked):         # equal to a class
+                    out.append((kind, {m: ("eq" if j == i else "gt" if j < i else "lt")
+                                       for j, d in enumerate(ranked) for m in d}))
+                for i in range(len(ranked) + 1):        # a new class below class i
+                    out.append((kind, {m: ("gt" if j < i else "lt")
+                                       for j, d in enumerate(ranked) for m in d}))
+            elif t == "part":
+                cls_ = self._classes(R, members)
+                for i in range(len(cls_) + 1):
+                    out.append((kind, {m: ("eq" if j == i else "ne")
+                                       for j, d in enumerate(cls_) for m in d}))
+            else:
+                cls_ = self._classes(R, members)
+                for i in range(len(cls_)):
+                    out.append((kind, {m: ("eq" if j == i else self._out(R, cls_[i][0], d[0]))
+                                       for j, d in enumerate(cls_) for m in d}))
+                for combo in itertools.product(("lt", "gt", "inc"), repeat=len(cls_)):
+                    outs = {m: o for o, d in zip(combo, cls_) for m in d}
+                    R2 = dict(R)
+                    R2.update({self._pair(x, m): (o if self.index[x] < self.index[m]
+                                                  else _OUTCOME_FLIP[o]) for m, o in outs.items()})
+                    if self._lists_ok(R2, members + [x]) is not None:
+                        out.append((kind, outs))
+        return out
+
+    def _extend(self, P: dict, R: dict, x: str, kind: tuple, outs: dict) -> tuple:
+        P2 = dict(P)
+        P2[x] = kind
+        R2 = dict(R)
+        for m, o in outs.items():
+            R2[self._pair(x, m)] = o if self.index[x] < self.index[m] else _OUTCOME_FLIP[o]
+        return P2, R2
+
+    def _amalgamate(self, H: tuple, x: str, kind: tuple, outs: dict) -> tuple | None:
+        """The pattern of all added quantities and x: x against the frontier
+        as outs says, and against the others as is consistent."""
+        P, R = H
+        sp = self._space(x, kind)
+        if sp is None:
+            return self._extend(P, R, x, kind, {})
+        members = [k for k in P if self._space(k, P[k]) == sp]
+        same = [m for m, o in outs.items() if o == "eq"]
+        if same:
+            y = same[0]
+            full = {m: self._out(R, y, m) for m in members}
+            return self._extend(P, R, x, kind, full)
+        t = self._space_type(*sp)
+        if t == "part":
+            return self._extend(P, R, x, kind, {m: "ne" for m in members})
+        if t == "order":
+            below = [m for m, o in outs.items() if o == "gt"]
+            ranked = self._ranked(R, members)
+            rank = {m: i for i, c in enumerate(ranked) for m in c}
+            top = max((rank[m] for m in below), default=-1)
+            return self._extend(P, R, x, kind,
+                                {m: ("gt" if rank[m] <= top else "lt") for m in members})
+        rest = [m for m in members if m not in outs]
+        fixed = dict(outs)
+
+        def search(i: int, cur: dict) -> dict | None:
+            _P, R2 = self._extend(P, R, x, kind, cur)
+            done = [m for m in members if m in cur]
+            if self._lists_ok(R2, done + [x]) is None:
+                return None
+            if i == len(rest):
+                return cur
+            for o in ("eq", "lt", "gt", "inc"):
+                got = search(i + 1, {**cur, rest[i]: o})
+                if got is not None:
+                    return got
+            return None
+
+        found = search(0, fixed)
+        return None if found is None else self._extend(P, R, x, kind, found)
+
+    def _realise(self, P: dict, R: dict, keys: Any) -> dict | None:
+        """Values of the classes with the pattern (P, R) on keys."""
+        keys = sorted(keys, key=self.index.get)
+        vals: dict = {}
+        spaces: dict = {}
+        for k in keys:
+            kind = P[k]
+            if kind[0] == "u":
+                vals[k] = self.unary[k][kind[1]]
+            elif kind[0] == "n":
+                continue                # a number of the arrangement
+            else:
+                spaces.setdefault(self._space(k, kind), []).append(k)
+        for (gi, s), members in spaces.items():
+            G = self.groups[gi]
+            t = self._space_type(gi, s)
+            if t == "lists":
+                got = self._lists_ok(R, members)
+                if got is None:
+                    return None
+                vals.update(got)
+                continue
+            grid = (G["obj"] if s == "obj" else G["list_eq"] if s == "list"
+                    else G["num_grid"][s[1]] if s[0] == "num" else G["text_grid"][s[1]])
+            cls_ = self._ranked(R, members) if t == "order" else self._classes(R, members)
+            if len(cls_) > len(grid):
+                return None
+            for v, c in zip(grid, cls_):
+                for m in c:
+                    vals[m] = copy.deepcopy(v)
+        return vals
+
+    def _leaf_value(self, lid: int, P: dict, R: dict) -> str:
+        tr, e, scope, keys = self.leaves[lid]
+        memo = (lid, tuple(P[k] for k in keys), tuple(R.get(p) for p in self.leaf_pairs[lid]))
+        v = self.memo.get(memo)
+        if v is None:
+            vals = self._realise(P, R, keys)
+            if vals is None:
+                raise NormsCheckError("internal: a pattern of a leaf has no values")
+            self.calls += 1
+            v = self.memo[memo] = tr._scoped_value(e, scope, vals)
+        return v
+
+    # --- symmetry -----------------------------------------------------------------
+    #
+    # When every predicate of the component is the same for every
+    # permutation of the members of a set (they use the members only through
+    # variables of quantifiers and aggregates over the whole set, compared
+    # with each other only by == and !=), the vectors of the valuations are
+    # those of the valuations whose members, in the order of the
+    # elimination, are sorted: by kind, then within a kind ascending (an
+    # order), equal ones together (equality, objects, lists) and never below
+    # the previous one (lists, a linear extension). Every valuation is a
+    # permutation of such a one, so only these are added.
+
+    def _symmetric_sets(self) -> list:
+        by_set: dict = {}
+        for k in self.keys:
+            m = re.fullmatch(r"([A-Za-z_]\w*)\[(\d+)\]\.(.+)", k)
+            if m:
+                by_set.setdefault(m.group(1), []).append((int(m.group(2)), m.group(3), k))
+        out = []
+        for name, items in sorted(by_set.items()):
+            keys = [k for _i, _f, k in sorted(items)]
+            if len(keys) < 2 or len({f for _i, f, _k in items}) != 1:
+                continue
+            ref = keys[0]
+            if any(self.kinds[k] != self.kinds[ref] or self.group.get(k) != self.group.get(ref)
+                   or not self._same_values(self.unary[k], self.unary[ref]) for k in keys):
+                continue
+            if all(self._invariant(self.env.preds[i].expr, name, {}) for i in self.ids):
+                out.append(keys)
+        return out
+
+    @staticmethod
+    def _same_values(a: list, b: list) -> bool:
+        return len(a) == len(b) and all(
+            type(x) is type(y) and json_text(x) == json_text(y) for x, y in zip(a, b))
+
+    def _invariant(self, e: Any, name: str, bound: dict) -> bool:
+        """Whether e is the same for every permutation of the members of the
+        set `name` (bound: variable -> whether it ranges over that set)."""
+        import dataclasses
+        from .ast_nodes import Comprehension, QuantifiedExpr
+
+        def var(idx: Any) -> Any:
+            if isinstance(idx, str):
+                return idx
+            if isinstance(idx, ActorRef) and idx.index is None:
+                return idx.name
+            return None
+
+        if isinstance(e, (QuantifiedExpr, Comprehension)):
+            dom = e.domain
+            if isinstance(dom, ActorRef) and dom.name == name:
+                if dom.index not in (None, "*"):        # R[*] is the whole set
+                    return False
+                inner = {**bound, e.variable: True}
+            else:
+                if not self._invariant(dom, name, bound):
+                    return False
+                inner = {**bound, e.variable: False}
+            body = e.predicate if isinstance(e, QuantifiedExpr) else e.element
+            return self._invariant(body, name, inner)
+        if isinstance(e, MemberAccess):
+            obj = e.obj
+            if obj.name == name:
+                return bound.get(var(obj.index)) is True
+            if obj.index is None and obj.name in bound:
+                return True
+            return self._invariant(obj, name, bound)
+        if isinstance(e, ActorRef):
+            if e.name == name or (e.index is None and bound.get(e.name) is True):
+                return False
+            if e.index is None or isinstance(e.index, int) or e.index == "*":
+                return True
+            v = var(e.index)
+            if v is not None:
+                return bound.get(v) is not True
+            return self._invariant(e.index, name, bound)
+        if isinstance(e, BinaryOp) and e.op in ("==", "!=") and all(
+                isinstance(s, ActorRef) and s.index is None and bound.get(s.name) is True
+                for s in (e.left, e.right)):
+            return True
+        if isinstance(e, str):
+            return bound.get(e) is not True
+        if isinstance(e, (list, tuple)):
+            return all(self._invariant(x, name, bound) for x in e)
+        if dataclasses.is_dataclass(e):
+            return all(self._invariant(getattr(e, f.name), name, bound)
+                       for f in dataclasses.fields(e) if f.name != "loc")
+        return True
+
+    def _canonical(self, P: dict, x: str, ext: tuple, y: Any, earlier: Any) -> bool:
+        """Whether x with the extension ext keeps the members of its set
+        sorted after the previous one y (when y is still in the frontier)."""
+        if y is None or y not in P:
+            return True
+        kind, outs = ext
+        kx, ky = self.kinds[x].index(kind), self.kinds[y].index(P[y])
+        if kx != ky or kind[0] != "s":
+            return kx > ky or kx == ky
+        o = outs.get(y)
+        t = self._space_type(*self._space(x, kind))
+        if o == "lt" and t in ("order", "lists"):
+            return False
+        if o != "eq" and t in ("part", "lists") and any(
+                outs.get(z) == "eq" for z in earlier if z in P):
+            return False
+        return True
+
+    # --- the elimination -----------------------------------------------------------
+
+    def _order(self, leaf_keys: list) -> list:
+        """An order of the keys that keeps the frontier small (greedy)."""
+        done: list = []
+        left = list(self.keys)
+        while left:
+            def frontier(x: str) -> tuple:
+                added = set(done) | {x}
+                f = {k for ks in leaf_keys if not set(ks) <= added for k in ks if k in added}
+                return (len(f), self.index[x])
+            x = min(left, key=frontier)
+            done.append(x)
+            left.remove(x)
+        return done
+
+    def run(self, limit: int) -> list | None:
+        """The vectors with a valuation each, or None beyond `limit` states.
+        Patterns of lists do not always combine (F.12: lists of a pattern
+        of the frontier and of the forgotten quantities may have no lists
+        that realise both, as for 0 < 1 < 2, 0 < 3 not comparable with 1
+        and 2, and a new list below 2 and not comparable with 0 and 1):
+        when a kept pattern cannot be extended, the elimination is run
+        again keeping every added list of a group in the states as long as
+        the group has quantities to add."""
+        self.kept_lists = False
+        self.exceeded = None
+        try:
+            try:
+                return self._run(limit, False)
+            except _NoAmalgam:
+                self.kept_lists = True
+                return self._run(limit, True)
+        except _TooMany:
+            self.exceeded = "points"
+            return None
+
+    def _run(self, limit: int, keep_lists: bool) -> list | None:
+        env = self.env
+        self.leaves, self.leaf_pairs, self._leaf_ids, self.memo = [], [], {}, {}
+        self.cad_cache: dict = {}
+        res: list = []
+        for i in self.ids:
+            p = env.preds[i]
+            ev = p.owner._evaluator({})
+            res.append(self._skeleton(p.owner, p.expr, {}, ev))
+        const = {lid: self.leaves[lid][0]._scoped_value(self.leaves[lid][1], self.leaves[lid][2], {})
+                 for lid in range(len(self.leaves)) if not self.leaves[lid][3]}
+        res = tuple(self._simp(r, const) for r in res)
+        order = self._order([lv[3] for lv in self.leaves])
+        # members that every predicate treats alike: in the order of the
+        # elimination, each one after the previous one of its set
+        prev: dict = {}
+        earlier: dict = {}
+        self.symmetric = self._symmetric_sets()
+        for keys in self.symmetric:
+            seq = [k for k in order if k in keys]
+            for a, b in zip(seq, seq[1:]):
+                prev[b] = a
+            for i, b in enumerate(seq):
+                earlier[b] = seq[:i]
+        # a state: (remainders, frontier keys, frontier pattern) -> (remainders,
+        # kinds, outcomes, kept pattern of all added quantities)
+        states: dict = {(res, (), ((), ())): (res, {}, {}, ({}, {}))}
+        cache: dict = {}
+        self.peak = 1
+        for step, x in enumerate(order):
+            added = set(order[:step + 1])
+            new: dict = {}
+            cache.clear()
+            for (_r, names, front_key), (res, P, R, H) in states.items():
+                _generation_time()
+                pending = set().union(*(self._pending(r, set()) for r in res))
+                ready = [lid for lid in pending if x in self.leaves[lid][3]
+                         and set(self.leaves[lid][3]) <= added]
+                nums = {k for k in P if P[k] == ("n",)}
+                ck = (names, front_key)
+                exts = cache.get(ck)
+                if exts is None:
+                    exts = cache[ck] = [
+                        e for e in self._extensions(P, R, x)
+                        if self._canonical(P, x, e, prev.get(x), earlier.get(x, ()))]
+                for kind, outs in exts:
+                    P2, R2 = self._extend(P, R, x, kind, outs)
+                    num = nums | ({x} if kind == ("n",) else set())
+                    vals = {lid: self._leaf_value(lid, P2, R2) for lid in ready
+                            if not num.intersection(self.leaves[lid][3])}
+                    res2 = tuple(self._simp(r, vals) for r in res)
+                    pend2 = set().union(*(self._pending(r, set()) for r in res2))
+                    front = {k for lid in pend2 for k in self.leaves[lid][3] if k in added}
+                    if keep_lists:
+                        front |= {k for k in P2 if P2[k] == ("s", "list")
+                                  and not set(self.groups[self.group[k]]["keys"]) <= added}
+                    canon = (res2, tuple(sorted(front, key=self.index.get)),
+                             self._canon(P2, R2, front))
+                    if canon in new:
+                        continue
+                    H2 = self._amalgamate(H, x, kind, outs)
+                    if H2 is None:
+                        if keep_lists:
+                            raise NormsCheckError(
+                                f"internal: no lists realise a pattern of "
+                                f"{', '.join(sorted(added))}")
+                        raise _NoAmalgam()
+                    new[canon] = (res2,) + self._restrict(P2, R2, front) + (H2,)
+                    if len(new) > limit:
+                        self.exceeded = "states"
+                        return None
+            states = new
+            self.peak = max(self.peak, len(states))
+        out: dict = {}
+        self.points = 0
+        for res, P, R, H in states.values():
+            for vec, point in self._numbers(res, P, R, limit):
+                if vec in out:
+                    continue
+                vals = self._realise(H[0], H[1], self.keys)
+                if vals is None:
+                    raise NormsCheckError("internal: a pattern of the component has no values")
+                for k in self.keys:
+                    if k not in vals:
+                        vals[k] = point.get(k, 0)    # a number that no leaf reads
+                self._verify(vec, vals, out)
+        self.states = len(states)
+        return list(out.items())
+
+    def _numbers(self, res: tuple, P: dict, R: dict, limit: int) -> list:
+        """The vectors of a final state, with the numbers of the arrangement:
+        the leaves that read numbers, at one decimal point of every face of
+        the arrangement of their linear forms."""
+        if all(isinstance(r, str) for r in res):
+            return [(res, {})]
+        pending = sorted(set().union(*(self._pending(r, set()) for r in res)))
+        variables = sorted((k for k in P if P[k] == ("n",)), key=self.index.get)
+        fixed = self._realise(P, R, [k for k in P if P[k] != ("n",)])
+        forms: list = []
+        for lid in pending:
+            tr, e, scope, _keys = self.leaves[lid]
+            tr.lin_cond(e, {v: (g, [i]) for v, (g, i) in scope.items()}, fixed, forms)
+        norm = {f for f in (_lnorm(f) for f in forms) if f is not None}
+        key = (frozenset(norm), tuple(variables))
+        points = self.cad_cache.get(key)
+        if points is None:
+            budget = [limit - self.points]
+            try:
+                cells = _cad(norm, variables, budget)
+            except _TooMany:
+                cells = None
+            if cells is None:
+                raise _TooMany()
+            ordered = sorted(norm)
+            by_face: dict = {}
+            for c in cells:
+                by_face.setdefault(tuple(_sign(_leval(f, c)) for f in ordered), c)
+            points = []
+            for c in by_face.values():
+                q = _decimal_in_face(ordered, c, variables)
+                if q is not None:
+                    points.append({k: _num(v) for k, v in q.items()})
+            self.cad_cache[key] = points
+        self.points += max(1, len(points))
+        if self.points > limit:
+            raise _TooMany()
+        out = []
+        for pt in points:
+            vals = {**fixed, **pt}
+            leaf = {lid: self.leaves[lid][0]._scoped_value(self.leaves[lid][1],
+                                                          self.leaves[lid][2], vals)
+                    for lid in pending}
+            got = tuple(self._simp(r, leaf) for r in res)
+            if not all(isinstance(r, str) for r in got):
+                raise NormsCheckError("internal: a leaf with numbers is left at the end")
+            out.append((got, pt))
+        return out
+
+    def _verify(self, vec: tuple, vals: dict, out: dict) -> None:
+        """Keep the valuation of a vector after checking it with the
+        evaluator of norms-eval."""
+        got = tuple(self.env._value(i, vals) for i in self.ids)
+        if got != vec:
+            raise NormsCheckError(
+                f"internal: the elimination gives {vec} for the valuation {vals}, the "
+                f"evaluator {got}")
+        out[vec] = vals
 
 
 # === Regions of a linear arrangement (F.12) ================================
