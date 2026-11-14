@@ -1374,7 +1374,7 @@ uint8 constant T_ERROR = 4;
 struct Pat { string name; uint8 ik; string idx; bool hasRange; int256 lo; int256 hi; }
 struct Term { uint8 kind; string text; uint256 root; Pat sender; Pat receiver; string msgName; bool hasArgs; uint256[] args; }
 struct NormDef {
-    string id; uint8 kind; bool frozen; int256 trigger; int256 until; int256 content;
+    string id; uint8 kind; int256 trigger; int256 until; int256 content;
     bool hasDeadline; int256 deadline; bool target; bool hasBearer; Pat bearer;
     string severity; bool hasSanction; string sanction; int256 reparation;
     bool hasReparationId; string reparationId; bool hasTransition; string transition;
@@ -1480,7 +1480,7 @@ library CadlNormsActs {
         powers(m, n, t, msgs, created);
         for (uint256 i = 0; i < m.normDefs.length; i++) {
             NormDef storage d = m.normDefs[i];
-            if (d.frozen || d.trigger < 0 || !occurs(m, uint256(d.trigger), n, msgs, created)) continue;
+            if (d.trigger < 0 || !occurs(m, uint256(d.trigger), n, msgs, created)) continue;
             if (m.recs[i].state == INACTIVE) setSt(m, i, ACTIVE, n, t);
         }
     }
@@ -1551,7 +1551,7 @@ library CadlNormsActs {
         bytes32 h = keccak256(bytes(name));
         for (uint256 p = 0; p < m.normDefs.length; p++) {
             NormDef storage d = m.normDefs[p];
-            if (d.kind == POWER && !d.frozen && m.terms[uint256(d.content)].kind == T_EVENT
+            if (d.kind == POWER && m.terms[uint256(d.content)].kind == T_EVENT
                 && keccak256(bytes(m.terms[uint256(d.content)].text)) == h) return true;
         }
         return false;
@@ -1569,7 +1569,7 @@ library CadlNormsActs {
         uint256 firstMsgAct = c;
         for (uint256 p = 0; p < m.normDefs.length; p++) {
             NormDef storage d = m.normDefs[p];
-            if (d.kind != POWER || d.frozen || m.terms[uint256(d.content)].kind != T_MESSAGE) continue;
+            if (d.kind != POWER || m.terms[uint256(d.content)].kind != T_MESSAGE) continue;
             for (uint256 k = 0; k < msgs.length; k++) {
                 if (!msgMatches(m, m.terms[uint256(d.content)], msgs[k], n)) continue;
                 Act memory act = Act(m.terms[uint256(d.content)].text, msgs[k].from,
@@ -1594,7 +1594,7 @@ library CadlNormsActs {
         bytes32 h = keccak256(bytes(act.content));
         for (uint256 p = 0; p < m.normDefs.length; p++) {
             NormDef storage d = m.normDefs[p];
-            if (d.kind != POWER || d.frozen || !active[p]) continue;
+            if (d.kind != POWER || !active[p]) continue;
             if (keccak256(bytes(m.terms[uint256(d.content)].text)) != h) continue;
             if (!isBearer(m, p, act.performer)) continue;
             any = true;
@@ -1610,7 +1610,6 @@ library CadlNormsActs {
     function applyEffects(Monitor storage m, uint256[] storage targets, uint8 from1, uint8 from2, uint8 to, uint256 n, int256 t) internal {
         for (uint256 k = 0; k < targets.length; k++) {
             uint256 x = targets[k];
-            if (m.normDefs[x].frozen) continue;
             uint8 s = m.recs[x].state;
             if (s == from1 || s == from2) setSt(m, x, to, n, t);
         }
@@ -1873,7 +1872,7 @@ abstract contract CadlNormsMonitorBase {
         for (uint256 i = 0; i < m.normDefs.length; i++) {
             NormDef storage d = m.normDefs[i];
             NormRec storage r = m.recs[i];
-            if (d.frozen || !d.hasDeadline || r.state != ACTIVE || (d.kind != OBLIGATION && d.kind != PROHIBITION)) continue;
+            if (!d.hasDeadline || r.state != ACTIVE || (d.kind != OBLIGATION && d.kind != PROHIBITION)) continue;
             int256 el = elapsed(m, i, m.lastT);
             if (el > d.deadline) continue;
             int256 at_ = m.lastT + d.deadline - el;
@@ -1889,7 +1888,7 @@ abstract contract CadlNormsMonitorBase {
         if (n == 0) {
             for (uint256 i = 0; i < m.normDefs.length; i++) {
                 NormDef storage d = m.normDefs[i];
-                if (!d.frozen && d.trigger < 0 && !d.target) setSt(m, i, ACTIVE, n, t);
+                if (d.trigger < 0 && !d.target) setSt(m, i, ACTIVE, n, t);
             }
         }
         bool was = m.failed;
@@ -1898,7 +1897,7 @@ abstract contract CadlNormsMonitorBase {
         Ev[] memory created = CadlNormsActs.acts(m, n, t, msgs);
         for (uint256 i = 0; i < m.normDefs.length; i++) {
             NormDef storage d = m.normDefs[i];
-            if (d.tmode == 0 || d.frozen) continue;
+            if (d.tmode == 0) continue;
             if (d.tmode == 1) CadlNormsWindows.note(m.windows[i], m.data, m.temporals[i], n, t);
             else CadlNormsMulti.note(m.multis[i], m.data, n, t);
         }
@@ -1920,7 +1919,7 @@ abstract contract CadlNormsMonitorBase {
         uint256 c = 0;
         for (uint256 i = 0; i < m.normDefs.length; i++) {
             NormDef storage d = m.normDefs[i];
-            if (d.frozen || n < m.recs[i].from) continue;
+            if (n < m.recs[i].from) continue;
             if (m.recs[i].state == ACTIVE && (d.kind == OBLIGATION || d.kind == PROHIBITION)
                 && judgeNorm(i, n, t, msgs, created)) buf[c++] = i;
             uint8 st = m.recs[i].state;
@@ -1979,7 +1978,7 @@ abstract contract CadlNormsMonitorBase {
         bool repActivated = false;
         if (activate && d.reparation >= 0) {
             uint256 rp = uint256(d.reparation);
-            if (!m.normDefs[rp].frozen && m.recs[rp].state == INACTIVE) repActivated = true;
+            if (m.recs[rp].state == INACTIVE) repActivated = true;
         }
         string memory transition = "";
         bool terminal = m.data.hasLifecycle && m.lcTerminal[keccak256(bytes(m.data.obsSt[n]))];
@@ -1999,7 +1998,7 @@ abstract contract CadlNormsMonitorBase {
         for (uint256 i = 0; i < m.normDefs.length; i++) {
             NormDef storage d = m.normDefs[i];
             NormRec storage r = m.recs[i];
-            if (d.frozen || r.state >= FULFILLED) continue;
+            if (r.state >= FULFILLED) continue;
             bool inForce = r.state == ACTIVE || r.state == SUSPENDED;
             if (inForce && r.act == int256(n)) { setSt(m, i, DISCHARGED, n, t); continue; }
             if (inForce && (d.kind == OBLIGATION || d.kind == PROHIBITION)
@@ -2075,10 +2074,10 @@ abstract contract CadlNormsMonitorBase {
         t.kind = kind; t.text = text; t.root = root; t.msgName = msgName; t.hasArgs = hasArgs;
     }
 
-    function _norm(string memory id, uint8 kind, bool frozen, int256 trigger, int256 until, int256 content,
+    function _norm(string memory id, uint8 kind, int256 trigger, int256 until, int256 content,
                    bool hasDeadline, int256 deadline, bool target) internal returns (NormDef storage d) {
         d = m.normDefs.push();
-        d.id = id; d.kind = kind; d.frozen = frozen; d.trigger = trigger; d.until = until; d.content = content;
+        d.id = id; d.kind = kind; d.trigger = trigger; d.until = until; d.content = content;
         d.hasDeadline = hasDeadline; d.deadline = deadline; d.target = target;
         d.reparation = -1;
         NormRec storage r = m.recs.push();

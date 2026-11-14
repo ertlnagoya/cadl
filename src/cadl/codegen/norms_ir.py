@@ -328,17 +328,16 @@ def build_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
         d = x.d
         where = f"norm '{d.id}'"
         entry: dict = {
-            "id": d.id, "kind": d.kind, "frozen": x.frozen,
+            "id": d.id, "kind": d.kind,
             "deadline": x.deadline,
             "target": d.id in eng.targets,
         }
         try:
-            if x.frozen is None:
-                entry["trigger"] = _term(x.trigger, f"{where}, trigger", exprs)
-                entry["until"] = _term(x.until, f"{where}, until", exprs)
-                entry["content"] = _term(x.content, f"{where}, content", exprs)
-            else:
-                entry["trigger"] = entry["until"] = entry["content"] = None
+            # the engine refuses a norm it could not judge (N-16), so every
+            # norm here has its terms
+            entry["trigger"] = _term(x.trigger, f"{where}, trigger", exprs)
+            entry["until"] = _term(x.until, f"{where}, until", exprs)
+            entry["content"] = _term(x.content, f"{where}, content", exprs)
             ref = x.bearer_ref
             if ref is None:
                 entry["bearer"] = None

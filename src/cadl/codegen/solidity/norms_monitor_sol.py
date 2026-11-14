@@ -55,8 +55,8 @@ SOLC_CHECKED = ("0.8.24", "0.8.37")
 # the constructor). Measured with the versions above, the optimizer with 1
 # and with 200 runs, plus 3 %; tests/test_norms_monitor_targets.py checks
 # them against solc.
-RUNTIME_ESTIMATE = {"monitor": 16840, "CadlNormsValues": 7810, "CadlNormsEval": 10410,
-                    "CadlNormsItems": 2370, "CadlNormsWindows": 5230, "CadlNormsActs": 12170,
+RUNTIME_ESTIMATE = {"monitor": 16670, "CadlNormsValues": 7810, "CadlNormsEval": 10410,
+                    "CadlNormsItems": 2370, "CadlNormsWindows": 5230, "CadlNormsActs": 12080,
                     "CadlNormsMulti": 7490}
 
 
@@ -218,7 +218,7 @@ def _content_roots(ir: dict) -> list[int]:
     out = []
     for nd in ir["norms"]:
         c = nd.get("content")
-        if (nd["frozen"] is None and c and c.get("kind") == "predicate" and not c.get("error")
+        if (c and c.get("kind") == "predicate" and not c.get("error")
                 and _temporal_nodes(ir["exprs"], c["expr"])):
             out.append(c["expr"])
     return out
@@ -259,14 +259,13 @@ def solidity_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
     refuses the contract."""
     ir = build_ir(sos, contract)
     contents = {nd["content"]["expr"] for nd in ir["norms"]
-                if nd["frozen"] is None and nd.get("content")
-                and nd["content"].get("kind") == "predicate" and not nd["content"].get("error")}
+                if nd.get("content") and nd["content"].get("kind") == "predicate" and not nd["content"].get("error")}
     ir = apply_limits(ir, lambda nodes, root: _problem(nodes, root, root in contents))
     reasons = []
     nodes = ir["exprs"]
     for nd in ir["norms"]:
         c = nd.get("content")
-        if not (nd["frozen"] is None and c and c.get("kind") == "predicate" and not c.get("error")):
+        if not (c and c.get("kind") == "predicate" and not c.get("error")):
             continue
         ops = sorted(_top_temporal(nodes, c["expr"]))
         if not ops:
@@ -439,17 +438,13 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
     norm_lines: list[str] = []
     for nd in ir["norms"]:
         trig, until, content = term(nd["trigger"]), term(nd["until"]), term(nd["content"])
-        if nd["frozen"] is not None:
-            content = -1
         deadline = nd["deadline"]
         norm_lines.append(
             f"        d = _norm({_s(nd['id'])}, {_KINDS[nd['kind']]}, "
-            f"{str(nd['frozen'] is not None).lower()}, {trig}, {until}, {content}, "
+            f"{trig}, {until}, {content}, "
             f"{str(deadline is not None).lower()}, "
             f"{scaled(deadline, 'deadline') if deadline is not None else 0}, "
             f"{str(nd['target']).lower()});")
-        if nd["frozen"] is not None:
-            continue
         norm_lines += _window_lines(ir, nd)
         if nd["bearer"] is not None:
             norm_lines.append("        d.hasBearer = true;")

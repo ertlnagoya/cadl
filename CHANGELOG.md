@@ -61,6 +61,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   deadlines `"0.5s"`, `"1.5s"` and `"2.5s"`, which were read as no
   deadline; they are now `500ms`, `1500ms` and `2500ms` (the numeric
   deadlines 2.5 and 0.5 were already valid).
+- The OPA and Solidity norms monitors no longer carry a `frozen` flag for
+  each norm (`NormDef.frozen` of the Solidity base contract, `frozen` of
+  the model of the Rego policy and of `build_ir`): the engine now refuses
+  a norm that it could not judge, so the flag was always false. The
+  runtime code of the Solidity contract is estimated at 16 670 bytes
+  (16 840 before) and that of `CadlNormsActs` at 12 080 (12 170).
 - `cadl a2a-gateway` installed its SIGTERM and SIGINT handlers after it
   had written the port file and started serving, and `cadl mcp-gateway`
   installed its SIGTERM handler after it had written the trace and
