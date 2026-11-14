@@ -2262,10 +2262,13 @@ class Environment:
         el = _Elimination(self, ids, keys, linear)
         got = el.run(MAX_VALUATIONS)
         if got is None:
+            what = (f"the leaves that read numbers of the linear arrangement needed more than "
+                    f"{MAX_VALUATIONS} points of its faces" if el.exceeded == "points" else
+                    f"more than {MAX_VALUATIONS} patterns of the quantities that the remaining "
+                    f"comparisons still read had to be kept at one step")
             raise NormsCheckError(
-                f"{why}; adding the quantities one at a time (F.12), more than "
-                f"{MAX_VALUATIONS} patterns of the quantities that the remaining comparisons "
-                f"still read had to be kept, and norms-check refuses more" + self._fewer(keys))
+                f"{why}; adding the quantities one at a time (F.12), {what}, and norms-check "
+                f"refuses more" + self._fewer(keys))
         return got
 
     def _linear_valuations(self, ids: list, keys: list) -> list:
@@ -3160,6 +3163,7 @@ class _Elimination:
         again keeping every added list of a group in the states as long as
         the group has quantities to add."""
         self.kept_lists = False
+        self.exceeded = None
         try:
             try:
                 return self._run(limit, False)
@@ -3167,6 +3171,7 @@ class _Elimination:
                 self.kept_lists = True
                 return self._run(limit, True)
         except _TooMany:
+            self.exceeded = "points"
             return None
 
     def _run(self, limit: int, keep_lists: bool) -> list | None:
@@ -3193,20 +3198,22 @@ class _Elimination:
                 prev[b] = a
             for i, b in enumerate(seq):
                 earlier[b] = seq[:i]
-        states: dict = {(res, ((), ())): (res, {}, {}, ({}, {}))}
+        # a state: (remainders, frontier keys, frontier pattern) -> (remainders,
+        # kinds, outcomes, kept pattern of all added quantities)
+        states: dict = {(res, (), ((), ())): (res, {}, {}, ({}, {}))}
         cache: dict = {}
         self.peak = 1
         for step, x in enumerate(order):
             added = set(order[:step + 1])
             new: dict = {}
             cache.clear()
-            for (_r, front_key), (res, P, R, H) in states.items():
+            for (_r, names, front_key), (res, P, R, H) in states.items():
                 _generation_time()
                 pending = set().union(*(self._pending(r, set()) for r in res))
                 ready = [lid for lid in pending if x in self.leaves[lid][3]
                          and set(self.leaves[lid][3]) <= added]
                 nums = {k for k in P if P[k] == ("n",)}
-                ck = (tuple(sorted(P)), front_key)
+                ck = (names, front_key)
                 exts = cache.get(ck)
                 if exts is None:
                     exts = cache[ck] = [
@@ -3223,7 +3230,8 @@ class _Elimination:
                     if keep_lists:
                         front |= {k for k in P2 if P2[k] == ("s", "list")
                                   and not set(self.groups[self.group[k]]["keys"]) <= added}
-                    canon = (res2, self._canon(P2, R2, front))
+                    canon = (res2, tuple(sorted(front, key=self.index.get)),
+                             self._canon(P2, R2, front))
                     if canon in new:
                         continue
                     H2 = self._amalgamate(H, x, kind, outs)
@@ -3235,6 +3243,7 @@ class _Elimination:
                         raise _NoAmalgam()
                     new[canon] = (res2,) + self._restrict(P2, R2, front) + (H2,)
                     if len(new) > limit:
+                        self.exceeded = "states"
                         return None
             states = new
             self.peak = max(self.peak, len(states))

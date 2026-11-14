@@ -13,7 +13,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   patterns), four or more ordered quantities whose classes differ (a
   domain, given by `--domain` or assumed), and four or more ordered
   quantities in a component with linear arithmetic, which 0.3.30
-  refused (F.12). The valuations were built only to find the vectors of
+  refused (F.12). Elimination is used when the valuations by types and
+  patterns of a component exceed 50,000; when a group of four or more
+  quantities ordered against each other cannot take them because its
+  quantities do not have the same classes (a quantity with a domain,
+  given or assumed, one that keeps only the classes its comparisons
+  tell apart, or different literals); and, in a component with linear
+  arithmetic, for four or more ordered quantities or when the classes
+  and the points of the faces exceed 50,000. The valuations were built only to find the vectors of
   predicate values, and each distinct vector is one choice (the 26,035
   valuations of four ordered quantities without other literals give 34
   vectors for a contract with four predicates), so these components now
@@ -29,13 +36,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   evaluated by the evaluator of `cadl norms-eval` on values of the
   classes, every state keeps one pattern of all its quantities, and
   every vector comes with a valuation that the evaluator confirms, so
-  every vector of the model is one of a trace and every vector of a
-  trace is found. Members of a set that every predicate uses only
-  through variables over the whole set, compared with each other only by
-  `==` and `!=`, are added in sorted order (every valuation is a
-  permutation of a sorted one). Patterns of lists do not always combine
-  (lists 0 < 1 < 2 with 3 above 0 only, and a new list below 2 and not
-  comparable with 0 and 1, have no common realisation): when a kept
+  every vector of the model is one of a trace. Every vector of a trace
+  is found because the value of a leaf is decided by the pattern of the
+  quantities it reads (comparisons of values of different types are
+  decided by the types, and arithmetic has a value only on numbers, see
+  Fixed) and the members of the domain of a quantifier do not depend on
+  the values. Members of a set are added in sorted order (every
+  valuation is a permutation of a sorted one) when the component reads
+  one field of the set, with the same kinds, classes and group for every
+  member, and every predicate uses the members only through variables
+  of quantifiers and aggregates over the whole set (`R` or `R[*]`),
+  compared with each other only by `==` and `!=`. Patterns of lists do
+  not always combine (lists p < q < r with s above p and not comparable
+  with q and r, and a new list x below r and not comparable with p and
+  q, have no common realisation): when a kept
   pattern cannot be extended, the elimination runs again keeping the
   added lists of a group until the group is complete. With linear
   arithmetic the leaves that read numbers are evaluated at the end, at
@@ -59,6 +73,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `_list_realise` accepts (1, 4, 29, 331), and, with
   `CADL_NORMS_CHECK_LONG=1`, five ordered quantities against all their
   valuations.
+
+### Fixed
+
+- Arithmetic (`+`, `-`, `*`, `/`) with an operand that is a list or an
+  object has no value (undefined), as with a text or a truth value; F.5
+  defines arithmetic on numbers only. `cadl norms-eval`, the generated
+  Python monitor and the agents runtime, which share its evaluator,
+  applied Python's operators: `[1] + [1] > [1]` was true and
+  `2 * [0] == [0, 0]` was true. `sum` and `avg` already gave no value
+  over elements that are not numbers. The design-time check relies on
+  this: a model built with the old evaluator could miss the vector of a
+  trace with list arithmetic. Tests: list and object operands in
+  `norms-eval`, and a component with `R[1].a + R[1].b == R[1].a` whose
+  vector for a = b = [0] the elimination, the valuations by types and
+  patterns and the classes all give.
 
 ## [0.3.30] — 2026-11-14
 

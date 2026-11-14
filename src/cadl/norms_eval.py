@@ -1341,7 +1341,10 @@ class _Evaluator:
                 return left > right
             if op == ">=":
                 return left >= right
-            if isinstance(left, (bool, str)) or isinstance(right, (bool, str)):
+            # arithmetic is defined on numbers only (F.5): a text, a truth
+            # value, a list or an object gives no value (Python would
+            # concatenate or repeat lists)
+            if not all(isinstance(v, _NUMBER) and not isinstance(v, bool) for v in (left, right)):
                 raise TypeError
             if op == "+":
                 return left + right

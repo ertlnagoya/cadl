@@ -855,6 +855,24 @@ class TestPredicates:
         """, [{"t": 0}, {"t": 1, "values": {"R[1].x": 5}}, {"t": 2}])
         assert states(r, "p")[-1] == (1, "violated") and r["warnings"] == []
 
+    @pytest.mark.parametrize("content, values", [
+        ("R[i].x + R[i].y > R[i].x", {"R[1].x": [1], "R[1].y": [1]}),
+        ("R[i].x * 2 == R[i].y", {"R[1].x": [0], "R[1].y": [0, 0]}),
+        ("R[i].x + R[i].y == R[i].x", {"R[1].x": [0], "R[1].y": []}),
+        ("R[i].x - 1 < 5", {"R[1].x": {"k": 1}}),
+        ("R[i].x / 2 < 5", {"R[1].x": [4]}),
+    ])
+    def test_arithmetic_on_lists_and_objects_has_no_value(self, content, values):
+        """Arithmetic is defined on numbers only (F.5): a list or an object
+        operand gives no value, as a text or a truth value does (Python
+        would concatenate or repeat lists)."""
+        r = run(f"""
+        norms:
+          - {{id: p, kind: prohibition, bearer: "R[i]", content: "{content}"}}
+        """, [{"t": 0, "values": values}, {"t": 1}])
+        assert norm(r, "p")["state"] != "violated"
+        assert any("cannot be applied" in w for w in r["warnings"]), r["warnings"]
+
     def test_function_call_is_not_evaluable(self):
         # In an item it is reported as not evaluated; in a norm it is an
         # error of `cadl check` (N-16) from 0.3.30 (up to 0.3.29 the norm

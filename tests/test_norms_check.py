@@ -2438,6 +2438,40 @@ def test_elimination_keeps_the_lists_when_a_pattern_cannot_be_extended(monkeypat
     assert got == want
 
 
+LIST_ARITH = ("R[1].a < R[1].b AND R[1].b < R[1].c AND R[1].c < R[1].d",
+              "R[1].a + R[1].b == R[1].a",
+              "R[1].a == R[1].b AND R[1].a < 0")
+
+
+@pytest.mark.parametrize("n", [3, 4])
+def test_arithmetic_on_lists_is_undefined_in_the_model(n, monkeypatch):
+    """A leaf's value depends only on the pattern of its quantities (F.12)
+    because arithmetic on a list has no value: with a = b = [0], c = 1 and
+    d = 2 the vector (F, U, U) is a choice, and the elimination finds the
+    vectors of the valuations by types and patterns (and, for three
+    quantities, of the classes)."""
+    import cadl.norms_check as nc
+    preds = list(LIST_ARITH)
+    if n == 3:
+        preds[0] = "R[1].a < R[1].b AND R[1].b < R[1].c"
+    body = "norms:\n" + "".join(
+        f"  - id: p{i}\n    kind: prohibition\n    bearer: D\n    content: \"{c}\"\n"
+        for i, c in enumerate(preds))
+    m = build_model(make_sos(body))
+    tr = m.trs[0]
+    (ids, vecs), = tr.components
+    got = {v for v, _vals in vecs}
+    vals = {"R[1].a": [0], "R[1].b": [0], "R[1].c": 1, "R[1].d": 2}
+    assert tuple(tr._oracle([tr.preds[i].expr for i in ids], vals)) == ("F", "U", "U")
+    assert ("F", "U", "U") in got
+    tr2, env = _env_of(m)
+    keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+    assert {v for v, _ in nc._Elimination(env, ids, keys).run(10 ** 6)} == got
+    monkeypatch.setattr(nc, "MAX_VALUATIONS", 2 * 10 ** 6)
+    old = build_model(make_sos(body)).trs[0].components[0][1]
+    assert {v for v, _vals in old} == got
+
+
 def test_four_ordered_quantities_with_a_domain():
     """Four ordered quantities, two of them with a domain assumed from a
     product (F.12): translated by elimination; integers of the domain and
