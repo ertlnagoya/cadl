@@ -176,6 +176,27 @@ class TestNeighbourhood:
         enc = [f for f in fit_check(data, "RULE").findings if f.condition == "encoding"]
         assert enc and "quantifier" in enc[0].message
 
+    def test_independent_conflicts_are_all_reported(self):
+        data = _sos(["A"], [
+            {"id": "RULE", "parties": ["A"], "assume": ["p == true"], "guarantee": ["q == true"]},
+            {"id": "D1", "parties": ["A"], "guarantee": ["p == false"]},
+            {"id": "D2", "parties": ["A"], "guarantee": ["q == false"]},
+            {"id": "D3", "parties": ["A"], "guarantee": ["r == true"]},
+        ])
+        r = fit_check(data, "RULE")
+        f3 = [(f.kind, f.contracts) for f in r.findings if f.condition == "F3"]
+        assert f3 == [("vacuous", ["D1"]), ("guarantee", ["D2"])]
+
+    def test_assumptions_not_established_are_named(self):
+        data = _sos(["A"], [
+            {"id": "RULE", "parties": ["A"], "assume": ["x >= 1", "y >= 1"], "guarantee": ["z >= 0"]},
+            {"id": "D", "parties": ["A"], "guarantee": ["x >= 5"]},
+        ])
+        r = fit_check(data, "RULE")
+        assert r.verdict == "fits"
+        info = [f.message for f in r.findings if f.condition == "info"]
+        assert any("do not establish" in m and "y >= 1" in m and "x >= 1" not in m for m in info)
+
     def test_no_neighbour(self):
         data = _sos(["A", "B"], [
             {"id": "RULE", "parties": ["A"], "guarantee": ["x <= 1"]},

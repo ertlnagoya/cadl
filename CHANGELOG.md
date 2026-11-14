@@ -31,6 +31,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   of destination contracts that can be in force together with it, so
   contracts for different operating modes, in the rule or in the
   destination, are an exclusion, not a guarantee conflict.
+  Independent conflicts are all reported in one run (the contracts of
+  each conflict are set aside and the rest checked again). When the rule
+  fits, the assumptions that no destination guarantee implies are named,
+  since consistent is not established.
   `--map` renames attribute names as well as actors. Exit code 0 (fits),
   1 (misfit), 2 (unknown).
 

@@ -182,20 +182,23 @@ class _Part:
     variables: Set[str]
     skipped: List[str]
     quantified: List[str]
+    terms: List[Tuple[str, Any]] = field(default_factory=list)
 
 
 def _translate(preds: List[Any], ctx: Z3Context) -> _Part:
-    parts, skipped, quantified = [], [], []
+    parts, skipped, quantified, terms = [], [], [], []
     for p in preds:
         try:
-            parts.append(_to_z3_bool(p, ctx))
+            z = _to_z3_bool(p, ctx)
         except Exception:
             skipped.append(_source(p))
             continue
+        parts.append(z)
+        terms.append((_source(p), z))
         if _has_quantifier(p):
             quantified.append(_source(p))
     f = z3.And(parts) if parts else z3.BoolVal(True)
-    return _Part(f, _variables(f), skipped, quantified)
+    return _Part(f, _variables(f), skipped, quantified, terms)
 
 
 def _source(expr: Any) -> str:
@@ -417,20 +420,47 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
         if _check(GN, z3.Not(Ac.formula)) == "unsat":
             report.findings.append(Finding("info", "info",
                 "The destination's guarantees establish the rule's assumptions"))
+        else:
+            # Consistent is not established: name the assumptions that no
+            # destination guarantee implies, which the transplant must bring
+            # along or the destination must add.
+            open_ = [t for t, z in Ac.terms if _check(GN, z3.Not(z)) == "sat"]
+            if open_:
+                report.findings.append(Finding("info", "info",
+                    "Assumptions the destination's guarantees do not establish "
+                    "(supply them with the rule or in the destination): " + "; ".join(open_)))
         _partial(report, abstracted)
         return report
 
-    S = failing
-    AS = z3.And(conj(S, 0)) if S else z3.BoolVal(True)
-    GS = z3.And(conj(S, 1)) if S else z3.BoolVal(True)
+    # Report every independent conflict in one run: classify, set the
+    # contracts of the conflict aside, and check the rest again.
+    S = list(failing)
+    while True:
+        _report_conflict(report, contract_id, Ac, Gc, S, parts)
+        involved = report.findings[-1].contracts
+        rest = [d for d in S if d not in involved]
+        if not involved or not rest or _check(Ac.formula, Gc.formula, *conj(rest, 0), *conj(rest, 1)) != "unsat":
+            break
+        S = rest
+    if excluded:
+        report.findings.append(Finding("info", "info",
+            "Set aside as exclusions (assumptions exclude the rule's): " + ", ".join(excluded)))
+    return report
+
+
+def _report_conflict(report, contract_id, Ac, Gc, S, parts) -> None:
+    """Classify the conflict of the rule with the set ``S`` (Definition 1)
+    and name the contracts of a minimal unsat core."""
+    AS = z3.And([parts[d][0].formula for d in S]) if S else z3.BoolVal(True)
+    GS = z3.And([parts[d][1].formula for d in S]) if S else z3.BoolVal(True)
     tracked = {f"{contract_id}.assume": Ac.formula, f"{contract_id}.guarantee": Gc.formula}
     for d in S:
         tracked[f"{d}.assume"] = parts[d][0].formula
         tracked[f"{d}.guarantee"] = parts[d][1].formula
     core = _core(tracked) or []
     involved = sorted({n.split(".")[0] for n in core} - {contract_id})
-    # Classified against the failing set (Definition 1); the core only
-    # names the contracts to report.
+    # Classified against the set (Definition 1); the core only names the
+    # contracts to report.
     if _check(Ac.formula, GS) == "unsat":
         kind = "vacuous"
         msg = ("The destination's guarantees exclude the rule's assumption: the rule "
@@ -448,10 +478,6 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
     if len(involved) > 1:
         msg += f" (only jointly: {', '.join(involved)})"
     report.findings.append(Finding("F3", "failed", msg, kind=kind, contracts=involved))
-    if excluded:
-        report.findings.append(Finding("info", "info",
-            "Set aside as exclusions (assumptions exclude the rule's): " + ", ".join(excluded)))
-    return report
 
 
 def format_text(report: FitReport) -> str:
