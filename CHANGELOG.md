@@ -96,18 +96,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     bounded by interval arithmetic and Bernstein coefficients, and the
     box with the largest bound is bisected (at the zero of the
     derivative when it is affine in that parameter), until the bound is
-    attained at a corner or 32 boxes have been bounded. Only the
+    attained at a corner or after 16 bisections. Only the
     enclosure is refined, not the cell. The relaxation, the
     well-definedness of a cell, the step payoffs and the lifted
     coordinates use it; a probability a + b · R gets a + b times the
-    range of R, so that the lifted corners stay within the relaxation.
+    range of R, so that the lifted corners stay within the relaxation
+    (except where a lifted polynomial is 1 minus the others; such a
+    corner is not used, as before).
   - Before the coupled bounds, PD+ and PD− are tried again with the
     advantages bounded through the Bellman equations of the profile
     (`unrolled_advantage`, I.9): the values of the successors are
     replaced by their equations (at most 16 times, 64 monomials, degree
-    6), so that A(v) = C(v) + Σ Q_x(v) · V(x, v) with polynomials C and
+    6), so that A(v) = K(v) + Σ Q_x(v) · V(x, v) with polynomials K and
     Q_x and only the values left bounded by l_p and u_p; in an acyclic
-    game the bound is the range of a polynomial.
+    game whose expansion fits these limits the bound is the range of a
+    polynomial (searched with 4 bisections per end).
   On the same partitions the undecided area in which the claim does not
   change falls from 6.72 to 0.67 (in units of a region; what remains
   is in four fuzz games with lifted functions whose coupled bounds stay
@@ -133,7 +136,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   cells; 145 cells of the maps above and of 80 fuzz games, 509 verdicts
   and 42 128 state values, no difference).
   `games_eval.TIGHT_RANGES = False` and `games_eval.UNROLL_ADVANTAGES =
-  False` give the maps of 0.3.30.
+  False` together give the maps of 0.3.30.
 - `tests/games_fuzz.py` compares the bounds of `advantage_bounds` and of
   the Bellman expansion directly with the advantages of the oracle, and
   has two new deliberate soundness bugs (`range_corners_only`: the range

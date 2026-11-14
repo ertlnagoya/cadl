@@ -976,7 +976,7 @@ def mutation(name: str | None):
     elif name == "range_corners_only":
         # The range of a polynomial that is not multi-affine from its values
         # at the corners of the cell, as if it were multi-affine.
-        def corners_only(poly, cell, boxes):
+        def corners_only(poly, cell, bisections):
             return max(ge._p_eval(poly, c) for c in itertools.product(*cell))
         ge._range_upper = corners_only
     elif name is not None:

@@ -1066,11 +1066,12 @@ def poly_bounds(poly: tuple, cell: tuple) -> tuple:
 
 # Whether a polynomial that is not multi-affine in the open parameters is
 # bounded on a cell by `poly_range` (False: by interval arithmetic on its
-# monomials, `_p_interval`, which gives the maps of cadl 0.3.30).
+# monomials, `_p_interval`, as in cadl 0.3.30; the maps of 0.3.30 need
+# UNROLL_ADVANTAGES False as well).
 TIGHT_RANGES = True
-# The largest number of boxes that `poly_range` bounds for each end of the
-# range of one polynomial on one cell.
-RANGE_BOXES = 32
+# The largest number of bisections of `poly_range` for each end of the
+# range of one polynomial on one cell (at most 1 + 2 · 16 = 33 boxes).
+RANGE_BISECTIONS = 16
 _RANGE_CACHE: dict = {}
 _RANGE_CACHE_LIMIT = 50_000
 
@@ -1096,9 +1097,9 @@ def _enclosure(poly: tuple, box: tuple) -> tuple:
     return a, b
 
 
-def _range_upper(poly: tuple, cell: tuple, boxes: int) -> Fraction:
+def _range_upper(poly: tuple, cell: tuple, bisections: int) -> Fraction:
     """An upper bound of a polynomial on a cell, equal to its largest value
-    there whenever the search below ends before RANGE_BOXES boxes.
+    there whenever the search below ends before `bisections` bisections.
 
     A box is first reduced along every variable on which the polynomial
     is monotone in the box (the enclosure of the partial derivative does
@@ -1110,12 +1111,13 @@ def _range_upper(poly: tuple, cell: tuple, boxes: int) -> Fraction:
     them so far (`best`) is a lower bound of the largest value; the upper
     end of the enclosure (`_enclosure`) of each reduced box is an upper
     bound on that box. The box with the largest upper bound is bisected
-    at the middle of its widest interval, until that bound is at most
-    `best` (then `best` is the largest value) or `boxes` boxes have
-    been bounded (the bisection is at the zero of the partial derivative
-    instead when `_stationary_point` gives one inside the interval) (then the largest upper bound of the boxes left is
-    returned). The boxes left always cover the cell, up to the faces that
-    replaced boxes, so the result is an upper bound."""
+    at the middle of its widest interval, or at the zero of the partial
+    derivative when `_stationary_point` gives one inside the interval.
+    The search ends when that bound is at most `best` (then `best` is the
+    largest value) or after `bisections` bisections (then the largest
+    upper bound of the boxes left is returned). The boxes left always
+    cover the cell, up to the faces that replaced boxes, so the result
+    is an upper bound."""
     n = len(cell)
     derivatives = [_derivative(poly, k) for k in range(n)]
 
@@ -1158,12 +1160,12 @@ def _range_upper(poly: tuple, cell: tuple, boxes: int) -> Fraction:
         heapq.heappush(heap, (-_enclosure(poly, box)[1], seq, box))
 
     push(cell)
-    bounded = 1
+    done = 0
     while True:
         upper = -heap[0][0]
         if upper <= best:
             return best
-        if bounded >= boxes:
+        if done >= bisections:
             return upper
         _, _, box = heapq.heappop(heap)
         k = max(range(n), key=lambda d: box[d][1] - box[d][0])
@@ -1175,7 +1177,7 @@ def _range_upper(poly: tuple, cell: tuple, boxes: int) -> Fraction:
             mid = (lo + hi) / 2
         for part in ((lo, mid), (mid, hi)):
             push(box[:k] + (part,) + box[k + 1:])
-        bounded += 2
+        done += 1
 
 
 def _stationary_point(derivative: tuple, box: tuple, k: int) -> Fraction | None:
@@ -1200,12 +1202,13 @@ def _stationary_point(derivative: tuple, box: tuple, k: int) -> Fraction | None:
     return -a / b if b else None
 
 
-def poly_range(poly: tuple, cell: tuple, boxes: int | None = None) -> tuple:
+def poly_range(poly: tuple, cell: tuple, bisections: int | None = None) -> tuple:
     """Exact bounds of a polynomial on a cell: its extreme values at the
     corners when it is multi-affine in the open parameters, and otherwise
     the bounds of `_range_upper` for the polynomial and its negation,
     which are its least and largest values on the cell unless the search
-    is cut off after `boxes` boxes (default RANGE_BOXES) for each end
+    is cut off after `bisections` bisections (default RANGE_BISECTIONS)
+    for each end
     (with TIGHT_RANGES False: `_p_interval`)."""
     if not poly:
         return ZERO, ZERO
@@ -1213,21 +1216,21 @@ def poly_range(poly: tuple, cell: tuple, boxes: int | None = None) -> tuple:
         return poly_bounds(poly, cell)
     if not TIGHT_RANGES:
         return _p_interval(poly, cell)
-    return range_end(poly, cell, 0, boxes), range_end(poly, cell, 1, boxes)
+    return range_end(poly, cell, 0, bisections), range_end(poly, cell, 1, bisections)
 
 
-def range_end(poly: tuple, cell: tuple, side: int, boxes: int | None = None) -> Fraction:
+def range_end(poly: tuple, cell: tuple, side: int, bisections: int | None = None) -> Fraction:
     """One end of `poly_range` for a polynomial that is not multi-affine:
     the lower (side 0) or upper (side 1) bound, by `_range_upper` for
     the negated polynomial or the polynomial itself."""
-    boxes = RANGE_BOXES if boxes is None else boxes
-    key = (poly, cell, side, boxes)
+    bisections = RANGE_BISECTIONS if bisections is None else bisections
+    key = (poly, cell, side, bisections)
     out = _RANGE_CACHE.get(key)
     if out is None:
         if side:
-            out = _range_upper(poly, cell, boxes)
+            out = _range_upper(poly, cell, bisections)
         else:
-            out = -_range_upper(tuple((e, -c) for e, c in poly), cell, boxes)
+            out = -_range_upper(tuple((e, -c) for e, c in poly), cell, bisections)
         if len(_RANGE_CACHE) >= _RANGE_CACHE_LIMIT:
             _RANGE_CACHE.clear()
         _RANGE_CACHE[key] = out
@@ -1239,7 +1242,10 @@ def prob_range(poly: tuple, cell: tuple) -> tuple:
     multi-affine is written a + b · R as in the lifting of I.9
     (`_lifted_form`), and its bounds are a + b times those of R
     (`poly_range`), so that its value at a corner of the lifted cell,
-    whose coordinate for R has the bounds of R, lies within them."""
+    whose coordinate for R has the bounds of R, lies within them. This
+    does not hold for a lifted polynomial that was replaced by 1 minus
+    the others (`lift_game`); a corner where it fails is not used
+    (`CornerTable.distribution`)."""
     if not poly or _multi_affine(poly) or not TIGHT_RANGES:
         return poly_range(poly, cell)
     a, b, r = _lifted_form(poly, len(cell))
@@ -1330,7 +1336,8 @@ def advantage_bounds(game: Game, proc: Process, cell: tuple, lower: list,
 
 # Whether PD+ and PD− are tried again with the bounds of the advantages
 # narrowed by the Bellman expansion (`unrolled_advantage`) before the
-# coupled bounds; False gives the maps of cadl 0.3.30.
+# coupled bounds; False, together with TIGHT_RANGES False, gives the
+# maps of cadl 0.3.30.
 UNROLL_ADVANTAGES = True
 # The largest number of values that `unrolled_advantage` replaces by their
 # Bellman equation, the largest number of monomials of a polynomial it
@@ -1338,8 +1345,8 @@ UNROLL_ADVANTAGES = True
 UNROLL_STEPS = 16
 UNROLL_TERMS = 64
 UNROLL_DEGREE = 6
-# The number of boxes of `poly_range` for the polynomial C + Σ_j m_j · Q_j.
-UNROLL_RANGE_BOXES = 8
+# The number of bisections of `poly_range` for the polynomial K + Σ_j m_j · Q_j.
+UNROLL_RANGE_BISECTIONS = 4
 
 
 def unrolled_advantage(game: Game, proc: Process, cell: tuple, i: int, k: int,
@@ -1356,17 +1363,21 @@ def unrolled_advantage(game: Game, proc: Process, cell: tuple, i: int, k: int,
     the value of a state j with l_p(j) < u_p(j) is replaced by its
     equation, in the order in which the states appear, at most
     UNROLL_STEPS times and while the polynomials have at most UNROLL_TERMS
-    monomials and degree at most UNROLL_DEGREE in each open parameter. Then A(v) = C(v) + Σ_j Q_j(v) · V_p(j, v) at every v of the
-    cell, with polynomials C and Q_j in the open parameters, and with m_j
-    the middle of [l_p(j), u_p(j)]
+    monomials and degree at most UNROLL_DEGREE in each open parameter.
+    Then A(v) = K(v) + Σ_j Q_j(v) · V_p(j, v) at every v of the cell,
+    with polynomials K and Q_j in the open parameters, and with m_j the
+    middle of [l_p(j), u_p(j)]
 
-        A(v) ∈ range(C + Σ_j m_j · Q_j) + Σ_j range(Q_j) · [l_p(j) − m_j, u_p(j) − m_j],
+        A(v) ∈ range(K + Σ_j m_j · Q_j) + Σ_j range(Q_j) · [l_p(j) − m_j, u_p(j) − m_j],
 
-    the first range bounded by `poly_bounds` (with UNROLL_RANGE_BOXES
-    boxes for `poly_range`), the others by `poly_bounds`
-    when Q_j is multi-affine and by one enclosure (`_enclosure`) otherwise. For an
-    acyclic game in which every expanded value is expanded to the end,
-    A is a single polynomial and the bounds are its range. None when a
+    the first range bounded by `poly_bounds` (with UNROLL_RANGE_BISECTIONS
+    bisections for `range_end`), the others by `poly_bounds` when Q_j is
+    multi-affine and by one enclosure (`_enclosure`) otherwise; with
+    TIGHT_RANGES False, by interval arithmetic (`_p_interval`) where the
+    polynomial is not multi-affine. For an acyclic game in which every
+    expanded value is expanded to the end within these limits, A is a
+    single polynomial and the bounds are its range, unless the search of
+    `range_end` is cut off. None when a
     successor with a probability that is not zero on the cell is not in
     R_C(p). With `sides` (0 lower, 1 upper), the search of `poly_range`
     is made only for these ends; the other end comes from one enclosure."""
@@ -1442,19 +1453,22 @@ def unrolled_advantage(game: Game, proc: Process, cell: tuple, i: int, k: int,
             total = _p_add(total, {e: c * m for e, c in q.items()})
         if lower[x] != upper[x]:
             q = _canonical(q)
-            q_range = poly_bounds(q, cell) if _multi_affine(q) else _enclosure(q, cell)
+            q_range = poly_bounds(q, cell) if _multi_affine(q) else \
+                _enclosure(q, cell) if TIGHT_RANGES else _p_interval(q, cell)
             a, b = _interval_product(q_range, (lower[x] - m, upper[x] - m))
             lo += a
             hi += b
     total = _canonical(total)
     if _multi_affine(total):
         a, b = poly_bounds(total, cell)
+    elif not TIGHT_RANGES:
+        a, b = _p_interval(total, cell)
     else:
         a, b = _enclosure(total, cell)
         if 0 in sides:
-            a = max(a, range_end(total, cell, 0, UNROLL_RANGE_BOXES))
+            a = max(a, range_end(total, cell, 0, UNROLL_RANGE_BISECTIONS))
         if 1 in sides:
-            b = min(b, range_end(total, cell, 1, UNROLL_RANGE_BOXES))
+            b = min(b, range_end(total, cell, 1, UNROLL_RANGE_BISECTIONS))
     return lo + a, hi + b
 
 

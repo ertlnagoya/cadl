@@ -97,7 +97,7 @@ class TestPolyRange:
         f = poly(p1q0=4, p2q0=-4, p1q1=1, p2q2=-3)
         cell = ((F(1, 7), F(6, 7)), (F(-1, 3), F(1, 2)))
         monkeypatch.setattr(ge, "_RANGE_CACHE", {})
-        lo, hi = poly_range(f, cell, boxes=1)
+        lo, hi = poly_range(f, cell, bisections=0)
         values = [_p_eval(f, x) for x in grid(cell, 12)]
         assert lo <= min(values) and max(values) <= hi
 
