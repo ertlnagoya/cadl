@@ -225,7 +225,7 @@ def generate_norms_monitor_rego(sos: SoSDefinition, contract: ContractDef) -> st
             args.append(f"msg_args[{j}] := [{vals}]")
     for i, nd in enumerate(model["norms"]):
         c = nd["content"]
-        if nd["frozen"] is None and model["terms"][c]["kind"] == "predicate":
+        if model["terms"][c]["kind"] == "predicate":
             root = model["terms"][c]["root"]
             content.append(f"content_vals[{i}] := {{k: c | some k in content_set({i}); "
                            f"c := content_of(truth(x{root}(pos(k))))}}")

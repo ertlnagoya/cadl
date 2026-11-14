@@ -509,7 +509,7 @@ class NormInfo:
     index: int
     id: str
     kind: str
-    status: str = "model"              # model | frozen | untranslated
+    status: str = "model"              # model | untranslated
     reason: str = ""
     trigger: Term | None = None
     until: Term | None = None
@@ -1004,13 +1004,13 @@ class Translator:
                 self.universe.append(name)
 
     def _static_engine(self) -> None:
-        """What `norms_eval` decides before reading a trace: the norms it
-        does not judge (frozen), the counts-as rules and contract items it
-        does not evaluate, and the targets of reparations and powers."""
+        """What `norms_eval` decides before reading a trace: the contract
+        items it does not evaluate and the targets of reparations and
+        powers. A norm or counts-as rule that it could not judge is refused
+        by the engine itself (N-16), so none is left inactive here."""
         obs = Observation(t=0.0, values={}, messages=[], state=None, state_after=None)
         engine = _Engine(self.contract, Trace(observations=[obs], bindings=self.bindings),
                          None, self.actors)
-        self.frozen = {n.d.id: n.frozen for n in engine.norms if n.frozen}
         self.rule_errors = []
         for _r, when, cond in engine.rules:
             self.rule_errors.append(bool(when.error or (cond is not None and cond.error)))
@@ -1573,8 +1573,8 @@ class Translator:
     @staticmethod
     def _check_temporal_position(expr: Any) -> None:
         """Refuse, with the exact reason, a temporal operator that is not the
-        whole predicate (norms-eval does not allow one in a trigger, an
-        until: or a counts-as rule, so those norms are not judged at all)."""
+        whole predicate (in a trigger, an until: or a counts-as rule one is
+        an error of `cadl check`, N-10, which norms-eval refuses too)."""
         from .norms import contains_temporal
         if isinstance(expr, FunctionCall) and expr.name in TEMPORAL_OPERATORS:
             if any(contains_temporal(a) for a in expr.args):
@@ -1632,9 +1632,6 @@ class Translator:
     def _norm(self, i: int, d: Any) -> NormInfo:
         n = NormInfo(index=i, id=d.id, kind=d.kind, content_text=(d.content or "").strip(),
                      on_amendment=d.on_amendment, transform_to=d.transform_to)
-        if d.id in self.frozen:
-            n.status, n.reason = "frozen", f"norms-eval does not judge it ({self.frozen[d.id]})"
-            return n
         n.deadline_ms = d.deadline_ms
         if d.on_violation and d.on_violation.reparation:
             n.reparation = d.on_violation.reparation
@@ -3200,7 +3197,7 @@ class NormsModel:
             return ir.FALSE
 
         # step 2: powers
-        powers = [n for n in tr.norms if n.kind == "power" and n.status != "frozen"]
+        powers = [n for n in tr.norms if n.kind == "power"]
         acts: list = []
         for name, performer in created:
             if any(p.content is not None and p.content.kind == "event"

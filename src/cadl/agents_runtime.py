@@ -1062,8 +1062,11 @@ class AgentsRuntime:
             term = _Term(d["until"], inst.engine.events, inst.engine.ev)
             _resolve_unknown(term, True)        # unknown: the derived instances end
             if term.error:
-                inst.engine.ev.warn(f"until of the delegation of '{nid}' is not evaluated: "
-                                    f"'{term.text}': {term.error}")
+                # an error of `cadl check` (N-16, G-12): never a delegation
+                # that does not end (fail-open)
+                raise NormsEvalError(f"until of the delegation of '{nid}' cannot be "
+                                     f"evaluated: '{term.text}': {term.error}; cadl check "
+                                     f"reports it as an error (N-16)")
             inst.until_terms[nid] = term
 
     def _load(self, name: str) -> SoSDefinition:

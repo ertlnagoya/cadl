@@ -801,14 +801,13 @@ N0 := [start_norm(S.norms[i], nd) | some i, nd in model.norms] if {
 } else := S.norms
 
 start_norm(rec, nd) := set_now(rec, "active") if {
-	nd.frozen == null
 	nd.trigger == null
 	not nd.target
 } else := rec
 
 # --- powers (step 2) -----------------------------------------------------------
 
-powers := [i | some i, nd in model.norms; nd.kind == "power"; nd.frozen == null]
+powers := [i | some i, nd in model.norms; nd.kind == "power"]
 
 event_power_texts := {model.terms[model.norms[i].content].text |
 	some i in powers
@@ -882,7 +881,6 @@ ops := [[target, kname] |
 	some h in holders(a)
 	some kname in _KINDS
 	some target in model.norms[h].effects[kname]
-	model.norms[target].frozen == null
 ]
 
 power_seq(i) := [o[1] | some o in ops; o[0] == i]
@@ -920,7 +918,6 @@ N1 := [power_apply(N0[i], power_seq(i)) | some i, _ in model.norms]
 N2 := [trigger_apply(N1[i], i, nd) | some i, nd in model.norms]
 
 trigger_apply(rec, i, nd) := set_now(rec, "active") if {
-	nd.frozen == null
 	nd.trigger != null
 	occurs(nd.trigger)
 	rec.state == "inactive"
@@ -977,7 +974,6 @@ judge_until(rec, nd) := set_now(rec, "discharged") if {
 } else := rec
 
 judge(rec, i, nd) := judge_until(judge_content(rec, i, nd), nd) if {
-	nd.frozen == null
 	n >= rec.from
 } else := rec
 
@@ -996,7 +992,6 @@ rep_act_true(vp) if {
 	v := viol[vp]
 	r := model.norms[v].reparation
 	r != null
-	model.norms[r].frozen == null
 	N3[r].state == "inactive"
 	not rep_earlier(vp, r)
 }
@@ -1053,8 +1048,6 @@ end_reason := "terminal" if {
 }
 
 settle(rec, nd, tt, k, fa) := rec if {
-	nd.frozen != null
-} else := rec if {
 	rec.state in _FINAL
 } else := setst(rec, "discharged", tt, k, fa) if {
 	rec.state in {"active", "suspended"}
@@ -1217,7 +1210,6 @@ next_deadline(st) := qf(first) if {
 	not st.ended
 	dues := [due(st.norms[i], nd, st.t) |
 		some i, nd in model.norms
-		nd.frozen == null
 		nd.deadline != null
 		nd.kind in {"obligation", "prohibition"}
 		st.norms[i].state == "active"
