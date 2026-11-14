@@ -28,6 +28,86 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   bodies are reported as warnings. Exit code 0 (fits), 1 (misfit), 2
   (unknown).
 
+## [0.3.30] — 2026-11-14
+
+### Fixed
+
+- A norm whose text could never be evaluated was silently left
+  `inactive` (frozen) instead of being reported. A fractional duration
+  such as `until(p, q, 2.5s)` or `within(2.5s, p)` is not a
+  `duration_lit` of A.1 (an integer followed by `ms`, `s`, `min` or `h`),
+  and a single-quoted string such as `'k'` is not a string of A.1, so
+  such a content did not parse; `cadl check` reported a text that is not
+  a predicate as a warning ("kept as text") when it had no temporal
+  operator, and `norms-eval`, the monitors and `norms-check` then never
+  judged the norm, with at most a warning. The same held for a function
+  other than the aggregates and the temporal operators, an aggregate
+  argument over two sets, a quantifier or comprehension over another
+  domain, `x.q` for a variable over a range of integers, a number outside
+  the exact range, a message event whose message is not a name or a
+  call, a quantifier, comprehension, wildcard, range or index variable
+  over a name that is not declared as a set (`for all r in Q: ...` with
+  `Q` undeclared, `count(r for r in X)` or `X[*].v` with `X` a single
+  actor, which were always undefined), and `+`, `-`, `*` or `/` on a
+  string or truth literal or a division by the literal 0, which never
+  have a value. These are now errors of `cadl check` under the new rule N-16 of
+  F.7, for the `trigger:`, `until:` and `content:` of a norm, the
+  `when:` and `if:` of a counts-as rule and the `until:` of a delegation,
+  with a hint for the usual mistakes (`2.5s`: "write 2.5s as 2500ms";
+  `'k'`: double quotes; `and`: capitals), never taken from the contents
+  of a string literal. Every duration field (the `deadline:` of a norm
+  and of a lifecycle transition, `on_denied.timeout`, `periodic(...)`)
+  gives the same advice; the one of `on_denied.timeout` said "a number
+  with a unit", which `2.5s` is. Other runtime type errors (a quantity
+  with a text value in arithmetic) stay undefined at the observation,
+  as F.5 says. Decimal durations are not
+  added to the language: A.1 has none, `deadline:` has always refused
+  them, and the textbook says so; a duration that is not a whole number
+  of milliseconds could not be written in the monitors either. The
+  engine (`cadl norms-eval`, the Python, OPA and Solidity monitors,
+  `norms-check`, `agents-run` and the gateways) also refuses such a norm
+  or rule with `NormsEvalError` when it is given a file that was not
+  checked, and so does a norm with an invalid `deadline:`, which it read
+  as a norm without deadline, and a malformed message event, which it
+  never matched. `cadl agents-run` and the gateways refuse a delegation
+  whose `until:` cannot be evaluated instead of warning and never ending
+  the delegated permission. `norms-check` no longer has a status
+  `frozen` for a norm. An aggregate over two sets in an
+  `assume:` or `guarantee:` item stays not evaluated, with the N-15
+  warning; N-15 no longer warns about it in a norm, where it is an error.
+  No bundled example and no example of the specification was affected.
+  Two test sets of `tests/test_norms_monitor_targets.py` had been frozen
+  this way: the norm `na` of RELEASE (`2.5s`, now `2500ms`) and the norm
+  `ci` of COMPARE (`IN (A.ok, false)`, a membership that E.3 writes with
+  brackets, now `IN [A.ok, false]`), and the id `no` of RELEASE, which a
+  YAML 1.1 loader reads as `false` (N-1), is now `nt`.
+  The random amendments of `tests/norms_amend_diff.py` drew the
+  deadlines `"0.5s"`, `"1.5s"` and `"2.5s"`, which were read as no
+  deadline; they are now `500ms`, `1500ms` and `2500ms` (the numeric
+  deadlines 2.5 and 0.5 were already valid).
+- The OPA and Solidity norms monitors no longer carry a `frozen` flag for
+  each norm (`NormDef.frozen` of the Solidity base contract, `frozen` of
+  the model of the Rego policy and of `build_ir`): the engine now refuses
+  a norm that it could not judge, so the flag was always false. The
+  runtime code of the Solidity contract is estimated at 16 670 bytes
+  (16 840 before) and that of `CadlNormsActs` at 12 080 (12 170).
+- `cadl a2a-gateway` installed its SIGTERM and SIGINT handlers after it
+  had written the port file and started serving, and `cadl mcp-gateway`
+  installed its SIGTERM handler after it had written the trace and
+  started the MCP server. A SIGTERM sent as soon as the gateway looked
+  ready killed it (status -15) instead of stopping it in order (status
+  0); this made `test_a2a_gateway.py::TestScenarios::test_authentication_failures`
+  fail now and then. Both gateways now install the handlers before they
+  publish anything (shared as `install_stop_handlers` and
+  `restore_handlers` in `cadl.gateway_core`); a stop requested while the
+  gateway is being built ends it before it writes a port file or starts
+  the MCP server. `serve()` restores the previous handlers when it
+  returns (a handler that Python did not install becomes the default,
+  `KeyboardInterrupt` for SIGINT), except under the command line, where
+  they stay installed so that a second SIGTERM while the process exits
+  is ignored instead of killing it. The other servers (`agents-run` and the gRPC front) install
+  no signal handlers.
+
 ## [0.3.29] — 2026-11-13
 
 ### Added

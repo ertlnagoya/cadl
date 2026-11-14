@@ -273,7 +273,10 @@ def _wildcard_notes(contract: ContractDef) -> list:
         notes: list = []
         desugar_wildcards(e, notes)
         place = where if pos is None else f"{where} {pos}"
-        out += [(place, text) for _, text in notes]
+        # An aggregate argument with two groups is an error (N-16) in the
+        # predicates of norms and counts_as rules; it is noted in the items.
+        out += [(place, text) for kind, text in notes
+                if not (kind == "aggregate" and pos is None)]
     return out
 
 
@@ -498,8 +501,7 @@ class TypeChecker:
             if tr.invalid_deadline is not None:
                 self.result.add_error(
                     f"The {where} has deadline '{tr.invalid_deadline}', which is "
-                    f"not a duration: write an integer followed by ms, s, min or h "
-                    f"(for example 5s)",
+                    f"not a duration: {self._how_to_write(tr.invalid_deadline)}",
                     tr.loc,
                 )
 
@@ -581,8 +583,9 @@ class TypeChecker:
                 self.result.add_error(
                     f"The {where} has sampling '{mon.sampling.invalid}', which is "
                     f"neither 'event' nor 'periodic(<duration>)' (for example "
-                    f"periodic(500ms)); the mapping form needs "
-                    f"{{kind: periodic, period_ms: <non-negative integer>}}",
+                    f"periodic(500ms)){self._deadline_hint(mon.sampling.invalid)}; the "
+                    f"mapping form needs {{kind: periodic, period_ms: <non-negative "
+                    f"integer>}}",
                     mon.loc,
                 )
 
@@ -672,25 +675,75 @@ class TypeChecker:
         """A predicate in which the temporal operators of F.4 may appear
         (the content of a norm). As in a rule, `x IN [a, b]` is allowed (F.3)."""
         from .norms import has_temporal_text, temporal_calls
+        from .norms_eval import syntax_hint
         from .parser import parse_rule
         try:
             expr = parse_rule(text)
         except Exception:
+            hint = syntax_hint(text)
+            hint = f" ({hint})" if hint else ""
             if has_temporal_text(text):
                 self.result.add_error(
                     f"{where} uses a temporal operator but is not a predicate "
-                    f"(Appendix A.10); write within(d, p), throughout(d, p) or "
-                    f"until(p, q, d) with a duration literal d (N-10): {text}",
+                    f"(Appendix A.10){hint}; write within(d, p), throughout(d, p) or "
+                    f"until(p, q, d) with a duration literal d (N-10, N-16): {text}",
                     loc,
                 )
             else:
-                self.result.add_warning(
-                    f"{where} is not a predicate (Appendix A.10) and is kept as "
-                    f"text: {text}", loc,
-                )
+                self._not_a_predicate(text, where, loc)
             return
+        before = len(self.result.errors)
         for call in temporal_calls(expr):
             self._check_temporal_call(call, where, loc)
+        if len(self.result.errors) == before:
+            self._check_evaluable(expr, text, where, loc, temporal=True)
+
+    def _declared_actors(self) -> dict | None:
+        from .norms_eval import declared_actors
+        sos = getattr(self, "_norms_sos", None)
+        return declared_actors(sos) if sos is not None else None
+
+    @staticmethod
+    def _how_to_write(text) -> str:
+        """The advice for a duration field that is not a duration: the same
+        for every field (deadlines, timeouts, periods)."""
+        from .norms_eval import duration_hint
+        return duration_hint(str(text)) or (
+            "write an integer followed by ms, s, min or h (for example 5s)")
+
+    @staticmethod
+    def _deadline_hint(text) -> str:
+        from .norms_eval import duration_hint
+        hint = duration_hint(str(text))
+        return f"; {hint}" if hint else ""
+
+    def _not_a_predicate(self, text: str, where: str, loc) -> None:
+        """N-16: a trigger, until, content, when or if that is neither a
+        message event nor an institutional event must be a predicate."""
+        from .norms_eval import syntax_hint
+        hint = syntax_hint(text)
+        hint = f" ({hint})" if hint else ""
+        self.result.add_error(
+            f"{where} is not a message event, an institutional event or a "
+            f"predicate of Appendix A.10{hint}, so the norm or rule could never "
+            f"be evaluated (N-16): {text}", loc,
+        )
+
+    def _check_evaluable(self, expr, text: str, where: str, loc, temporal: bool) -> None:
+        """N-16: a predicate of a norm, a counts_as rule or a delegation
+        uses only what F.4 and F.5 give a meaning: no other function, a
+        quantifier or comprehension over a set or a range, an aggregate
+        argument that refers to one set, numbers in the exact range."""
+        from .norms_eval import _Evaluator, desugar_wildcards
+        try:
+            reason = _Evaluator.unsupported(desugar_wildcards(expr), temporal, None,
+                                            self._declared_actors())
+        except Exception as e:     # pragma: no cover - an error of the checker
+            reason = f"{type(e).__name__}: {e}"
+        if reason:
+            self.result.add_error(
+                f"{where} cannot be evaluated: {reason} (N-16): {text}", loc,
+            )
 
     def _check_no_temporal(self, text, where: str, loc, as_rule: bool = True) -> None:
         """N-10: no temporal operator outside the places F.4 allows (the
@@ -784,10 +837,13 @@ class TypeChecker:
         if isinstance(expr, StringLiteral):
             # Not a predicate of A.10: kept as an opaque item.
             if has_temporal_text(expr.value):
+                from .norms_eval import syntax_hint
+                hint = syntax_hint(expr.value)
                 self.result.add_error(
                     f"{where} uses a temporal operator but is not a predicate "
-                    f"(Appendix A.10); write within(d, p), throughout(d, p) or "
-                    f"until(p, q, d) with a duration literal d (N-10): {expr.value}",
+                    f"(Appendix A.10){f' ({hint})' if hint else ''}; write within(d, p), "
+                    f"throughout(d, p) or until(p, q, d) with a duration literal d "
+                    f"(N-10): {expr.value}",
                     loc,
                 )
             return
@@ -818,13 +874,30 @@ class TypeChecker:
                     f"The {role} '{actor_ref_to_source(ref)}' of the message event "
                     f"in {where} is not a declared actor (N-9)", loc,
                 )
+        from .ast_nodes import FunctionCall
+        from .norms_eval import _Evaluator, syntax_hint
+        message = m.group(3).strip()
         try:
-            parse_expr(m.group(3).strip())
+            msg = parse_expr(message)
         except Exception:
-            self.result.add_warning(
-                f"{where} names a message that is not a function call or "
-                f"an identifier: {m.group(3).strip()}", loc,
+            msg = None
+        if not isinstance(msg, (FunctionCall, ActorRef)) or (
+                isinstance(msg, ActorRef) and msg.index is not None):
+            hint = syntax_hint(message)
+            self.result.add_error(
+                f"{where} names a message that is not a name or a call "
+                f"name(args) (E.3){f' ({hint})' if hint else ''}, so it never "
+                f"occurs (N-16): {message}", loc,
             )
+        else:
+            for arg in getattr(msg, "args", None) or []:
+                reason = _Evaluator.unsupported(arg, False, None, self._declared_actors())
+                if reason:
+                    self.result.add_error(
+                        f"An argument of the message of {where} cannot be "
+                        f"evaluated: {reason} (N-16): {message}", loc,
+                    )
+                    break
         return actor_ref_to_source(sender)
 
     def _check_norm_term(
@@ -855,16 +928,18 @@ class TypeChecker:
 
     def _check_predicate_text(self, text: str, where: str, loc) -> None:
         """A predicate of a norm event or a counts_as rule: no temporal
-        operator (N-10); text that is not a predicate is kept as text."""
+        operator (N-10), and a predicate that can be evaluated (N-16)."""
         from .parser import parse_rule
+        before = len(self.result.errors)
         self._check_no_temporal(text, where, loc)
         try:
-            parse_rule(text)
+            expr = parse_rule(text)
         except Exception:
-            self.result.add_warning(
-                f"{where} is not a predicate (Appendix A.10) and is kept as "
-                f"text: {text}", loc,
-            )
+            if len(self.result.errors) == before:
+                self._not_a_predicate(text, where, loc)
+            return
+        if len(self.result.errors) == before:
+            self._check_evaluable(expr, text, where, loc, temporal=False)
 
     def _check_norms(self, contract: ContractDef, ctx: str) -> None:
         from .norms import NORM_KINDS
@@ -967,8 +1042,8 @@ class TypeChecker:
             if norm.invalid_deadline is not None:
                 self.result.add_error(
                     f"The {where} has deadline '{norm.invalid_deadline}', which is "
-                    f"not a duration: write an integer followed by ms, s, min or h "
-                    f"(for example 5s) (N-4)", norm.loc,
+                    f"not a duration: {self._how_to_write(norm.invalid_deadline)} (N-4)",
+                    norm.loc,
                 )
             if kind in ("permission", "power"):
                 if norm.deadline_ms is not None or norm.invalid_deadline is not None:
@@ -1461,8 +1536,8 @@ class TypeChecker:
             if od.invalid_timeout is not None:
                 self.result.add_error(
                     f"on_denied.timeout of the {where} is '{od.invalid_timeout}', "
-                    f"which is not a duration: write a number with a unit ms, s, "
-                    f"min or h (for example 10min) (G-7)", norm.loc,
+                    f"which is not a duration: {self._how_to_write(od.invalid_timeout)} "
+                    f"(G-7)", norm.loc,
                 )
             elif od.timeout_ms == 0:
                 self.result.add_error(

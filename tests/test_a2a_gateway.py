@@ -45,6 +45,34 @@ from .a2a_fake_agent import FakeAgent
 ROOT = Path(__file__).parent.parent
 CADL = Path(__file__).parent / "data" / "a2a_delegated_work.cadl"
 BOOT = "import sys; from cadl.cli import main; sys.exit(main(sys.argv[1:]))"
+# The gateway sends itself SIGTERM at the moment it writes the port file,
+# as a test that stops it as soon as the file appears may do.
+BOOT_TERM_AT_PORT_FILE = """
+import os, signal, sys
+import cadl.a2a_gateway as g
+class _Os:
+    def __getattr__(self, name):
+        return getattr(os, name)
+    def replace(self, src, dst):
+        os.replace(src, dst)
+        if os.path.basename(str(dst)) == "port":
+            os.kill(os.getpid(), signal.SIGTERM)
+g.os = _Os()
+from cadl.cli import main
+sys.exit(main(sys.argv[1:]))
+"""
+# ... and while it builds the gateway, before anything is announced.
+BOOT_TERM_IN_INIT = """
+import os, signal, sys
+import cadl.a2a_gateway as g
+_init = g.A2AGateway.__init__
+def _term_init(self, *args, **kwargs):
+    os.kill(os.getpid(), signal.SIGTERM)
+    _init(self, *args, **kwargs)
+g.A2AGateway.__init__ = _term_init
+from cadl.cli import main
+sys.exit(main(sys.argv[1:]))
+"""
 KEY = b"a2a-gateway-test-key-0123456789"
 CLIENT_KEYS = {"PLANNER": b"planner-client-key-0123456789",
                "OPERATOR": b"operator-client-key-0123456789"}
@@ -175,7 +203,7 @@ class Run:
     """A gateway subprocess in front of a fake agent, and a fake client."""
 
     def __init__(self, tmp_path, cadl=CADL, key: bool = False, upstream: str | None = None,
-                 extra=(), name="gw"):
+                 extra=(), name="gw", boot=BOOT, wait=True):
         self.dir = tmp_path / name
         self.dir.mkdir()
         self.cadl = cadl
@@ -197,8 +225,10 @@ class Run:
             self.key = self.dir / "key"
             self.key.write_bytes(KEY)
             args += ["--audit-key", str(self.key)]
-        self.proc = subprocess.Popen([sys.executable, "-c", BOOT, *args],
+        self.proc = subprocess.Popen([sys.executable, "-c", boot, *args],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not wait:
+            return
         # Wait for the published files, not only for the trace.
         wait_for(lambda: self.port_file.exists() and self.port_file.read_text().strip(),
                  "the port file")
@@ -260,6 +290,33 @@ class Run:
 # === Scenarios through the subprocess ==========================================
 
 class TestScenarios:
+
+    def test_sigterm_as_soon_as_the_port_file_appears(self, tmp_path):
+        """The handlers of SIGTERM and SIGINT are installed before the port
+        file is written: a SIGTERM at that moment stops the gateway in
+        order (status 0). Up to 0.3.29 it killed it (-15), which made the
+        tests that stop a gateway right after a few calls fail now and then."""
+        r = Run(tmp_path, boot=BOOT_TERM_AT_PORT_FILE, wait=False)
+        try:
+            code = r.proc.wait(timeout=60)
+            err = r.proc.stderr.read().decode()
+        finally:
+            r.agent.close()
+        assert code == 0, err
+        assert r.port_file.exists() and "listening on" in err
+
+    def test_sigterm_while_the_gateway_is_built(self, tmp_path):
+        """A SIGTERM while the gateway reads the file and publishes run.json
+        stops it in order (status 0) before it announces anything: no port
+        file and no "listening on"."""
+        r = Run(tmp_path, boot=BOOT_TERM_IN_INIT, wait=False)
+        try:
+            code = r.proc.wait(timeout=60)
+            err = r.proc.stderr.read().decode()
+        finally:
+            r.agent.close()
+        assert code == 0, err
+        assert not r.port_file.exists() and "listening on" not in err
 
     def test_allow_deny_and_own_tasks(self, tmp_path, capsys):
         r = Run(tmp_path, key=True)
@@ -1812,3 +1869,25 @@ class TestSixthReview:
         out = capsys.readouterr().out
         assert "\u202e" not in out and "\\u202ecod.exe" in out
         loc.stop_and_replay()
+
+
+def test_stop_handlers_are_restored():
+    """`restore_handlers` puts back what `install_stop_handlers` replaced; a
+    handler that Python did not install (None) becomes the default, which
+    is the KeyboardInterrupt of Python for SIGINT."""
+    from cadl.gateway_core import install_stop_handlers, restore_handlers
+    before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        stopped = []
+        previous = install_stop_handlers(lambda: stopped.append(1))
+        assert set(previous) == set(before)
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        assert stopped == [1]
+        restore_handlers(previous)
+        assert {s: signal.getsignal(s) for s in before} == before
+        restore_handlers({signal.SIGINT: None, signal.SIGTERM: None})
+        assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+    finally:
+        for s, h in before.items():
+            signal.signal(s, h)

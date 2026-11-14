@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 
 from cadl.norms_eval import (
-    UNKNOWN, _Evaluator, declared_actors, desugar_wildcards, evaluate, parse_trace,
+    UNKNOWN, NormsEvalError, _Evaluator, declared_actors, desugar_wildcards, evaluate,
+    parse_trace,
 )
 from cadl.parser import parse, parse_rule
 from cadl.type_checker import type_check
@@ -351,19 +352,22 @@ class TestNotEvaluable:
         ev = evaluator([{"t": 0}])
         assert ev.unsupported(desugar_wildcards(parse_rule(text)), False) is None
 
-    def test_norm_is_reported_not_evaluable(self):
+    def test_norm_is_refused(self):
         # an aggregate shorthand over two sets is what stays of the
         # wildcards (F.5): `R[*].x > 1` alone is evaluated, see
-        # test_norms_wildcards.py
+        # test_norms_wildcards.py. From 0.3.30 such a norm is an error of
+        # `cadl check` (N-16) and the engine refuses it; up to 0.3.29 it
+        # stayed inactive with the verdict pending.
         content = "sum(R[*].x * S[*].x) > 1"
-        sos = make_sos('norms:\n  - {id: p, kind: prohibition, bearer: D, content: "%s"}\n'
-                       % content)
-        r = evaluate(sos, parse_trace([json.dumps({"t": 0}), json.dumps({"t": 1})]))
-        n = r["norms"][0]
-        assert n["verdict"] == "pending"
-        assert n["reason"] == (f"not evaluable: content '{content}': the argument of sum() "
-                               f"refers to R[*] and S[*]; an aggregate ranges over one set "
-                               f"or range")
+        sos = parse(ACTORS + '      norms:\n        - {id: p, kind: prohibition, bearer: D, '
+                    'content: "%s"}\n' % content)
+        with pytest.raises(NormsEvalError) as e:
+            evaluate(sos, parse_trace([json.dumps({"t": 0}), json.dumps({"t": 1})]))
+        assert str(e.value) == (
+            f"norm 'p' cannot be judged (not evaluable: content '{content}': the argument "
+            f"of sum() refers to R[*] and S[*]; an aggregate ranges over one set or "
+            f"range); cadl check reports it as an error (N-16)")
+        assert any("(N-16)" in str(x) for x in type_check(sos).errors)
 
 
 # === Soundness of the open domain ==============================================

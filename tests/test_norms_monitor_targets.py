@@ -964,16 +964,16 @@ RELEASE = """\
         - {id: nu, kind: prohibition, bearer: A, trigger: "B -> A : start",
            content: "NOT until(A.ok == true, A.done == true, 3s)", deadline: 6s,
            on_violation: {severity: Major, reparation: rp}}
-        - {id: no, kind: obligation, bearer: A, trigger: "B -> A : go",
+        - {id: nt, kind: obligation, bearer: A, trigger: "B -> A : go",
            content: "NOT until(A.ok == true, A.done == true, 2s) OR A.z == 1", deadline: 5s}
         - {id: na, kind: obligation, bearer: A,
-           content: "NOT (until(A.ok == true, A.done == true, 2.5s) OR A.z == 1)", deadline: 7s}
+           content: "NOT (until(A.ok == true, A.done == true, 2500ms) OR A.z == 1)", deadline: 7s}
         - {id: rp, kind: obligation, bearer: A, content: "NOT until(A.ok == true, A.y == 0, 1s)",
            deadline: 3s}
         - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
-           effects: {suspend: [nu, no, na, rp]}}
+           effects: {suspend: [nu, nt, na, rp]}}
         - {id: re, kind: power, bearer: B, content: "B -> A : resume",
-           effects: {resume: [nu, no, na, rp]}}
+           effects: {resume: [nu, nt, na, rp]}}
 """
 
 COMPARE = """\
@@ -985,7 +985,7 @@ COMPARE = """\
         - {id: cl, kind: obligation, bearer: A, trigger: "B -> A : start",
            content: "until(A.ok == true, A.done == true, 3s) <= A.y", deadline: 6s}
         - {id: ci, kind: obligation, bearer: A, trigger: "B -> A : go",
-           content: "within(2s, A.x == 0) IN (A.ok, false)", deadline: 4s}
+           content: "within(2s, A.x == 0) IN [A.ok, false]", deadline: 4s}
         - {id: cr, kind: prohibition, bearer: A, content: "NOT until(A.ok == true, A.done == true, 2s) == A.ok",
            deadline: 4s}
         - {id: pa, kind: power, bearer: B, content: "B -> A : pause",

@@ -997,9 +997,16 @@ _PAYLOADS = [
 
 
 def _hostile_sos(payload: str):
-    """A file whose ids, events, predicates, message names and states carry
+    """A file whose ids, events, predicates, message arguments and states carry
     `payload`. It does not pass `cadl check`; `evaluate` and the generator
-    of the monitor accept it."""
+    of the monitor accept it. In the predicates of norms and counts-as
+    rules the payload stands in a string literal (without `"`, which a
+    string of A.1 cannot contain): from 0.3.30 a norm or rule whose text
+    is not a predicate is refused (N-16) instead of never being judged."""
+    lit = payload.replace('"', "")
+    # A message event is one line, and its message a name or a call
+    # (N-16): the payload is the string argument of a call.
+    arg = '("' + " ".join(lit.splitlines()) + '")'
     doc = {"sos": {
         "name": "Hostile",
         "extensions": [{"norms": 0.1}],
@@ -1012,19 +1019,20 @@ def _hostile_sos(payload: str):
                           "within(1s, " + payload + ")"],
             "lifecycle": {"states": ["S", payload], "initial": "S", "terminal": [payload]},
             "counts_as": [
-                {"when": "A -> B : " + payload, "creates": payload},
-                {"when": "A -> B : go", "creates": "going", "if": payload},
-                {"when": payload, "creates": "ev"},
+                {"when": "A -> B : m" + arg, "creates": payload},
+                {"when": "A -> B : go", "creates": "going", "if": f'A.name != "{lit}"'},
+                {"when": f'A.name == "{lit}"', "creates": "ev"},
             ],
             "norms": [
                 {"id": payload, "kind": "obligation", "bearer": "A",
-                 "trigger": "A -> B : m" + payload, "content": "B -> A : " + payload,
+                 "trigger": "A -> B : m" + arg, "content": "B -> A : r" + arg,
                  "deadline": "5s",
                  "on_violation": {"severity": "Major", "sanction": payload, "reparation": "r"}},
-                {"id": "r", "kind": "obligation", "bearer": payload, "content": payload,
-                 "until": payload, "deadline": "1s"},
+                {"id": "r", "kind": "obligation", "bearer": payload,
+                 "content": f'A.name == "{lit}"', "until": f'A.name == "{lit}"',
+                 "deadline": "1s"},
                 {"id": "p", "kind": "prohibition", "bearer": "A",
-                 "content": "A.name == \"" + payload + "\" OR A.x > 3"},
+                 "content": f'A.name == "{lit}" OR A.x > 3'},
                 {"id": "q", "kind": "obligation", "bearer": "A", "trigger": "A -> B : go",
                  "content": "B -> A : done", "deadline": "2s"},
             ],
@@ -1072,9 +1080,8 @@ class TestHostileStrings:
         expected = _norms_eval(sos, lines)
         assert "result" in expected, expected
         states = {n["id"]: n["state"] for n in expected["result"]["norms"]}
-        # q does not use the payload; p does, and is judged where the
-        # payload leaves its content a predicate
-        assert states["q"] == "violated" and states["p"] in ("violated", "inactive")
+        # q does not use the payload; p does, in a string literal
+        assert states["q"] == "violated" and states["p"] == "violated"
 
         _write_package(tmp_path, "hostile", source)
         script = _NO_CADL + """
@@ -1113,21 +1120,25 @@ print(json.dumps({"model": nm.MODEL, "result": result}))
                                        "message"])
     def test_each_norms_field_is_checked(self, where, tmp_path):
         bad = 'x" + __import__("os").system("true") + "'
+        # a predicate or a message keeps it in a string literal, with ' for "
+        # (N-16)
+        literal = '"' + bad.replace('"', "'") + '"'
+        quoted = "A.name == " + literal
         norm = {"id": "n", "kind": "obligation", "bearer": "A", "content": "A.ok == true",
                 "trigger": "A -> B : go", "on_violation": {"sanction": "s"}}
         rule = {"when": "A -> B : go", "creates": "going"}
         if where == "norm_id":
             norm["id"] = bad
         elif where == "content":
-            norm["content"] = "A.name == \"" + bad + "\""
+            norm["content"] = quoted
         elif where == "trigger":
-            norm["trigger"] = bad
+            norm["trigger"] = quoted
         elif where == "creates":
             rule["creates"] = bad
         elif where == "sanction":
             norm["on_violation"]["sanction"] = bad
         else:
-            rule["when"] = "A -> B : " + bad
+            rule["when"] = "A -> B : go(" + literal + ")"
         doc = {"sos": {"name": "H", "extensions": [{"norms": 0.1}],
                        "actors": [{"id": "A", "role": "a"}, {"id": "B", "role": "b"}],
                        "contracts": [{"id": "C", "parties": ["A", "B"], "norms": [norm],
@@ -1138,7 +1149,8 @@ print(json.dumps({"model": nm.MODEL, "result": result}))
         assert not (tmp_path / "out").exists()
         # and when it is embedded, it is data
         source = generate_norms_monitor_module(sos)
-        assert any(bad in text for text in _strings(build_model(sos)))
+        needle = {"content": quoted, "trigger": quoted, "message": literal}.get(where, bad)
+        assert any(needle in text for text in _strings(build_model(sos)))
         _write_package(tmp_path, "h", source)
         proc = _isolated(_NO_CADL + "from h.norms_monitor import NormsMonitor, MODEL\n"
                          "m = NormsMonitor(); m.observe({'t': 0}); m.end(); print('ok')",
@@ -1187,8 +1199,8 @@ class TestModelAsJson:
     @pytest.mark.parametrize("predicate", [
         " AND ".join(f"A.x > {i}" for i in range(250)),
         "(" * 120 + "A.x > 0" + ")" * 120,
-        "A.x < " + "9" * 400,
-    ], ids=["and250", "paren120", "int400"])
+        "A.x < " + "9" * 300,
+    ], ids=["and250", "paren120", "int300"])
     def test_large_predicates(self, predicate, tmp_path):
         """A deep or long predicate was written as a nested Python literal
         that Python could not compile, or only slowly."""
@@ -1223,12 +1235,14 @@ class TestModelAsJson:
           bearer: A
           content: "A.x < 1e999"
 """)
-        lines = _lines({"t": 0, "values": {"A.x": 5}})
-        expected = _norms_eval(sos, lines)
-        assert expected["result"]["norms"][0]["evaluable"] is False
-        (got,) = _batch(tmp_path, [{"source": generate_norms_monitor_module(sos),
-                                    "lines": lines}])
-        assert got == expected
+        # From 0.3.30 such a norm is an error of `cadl check` (N-16), and
+        # neither norms-eval nor the generator accepts it; up to 0.3.29 it
+        # was a norm that was never judged.
+        assert any("N-16" in str(e) for e in type_check(sos).errors)
+        with pytest.raises(NormsEvalError, match="cannot be judged"):
+            evaluate(sos, parse_trace(_lines({"t": 0})))
+        with pytest.raises(NormsMonitorError, match="cannot be judged"):
+            generate_norms_monitor_module(sos)
 
     @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
     def test_non_finite_number_in_the_model_is_a_generation_error(self, value, tmp_path):

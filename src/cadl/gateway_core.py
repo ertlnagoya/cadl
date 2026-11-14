@@ -85,6 +85,30 @@ class _Refused(ValueError):
         self.event, self.hold_id, self.message, self.reason = event, hold_id, message, reason
 
 
+def install_stop_handlers(stop) -> dict | None:
+    """Make SIGTERM and SIGINT call `stop()`. Returns the handlers they
+    replace, for `restore_handlers`; None outside the main thread, where
+    Python cannot install handlers. A gateway installs them before it
+    publishes anything (run.json, the trace, a port file), so that a
+    SIGTERM sent as soon as it looks ready stops it in order."""
+    import signal
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    return {sig: signal.signal(sig, lambda *_: stop())
+            for sig in (signal.SIGTERM, signal.SIGINT)}
+
+
+def restore_handlers(previous: dict | None) -> None:
+    """Put back the handlers that `install_stop_handlers` replaced. A
+    handler that Python did not install is reported as None; it is
+    replaced by the default (for SIGINT the KeyboardInterrupt of Python)."""
+    import signal
+    for sig, handler in (previous or {}).items():
+        if handler is None:
+            handler = signal.default_int_handler if sig == signal.SIGINT else signal.SIG_DFL
+        signal.signal(sig, handler)
+
+
 def log(prefix: str, text: str) -> None:
     try:
         sys.stderr.write(f"{prefix}: {text}\n")
