@@ -12,8 +12,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   compared with each other (at least 424,213 valuations by types and
   patterns), four or more ordered quantities whose classes differ (a
   domain, given by `--domain` or assumed), and four or more ordered
-  quantities in a component with linear arithmetic, which 0.3.30
-  refused (F.12). Elimination is used when the valuations by types and
+  quantities in a component with linear arithmetic (within the limit on
+  face points), which 0.3.30 refused (F.12). Elimination is used when the valuations by types and
   patterns of a component exceed 50,000; when a group of four or more
   quantities ordered against each other cannot take them because its
   quantities do not have the same classes (a quantity with a domain,
@@ -39,8 +39,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   every vector of the model is one of a trace. Every vector of a trace
   is found because the value of a leaf is decided by the pattern of the
   quantities it reads (comparisons of values of different types are
-  decided by the types, and arithmetic has a value only on numbers, see
-  Fixed) and the members of the domain of a quantifier do not depend on
+  decided by the types, except that an ordering compares true as 1 and
+  false as 0, which the classes include, and arithmetic has a value only
+  on numbers, see Fixed) and the members of the domain of a quantifier do not depend on
   the values. Members of a set are added in sorted order (every
   valuation is a permutation of a sorted one) when the component reads
   one field of the set, with the same kinds, classes and group for every
