@@ -55,6 +55,7 @@ from .stochastic_regions import (
     DEFAULT_MAX_CELLS,
     DEFAULT_MAX_DEPTH,
     ONE,
+    POLYTOPE_SUCCESSOR_LIMIT,
     ZERO,
     Row,
     _canonical,
@@ -63,6 +64,8 @@ from .stochastic_regions import (
     _p_add,
     _p_eval,
     _p_interval,
+    _p_mul,
+    _polytope_vertices,
     _row_actions,
     _Unknown,
     _volume,
@@ -952,7 +955,7 @@ def cell_distributions(game: Game, cell: tuple) -> Callable:
     design is not shown to be well-defined on the cell."""
     for index, polys in game.non_affine:
         for p in polys:
-            lo, hi = _p_interval(p, cell)
+            lo, hi = prob_range(p, cell)
             if lo < 0 or hi > 1:
                 raise _Unknown("not_well_defined")
     cache: dict = {}
@@ -962,7 +965,7 @@ def cell_distributions(game: Game, cell: tuple) -> Callable:
         key = id(c.row)
         if key not in cache:
             try:
-                values = _row_actions(game, c.row, cell)
+                values = row_actions(game, c.row, cell)
             except EvaluationError as e:
                 raise _Unknown("not_well_defined") from e
             if not values:
@@ -995,7 +998,7 @@ def reward_bounds(game: Game, proc: Process, cell: tuple) -> tuple:
                     values.append(_p_eval(poly, point))
                 cache[poly] = (min(values), max(values))
             else:
-                cache[poly] = _p_interval(poly, cell)
+                cache[poly] = poly_range(poly, cell)
         return cache[poly]
 
     return (lambda i, k: bounds(i, k)[0]), (lambda i, k: bounds(i, k)[1])
@@ -1058,7 +1061,210 @@ def poly_bounds(poly: tuple, cell: tuple) -> tuple:
                 point[d] = cell[d][side]
             values.append(_p_eval(poly, point))
         return min(values), max(values)
-    return _p_interval(poly, cell)
+    return poly_range(poly, cell)
+
+
+# Whether a polynomial that is not multi-affine in the open parameters is
+# bounded on a cell by `poly_range` (False: by interval arithmetic on its
+# monomials, `_p_interval`, which gives the maps of cadl 0.3.30).
+TIGHT_RANGES = True
+# The largest number of boxes that `poly_range` bounds for each end of the
+# range of one polynomial on one cell.
+RANGE_BOXES = 32
+_RANGE_CACHE: dict = {}
+_RANGE_CACHE_LIMIT = 50_000
+
+
+def _derivative(poly: tuple, k: int) -> tuple:
+    """The partial derivative of a polynomial with respect to variable k."""
+    out = {}
+    for e, c in poly:
+        if e[k]:
+            d = e[:k] + (e[k] - 1,) + e[k + 1:]
+            out[d] = out.get(d, ZERO) + c * e[k]
+    return _canonical({e: c for e, c in out.items() if c})
+
+
+def _enclosure(poly: tuple, box: tuple) -> tuple:
+    """An exact enclosure of a polynomial on a box: interval arithmetic on
+    its monomials, intersected with the Bernstein enclosure when it has
+    at most BERNSTEIN_LIMIT coefficients."""
+    a, b = _p_interval(poly, box)
+    if bernstein_size(poly, len(box)) <= BERNSTEIN_LIMIT:
+        c, d = bernstein_interval(poly, box)
+        a, b = max(a, c), min(b, d)
+    return a, b
+
+
+def _range_upper(poly: tuple, cell: tuple, boxes: int) -> Fraction:
+    """An upper bound of a polynomial on a cell, equal to its largest value
+    there whenever the search below ends before RANGE_BOXES boxes.
+
+    A box is first reduced along every variable on which the polynomial
+    is monotone in the box (the enclosure of the partial derivative does
+    not change sign; the derivative is the zero polynomial when the
+    variable does not occur): the largest value on the box is taken on
+    the face where that variable is at the end in the direction of
+    increase, so the box is replaced by that face. The values at the
+    corners of a reduced box are values on the cell, and the largest of
+    them so far (`best`) is a lower bound of the largest value; the upper
+    end of the enclosure (`_enclosure`) of each reduced box is an upper
+    bound on that box. The box with the largest upper bound is bisected
+    at the middle of its widest interval, until that bound is at most
+    `best` (then `best` is the largest value) or `boxes` boxes have
+    been bounded (the bisection is at the zero of the partial derivative
+    instead when `_stationary_point` gives one inside the interval) (then the largest upper bound of the boxes left is
+    returned). The boxes left always cover the cell, up to the faces that
+    replaced boxes, so the result is an upper bound."""
+    n = len(cell)
+    derivatives = [_derivative(poly, k) for k in range(n)]
+
+    def reduce(box: tuple) -> tuple:
+        box = list(box)
+        changed = True
+        while changed:
+            changed = False
+            for k in range(n):
+                lo, hi = box[k]
+                if lo == hi:
+                    continue
+                if not derivatives[k]:
+                    box[k] = (lo, lo)
+                    changed = True
+                    continue
+                a, b = _p_interval(derivatives[k], tuple(box))
+                if a < 0 < b:
+                    a, b = _enclosure(derivatives[k], tuple(box))
+                if a >= 0:
+                    box[k] = (hi, hi)
+                    changed = True
+                elif b <= 0:
+                    box[k] = (lo, lo)
+                    changed = True
+        return tuple(box)
+
+    best = None
+    heap: list = []
+    seq = 0
+
+    def push(box: tuple) -> None:
+        nonlocal best, seq
+        box = reduce(box)
+        for corner in itertools.product(*[sorted({lo, hi}) for lo, hi in box]):
+            v = _p_eval(poly, corner)
+            if best is None or v > best:
+                best = v
+        seq += 1
+        heapq.heappush(heap, (-_enclosure(poly, box)[1], seq, box))
+
+    push(cell)
+    bounded = 1
+    while True:
+        upper = -heap[0][0]
+        if upper <= best:
+            return best
+        if bounded >= boxes:
+            return upper
+        _, _, box = heapq.heappop(heap)
+        k = max(range(n), key=lambda d: box[d][1] - box[d][0])
+        lo, hi = box[k]
+        if lo == hi:                       # a point: its enclosure is its value
+            return upper
+        mid = _stationary_point(derivatives[k], box, k)
+        if mid is None or not lo < mid < hi:
+            mid = (lo + hi) / 2
+        for part in ((lo, mid), (mid, hi)):
+            push(box[:k] + (part,) + box[k + 1:])
+        bounded += 2
+
+
+def _stationary_point(derivative: tuple, box: tuple, k: int) -> Fraction | None:
+    """The zero of the partial derivative along variable k on the box when,
+    with the variables whose interval is a point set to their values,
+    it is affine in x_k alone and not constant; None otherwise. Bisecting
+    there gives two boxes on which the polynomial is monotone in x_k."""
+    a = b = ZERO
+    for e, c in derivative:
+        for d, x in enumerate(e):
+            if x and d != k:
+                lo, hi = box[d]
+                if lo != hi:
+                    return None
+                c *= lo ** x
+        if e[k] == 0:
+            a += c
+        elif e[k] == 1:
+            b += c
+        else:
+            return None
+    return -a / b if b else None
+
+
+def poly_range(poly: tuple, cell: tuple, boxes: int | None = None) -> tuple:
+    """Exact bounds of a polynomial on a cell: its extreme values at the
+    corners when it is multi-affine in the open parameters, and otherwise
+    the bounds of `_range_upper` for the polynomial and its negation,
+    which are its least and largest values on the cell unless the search
+    is cut off after `boxes` boxes (default RANGE_BOXES) for each end
+    (with TIGHT_RANGES False: `_p_interval`)."""
+    if not poly:
+        return ZERO, ZERO
+    if _multi_affine(poly):
+        return poly_bounds(poly, cell)
+    if not TIGHT_RANGES:
+        return _p_interval(poly, cell)
+    return range_end(poly, cell, 0, boxes), range_end(poly, cell, 1, boxes)
+
+
+def range_end(poly: tuple, cell: tuple, side: int, boxes: int | None = None) -> Fraction:
+    """One end of `poly_range` for a polynomial that is not multi-affine:
+    the lower (side 0) or upper (side 1) bound, by `_range_upper` for
+    the negated polynomial or the polynomial itself."""
+    boxes = RANGE_BOXES if boxes is None else boxes
+    key = (poly, cell, side, boxes)
+    out = _RANGE_CACHE.get(key)
+    if out is None:
+        if side:
+            out = _range_upper(poly, cell, boxes)
+        else:
+            out = -_range_upper(tuple((e, -c) for e, c in poly), cell, boxes)
+        if len(_RANGE_CACHE) >= _RANGE_CACHE_LIMIT:
+            _RANGE_CACHE.clear()
+        _RANGE_CACHE[key] = out
+    return out
+
+
+def prob_range(poly: tuple, cell: tuple) -> tuple:
+    """Exact bounds of a probability on a cell. One that is not
+    multi-affine is written a + b · R as in the lifting of I.9
+    (`_lifted_form`), and its bounds are a + b times those of R
+    (`poly_range`), so that its value at a corner of the lifted cell,
+    whose coordinate for R has the bounds of R, lies within them."""
+    if not poly or _multi_affine(poly) or not TIGHT_RANGES:
+        return poly_range(poly, cell)
+    a, b, r = _lifted_form(poly, len(cell))
+    lo, hi = poly_range(r, cell)
+    x, y = a + b * lo, a + b * hi
+    return min(x, y), max(x, y)
+
+
+def row_actions(game: Game, row: Row, cell: tuple) -> list:
+    """The distributions a command with this row may choose on the cell
+    (the relaxed process of I.9): those of `_row_actions` when the row is
+    multi-affine, and otherwise the vertices of the set of distributions
+    within the bounds of `prob_range`."""
+    if row.multi_affine or not TIGHT_RANGES:
+        return _row_actions(game, row, cell)
+    if len(row.polys) > POLYTOPE_SUCCESSOR_LIMIT:
+        raise _Unknown(
+            f"command {row.command} of design {game.design} has probabilities that are "
+            f"not multi-affine in the open parameters and more than "
+            f"{POLYTOPE_SUCCESSOR_LIMIT} successors")
+    intervals = []
+    for p in row.polys:
+        lo, hi = prob_range(p, cell)
+        intervals.append((max(lo, ZERO), min(hi, ONE)))
+    return _polytope_vertices(intervals)
 
 
 def _interval_product(a: tuple, b: tuple) -> tuple:
@@ -1120,6 +1326,136 @@ def advantage_bounds(game: Game, proc: Process, cell: tuple, lower: list,
                     hi += b
             out[(i, k)] = (lo, hi)
     return out
+
+
+# Whether PD+ and PD− are tried again with the bounds of the advantages
+# narrowed by the Bellman expansion (`unrolled_advantage`) before the
+# coupled bounds; False gives the maps of cadl 0.3.30.
+UNROLL_ADVANTAGES = True
+# The largest number of values that `unrolled_advantage` replaces by their
+# Bellman equation, the largest number of monomials of a polynomial it
+# keeps expanding, and the largest degree in one open parameter.
+UNROLL_STEPS = 16
+UNROLL_TERMS = 64
+UNROLL_DEGREE = 6
+# The number of boxes of `poly_range` for the polynomial C + Σ_j m_j · Q_j.
+UNROLL_RANGE_BOXES = 8
+
+
+def unrolled_advantage(game: Game, proc: Process, cell: tuple, i: int, k: int,
+                       lower: list, upper: list, sides: tuple = (0, 1)) -> tuple | None:
+    """Bounds of the advantage A_p(s, c, v) of I.9 on a cell that keep the
+    dependence of the values of the successors on v. At every valuation v
+    of the cell the profile is admissible (the relaxed process is proper)
+    and V_p(·, v) satisfies the Bellman equations of the profile:
+    V_p(j, v) = 0 where the target holds, and otherwise
+
+        V_p(j, v) = ρ_p(j, σ(j), v) + Σ_j′ P(j, σ(j), j′, v) · V_p(j′, v).
+
+    Starting from A = ρ_p(s, c) − ρ_p(s, σ(s)) + Σ_j (P(s, c, j) − P(s, σ(s), j)) · V_p(j),
+    the value of a state j with l_p(j) < u_p(j) is replaced by its
+    equation, in the order in which the states appear, at most
+    UNROLL_STEPS times and while the polynomials have at most UNROLL_TERMS
+    monomials and degree at most UNROLL_DEGREE in each open parameter. Then A(v) = C(v) + Σ_j Q_j(v) · V_p(j, v) at every v of the
+    cell, with polynomials C and Q_j in the open parameters, and with m_j
+    the middle of [l_p(j), u_p(j)]
+
+        A(v) ∈ range(C + Σ_j m_j · Q_j) + Σ_j range(Q_j) · [l_p(j) − m_j, u_p(j) − m_j],
+
+    the first range bounded by `poly_bounds` (with UNROLL_RANGE_BOXES
+    boxes for `poly_range`), the others by `poly_bounds`
+    when Q_j is multi-affine and by one enclosure (`_enclosure`) otherwise. For an
+    acyclic game in which every expanded value is expanded to the end,
+    A is a single polynomial and the bounds are its range. None when a
+    successor with a probability that is not zero on the cell is not in
+    R_C(p). With `sides` (0 lower, 1 upper), the search of `poly_range`
+    is made only for these ends; the other end comes from one enclosure."""
+    rho = game.rho(proc.player)
+    local = {g: x for x, g in enumerate(proc.states)}
+    zero_cell: dict = {}
+    # A polynomial that is not zero vanishes on a box only when an interval
+    # of the box is a point.
+    point = any(lo == hi for lo, hi in cell)
+
+    def vanishes(poly: tuple) -> bool:
+        if not point:
+            return False
+        if poly not in zero_cell:
+            zero_cell[poly] = poly_bounds(poly, cell) == (ZERO, ZERO)
+        return zero_cell[poly]
+
+    g = proc.states[i]
+    sel = proc.selected[i]
+    const = _p_add(dict(rho[g][k]), dict(rho[g][sel]), -1)
+    coeff: dict = {}                   # local state -> polynomial (dict)
+    queue: list = []
+
+    def add(poly: dict, command: Any, scale: int = 1) -> bool:
+        """coeff += scale · poly · P(command); False for a successor outside R_C(p)."""
+        for j, p in zip(command.targets, command.row.polys):
+            if not p or vanishes(p):
+                continue
+            if j not in local:
+                return False
+            x = local[j]
+            if proc.target[x]:
+                continue
+            term = _p_mul(poly, dict(p))
+            new = _p_add(coeff.get(x, {}), term, scale)
+            if new:
+                coeff[x] = new
+            else:
+                coeff.pop(x, None)
+            if lower[x] != upper[x] and x not in queue:
+                queue.append(x)
+        return True
+
+    one = {(0,) * len(cell): ONE}
+    if not add(one, game.commands[g][k]) or not add(one, game.commands[g][sel], -1):
+        return None
+    steps = 0
+    while queue and steps < UNROLL_STEPS:
+        x = queue.pop(0)
+        q = coeff.get(x)
+        if q is None:
+            continue
+        gx = proc.states[x]
+        sx = proc.selected[x]
+        if not game.commands[gx] or sx is None:
+            continue
+        cmd = game.commands[gx][sx]
+        if len(q) * max(len(p) for p in cmd.row.polys) > UNROLL_TERMS or \
+                any(max((e[d] for e in q), default=0)
+                    + max((e[d] for p in cmd.row.polys for e, _ in p), default=0)
+                    > UNROLL_DEGREE for d in range(len(cell))):
+            continue
+        del coeff[x]
+        const = _p_add(const, _p_mul(q, dict(rho[gx][sx])))
+        if not add(q, cmd):
+            return None
+        steps += 1
+    total = dict(const)
+    lo = hi = ZERO
+    for x, q in coeff.items():
+        m = (lower[x] + upper[x]) / 2
+        if m:
+            total = _p_add(total, {e: c * m for e, c in q.items()})
+        if lower[x] != upper[x]:
+            q = _canonical(q)
+            q_range = poly_bounds(q, cell) if _multi_affine(q) else _enclosure(q, cell)
+            a, b = _interval_product(q_range, (lower[x] - m, upper[x] - m))
+            lo += a
+            hi += b
+    total = _canonical(total)
+    if _multi_affine(total):
+        a, b = poly_bounds(total, cell)
+    else:
+        a, b = _enclosure(total, cell)
+        if 0 in sides:
+            a = max(a, range_end(total, cell, 0, UNROLL_RANGE_BOXES))
+        if 1 in sides:
+            b = min(b, range_end(total, cell, 1, UNROLL_RANGE_BOXES))
+    return lo + a, hi + b
 
 
 def cell_corners(cell: tuple) -> list:
@@ -1332,6 +1668,8 @@ def lifted_interval(poly: tuple, cell: tuple) -> tuple:
     the Bernstein coefficients, or the first alone when there would be
     more than BERNSTEIN_LIMIT coefficients. Both contain the values on
     the cell."""
+    if TIGHT_RANGES:
+        return poly_range(poly, cell)
     a, b = _p_interval(poly, cell)
     if not LIFT_BERNSTEIN or bernstein_size(poly, len(cell)) > BERNSTEIN_LIMIT:
         return a, b
@@ -1404,7 +1742,7 @@ class CornerTable:
         if key not in self._checked:
             out = []
             for p in row.polys:
-                lo, hi = _p_interval(p, self.cell)
+                lo, hi = prob_range(p, self.cell)
                 out.append((max(lo, ZERO), min(hi, ONE)))
             self._checked[key] = out
         return self._checked[key]
@@ -1711,7 +2049,7 @@ def positive_on_cell(poly: tuple, cell: tuple) -> bool:
             if _p_eval(poly, point) <= 0:
                 return False
         return True
-    return _p_interval(poly, cell)[0] > 0
+    return prob_range(poly, cell)[0] > 0
 
 
 def certified_reach(game: Game, profile: str, player: str, cell: tuple) -> set:
@@ -1751,7 +2089,9 @@ class PlayerOnCell:
     # (index of the game) and the lower bound of the gain from s.
     state: Any = None
     state_gain_lower: Fraction = ZERO
-    # Whether PD+ or PD− decided the player with the coupled bounds.
+    # Whether PD+ or PD− decided the player with the bounds of the
+    # Bellman expansion, or with the coupled bounds.
+    unrolled: bool = False
     coupled: bool = False
 
 
@@ -1818,43 +2158,64 @@ def player_on_cell(game: Game, profile: str, player: str, cell: tuple, dists: Ca
             return out
         if adv is not None and pd_minus(proc, out, adv, at, epsilon, every_state):
             return out
-    if adv is not None and coupling_applies(game) and \
-            (USE_COUPLING if use_coupling is None else use_coupling):
-        # PD+ and PD− again, with the bounds of the advantages narrowed by
+    coupling = adv is not None and coupling_applies(game) and \
+        (USE_COUPLING if use_coupling is None else use_coupling)
+    if adv is not None and (UNROLL_ADVANTAGES or coupling):
+        # PD+ and PD− again, with the bounds of the advantages narrowed,
+        # first by the Bellman expansion (`unrolled_advantage`), then by
         # the coupled relaxation (I.9): the upper bounds that are positive
         # for PD+, and the lower bounds of the commands of τ for PD−. The
         # bounds hold at the centre of the cell, so PD+ cannot hold when
         # the player gains more than ε there, and PD− cannot hold when it
         # does not; the condition that cannot hold is not tried.
-        plays = CoupledPlays(game, proc, table or CornerTable(game, cell))
         adv = dict(adv)
         gain_at_centre = at.state_gain if every_state else at.gain
+        unrolled: dict = {}
+
+        def unrolled_bound(key: tuple, maximize: bool) -> Fraction | None:
+            if key not in unrolled:
+                unrolled[key] = unrolled_advantage(game, proc, cell, *key, lower, upper,
+                                                   sides=(1 if maximize else 0,))
+            return None if unrolled[key] is None else unrolled[key][1 if maximize else 0]
+
         if not at.admissible or gain_at_centre <= epsilon:
-            narrowed = False
-            for key, (a, b) in adv.items():
-                if b > 0 and plays.may_narrow(*key, lower, upper):
-                    c = _coupled_bound(plays, key, True)
-                    if c is not None and c < b:
-                        adv[key] = (a, c)
-                        narrowed = True
-            if narrowed and pd_plus(proc, out, adv, epsilon, every_state):
-                out.coupled = True
-                return out
+            keys = [key for key, (a, b) in adv.items() if b > 0]
+            maximize = True
         elif at.deviation or every_state:
-            narrowed = False
             tau = at.best_response if every_state else at.deviation
             local = {g: i for i, g in enumerate(proc.states)}
-            for g, k in tau.items():
-                key = (local.get(g), k)
-                if key in adv and plays.may_narrow(*key, lower, upper):
-                    a, b = adv[key]
-                    c = _coupled_bound(plays, key, False)
-                    if c is not None and c > a:
-                        adv[key] = (c, b)
-                        narrowed = True
-            if narrowed and at.deviation and \
+            keys = [key for key in ((local.get(g), k) for g, k in tau.items()) if key in adv]
+            maximize = False
+        else:
+            keys = []
+        steps = []
+        if UNROLL_ADVANTAGES:
+            steps.append(("unrolled", unrolled_bound))
+        if coupling:
+            plays = CoupledPlays(game, proc, table or CornerTable(game, cell))
+            steps.append(("coupled", lambda key, maximize: _coupled_bound(plays, key, maximize)
+                          if plays.may_narrow(*key, lower, upper) else None))
+        for name, bound in steps if keys else []:
+            narrowed = False
+            for key in keys:
+                a, b = adv[key]
+                if maximize and b <= 0:
+                    continue
+                c = bound(key, maximize)
+                if c is None:
+                    continue
+                if maximize and c < b:
+                    adv[key] = (a, c)
+                    narrowed = True
+                elif not maximize and c > a:
+                    adv[key] = (c, b)
+                    narrowed = True
+            if not narrowed:
+                continue
+            if maximize and pd_plus(proc, out, adv, epsilon, every_state) or \
+                    not maximize and at.deviation and \
                     pd_minus(proc, out, adv, at, epsilon, every_state):
-                out.coupled = True
+                setattr(out, name, True)
                 return out
     if every_state and at.admissible and at.state_gain > epsilon:
         state_deviation(game, profile, proc, out, at, lo, upper, cell, epsilon, adv)

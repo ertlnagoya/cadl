@@ -75,6 +75,83 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `CADL_NORMS_CHECK_LONG=1`, five ordered quantities against all their
   valuations.
 
+- Equilibrium maps (`cadl game-check --certify`) leave fewer cells
+  `undecided`; every claim is still exact and certified (I.9).
+  Measured first by the reason of each undecided cell (uniform
+  partitions of the maps of the examples, of the three-parameter test
+  maps and of 45 fuzz games, the exact claim of each cell taken at its
+  corners, face centres, centre and 4 random points):
+  of the undecided area in which the claim does not change, 72 % was
+  `not_well_defined`, because the
+  enclosure of a probability that is not multi-affine by interval
+  arithmetic on its monomials goes above 1 or below 0 (4 · p · (1 − p),
+  (1 − p)² = 1 − 2p + p² near p = 0) however small the cell, and most of
+  the rest came from bounds of the advantages that take the value of a
+  successor between l_p and u_p although it depends on the valuation
+  together with the probabilities. Two changes:
+  - A polynomial that is not multi-affine in the open parameters (a
+    probability, a step payoff, a difference of them, a lifted
+    function) is bounded by its range on the cell (`poly_range`):
+    boxes are reduced along the parameters in which it is monotone,
+    bounded by interval arithmetic and Bernstein coefficients, and the
+    box with the largest bound is bisected (at the zero of the
+    derivative when it is affine in that parameter), until the bound is
+    attained at a corner or 32 boxes have been bounded. Only the
+    enclosure is refined, not the cell. The relaxation, the
+    well-definedness of a cell, the step payoffs and the lifted
+    coordinates use it; a probability a + b · R gets a + b times the
+    range of R, so that the lifted corners stay within the relaxation.
+  - Before the coupled bounds, PD+ and PD− are tried again with the
+    advantages bounded through the Bellman equations of the profile
+    (`unrolled_advantage`, I.9): the values of the successors are
+    replaced by their equations (at most 16 times, 64 monomials, degree
+    6), so that A(v) = C(v) + Σ Q_x(v) · V(x, v) with polynomials C and
+    Q_x and only the values left bounded by l_p and u_p; in an acyclic
+    game the bound is the range of a polynomial.
+  On the same partitions the undecided area in which the claim does not
+  change falls from 6.72 to 0.67 (in units of a region; what remains
+  is in four fuzz games with lifted functions whose coupled bounds stay
+  too wide), and the area of cells that contain a change of the claim,
+  which no sufficient condition can decide, from 2.96 to 2.90. With bisection (CPU time, before
+  and after measured together): the map `comply_by_lambda_and_failure`
+  of the robot example reaches the resolution with 125 cells analysed
+  instead of 567; the three-parameter maps of I.14 with 363 and 291
+  instead of 7 987 and 463 cells (first example, 6 s instead of 32 s)
+  and 4 059 instead of 13 853 (second example, 31 s instead of 84 s);
+  with (1 − p_fail)² the second example reaches the resolution 0.1
+  after 5 311 cells (61 s) instead of leaving 0.174 undecided after
+  39 999 (291 s), with 1 − 4 · p_fail · (1 − p_fail) after 11 103
+  (111 s) instead of 0.431 after 39 999 (284 s), with
+  1 − p_fail · q_local · (1 − q_local) after 349 cells (6 s) instead of
+  32 083 (199 s), and the first example with (1 − p_fail)² after 2 551
+  (33 s) instead of 0.231 after 39 999 (152 s). A cell costs more
+  (about twice on uniform partitions), but far fewer cells are needed.
+  No decided cell changes its claim: the decided cells of the maps
+  before and after were compared where they overlap, and the cells
+  decided only after were checked against the exact check and
+  PRISM-games 3.2.4 at their centres (465 overlapping pairs of decided
+  cells; 145 cells of the maps above and of 80 fuzz games, 509 verdicts
+  and 42 128 state values, no difference).
+  `games_eval.TIGHT_RANGES = False` and `games_eval.UNROLL_ADVANTAGES =
+  False` give the maps of 0.3.30.
+- `tests/games_fuzz.py` compares the bounds of `advantage_bounds` and of
+  the Bellman expansion directly with the advantages of the oracle, and
+  has two new deliberate soundness bugs (`range_corners_only`: the range
+  of a polynomial from its corners, `unroll_drop_remainder`: the
+  remaining values taken as exact), each detected by the direct
+  comparison and by wrong claims of maps. The mutants of the end points
+  and of N, E1, E2 run with interval arithmetic, as before, so that the
+  cells reach the mutated condition. With the final code, 1 800 games
+  (700 of the default kind and 700 of `--mode nonaffine`, 300 of each
+  asking for `every_reachable_state`, 200 with three or four players
+  and both concepts, 200 of `--mode endpoints`; 1 133 with a
+  probability that is not multi-affine): 1 297 `equilibrium` and 1 690 `not_equilibrium` cells,
+  59 875 exact point evaluations and 583 214 direct comparisons of
+  bounds of advantages (417 596 in games that are not multi-affine),
+  no wrong claim and no bound outside; 2 361 players were decided by
+  PD+ or PD− with the Bellman expansion, and no cell was
+  `not_well_defined`. New tests in `tests/test_games_ranges.py`.
+
 ### Fixed
 
 - Arithmetic (`+`, `-`, `*`, `/`) with an operand that is a list or an
@@ -89,6 +166,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `norms-eval`, and a component with `R[1].a + R[1].b == R[1].a` whose
   vector for a = b = [0] the elimination, the valuations by types and
   patterns and the classes all give.
+
 
 ## [0.3.30] — 2026-11-14
 
