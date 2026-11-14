@@ -29,9 +29,11 @@ into the response message of the RPC.
 
 from __future__ import annotations
 
+import inspect
 import itertools
 import json
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -76,6 +78,49 @@ def modules():
         raise GatewayError(f"--grpc-listen needs the gRPC extra ({EXTRA}): {e}") from None
     return grpc, a2a_pb2, json_format, empty_pb2, status_pb2, error_details_pb2, \
         unknown_fields
+
+
+_HOOK_LOCK = threading.Lock()
+_FRONTS: "weakref.WeakSet[Front]" = weakref.WeakSet()
+_HOOKED = False
+
+
+def hook_rejections(front: Front) -> bool:
+    """Let the calls that `grpcio` refuses itself, before a handler runs
+    (an unknown method: UNIMPLEMENTED; beyond `maximum_concurrent_rpcs`:
+    RESOURCE_EXHAUSTED), count as calls of their connection for the
+    deadline of `front`. `grpcio` has no public hook there, so its
+    internal `grpc._server._reject_rpc(rpc_event, rpc_state, status,
+    details)` is wrapped once per process; the wrapper only looks up the
+    peer of the call (as `context.peer()` does) and then refuses the call
+    as before. Returns whether the hook is in place: False when `grpcio`
+    does not have that function (the calls then do not count, as
+    before)."""
+    global _HOOKED
+    try:
+        from grpc import _common, _server
+    except ImportError:
+        return False
+    with _HOOK_LOCK:
+        if not _HOOKED:
+            original = getattr(_server, "_reject_rpc", None)
+            if original is None or list(inspect.signature(original).parameters) \
+                    != ["rpc_event", "rpc_state", "status", "details"]:
+                return False
+
+            def _reject_rpc(rpc_event, rpc_state, status, details):
+                try:
+                    peer = _common.decode(rpc_event.call.peer())
+                    for f in list(_FRONTS):
+                        f.client(peer)
+                except Exception:       # noqa: BLE001 - the call is refused anyway
+                    pass
+                return original(rpc_event, rpc_state, status, details)
+            _reject_rpc.cadl_original = original
+            _server._reject_rpc = _reject_rpc
+            _HOOKED = True
+        _FRONTS.add(front)
+    return True
 
 
 def _unknown(msg, unknown_fields) -> bool:
@@ -442,14 +487,21 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
           max_readers: int = 64, max_readers_per_address: int = 4,
           max_readers_per_prefix: int = 16, max_connections: int = 64,
           max_connections_per_address: int = 4, max_connections_per_prefix: int = 16,
-          unix: bool | None = None):
+          unix: bool | None = None, max_connection_age: float = 300.0,
+          max_connection_age_grace: float = 60.0, connection_wait: float = 10.0):
     """Start the gRPC service of `gw` on `listen`: (Listener, port). The
     connections are accepted by a front listener (`a2a_grpc_front`) under
     the caps `max_connections*` and the deadline `read_timeout` to the
     first call, and spliced to the gRPC server on a Unix socket (or on
     loopback), which does TLS. Its workers are enough for `max_readers`
     calls not yet authenticated next to `max_handlers` + 16 authenticated
-    ones, so that the former cannot take the places of the latter."""
+    ones, so that the former cannot take the places of the latter.
+
+    gRPC sends GOAWAY to a connection at `max_connection_age` seconds
+    (with a jitter of 10 %) and closes it `max_connection_age_grace`
+    seconds later at most; the front listener resets one that is still
+    open after that (`Front.lifetime`). A connection that finds every
+    place taken waits up to `connection_wait` seconds (0: none) for one."""
     grpc = modules()[0]
     binding = GrpcBinding(gw, mtls=client_ca is not None, read_timeout=read_timeout,
                           max_readers=max_readers,
@@ -460,10 +512,13 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
     try:
         front = Front(gw, listen, deadline=read_timeout, max_connections=max_connections,
                       max_per_address=max_connections_per_address,
-                      max_per_prefix=max_connections_per_prefix, unix=unix)
+                      max_per_prefix=max_connections_per_prefix, unix=unix,
+                      max_age=max_connection_age, age_grace=max_connection_age_grace,
+                      wait=connection_wait)
     except (OSError, ValueError) as e:
         raise GatewayError(f"--grpc-listen: cannot listen on {address}: {e}") from None
     binding.front = front
+    hook_rejections(front)
     workers = max_handlers + 16 + max_readers
     server = None
     try:
@@ -477,6 +532,11 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
                      ("grpc.http2.min_ping_interval_without_data_ms", 10_000),
                      ("grpc.http2.max_ping_strikes", 2),
                      ("grpc.max_connection_idle_ms", 120_000),
+                     # Every connection ends: GOAWAY at its age, then the
+                     # calls under way have the grace to end.
+                     ("grpc.max_connection_age_ms", int(max_connection_age * 1000)),
+                     ("grpc.max_connection_age_grace_ms",
+                      int(max_connection_age_grace * 1000)),
                      # A connection with a call open is pinged after 60 s
                      # without data; a peer that does not answer within
                      # 20 s (gone without closing) loses it. grpcio 1.85

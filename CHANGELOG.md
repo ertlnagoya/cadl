@@ -6,6 +6,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `cadl a2a-gateway --grpc-listen`: every connection of the gRPC front
+  listener ends. gRPC sends GOAWAY at `--grpc-max-connection-age`
+  (default 300 s, with a jitter of 10 %) and closes the connection at
+  most `--grpc-max-connection-age-grace` (default 60 s) later; calls
+  under way go on during the grace, the client's channel opens a new
+  connection for its next calls, and a stream still open at the end of
+  the grace ends with `UNAVAILABLE`. The front listener resets a
+  connection still open at `--read-timeout` + 1.1 × age + grace + 10 s
+  after its accept (`read_timeout`, `grpc age`). Before, a connection
+  that had carried one call stayed for as long as its client kept
+  calling, so hosts with 16 addresses in 4 networks could hold the 64
+  connections indefinitely; now each for at most 395 s after its
+  handshake with the defaults.
+- `--grpc-connection-wait SECONDS` (default 10; 0 restores the reset at
+  once): a connection that finds only the cap in all
+  (`--max-grpc-connections`) reached waits for a place instead of being
+  reset at once. At most `--max-grpc-connections` connections wait, a
+  waiting connection counts against the caps of its address and prefix,
+  and a place that comes back goes to the waiting connection whose
+  address, then whose /24 or /48, holds the fewest connections (then to
+  the first), before any new connection; one that gets none is reset
+  (`overloaded`, `connections`).
+
 ### Changed
 
 - `cadl norms-check` translates groups of five and more quantities
@@ -169,6 +194,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `norms-eval`, and a component with `R[1].a + R[1].b == R[1].a` whose
   vector for a = b = [0] the elimination, the valuations by types and
   patterns and the classes all give.
+
+- `cadl a2a-gateway --grpc-listen`: a call that `grpcio` refuses itself
+  before a handler runs (an unknown method, `UNIMPLEMENTED`; no free
+  worker, `RESOURCE_EXHAUSTED`) did not count as a call of its
+  connection, so the front listener reset the connection of such a
+  client at `--read-timeout`. It now counts, with TLS as without: the
+  gateway wraps the internal `grpc._server._reject_rpc` of `grpcio`
+  (only when it has the expected parameters) to look up the peer of the
+  refused call.
 
 
 ## [0.3.30] — 2026-11-14
