@@ -577,6 +577,8 @@ def test_opa_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
     for case in norms_eval_cases["cases"]:
         if case["versions"] or any('"amend"' in l for l in case["lines"]):
             continue
+        if not S.scalar_values(case["lines"]):
+            continue                    # the monitors refuse a list or an object
         sos = pickle.loads(base64.b64decode(case["sos"]))
         try:
             contract = select_contract(sos, case["contract"])
@@ -756,6 +758,8 @@ def test_evm_cases_of_test_norms_eval(norms_eval_cases, tmp_path, monkeypatch):
     for case in norms_eval_cases["cases"]:
         if case["versions"] or any('"amend"' in l for l in case["lines"]):
             continue
+        if not S.scalar_values(case["lines"]):
+            continue                    # the monitors refuse a list or an object
         sos = pickle.loads(base64.b64decode(case["sos"]))
         if not S.six_decimals(case["lines"]):
             continue                    # its host cannot pass such a number

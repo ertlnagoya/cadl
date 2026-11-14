@@ -375,6 +375,22 @@ def compile_solidity(source: str, name: str, tmp: Path, runs: int = 1) -> dict:
     return out
 
 
+def scalar_values(lines: list) -> bool:
+    """Whether every value the trace observes (in `values` and `request`)
+    is null, a boolean, a number or a string: the Rego and Solidity
+    monitors refuse a list or an object there, while `cadl norms-eval`
+    reads it."""
+    def flat(v) -> bool:
+        return not isinstance(v, (list, dict))
+    for rec in records(lines):
+        if not all(flat(v) for v in (rec.get("values") or {}).values()):
+            return False
+        req = rec.get("request")
+        if isinstance(req, dict) and any(isinstance(v, list) for v in req.values()):
+            return False
+    return True
+
+
 def six_decimals(lines: list) -> bool:
     """Whether every number of the trace, as written, has at most six
     decimals (what a host of the Solidity monitor can pass)."""
