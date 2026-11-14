@@ -53,6 +53,7 @@ from .verifier import Z3Context, _to_z3_bool
 
 TIMEOUT_MS = 5000
 MAX_ENUM = 14
+MAX_CORES = 16
 
 # Words of the expression language that look like actor names.
 _KEYWORDS = {"AND", "OR", "NOT", "IN", "TRUE", "FALSE", "ALL", "N", "M"}
@@ -411,20 +412,26 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
                    "situations (need not be a defect)")
             if len(sets) > 1:
                 msg += f"; checked against {len(sets)} sets of destination contracts that can be in force together"
+            # Neighbours missing from some set: never, or only in some
+            # situations, in force together with the rule (order-free).
             report.findings.append(Finding("F3", "warning", msg, kind="exclusion",
-                                           contracts=sorted(set(neigh) - set(sets[0])) if sets else excluded))
+                contracts=sorted(d for d in neigh if not all(d in S for S in sets))))
         else:
             report.findings.append(Finding("F3", "passed",
                 f"Jointly satisfiable with the {len(neigh)} contract(s) of the neighbourhood"))
-        GN = z3.And(conj(sets[0], 1)) if sets and sets[0] else z3.BoolVal(True)
-        if _check(GN, z3.Not(Ac.formula)) == "unsat":
+        # Established only if every set that can be in force with the rule
+        # implies it.
+        def implied(z):
+            return all(_check(z3.And(conj(S, 1)) if S else z3.BoolVal(True), z3.Not(z)) == "unsat"
+                       for S in (sets or [[]]))
+        if implied(Ac.formula):
             report.findings.append(Finding("info", "info",
                 "The destination's guarantees establish the rule's assumptions"))
         else:
             # Consistent is not established: name the assumptions that no
             # destination guarantee implies, which the transplant must bring
             # along or the destination must add.
-            open_ = [t for t, z in Ac.terms if _check(GN, z3.Not(z)) == "sat"]
+            open_ = [t for t, z in Ac.terms if not implied(z)]
             if open_:
                 report.findings.append(Finding("info", "info",
                     "Assumptions the destination's guarantees do not establish "
@@ -432,52 +439,75 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
         _partial(report, abstracted)
         return report
 
-    # Report every independent conflict in one run: classify, set the
-    # contracts of the conflict aside, and check the rest again.
-    S = list(failing)
-    while True:
-        _report_conflict(report, contract_id, Ac, Gc, S, parts)
-        involved = report.findings[-1].contracts
-        rest = [d for d in S if d not in involved]
-        if not involved or not rest or _check(Ac.formula, Gc.formula, *conj(rest, 0), *conj(rest, 1)) != "unsat":
+    # Every minimal conflict, over every set that can be in force with the
+    # rule: a minimal core K is found, and the search branches on removing
+    # each contract of K, so every other minimal conflict, which must miss
+    # some contract of K, is reached (bounded by MAX_CORES).
+    failing_sets = [S for S in sets
+                    if _check(Ac.formula, Gc.formula, *conj(S, 0), *conj(S, 1)) == "unsat"]
+    cores: List[List[str]] = []
+    seen: Set[frozenset] = set()
+    stack = [list(S) for S in failing_sets]
+    truncated = False
+    while stack:
+        S = stack.pop()
+        if frozenset(S) in seen:
+            continue
+        if len(seen) >= 64 * MAX_CORES:
+            truncated = True
             break
-        S = rest
+        seen.add(frozenset(S))
+        if _check(Ac.formula, Gc.formula, *conj(S, 0), *conj(S, 1)) != "unsat":
+            continue
+        tracked = {f"{contract_id}.assume": Ac.formula, f"{contract_id}.guarantee": Gc.formula}
+        for d in S:
+            tracked[f"{d}.assume"] = parts[d][0].formula
+            tracked[f"{d}.guarantee"] = parts[d][1].formula
+        K = sorted({n.split(".")[0] for n in _core(tracked) or []} - {contract_id})
+        if not K:
+            # The rule contradicts itself (F2); (F3) fails with it.
+            report.findings.append(Finding("F3", "failed",
+                "Fails because the rule itself is unsatisfiable (F2)", kind="other"))
+            break
+        if K not in cores:
+            if len(cores) == MAX_CORES:
+                truncated = True
+                break
+            cores.append(K)
+        for k in K:
+            stack.append([d for d in S if d != k])
+    order = {"vacuous": 0, "guarantee": 1, "other": 2}
+    found = sorted((_classify(contract_id, Ac, Gc, K, parts) + (K,) for K in cores),
+                   key=lambda x: (order[x[0]], len(x[2]), x[2]))
+    for kind, msg, K in found:
+        if len(K) > 1:
+            msg += f" (only jointly: {', '.join(K)})"
+        report.findings.append(Finding("F3", "failed", msg, kind=kind, contracts=K))
+    if truncated:
+        report.findings.append(Finding("info", "info",
+            f"More than {MAX_CORES} minimal conflicts; only the first are reported"))
     if excluded:
         report.findings.append(Finding("info", "info",
             "Set aside as exclusions (assumptions exclude the rule's): " + ", ".join(excluded)))
     return report
 
 
-def _report_conflict(report, contract_id, Ac, Gc, S, parts) -> None:
-    """Classify the conflict of the rule with the set ``S`` (Definition 1)
-    and name the contracts of a minimal unsat core."""
-    AS = z3.And([parts[d][0].formula for d in S]) if S else z3.BoolVal(True)
-    GS = z3.And([parts[d][1].formula for d in S]) if S else z3.BoolVal(True)
-    tracked = {f"{contract_id}.assume": Ac.formula, f"{contract_id}.guarantee": Gc.formula}
-    for d in S:
-        tracked[f"{d}.assume"] = parts[d][0].formula
-        tracked[f"{d}.guarantee"] = parts[d][1].formula
-    core = _core(tracked) or []
-    involved = sorted({n.split(".")[0] for n in core} - {contract_id})
-    # Classified against the set (Definition 1); the core only names the
-    # contracts to report.
-    if _check(Ac.formula, GS) == "unsat":
-        kind = "vacuous"
-        msg = ("The destination's guarantees exclude the rule's assumption: the rule "
-               "never applies while these destination contracts are in force")
-    elif _check(AS, Gc.formula) == "unsat":
-        kind = "vacuous"
-        msg = ("The rule's guarantees exclude the assumption of destination contracts, "
-               "which never apply while the rule is in force")
-    elif _check(Gc.formula, GS) == "unsat":
-        kind = "guarantee"
-        msg = "The rule's guarantees contradict the destination's guarantees"
-    else:
-        kind = "other"
-        msg = "The rule and the destination contracts cannot hold together"
-    if len(involved) > 1:
-        msg += f" (only jointly: {', '.join(involved)})"
-    report.findings.append(Finding("F3", "failed", msg, kind=kind, contracts=involved))
+def _classify(contract_id, Ac, Gc, K, parts):
+    """Class of the minimal conflict of the rule with the contracts ``K``
+    (Definition 1). Minimal conflicts are unique, so the class does not
+    depend on which core the solver returns first."""
+    AK = z3.And([parts[d][0].formula for d in K]) if K else z3.BoolVal(True)
+    GK = z3.And([parts[d][1].formula for d in K]) if K else z3.BoolVal(True)
+    if _check(Ac.formula, GK) == "unsat":
+        return ("vacuous", "The destination's guarantees exclude the rule's assumption: the rule "
+                "never applies while these destination contracts are in force")
+    if _check(AK, Gc.formula) == "unsat":
+        return ("vacuous", "The rule's guarantees exclude the assumption of destination contracts, "
+                "which never apply while the rule is in force")
+    if _check(Gc.formula, GK) == "unsat":
+        return ("guarantee", "The rule's guarantees contradict the destination's guarantees: the "
+                "rule applies but cannot be met together with them")
+    return ("other", "The rule and the destination contracts cannot hold together")
 
 
 def format_text(report: FitReport) -> str:

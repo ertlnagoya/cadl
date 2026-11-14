@@ -187,6 +187,27 @@ class TestNeighbourhood:
         f3 = [(f.kind, f.contracts) for f in r.findings if f.condition == "F3"]
         assert f3 == [("vacuous", ["D1"]), ("guarantee", ["D2"])]
 
+    def test_overlapping_conflicts_are_all_reported(self):
+        # Two minimal conflicts that share D2: {D1, D2} and {D2, D3}.
+        data = _sos(["A"], [
+            {"id": "RULE", "parties": ["A"], "assume": ["x + y <= 10", "y + z <= 10"]},
+            {"id": "D1", "parties": ["A"], "guarantee": ["x >= 6"]},
+            {"id": "D2", "parties": ["A"], "guarantee": ["y >= 6"]},
+            {"id": "D3", "parties": ["A"], "guarantee": ["z >= 6"]},
+        ])
+        r = fit_check(data, "RULE")
+        f3 = sorted(f.contracts for f in r.findings if f.condition == "F3")
+        assert f3 == [["D1", "D2"], ["D2", "D3"]]
+
+    def test_exclusion_does_not_depend_on_the_order_of_sets(self):
+        modes = [{"id": "D1", "parties": ["A"], "assume": ["mode == 1"], "guarantee": ["s <= 10"]},
+                 {"id": "D2", "parties": ["A"], "assume": ["mode == 2"], "guarantee": ["s >= 30"]},
+                 {"id": "D3", "parties": ["A"], "guarantee": ["t >= 0"]}]
+        rule = {"id": "RULE", "parties": ["A"], "assume": ["x <= 5"], "guarantee": ["y >= 0"]}
+        for ds in (modes, modes[::-1]):
+            r = fit_check(_sos(["A"], [rule] + ds), "RULE")
+            assert [f.contracts for f in r.findings if f.condition == "F3"] == [["D1", "D2"]]
+
     def test_assumptions_not_established_are_named(self):
         data = _sos(["A"], [
             {"id": "RULE", "parties": ["A"], "assume": ["x >= 1", "y >= 1"], "guarantee": ["z >= 0"]},

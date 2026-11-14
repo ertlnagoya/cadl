@@ -31,10 +31,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   of destination contracts that can be in force together with it, so
   contracts for different operating modes, in the rule or in the
   destination, are an exclusion, not a guarantee conflict.
-  Independent conflicts are all reported in one run (the contracts of
-  each conflict are set aside and the rest checked again). When the rule
-  fits, the assumptions that no destination guarantee implies are named,
-  since consistent is not established.
+  Every minimal conflict is reported in one run, also when conflicts share
+  contracts (the search branches on removing each contract of a minimal
+  core; at most 16 are reported), each classified by its own contracts.
+  Neighbours missing from some set that can be in force with the rule are
+  reported as an exclusion, independent of the order of the sets. When the
+  rule fits, the assumptions that the guarantees of some such set do not
+  imply are named, since consistent is not established.
   `--map` renames attribute names as well as actors. Exit code 0 (fits),
   1 (misfit), 2 (unknown).
 
