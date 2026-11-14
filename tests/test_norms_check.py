@@ -2202,78 +2202,298 @@ def test_reduced_valuations_agree_with_the_classes():
         assert checked, name
 
 
-def test_five_ordered_quantities_are_refused_with_the_reason():
-    """Five quantities ordered against each other have 424 213 valuations
-    by types and patterns even without other literals, more than the limit
-    of 50 000 (F.12); the refusal gives the numbers of patterns per type.
-    Four with two more numeric literals are refused in the same way."""
-    names = "abcde"
-    chain = " AND ".join(f"R[1].{x} < R[1].{y}" for x, y in zip(names, names[1:]))
-    body = f"""\
+# === Elimination of the quantities of a component (F.12) ====================
+
+def _env_of(m):
+    from cadl.norms_check import Environment
+    tr = m.trs[0]
+    env = Environment.__new__(Environment)
+    env.quantities, env.preds, env.link_groups = tr.quantities, tr.preds, tr.link_groups
+    env.ordered_links = [link for t in m.trs for link in t.ordered_links]
+    return tr, env
+
+
+def _linear_component(tr, keys):
+    return any(tr.quantities[k].linear and tr.quantities[k].domain is None for k in keys)
+
+
+@pytest.mark.parametrize("name, kw", [
+    ("FOUR", {}), ("FOUR_EQ", {}), ("EXACT4", {}), ("LISTS", {}), ("MIXED", {"members": ["R=2"]}),
+    ("QUANT", {"members": ["R=2"]}), ("ARITH", {"bindings": ["i=1"]}),
+    ("LINEAR", {"members": ["R=2"]}), ("LINEAR2", {}),
+    (str(EXAMPLES / "norms_check_linear.cadl"), {"members": ["ROBOT=2"]}),
+    (str(EXAMPLES / "norms_check_value_types.cadl"), {"bindings": ["i=1"]})])
+def test_elimination_agrees_with_the_valuations(name, kw):
+    """The elimination of the quantities (F.12) finds the vectors of
+    predicate values that the classes, the valuations by types and
+    patterns and the points of the linear arrangement give, for every
+    component of these contracts; so does the elimination that keeps the
+    added lists of a group."""
+    from cadl.norms_check import _Elimination
+    _sos, m, _pm = model_of(name, **kw)
+    tr, env = _env_of(m)
+    checked = 0
+    for ids, vecs in tr.components:
+        keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+        el = _Elimination(env, ids, keys, _linear_component(tr, keys))
+        want = {v for v, _vals in vecs}
+        assert {v for v, _vals in el.run(10 ** 6)} == want, (name, keys)
+        assert {v for v, _vals in el._run(10 ** 6, True)} == want, (name, keys)
+        checked += 1
+    assert checked, name
+
+
+def _chain(n, op="<", extra=""):
+    names = [f"q{i}" for i in range(n)]
+    chain = " AND ".join(f"R[1].{x} {op} R[1].{y}" for x, y in zip(names, names[1:]))
+    return f"""\
 norms:
   - id: chain
     kind: prohibition
     bearer: D
-    content: "{chain}"
+    content: "{chain}{extra}"
 """
-    with pytest.raises(NormsCheckError) as e:
-        build_model(make_sos(body))
-    text = str(e.value)
-    assert "have 424213 valuations by types and patterns" in text, text
-    assert "lists [1, 4, 29, 331, 5262]" in text and "more than 50000" in text
-    four = body.replace(" AND R[1].d < R[1].e", " AND R[1].a > 3 AND R[1].d < 9")
-    with pytest.raises(NormsCheckError, match=r"valuations by types and patterns"):
-        build_model(make_sos(four))
 
 
-def test_large_groups_are_refused_quickly():
-    """A group too large for the limit is refused from the counts of its
-    patterns, before any pattern is built: twelve quantities compared for
-    equality, and a wildcard comparison over eight members, within a few
-    seconds (the first version built every pattern and ignored
-    --timeout). The refusal marks the lower bounds for more than five
-    lists and keeps the hint about --members."""
+def _values_reach_choices(tr, rng, count, numbers=None):
+    """Random JSON values of every type (copies for equalities) give the
+    predicates of each component the values of one of its vectors."""
+    for ids, vecs in tr.components:
+        keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+        exprs = [tr.preds[i].expr for i in ids]
+        known = {v for v, _vals in vecs}
+        for _ in range(count):
+            vals = {k: (_random_nested(rng) if rng.random() < 0.5 or numbers is None
+                        else rng.choice(numbers)) for k in keys}
+            for _j in range(rng.randint(0, 3)):
+                a, b = rng.sample(keys, 2)
+                vals[a] = vals[b]
+            assert tuple(tr._oracle(exprs, vals)) in known, vals
+
+
+@pytest.mark.parametrize("n, op", [(5, "<"), (6, "<="), (8, "<"), (5, "=="), (12, "==")])
+def test_five_and_more_compared_quantities(n, op):
+    """Five and more quantities compared with each other (424 213 and more
+    valuations by types and patterns) are translated by elimination: a
+    chain keeps one quantity in the frontier, so its vectors are found in
+    a few states."""
+    import random as _random
+    m = build_model(make_sos(_chain(n, op)))
+    tr = m.trs[0]
+    (ids, vecs), = tr.components
+    assert {v for v, _vals in vecs} == {("T",), ("F",), ("U",)}
+    _values_reach_choices(tr, _random.Random(n), 600 if LONG else 150,
+                          [0, 0.5, 1, 2, -1, "a", "b", True, False, None])
+
+
+def test_five_ordered_quantities_agree_with_all_valuations(monkeypatch):
+    """With the limit lifted, the 424 213 valuations by types and patterns
+    of five ordered quantities give the vectors the elimination finds."""
+    if not LONG:
+        pytest.skip("set CADL_NORMS_CHECK_LONG=1")
+    import cadl.norms_check as nc
+    body = _chain(5, "<", " OR R[1].q0 == R[1].q4 AND R[1].q2 > 0.5")
+    m = build_model(make_sos(body))
+    got = {v for v, _vals in m.trs[0].components[0][1]}
+    monkeypatch.setattr(nc, "MAX_VALUATIONS", 10 ** 7)
+    m2 = build_model(make_sos(body))
+    assert got == {v for v, _vals in m2.trs[0].components[0][1]}
+
+
+MEMBERS_HEAD = """\
+sos:
+  name: T
+  extensions:
+    - norms: 0.1
+  actors:
+    - {id: D, role: d}
+    - {id: "R[1..N]", role: r}
+  contracts:
+    - id: C
+      parties: [D, "R[*]"]
+"""
+
+
+def _members_sos(*contents):
+    body = "norms:\n" + "".join(
+        f"  - id: p{i}\n    kind: prohibition\n    bearer: D\n    content: \"{c}\"\n"
+        for i, c in enumerate(contents))
+    sos = parse(MEMBERS_HEAD + textwrap.indent(body, "      "))
+    assert type_check(sos).ok
+    return sos
+
+
+SYMMETRIC = ("exists j in R: exists k in R: j != k AND R[j].load == R[k].load",
+             "exists j in R: exists k in R: R[j].load < R[k].load")
+
+
+@pytest.mark.parametrize("content", SYMMETRIC)
+def test_members_that_predicates_treat_alike(content, monkeypatch):
+    """Predicates that use the members of a set only through variables
+    over the whole set (compared with each other only by == and !=) are
+    the same for every permutation of the members, so only the sorted
+    valuations are added (F.12): every pair of six members is compared,
+    and the vectors are those found without the symmetry for four."""
+    import random as _random
+    from cadl.norms_check import _Elimination
+    m = build_model(_members_sos(content), members=["R=6"])
+    tr = m.trs[0]
+    assert {v for v, _vals in tr.components[0][1]} == {("T",), ("F",), ("U",)}
+    _values_reach_choices(tr, _random.Random(6), 300 if LONG else 100, [0, 1, 2, "a", None])
+    m = build_model(_members_sos(content, "R[1].load > 1 OR R[2].load == D.load"),
+                    members=["R=4"])
+    tr, env = _env_of(m)
+    for ids, vecs in tr.components:
+        keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+        sym = _Elimination(env, ids, keys).run(10 ** 6)
+        monkeypatch.setattr(_Elimination, "_symmetric_sets", lambda self: [])
+        plain = _Elimination(env, ids, keys).run(10 ** 6)
+        monkeypatch.undo()
+        assert {v for v, _ in sym} == {v for v, _ in plain} == {v for v, _ in vecs}
+
+
+def test_symmetry_is_detected_only_when_it_holds():
+    """A literal index, a bound index, an order of indices or another field
+    of the members breaks the symmetry."""
+    from cadl.norms_check import _Elimination
+    cases = [("exists j in R: exists k in R: j != k AND R[j].load == R[k].load", True),
+             ("max(r.load for r in R) > D.load", True),
+             ("R[*].load <= D.load", True),
+             ("exists j in R[1..2]: R[j].load > D.load", False),
+             ("for all j in R: for all k in R: j >= k OR R[j].load <= R[k].load", False),
+             ("exists j in R: R[j].load == R[1].load", False),
+             ("exists j in R: R[j].load > 1 AND R[j].v == R[j].load", False)]
+    for content, sym in cases:
+        m = build_model(_members_sos(content), members=["R=3"])
+        tr, env = _env_of(m)
+        for ids, _vecs in tr.components:
+            keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+            el = _Elimination(env, ids, keys)
+            assert bool(el._symmetric_sets()) == sym, content
+
+
+def test_list_patterns_do_not_always_combine():
+    """Why the elimination may have to keep the added lists (F.12): the
+    lists 0 < 1 < 2 with 3 above 0 and not comparable with 1 and 2, and a
+    list x below 2 and not comparable with 0 and 1, are each realisable,
+    but no outcome of 3 and x realises both; the patterns that
+    _list_realise accepts are the 1, 4, 29 and 331 series-parallel ones."""
+    import itertools
+    from cadl.norms_check import _list_outcome, _list_realise
+    flip = {"lt": "gt", "gt": "lt", "eq": "eq", "inc": "inc"}
+
+    def ok(rel, n):
+        def r(a, b):
+            return rel[(a, b)] if (a, b) in rel else flip[rel[(b, a)]]
+        cls = []
+        for i in range(n):
+            if not any(r(c, i) == "eq" for c in cls):
+                cls.append(i)
+        got = _list_realise(cls, r)
+        if got is None:
+            return False
+        val = {i: got[next(c for c in cls if c == i or r(c, i) == "eq")] for i in range(n)}
+        return all(_list_outcome(val[a], val[b]) == r(a, b)
+                   for a, b in itertools.combinations(range(n), 2))
+
+    counts = []
+    for n in range(1, 5):
+        pairs = list(itertools.combinations(range(n), 2))
+        counts.append(sum(ok(dict(zip(pairs, c)), n)
+                          for c in itertools.product(("eq", "lt", "gt", "inc"), repeat=len(pairs))))
+    assert counts == [1, 4, 29, 331]
+    base = {(0, 1): "lt", (0, 2): "lt", (1, 2): "lt", (0, 3): "lt", (1, 3): "inc", (2, 3): "inc"}
+    assert ok(base, 4)
+    assert ok({(0, 1): "lt", (0, 2): "lt", (1, 2): "lt", (0, 3): "inc", (1, 3): "inc",
+               (2, 3): "gt"}, 4)
+    for o in ("eq", "lt", "gt", "inc"):
+        assert not ok({**base, (0, 4): "inc", (1, 4): "inc", (2, 4): "gt", (3, 4): o}, 5)
+
+
+def test_elimination_keeps_the_lists_when_a_pattern_cannot_be_extended(monkeypatch):
+    """When a kept pattern of all added quantities cannot be extended (a
+    new list that no list realises against the forgotten ones), the
+    elimination runs again keeping the added lists of the group, and
+    finds the same vectors."""
+    from cadl.norms_check import _Elimination
+    run, amalgamate = _Elimination._run, _Elimination._amalgamate
+    calls = []
+
+    def run_(self, limit, keep):
+        self._keep = keep
+        calls.append(keep)
+        return run(self, limit, keep)
+
+    def amalgamate_(self, H, x, kind, outs):
+        if not self._keep and kind == ("s", "list") and len(outs) >= 1:
+            return None
+        return amalgamate(self, H, x, kind, outs)
+
+    body = _chain(5, "<", " OR R[1].q0 == R[1].q3")
+    want = {v for v, _vals in build_model(make_sos(body)).trs[0].components[0][1]}
+    monkeypatch.setattr(_Elimination, "_run", run_)
+    monkeypatch.setattr(_Elimination, "_amalgamate", amalgamate_)
+    got = {v for v, _vals in build_model(make_sos(body)).trs[0].components[0][1]}
+    assert calls == [False, True]
+    assert got == want
+
+
+def test_four_ordered_quantities_with_a_domain():
+    """Four ordered quantities, two of them with a domain assumed from a
+    product (F.12): translated by elimination; integers of the domain and
+    values of every other type give the vectors of the model."""
+    import random as _random
+    body = _chain(4, "<", " AND R[1].q0 * R[1].q1 > 2")
+    m = build_model(make_sos(body))
+    tr = m.trs[0]
+    assert all(n.status == "model" for n in tr.norms)
+    assert {v for v, _vals in tr.components[0][1]} == {("T",), ("F",), ("U",)}
+    lo, hi = tr.quantities["R[1].q0"].domain
+    rng = _random.Random(3)
+    exprs = [p.expr for p in tr.preds]
+    known = {v for v, _vals in tr.components[0][1]}
+    for _ in range(300):
+        vals = {}
+        for k in tr.quantities:
+            q = tr.quantities[k]
+            vals[k] = (rng.randint(q.domain[0], q.domain[1]) if q.domain and rng.random() < 0.7
+                       else rng.choice([0, 0.5, 2, 9, "a", None, True, [0], {}]) if not q.domain
+                       else _random_nested(rng))
+        assert tuple(tr._oracle(exprs, vals)) in known, vals
+    assert (lo, hi) == tr.quantities["R[1].q1"].domain
+
+
+@pytest.mark.parametrize("n", [4, 5])
+def test_ordered_quantities_with_linear_arithmetic(n):
+    """Four and five ordered quantities with linear arithmetic: the numbers
+    are points of the faces of the arrangement of the leaves that read
+    them, after the other kinds are added one at a time (F.12)."""
+    import random as _random
+    body = _chain(n, "<", f" AND R[1].q0 + R[1].q{n - 1} > 2")
+    m = build_model(make_sos(body))
+    tr = m.trs[0]
+    assert {v for v, _vals in tr.components[0][1]} == {("T",), ("F",), ("U",)}
+    _values_reach_choices(tr, _random.Random(n), 300 if LONG else 100,
+                          [0, 0.5, 1, 1.5, 2, 2.5, 3, -1, "a"])
+
+
+def test_large_groups_are_refused_with_the_reason():
+    """A group whose elimination keeps more than 50 000 patterns is
+    refused, within seconds and with the hint about --members: every
+    pair of eight members ordered by their indices (no symmetry), and the
+    maximum of eight members compared with a quantity (one leaf reads all
+    nine)."""
     import time
-    chain = " AND ".join(f"R[1].q{i} == R[1].q{i + 1}" for i in range(11))
-    body = f"""\
-norms:
-  - id: eq
-    kind: prohibition
-    bearer: D
-    content: "{chain}"
-"""
-    t = time.monotonic()
-    with pytest.raises(NormsCheckError) as e:
-        build_model(make_sos(body))
-    assert time.monotonic() - t < 10
-    assert "at least" in str(e.value) and "(set partitions)" in str(e.value)
-    body = """\
-norms:
-  - id: same
-    kind: prohibition
-    bearer: D
-    content: "R[*].load == D.load AND R[*].v == D.v"
-"""
-    t = time.monotonic()
-    with pytest.raises(NormsCheckError, match=r"Use fewer --members \(R\)"):
-        build_model(make_sos(body), members=["R=3"])
-    assert time.monotonic() - t < 10
-    # five quantities only compared for equality are refused as well
-    chain = " AND ".join(f"R[1].q{i} == R[1].q{i + 1}" for i in range(4))
-    with pytest.raises(NormsCheckError, match=r"have 424213 valuations"):
-        build_model(make_sos(body.replace("R[*].load == D.load AND R[*].v == D.v", chain)))
-
-
-def test_ordered_quantities_with_linear_arithmetic_are_refused():
-    body = """\
-norms:
-  - id: chain
-    kind: prohibition
-    bearer: D
-    content: "R[1].a < R[1].b AND R[1].b < R[1].c AND R[1].c < R[1].d AND R[1].a + R[1].d > 2"
-"""
-    with pytest.raises(NormsCheckError, match=r"linear arithmetic; norms-check translates"):
-        build_model(make_sos(body))
+    for content in ("for all j in R: for all k in R: j >= k OR R[j].load <= R[k].load",
+                    "max(r.load for r in R) > D.load"):
+        t = time.monotonic()
+        with pytest.raises(NormsCheckError) as e:
+            build_model(_members_sos(content), members=["R=8"])
+        assert time.monotonic() - t < 120
+        text = str(e.value)
+        assert "valuations by types and patterns" in text and "more than 50000" in text, text
+        assert "adding the quantities one at a time" in text, text
+        assert "Use fewer --members (R)" in text, text
 
 
 # === Finite decimal points of the faces (F.12) ==============================

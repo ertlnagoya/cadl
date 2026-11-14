@@ -6,6 +6,60 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `cadl norms-check` translates groups of five and more quantities
+  compared with each other (at least 424,213 valuations by types and
+  patterns), four or more ordered quantities whose classes differ (a
+  domain, given by `--domain` or assumed), and four or more ordered
+  quantities in a component with linear arithmetic, which 0.3.30
+  refused (F.12). The valuations were built only to find the vectors of
+  predicate values, and each distinct vector is one choice (the 26,035
+  valuations of four ordered quantities without other literals give 34
+  vectors for a contract with four predicates), so these components now
+  find the vectors by elimination: each predicate is split into leaves
+  (a comparison, a quantity as a condition, `IN`, an aggregate) joined
+  by Kleene's `AND`, `OR`, `NOT`, `exists` and `for all` over the
+  members; the quantities are added one at a time, in an order that
+  keeps few of them pending; a state is what remains of each predicate
+  and the pattern of the added quantities that a remaining leaf still
+  reads (type, literal or gap, the order of numbers and texts within a
+  gap, which objects are equal, the outcomes of lists, only equality in
+  a group without an order); equal states are merged. Every leaf is
+  evaluated by the evaluator of `cadl norms-eval` on values of the
+  classes, every state keeps one pattern of all its quantities, and
+  every vector comes with a valuation that the evaluator confirms, so
+  every vector of the model is one of a trace and every vector of a
+  trace is found. Members of a set that every predicate uses only
+  through variables over the whole set, compared with each other only by
+  `==` and `!=`, are added in sorted order (every valuation is a
+  permutation of a sorted one). Patterns of lists do not always combine
+  (lists 0 < 1 < 2 with 3 above 0 only, and a new list below 2 and not
+  comparable with 0 and 1, have no common realisation): when a kept
+  pattern cannot be extended, the elimination runs again keeping the
+  added lists of a group until the group is complete. With linear
+  arithmetic the leaves that read numbers are evaluated at the end, at
+  one decimal point of every face of the arrangement of their forms.
+  The components that 0.3.30 translated keep their valuations, models
+  and reports. Measured on a loaded machine: chains of 5, 6, 8 and 12
+  ordered quantities in less than a second; `exists j in R: exists k
+  in R: R[j].load < R[k].load` over 6 members in about 1 s and over 8
+  in about 12 s; four ordered quantities with linear arithmetic in less
+  than a second and five in about 4 s. Still refused, with the numbers
+  of valuations by types and patterns and the hint about `--members`:
+  more than 50,000 states at one step, as for a leaf that reads many
+  quantities (`max(r.load for r in R) > D.load` over 6 or more members;
+  5 take about 40 s) or every pair of 6 or more members ordered in a
+  way that depends on their indices. Tests: the elimination against the
+  classes, the valuations by types and patterns and the points of the
+  arrangement on every component of the test contracts and examples
+  (also keeping the lists), random JSON values of every type against
+  the choices for chains of 5 to 12 and for six members, the symmetry
+  against the elimination without it, the patterns of lists that
+  `_list_realise` accepts (1, 4, 29, 331), and, with
+  `CADL_NORMS_CHECK_LONG=1`, five ordered quantities against all their
+  valuations.
+
 ## [0.3.30] — 2026-11-14
 
 ### Fixed
