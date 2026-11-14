@@ -946,3 +946,33 @@ def test_gateway_options_must_be_positive(tmp_path, capsys):
                      str(tmp_path / "clients.json"), "--audit", str(tmp_path / "a.jsonl"),
                      "--grpc-listen", "127.0.0.1:0", option, value]) == 2
         assert "--grpc-max-connection-age must be at least 1 second"             in capsys.readouterr().err
+
+
+def test_gateway_held_blocking_call_keeps_its_connection(tmp_path, grpc, monkeypatch,
+                                                          capsys):
+    """Through the gateway (age 1 s, no grace): an authenticated blocking
+    SendMessage held for approval marks its connection, so the front
+    listener does not reset it at the reset of connections without an
+    authenticated call (here 2 + 1.1 + 1 + 2 + 10 = 16.1 s, with the ping
+    timeout shortened to 1 s by the test-only environment variable); the
+    call is answered after the approval and nothing is recorded as
+    `read_timeout`."""
+    pb = pytest.importorskip("a2a.types.a2a_pb2")
+    monkeypatch.setenv("CADL_TEST_GRPC_PING_TIMEOUT_MS", "1000")
+    r, port = _run(tmp_path, "--read-timeout", "2", "--grpc-max-connection-age", "1")
+    g = GrpcClient(r, grpc, pb, port)
+    data = grpc_message(pb, "publish", "report").SerializeToString()
+    md = g._md("PLANNER", "SendMessage", data)
+    fn = g.channel.unary_unary("/lf.a2a.v1.A2AService/SendMessage")
+    with ThreadPoolExecutor(1) as pool:
+        fut = pool.submit(lambda: fn(data, metadata=md, timeout=120))
+        r.wait_hold("h-1")
+        time.sleep(20.0)
+        assert not fut.done(), fut.exception()
+        r.approve("h-1")
+        got = pb.SendMessageResponse.FromString(fut.result(timeout=30))
+    assert got.task.id == "up-task-1"
+    g.channel.close()
+    r.stop()
+    assert events(r.audit, "read_timeout") == []
+    capsys.readouterr()

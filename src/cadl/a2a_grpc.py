@@ -30,6 +30,7 @@ into the response message of the RPC.
 from __future__ import annotations
 
 import inspect
+import os
 import itertools
 import json
 import threading
@@ -523,6 +524,14 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
     without a key must have ended. A connection that finds every place taken
     waits up to `connection_wait` seconds (0: none) for one."""
     grpc = modules()[0]
+    # For tests only: a shorter ping timeout (and so a shorter staged
+    # GOAWAY), so that the reset at the age can be tested in seconds. Not an
+    # option of the gateway.
+    try:
+        ping_ms = int(os.environ.get("CADL_TEST_GRPC_PING_TIMEOUT_MS", PING_TIMEOUT_MS))
+    except ValueError:
+        ping_ms = PING_TIMEOUT_MS
+    ping_ms = max(100, ping_ms)
     binding = GrpcBinding(gw, mtls=client_ca is not None, read_timeout=read_timeout,
                           max_readers=max_readers,
                           max_readers_per_address=max_readers_per_address,
@@ -534,7 +543,7 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
                       max_per_address=max_connections_per_address,
                       max_per_prefix=max_connections_per_prefix, unix=unix,
                       max_age=max_connection_age, age_grace=max_connection_age_grace,
-                      wait=connection_wait, ping_timeout=PING_TIMEOUT_MS / 1000)
+                      wait=connection_wait, ping_timeout=ping_ms / 1000)
     except (OSError, ValueError) as e:
         raise GatewayError(f"--grpc-listen: cannot listen on {address}: {e}") from None
     binding.front = front
@@ -562,8 +571,8 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
                      # times the answer with ping_timeout_ms, not
                      # keepalive_timeout_ms, so both are set.
                      ("grpc.keepalive_time_ms", 60_000),
-                     ("grpc.keepalive_timeout_ms", PING_TIMEOUT_MS),
-                     ("grpc.http2.ping_timeout_ms", PING_TIMEOUT_MS),
+                     ("grpc.keepalive_timeout_ms", ping_ms),
+                     ("grpc.http2.ping_timeout_ms", ping_ms),
                      # The front listener resets a connection without a call
                      # at read_timeout (and records it); this is a backstop.
                      ("grpc.server_handshake_timeout_ms", int(read_timeout * 2000) + 1000),

@@ -553,7 +553,14 @@ class Front:
         its calls under way (a held blocking request, a slow answer of the
         agent, a stream) are not cut. With a finite grace every
         connection is reset `age_grace` + `AGE_MARGIN` after its last call
-        could start."""
+        could start.
+
+        One case is not covered: when the first authenticated call of a
+        connection starts between the first and the final GOAWAY (its
+        earlier calls had no key or were refused), its handler starts more
+        than `AGE_MARGIN` after the call reached gRPC (a backlog of calls
+        without a key), and the call lasts long, the connection can be
+        reset before `keyed` marks it, which cuts that call."""
         if self.max_age is None:
             return None
         last_call = self.deadline + 1.1 * self.max_age + self.ping_timeout
