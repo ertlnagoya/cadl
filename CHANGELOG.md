@@ -6,6 +6,249 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.31] — 2026-11-14
+
+### Added
+
+- `cadl a2a-gateway --grpc-listen`: gRPC sends GOAWAY to each connection
+  at `--grpc-max-connection-age` (default 300 s, at least 1 s, with a
+  jitter of 10 %; the GOAWAY is staged, and the connection takes new
+  calls until the final GOAWAY, at most the ping timeout of 20 s later),
+  and the client's channel opens a new connection for its next calls. By
+  default the calls under way go on to their end and the connection
+  closes after the last one. A connection on which no authenticated call
+  has run (the gateway marks the connection of each call that
+  authenticates) is reset by the front listener when its calls without a
+  key must have ended, `--read-timeout` + 1.1 × age + 20 s +
+  `--read-timeout` + 10 s after the end of its wait (`read_timeout`,
+  `grpc age`); with the defaults gRPC closes it within 360 s of its
+  handshake and the reset comes at the latest 390 s after its accept,
+  also for a client that keeps answers pending by reading slowly. Before,
+  a connection that had carried one call stayed for as long as its
+  client kept calling, so hosts with 16 addresses in 4 networks could
+  hold the 64 connections indefinitely. A connection with an
+  authenticated call still stays while a call is under way (a blocking
+  request held for approval, an upstream answer within
+  `--upstream-timeout`, a stream). `--grpc-max-connection-age-grace
+  SECONDS` (default none) gives a hard bound for every connection: gRPC
+  closes it at most SECONDS after the final GOAWAY and the front listener
+  resets one still open `--read-timeout` + 1.1 × age + 20 s + grace +
+  10 s after the end of its wait; the calls still under way are then cut
+  with `UNAVAILABLE` (a held blocking request is withdrawn, a unary call
+  already processed by the agent gets no answer, a stream ends).
+- `--grpc-connection-wait SECONDS` (default 10; 0 restores the reset at
+  once): a connection that finds only the cap in all
+  (`--max-grpc-connections`) reached waits for a place instead of being
+  reset at once. At most `--max-grpc-connections` connections wait, a
+  waiting connection counts against the caps of its address and prefix,
+  and a place that comes back goes to the waiting connection whose
+  address, then whose /24 or /48, holds the fewest connections (then to
+  the first), before any new connection; one that gets none is reset
+  (`overloaded`, `connections`).
+
+### Changed
+
+- `cadl norms-check` translates groups of five and more quantities
+  compared with each other (at least 424,213 valuations by types and
+  patterns), four or more ordered quantities whose classes differ (a
+  domain, given by `--domain` or assumed), and four or more ordered
+  quantities in a component with linear arithmetic (within the limit on
+  face points), which 0.3.30 refused (F.12). Elimination is used when the valuations by types and
+  patterns of a component exceed 50,000; when a group of four or more
+  quantities ordered against each other cannot take them because its
+  quantities do not have the same classes (a quantity with a domain,
+  given or assumed, one that keeps only the classes its comparisons
+  tell apart, or different literals); and, in a component with linear
+  arithmetic, for four or more ordered quantities or when the classes
+  and the points of the faces exceed 50,000. The valuations were built only to find the vectors of
+  predicate values, and each distinct vector is one choice (the 26,035
+  valuations of four ordered quantities without other literals give 34
+  vectors for a contract with four predicates), so these components now
+  find the vectors by elimination: each predicate is split into leaves
+  (a comparison, a quantity as a condition, `IN`, an aggregate) joined
+  by Kleene's `AND`, `OR`, `NOT`, `exists` and `for all` over the
+  members; the quantities are added one at a time, in an order that
+  keeps few of them pending; a state is what remains of each predicate
+  and the pattern of the added quantities that a remaining leaf still
+  reads (type, literal or gap, the order of numbers and texts within a
+  gap, which objects are equal, the outcomes of lists, only equality in
+  a group without an order); equal states are merged. Every leaf is
+  evaluated by the evaluator of `cadl norms-eval` on values of the
+  classes, every state keeps one pattern of all its quantities, and
+  every vector comes with a valuation that the evaluator confirms, so
+  every vector of the model is one of a trace. Every vector of a trace
+  is found because the value of a leaf is decided by the pattern of the
+  quantities it reads (comparisons of values of different types are
+  decided by the types, except that an ordering compares true as 1 and
+  false as 0, which the classes include, and arithmetic has a value only
+  on numbers, see Fixed) and the members of the domain of a quantifier do not depend on
+  the values. Members of a set are added in sorted order (every
+  valuation is a permutation of a sorted one) when the component reads
+  one field of the set, with the same kinds, classes and group for every
+  member, and every predicate uses the members only through variables
+  of quantifiers and aggregates over the whole set (`R` or `R[*]`),
+  compared with each other only by `==` and `!=`. Patterns of lists do
+  not always combine (lists p < q < r with s above p and not comparable
+  with q and r, and a new list x below r and not comparable with p and
+  q, have no common realisation): when a kept
+  pattern cannot be extended, the elimination runs again keeping the
+  added lists of a group until the group is complete. With linear
+  arithmetic the leaves that read numbers are evaluated at the end, at
+  one decimal point of every face of the arrangement of their forms.
+  The components that 0.3.30 translated keep their valuations, models
+  and reports. Measured on a loaded machine: chains of 5, 6, 8 and 12
+  ordered quantities in less than a second; `exists j in R: exists k
+  in R: R[j].load < R[k].load` over 6 members in about 1 s and over 8
+  in about 12 s; four ordered quantities with linear arithmetic in less
+  than a second and five in about 4 s. Still refused, with the numbers
+  of valuations by types and patterns and the hint about `--members`:
+  more than 50,000 states at one step, as for a leaf that reads many
+  quantities (`max(r.load for r in R) > D.load` over 6 or more members;
+  5 take about 40 s) or every pair of 6 or more members ordered in a
+  way that depends on their indices. Tests: the elimination against the
+  classes, the valuations by types and patterns and the points of the
+  arrangement on every component of the test contracts and examples
+  (also keeping the lists), random JSON values of every type against
+  the choices for chains of 5 to 12 and for six members, the symmetry
+  against the elimination without it, the patterns of lists that
+  `_list_realise` accepts (1, 4, 29, 331), and, with
+  `CADL_NORMS_CHECK_LONG=1`, five ordered quantities against all their
+  valuations.
+
+- Equilibrium maps (`cadl game-check --certify`) leave fewer cells
+  `undecided`; every claim is still exact and certified (I.9).
+  Measured first by the reason of each undecided cell (uniform
+  partitions of the maps of the examples, of the three-parameter test
+  maps and of 45 fuzz games, the exact claim of each cell taken at its
+  corners, face centres, centre and 4 random points):
+  of the undecided area in which the claim does not change, 72 % was
+  `not_well_defined`, because the
+  enclosure of a probability that is not multi-affine by interval
+  arithmetic on its monomials goes above 1 or below 0 (4 · p · (1 − p),
+  (1 − p)² = 1 − 2p + p² near p = 0) however small the cell, and most of
+  the rest came from bounds of the advantages that take the value of a
+  successor between l_p and u_p although it depends on the valuation
+  together with the probabilities. Two changes:
+  - A polynomial that is not multi-affine in the open parameters (a
+    probability, a step payoff, a difference of them, a lifted
+    function) is bounded by its range on the cell (`poly_range`):
+    boxes are reduced along the parameters in which it is monotone,
+    bounded by interval arithmetic and Bernstein coefficients, and the
+    box with the largest bound is bisected (at the zero of the
+    derivative when it is affine in that parameter), until the bound is
+    attained at a corner or after 16 bisections. Only the
+    enclosure is refined, not the cell. The relaxation, the
+    well-definedness of a cell, the step payoffs and the lifted
+    coordinates use it; a probability a + b · R gets a + b times the
+    range of R, so that the lifted corners stay within the relaxation
+    (except where a lifted polynomial is 1 minus the others; such a
+    corner is not used, as before).
+  - Before the coupled bounds, PD+ and PD− are tried again with the
+    advantages bounded through the Bellman equations of the profile
+    (`unrolled_advantage`, I.9): the values of the successors are
+    replaced by their equations (at most 16 times, 64 monomials, degree
+    6), so that A(v) = K(v) + Σ Q_x(v) · V(x, v) with polynomials K and
+    Q_x and only the values left bounded by l_p and u_p; in an acyclic
+    game whose expansion fits these limits the bound is the range of a
+    polynomial (searched with 4 bisections per end).
+  On the same partitions the undecided area in which the claim does not
+  change falls from 6.72 to 0.67 (in units of a region; what remains
+  is in four fuzz games with lifted functions whose coupled bounds stay
+  too wide), and the area of cells that contain a change of the claim,
+  which no sufficient condition can decide, from 2.96 to 2.90. With bisection (CPU time, before
+  and after measured together): the map `comply_by_lambda_and_failure`
+  of the robot example reaches the resolution with 125 cells analysed
+  instead of 567; the three-parameter maps of I.14 with 363 and 291
+  instead of 7 987 and 463 cells (first example, 6 s instead of 32 s)
+  and 4 059 instead of 13 853 (second example, 31 s instead of 84 s);
+  with (1 − p_fail)² the second example reaches the resolution 0.1
+  after 5 311 cells (61 s) instead of leaving 0.174 undecided after
+  39 999 (291 s), with 1 − 4 · p_fail · (1 − p_fail) after 11 103
+  (111 s) instead of 0.431 after 39 999 (284 s), with
+  1 − p_fail · q_local · (1 − q_local) after 349 cells (6 s) instead of
+  32 083 (199 s), and the first example with (1 − p_fail)² after 2 551
+  (33 s) instead of 0.231 after 39 999 (152 s). A cell costs more
+  (about twice on uniform partitions), but far fewer cells are needed.
+  No decided cell changes its claim: the decided cells of the maps
+  before and after were compared where they overlap, and the cells
+  decided only after were checked against the exact check and
+  PRISM-games 3.2.4 at their centres (465 overlapping pairs of decided
+  cells; 145 cells of the maps above and of 80 fuzz games, 509 verdicts
+  and 42 128 state values, no difference).
+  `games_eval.TIGHT_RANGES = False` and `games_eval.UNROLL_ADVANTAGES =
+  False` together give the maps of 0.3.30.
+- `tests/games_fuzz.py` compares the bounds of `advantage_bounds` and of
+  the Bellman expansion directly with the advantages of the oracle, and
+  has two new deliberate soundness bugs (`range_corners_only`: the range
+  of a polynomial from its corners, `unroll_drop_remainder`: the
+  remaining values taken as exact), each detected by the direct
+  comparison and by wrong claims of maps. The mutants of the end points
+  and of N, E1, E2 run with interval arithmetic, as before, so that the
+  cells reach the mutated condition. With the final code, 1 800 games
+  (700 of the default kind and 700 of `--mode nonaffine`, 300 of each
+  asking for `every_reachable_state`, 200 with three or four players
+  and both concepts, 200 of `--mode endpoints`; 1 133 with a
+  probability that is not multi-affine): 1 297 `equilibrium` and 1 690 `not_equilibrium` cells,
+  59 875 exact point evaluations and 583 214 direct comparisons of
+  bounds of advantages (417 596 in games that are not multi-affine),
+  no wrong claim and no bound outside; 2 361 players were decided by
+  PD+ or PD− with the Bellman expansion, and no cell was
+  `not_well_defined`. New tests in `tests/test_games_ranges.py`.
+
+- The Solidity norms monitor (`cadl codegen -t solidity`, Appendix D,
+  D.5) monitors three and more levels of nested `within` / `throughout`
+  in the content of a norm (`within(5s, throughout(3s, NOT within(1s,
+  p)))`), which it refused. A nested operator is now a chain of levels:
+  each level turns the runs of decided values fed to it into the runs of
+  its own decided values (at most three runs per level at any depth:
+  undefined, then not decisive, then decisive), always those of the
+  first observations, and the last level feeds the outer operator of the
+  segment tree; D.5 proves the result equal to F.5. The gas per level
+  does not depend on the depth. `until` in a nesting stays refused (a
+  later value can be decided first, and no construction with bounded gas
+  is known). An operand that combines a nested operator with other parts
+  (`within(5s, throughout(2s, p) AND r)`) stays refused, now with the
+  reason that deciding its values out of order can make one observation
+  change as many ranges of candidates as there are candidates.
+- The Solidity norms monitor decides contents with five temporal
+  operators (four at most before): `CadlNormsEval.table` returns the 4^m
+  values of a content in 4^(m - 4) words, and a node of the segment tree
+  has 25 storage words. Six or more stay refused: a node would have 125
+  words and an observation would cost about five times as much (five
+  operators: up to 1.0 × 10^7 gas at one observation per second into
+  1000 s windows), of the order of the gas limit of a block. The runtime estimates of `CadlNormsMulti`,
+  `CadlNormsEval` and `CadlNormsWindows` are 10 120, 11 440 and 5 490
+  bytes (7 490, 10 410 and 5 230). The generated constructor calls
+  `_nested(outer, d, node, p, oneg)` followed by one `_level(mode, neg,
+  d)` per level.
+- scripts/norms_monitor_mutations.py: mutants of the levels and of the
+  words of five operators (sets DEEP and FIVE).
+
+### Fixed
+
+- Arithmetic (`+`, `-`, `*`, `/`) with an operand that is a list or an
+  object has no value (undefined), as with a text or a truth value; F.5
+  defines arithmetic on numbers only. `cadl norms-eval`, the generated
+  Python monitor and the agents runtime, which share its evaluator,
+  applied Python's operators: `[1] + [1] > [1]` was true and
+  `2 * [0] == [0, 0]` was true. `sum` and `avg` already gave no value
+  over elements that are not numbers. The design-time check relies on
+  this: a model built with the old evaluator could miss the vector of a
+  trace with list arithmetic. Tests: list and object operands in
+  `norms-eval`, and a component with `R[1].a + R[1].b == R[1].a` whose
+  vector for a = b = [0] the elimination, the valuations by types and
+  patterns and the classes all give.
+
+- `cadl a2a-gateway --grpc-listen`: a call that `grpcio` refuses itself
+  before a handler runs (an unknown method, `UNIMPLEMENTED`; no free
+  worker, `RESOURCE_EXHAUSTED`) did not count as a call of its
+  connection, so the front listener reset the connection of such a
+  client at `--read-timeout`. It now counts, with TLS as without: the
+  gateway wraps the internal `grpc._server._reject_rpc` of `grpcio`
+  (only when it has the expected parameters) to look up the peer of the
+  refused call.
+
+
 ## [0.3.30] — 2026-11-14
 
 ### Fixed

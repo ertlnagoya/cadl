@@ -55,9 +55,9 @@ SOLC_CHECKED = ("0.8.24", "0.8.37")
 # the constructor). Measured with the versions above, the optimizer with 1
 # and with 200 runs, plus 3 %; tests/test_norms_monitor_targets.py checks
 # them against solc.
-RUNTIME_ESTIMATE = {"monitor": 16670, "CadlNormsValues": 7810, "CadlNormsEval": 10410,
-                    "CadlNormsItems": 2370, "CadlNormsWindows": 5230, "CadlNormsActs": 12080,
-                    "CadlNormsMulti": 7490}
+RUNTIME_ESTIMATE = {"monitor": 16670, "CadlNormsValues": 7810, "CadlNormsEval": 11440,
+                    "CadlNormsItems": 2370, "CadlNormsWindows": 5490, "CadlNormsActs": 12080,
+                    "CadlNormsMulti": 10120}
 
 
 def estimated_initcode(text: str) -> int:
@@ -181,36 +181,50 @@ def _top_temporal(nodes: list[dict], root: int) -> list[int]:
 
 
 # The most temporal operators in one content (D.5). CadlNormsEval.table
-# keeps the 4^m values of a content in one 256-bit word, so the bound is
-# at most 4; a node of the segment tree has 5^(m - 3) words for m > 3.
-MAX_TEMPORAL = 4
+# keeps the 4^m values of a content in 4^(m - 4) words of 256 bits for
+# m > 4, and a node of the segment tree has 5^(m - 3) storage words for
+# m > 3: 25 for five operators. With six, a node would have 125 words and
+# an observation would cost about five times as much as with five (up to
+# 10^7 gas measured), of the order of the gas limit of a block.
+MAX_TEMPORAL = 5
 
 
 def _nesting(nodes: list[dict], k: int) -> tuple[dict | None, str | None]:
     """A temporal operator k of a content with a temporal operator inside:
-    its record for `_nested`, or why the monitor refuses it."""
+    its record for `_nested` (the outer operator and its levels, the first
+    over an operand p without a temporal operator), or why the monitor
+    refuses it."""
     outer = nodes[k]
     if outer["op"] == "until":
         return None, ("until with a temporal operator in an operand (the decided values of "
                       "such an operand do not reach until in the order of the observations, "
                       "see D.5)")
-    x, negations = outer["x"], 0
-    while nodes[x]["op"] == "not":
-        x, negations = nodes[x]["x"], negations + 1
-    inner = nodes[x]
-    if inner["op"] not in ("within", "throughout", "until"):
-        return None, ("an operand of within or throughout that has a temporal operator and "
-                      "is more than that operator or its negation (its value can be decided "
-                      "before that of an earlier observation, see D.5)")
-    if inner["op"] == "until":
-        return None, ("until inside within or throughout (until decides a later observation "
-                      "before an earlier one, see D.5)")
-    if _temporal_inside(nodes, inner["x"]):
-        return None, "three nested temporal operators (the monitor nests two)"
-    is_within = inner["op"] == "within"
-    return {"node": k, "outer": _WINDOW_MODES[outer["op"]], "d": outer["d"], "p": inner["x"],
-            "ineg": is_within, "oneg": (negations % 2 == 1) != is_within,
-            "id": inner["d"]}, None
+    levels = []                      # from the outer operator inwards: (mode, d, negated)
+    x = outer["x"]
+    while True:
+        negations = 0
+        while nodes[x]["op"] == "not":
+            x, negations = nodes[x]["x"], negations + 1
+        inner = nodes[x]
+        if inner["op"] not in ("within", "throughout", "until"):
+            return None, ("an operand of within or throughout that has a temporal operator and "
+                          "is more than that operator or its negation (its value can be decided "
+                          "before that of an earlier observation, and the decided values can "
+                          "alternate along the candidates of one observation, see D.5)")
+        if inner["op"] == "until":
+            return None, ("until inside within or throughout (until decides a later observation "
+                          "before an earlier one, see D.5)")
+        levels.append((inner["op"], inner["d"], negations % 2 == 1))
+        if not _temporal_inside(nodes, inner["x"]):
+            p = inner["x"]
+            break
+        x = inner["x"]
+    # each level reads the one inside it, negated when NOT stands between them
+    negs = [neg for _, _, neg in levels]
+    return {"node": k, "outer": _WINDOW_MODES[outer["op"]], "d": outer["d"], "p": p,
+            "oneg": negs[0],
+            "levels": [(_WINDOW_MODES[op], negs[j + 1] if j + 1 < len(levels) else False, d)
+                       for j, (op, d, _) in enumerate(levels)][::-1]}, None
 
 
 def _content_roots(ir: dict) -> list[int]:
@@ -274,9 +288,10 @@ def solidity_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
         if len(ops) > MAX_TEMPORAL:
             reasons.append(
                 f"{where}: {len(ops)} temporal operators (the Solidity monitor decides the "
-                f"candidates of a content from at most {MAX_TEMPORAL}: it reads the content for "
-                f"the 4^m combinations of their values in one 256-bit word, and a node of its "
-                f"segment tree has 5^(m - 3) storage words)")
+                f"candidates of a content from at most {MAX_TEMPORAL}: a node of its segment "
+                f"tree has 5^(m - 3) storage words, 125 for six operators, and the gas of an "
+                f"observation would be about five times that of five operators, of the order "
+                f"of the gas limit of a block)")
             continue
         specs, nested = [], False
         for k in ops:
@@ -325,8 +340,9 @@ def _window_lines(ir: dict, nd: dict) -> list[str]:
                 out.append(f"        _op({_op_args(ir, sp['node'])});")
                 continue
             out.append(f"        _nested({sp['outer']}, {scaled(sp['d'], 'a duration')}, "
-                       f"{sp['node']}, {sp['p']}, {str(sp['ineg']).lower()}, "
-                       f"{str(sp['oneg']).lower()}, {scaled(sp['id'], 'a duration')});")
+                       f"{sp['node']}, {sp['p']}, {str(sp['oneg']).lower()});")
+            out += [f"        _level({mode}, {str(neg).lower()}, {scaled(d, 'a duration')});"
+                    for mode, neg, d in sp["levels"]]
         return out
     tm = nd.get("temporal")
     if tm is None:

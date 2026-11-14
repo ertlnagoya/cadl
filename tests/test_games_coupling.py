@@ -158,7 +158,10 @@ class TestCoupling:
                     for (i, k), (lo, hi) in coupled.items():
                         assert lo <= exact[(proc.states[i], k)] <= hi
 
-    def test_a_cell_decided_only_with_the_coupled_bounds(self):
+    def test_a_cell_decided_only_with_the_coupled_bounds(self, monkeypatch):
+        # Without the Bellman expansion of the advantages (cadl 0.3.31),
+        # which decides this cell before the coupled bounds are tried.
+        monkeypatch.setattr(ge, "UNROLL_ADVANTAGES", False)
         dists = cell_distributions(GAME, CELL_D_DECIDED)
         on = player_on_cell(GAME, "comply_if_watched", "D", CELL_D_DECIDED, dists, F(0))
         assert on.coupled and on.e2 and on.gain_upper == 0
@@ -169,7 +172,8 @@ class TestCoupling:
         for point in points_of(CELL_D_DECIDED, random.Random(4)):
             assert player_at_point(GAME, "comply_if_watched", "D", point).gain == 0
 
-    def test_the_map_with_three_parameters(self):
+    def test_the_map_with_three_parameters(self, monkeypatch):
+        monkeypatch.setattr(ge, "UNROLL_ADVANTAGES", False)
         with_coupling = ge.design_map(GAME, QUERY, max_cells=300)
         saved = ge.USE_COUPLING
         ge.USE_COUPLING = False
@@ -248,10 +252,12 @@ class TestCoupledProcess:
                             compared += 1
         assert compared > 20
 
-    def test_the_coupled_bounds_only_add_decisions(self):
+    def test_the_coupled_bounds_only_add_decisions(self, monkeypatch):
         # A cell that N, E1, E2, PD+ and PD− decide keeps its status and
         # its deviators (the coupled bounds may establish more of them);
-        # the coupled bounds decide some cells that they leave open.
+        # the coupled bounds decide some cells that they leave open
+        # (without the Bellman expansion, which decides most of them).
+        monkeypatch.setattr(ge, "UNROLL_ADVANTAGES", False)
         rng = random.Random(9)
         more = 0
         for g, model in fuzz_games(11, 30, mode="scale"):
@@ -372,9 +378,12 @@ class TestLifting:
                             checked += 1
         assert checked > 100
 
-    def test_the_bernstein_enclosure(self):
+    def test_the_bernstein_enclosure(self, monkeypatch):
         # It contains the values on the box, and it is within the
         # enclosure by interval arithmetic for (1 − p)² on small boxes.
+        # The interval of a lifted coordinate: from cadl 0.3.31 the range
+        # of `poly_range`, within both enclosures; with TIGHT_RANGES False
+        # their intersection, as in 0.3.29.
         rng = random.Random(25)
         for _ in range(400):
             n = rng.randint(1, 3)
@@ -392,9 +401,13 @@ class TestLifting:
             cell = tuple(cell)
             lo, hi = ge.bernstein_interval(poly, cell)
             a, b = ge.lifted_interval(poly, cell)
-            assert max(lo, ge._p_interval(poly, cell)[0]) == a
+            i_lo, i_hi = ge._p_interval(poly, cell)
+            assert max(lo, i_lo) <= a and b <= min(hi, i_hi)
+            with monkeypatch.context() as m:
+                m.setattr(ge, "TIGHT_RANGES", False)
+                assert ge.lifted_interval(poly, cell) == (max(lo, i_lo), min(hi, i_hi))
             for x in itertools.product(*[(a_, (a_ + b_) / 2, b_) for a_, b_ in cell]):
-                assert lo <= ge._p_eval(poly, x) <= hi
+                assert lo <= a <= ge._p_eval(poly, x) <= b <= hi
         square = (((0,), F(1)), ((1,), F(-2)), ((2,), F(1)))        # (1 − p)²
         cell = ((F(1, 4), F(5, 16)),)
         lo, hi = ge.bernstein_interval(square, cell)
@@ -490,7 +503,8 @@ class TestLifting:
                         exact = exact_advantages(game, player, point)
                         assert c <= exact[(proc.states[key[0]], key[1])] <= d
 
-    def test_the_map_of_the_squared_example(self):
+    def test_the_map_of_the_squared_example(self, monkeypatch):
+        monkeypatch.setattr(ge, "UNROLL_ADVANTAGES", False)
         _, query, game = squared_game()
         with_lifting = ge.design_map(game, query, max_cells=300)
         saved = ge.USE_LIFTING
@@ -551,7 +565,10 @@ class TestFuzz:
         stats = games_fuzz.run(2, 20, name)
         assert "failure" in stats, f"the mutant {name} survived {stats}"
 
-    def test_probabilities_that_are_not_multi_affine(self):
+    def test_probabilities_that_are_not_multi_affine(self, monkeypatch):
+        # The lifted coupled bounds, without the Bellman expansion of the
+        # advantages that is tried before them (tests/test_games_ranges.py).
+        monkeypatch.setattr(ge, "UNROLL_ADVANTAGES", False)
         stats = games_fuzz.run(33, 30, mode="nonaffine")
         assert_sound(stats)
         assert stats["players_decided_by_coupling_lifted"] > 0

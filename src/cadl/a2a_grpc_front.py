@@ -18,16 +18,33 @@ The listener bounds:
 
 - the open connections of one remote address (an IPv4 address, or the /64
   of an IPv6 address), of one IPv4 /24 or IPv6 /48, and in all; a
-  connection beyond them is reset at once and recorded at the capped rate
-  (`overloaded`, reason `connections`). A connection counts until its
-  sockets are closed;
+  connection beyond the cap of its address or prefix is reset at once and
+  recorded at the capped rate (`overloaded`, reason `connections`). A
+  connection that finds only the cap in all full waits up to `wait`
+  seconds for a place (at most `max_connections` wait, and a waiting
+  connection counts against the caps of its address and prefix); a
+  place that comes back goes to the waiting connection whose address,
+  then whose prefix, holds the fewest connections, before any new
+  connection. One that gets none is reset and recorded as above. A
+  connection counts until its sockets are closed;
 - the time to the first call: a connection on which no call has reached
   the gateway within the deadline (`--read-timeout`, counted from the
-  accept) is reset and recorded (`read_timeout`, reason `grpc handshake`).
-  This covers a client that sends nothing, one that never starts or never
-  finishes TLS, one that sends its handshake byte by byte, and a half-open
-  connection. A call that gRPC refuses before the gateway sees it (an
-  unknown method, or beyond the workers) does not count;
+  accept, or from the end of its wait) is reset and recorded
+  (`read_timeout`, reason `grpc handshake`). This covers a client that
+  sends nothing, one that never starts or never finishes TLS, one that
+  sends its handshake byte by byte, and a half-open connection. A call
+  that gRPC refuses before a handler runs (an unknown method, or beyond
+  the workers) counts too: `a2a_grpc.hook_rejections` tells `client` of
+  it;
+- the age: gRPC sends GOAWAY to a connection at `max_age` (with a jitter
+  of 10 %; the final GOAWAY, after which the connection takes no new
+  call, follows within `ping_timeout`), and closes it when its calls
+  under way have ended. A connection still open at `lifetime(keyed)`
+  from the end of its wait (the accept, when it did not wait) is reset
+  and recorded (`read_timeout`, reason `grpc age`): one on which no
+  authenticated call has run (`keyed`, set by the binding) when its
+  calls without a key must have ended, and with a finite `age_grace`
+  every one at the end of the grace;
 - the time a side may refuse the bytes for the other: when the bytes
   that wait for the client (beyond `PENDING`) or for the gRPC server
   (beyond the high-water mark of the transport) do not drain to its
@@ -80,7 +97,27 @@ CLOSE_GRACE = 5.0          # seconds to flush a connection that is closed
 DRAIN_TIMEOUT = 30.0       # seconds for written bytes to go out
 PENDING = 1 << 18          # bytes for the client that may wait while the
                            # gRPC server is read on
+PING_TIMEOUT = 20.0        # seconds: grpc.http2.ping_timeout_ms of the server
+AGE_MARGIN = 10.0          # seconds past the age and its grace before the
+                           # listener resets a connection that gRPC kept
 _PLAIN = re.compile(r"[A-Za-z0-9/._-]+")
+
+
+def _bump(table: dict, key: str, by: int) -> None:
+    n = table.get(key, 0) + by
+    if n > 0:
+        table[key] = n
+    else:
+        table.pop(key, None)
+
+
+class _Waiter:
+    """A connection that waits for a place."""
+
+    __slots__ = ("key", "prefix", "seq", "future")
+
+    def __init__(self, key: str, prefix: str, seq: int, future) -> None:
+        self.key, self.prefix, self.seq, self.future = key, prefix, seq, future
 
 
 def peer_key(host: str) -> str:
@@ -112,14 +149,16 @@ def prefix_key(host: str) -> str:
 
 
 class Connection:
-    """An accepted connection: the address of the client, and whether a
-    call on it has reached the gateway."""
+    """An accepted connection: the address of the client, whether a call
+    on it has reached the gateway (or was refused by gRPC), and whether an
+    authenticated call has run on it (`keyed`)."""
 
-    __slots__ = ("host", "called", "client", "backend")
+    __slots__ = ("host", "called", "keyed", "client", "backend")
 
     def __init__(self, host: str) -> None:
         self.host = host
         self.called = False
+        self.keyed = False
         self.client: Any = None
         self.backend: Any = None
 
@@ -250,9 +289,19 @@ class Front:
     def __init__(self, gw, listen: tuple[str, int], deadline: float = 10.0,
                  max_connections: int = 64, max_per_address: int = 4,
                  max_per_prefix: int = 16, unix: bool | None = None,
-                 drain_timeout: float = DRAIN_TIMEOUT) -> None:
+                 drain_timeout: float = DRAIN_TIMEOUT, max_age: float | None = None,
+                 age_grace: float | None = None, wait: float = 0.0,
+                 ping_timeout: float = PING_TIMEOUT) -> None:
         self.gw = gw
         self.deadline = deadline
+        self.max_age = max_age
+        self.age_grace = age_grace
+        self.ping_timeout = ping_timeout
+        self.wait = wait
+        self.waiters: list[_Waiter] = []
+        self.waiting_address: dict[str, int] = {}
+        self.waiting_prefix: dict[str, int] = {}
+        self.seq = itertools.count()
         self.drain_timeout = drain_timeout
         self.max_connections = max_connections
         self.max_per_address = max_per_address
@@ -308,6 +357,15 @@ class Front:
         if conn is not None:
             conn.called = True
         return conn
+
+    def keyed(self, peer: str) -> None:
+        """Mark the connection of `peer` as one on which an authenticated
+        call has run: the reset at the age without a grace does not apply
+        to it (`lifetime`)."""
+        with self.lock:
+            conn = self.peers.get(peer)
+            if conn is not None:
+                conn.keyed = True
 
     # --- the thread -------------------------------------------------------------
 
@@ -396,26 +454,122 @@ class Front:
 
     # --- one connection ---------------------------------------------------------
 
-    def _take(self, key: str, prefix: str) -> bool:
+    def _take(self, key: str, prefix: str) -> str:
+        """Take a place: "ok", or the cap that is full ("address",
+        "prefix", "total"). Waiting connections count against the caps of
+        their address and prefix."""
         with self.lock:
-            if self.address_count.get(key, 0) >= self.max_per_address \
-                    or self.prefix_count.get(prefix, 0) >= self.max_per_prefix \
-                    or self.total >= self.max_connections:
+            if self.address_count.get(key, 0) + self.waiting_address.get(key, 0) \
+                    >= self.max_per_address:
+                return "address"
+            if self.prefix_count.get(prefix, 0) + self.waiting_prefix.get(prefix, 0) \
+                    >= self.max_per_prefix:
+                return "prefix"
+            if self.total >= self.max_connections or self.waiters:
+                return "total"
+            self._count(key, prefix)
+            return "ok"
+
+    def _count(self, key: str, prefix: str) -> None:
+        self.total += 1
+        self.address_count[key] = self.address_count.get(key, 0) + 1
+        self.prefix_count[prefix] = self.prefix_count.get(prefix, 0) + 1
+
+    async def _queue(self, key: str, prefix: str) -> bool:
+        """Wait up to `wait` seconds for a place when all are taken: True
+        when one was given. At most `max_connections` connections wait;
+        when a place comes back it goes to the waiting connection whose
+        address, then whose prefix, holds the fewest connections (then the
+        one that came first), before any new connection."""
+        with self.lock:
+            if len(self.waiters) >= self.max_connections:
                 return False
-            self.total += 1
-            self.address_count[key] = self.address_count.get(key, 0) + 1
-            self.prefix_count[prefix] = self.prefix_count.get(prefix, 0) + 1
+            w = _Waiter(key, prefix, next(self.seq),
+                        asyncio.get_running_loop().create_future())
+            self.waiters.append(w)
+            _bump(self.waiting_address, key, 1)
+            _bump(self.waiting_prefix, prefix, 1)
+        try:
+            await asyncio.wait({w.future}, timeout=self.wait)
+        except BaseException:
+            # Cancelled (the listener stops): a place given just before
+            # goes back, as the caller does not take it.
+            with self.lock:
+                if w in self.waiters:
+                    self._unwait(w)
+            if w.future.done() and not w.future.cancelled():
+                self._release(key, prefix)
+            else:
+                w.future.cancel()
+            raise
+        with self.lock:
+            if w in self.waiters:
+                self._unwait(w)
+        if w.future.done() and not w.future.cancelled():
             return True
+        w.future.cancel()
+        return False
+
+    def _unwait(self, w: "_Waiter") -> None:
+        self.waiters.remove(w)
+        _bump(self.waiting_address, w.key, -1)
+        _bump(self.waiting_prefix, w.prefix, -1)
+
+    def _grant(self) -> None:
+        """Give the free places to waiting connections (in the loop
+        thread, so that no new connection comes in between)."""
+        with self.lock:
+            while self.total < self.max_connections and self.waiters:
+                w = min(self.waiters, key=lambda w: (self.address_count.get(w.key, 0),
+                                                     self.prefix_count.get(w.prefix, 0),
+                                                     w.seq))
+                self._unwait(w)
+                if w.future.done():
+                    continue
+                self._count(w.key, w.prefix)
+                w.future.set_result(True)
 
     def _release(self, key: str, prefix: str) -> None:
         with self.lock:
             self.total -= 1
-            for table, k in ((self.address_count, key), (self.prefix_count, prefix)):
-                n = table.get(k, 1) - 1
-                if n > 0:
-                    table[k] = n
-                else:
-                    table.pop(k, None)
+            _bump(self.address_count, key, -1)
+            _bump(self.prefix_count, prefix, -1)
+        self._grant()
+
+    def lifetime(self, keyed: bool) -> float | None:
+        """The longest time from the end of its wait (the accept, when it
+        did not wait) that a connection may stay after its first call;
+        None for no limit.
+
+        At its age (with a jitter of 10 %) gRPC sends a first GOAWAY and a
+        PING, and the final GOAWAY, after which no new call is taken, when
+        the PING is answered or at the ping timeout. So the last call of a
+        connection starts at most deadline (the handshake) + 1.1 × age +
+        `ping_timeout` after the end of its wait. A call without a key
+        ends within the deadline (it waits that long for its message, and
+        is refused when it does not authenticate), so a connection on
+        which no authenticated call has run is reset another deadline and
+        `AGE_MARGIN` later; one with an authenticated call is not, so that
+        its calls under way (a held blocking request, a slow answer of the
+        agent, a stream) are not cut. With a finite grace every
+        connection is reset `age_grace` + `AGE_MARGIN` after its last call
+        could start.
+
+        One case is not covered: when the first authenticated call of a
+        connection starts between the first and the final GOAWAY (its
+        earlier calls had no key or were refused), its handler starts more
+        than `AGE_MARGIN` after the call reached gRPC (a backlog of calls
+        without a key), and the call lasts long, the connection can be
+        reset before `keyed` marks it, which cuts that call."""
+        if self.max_age is None:
+            return None
+        last_call = self.deadline + 1.1 * self.max_age + self.ping_timeout
+        bounds = []
+        if self.age_grace is not None:
+            bounds.append(last_call + self.age_grace + AGE_MARGIN)
+        if not keyed:
+            bounds.append(last_call + self.deadline + AGE_MARGIN)
+        return min(bounds) if bounds else None
 
     async def _connect(self):
         """A connection to the gRPC server from an address of its own:
@@ -495,10 +649,19 @@ class Front:
         peername = writer.get_extra_info("peername")
         host = str(peername[0]) if peername else ""
         key, prefix = peer_key(host), prefix_key(host)
-        if not self._take(key, prefix):
+        verdict = self._take(key, prefix)
+        if verdict == "total" and self.wait > 0:
+            try:
+                if await self._queue(key, prefix):
+                    verdict = "ok"
+            except BaseException:
+                writer.transport.abort()
+                raise
+        if verdict != "ok":
             writer.transport.abort()
             self._refused("overloaded", "connections")
             return
+        start = asyncio.get_running_loop().time()
         conn = Connection(host)
         conn.client = writer
         name = None
@@ -531,7 +694,17 @@ class Front:
                 if not conn.called:
                     self._refused("read_timeout", "grpc handshake")
                     return
-                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                while not done:
+                    lifetime = self.lifetime(conn.keyed)
+                    left = None if lifetime is None \
+                        else start + lifetime - asyncio.get_running_loop().time()
+                    if left is not None and left <= 0:
+                        # Past its age: a connection without an
+                        # authenticated call, or past a finite grace.
+                        self._refused("read_timeout", "grpc age")
+                        return
+                    done, _ = await asyncio.wait(tasks, timeout=left,
+                                                 return_when=asyncio.FIRST_COMPLETED)
             if any(t.done() and not t.cancelled() and t.exception() is None
                    and t.result() == "stalled" for t in (up, down)):
                 self._refused("read_timeout", "grpc stalled")
