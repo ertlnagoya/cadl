@@ -40,6 +40,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   reported as an exclusion, independent of the order of the sets. When the
   rule fits, the assumptions that the guarantees of some such set do not
   imply are named, since consistent is not established.
+  A rule whose guarantees exclude the assumption of destination contracts
+  is reported as `disabling` (the rule applies, the destination contracts do
+  not), separately from a vacuous rule (the destination excludes the rule's
+  assumption). The sets of destination contracts that can be in force
+  together are enumerated as maximal satisfiable sets (a solver call finds a
+  set not contained in those found, which is then grown), so many exclusive
+  modes are handled; more than 64 sets give unknown (the subset search
+  stopped at 14 neighbours).
   The neighbourhood is the connected component of the rule: the contracts
   linked to it through any chain of shared parties or variables, so a
   conflict through an intermediate contract is found; contracts outside it

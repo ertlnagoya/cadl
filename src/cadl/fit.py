@@ -19,8 +19,9 @@ only several destination contracts create together is found, and a
 failure is classified:
 
   vacuous           the destination's guarantees exclude ``A_c``, so the
-                    transplanted rule never applies (or ``G_c`` excludes
-                    the assumption of a destination contract)
+                    transplanted rule never applies
+  disabling         ``G_c`` excludes the assumption of destination
+                    contracts, which then never apply (the rule does)
   guarantee         ``G_c`` contradicts the destination's guarantees
   other             none of the above
 
@@ -39,7 +40,6 @@ from __future__ import annotations
 
 import copy
 import re
-from itertools import combinations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -53,7 +53,7 @@ from .unparse import expr_to_source
 from .verifier import Z3Context, _to_z3_bool
 
 TIMEOUT_MS = 5000
-MAX_ENUM = 14
+MAX_SETS = 64
 MAX_CORES = 16
 
 # Words of the expression language that look like actor names.
@@ -407,19 +407,13 @@ def fit_check(data: dict, contract_id: str, scope: str = "both",
     # give one set per mode.
     if _check(Ac.formula, *conj(cand, 0)) == "sat":
         sets = [cand]
-    elif len(cand) > MAX_ENUM:
-        report.findings.append(Finding("F3", "unknown",
-            f"The assumptions of the {len(cand)} neighbours exclude each other in "
-            f"ways too many to enumerate (more than {MAX_ENUM})"))
-        return report
     else:
-        sets = []
-        for k in range(len(cand), 0, -1):
-            for S in combinations(cand, k):
-                if any(set(S) <= set(T) for T in sets):
-                    continue
-                if _check(Ac.formula, *conj(S, 0)) == "sat":
-                    sets.append(list(S))
+        sets = _maximal_sets(Ac.formula, cand, {d: parts[d][0].formula for d in cand})
+        if sets is None:
+            report.findings.append(Finding("F3", "unknown",
+                f"The assumptions of the {len(cand)} neighbours exclude each other in more "
+                f"than {MAX_SETS} ways (sets that can be in force together); not enumerated"))
+            return report
     for S in sets:
         if _check(*conj(S, 0), *conj(S, 1)) == "unsat":
             core = _core({f"{d}.{k}": parts[d][i].formula for d in S
@@ -509,7 +503,7 @@ def fit_check(data: dict, contract_id: str, scope: str = "both",
             cores.append(K)
         for k in K:
             stack.append([d for d in S if d != k])
-    order = {"vacuous": 0, "guarantee": 1, "other": 2}
+    order = {"vacuous": 0, "disabling": 1, "guarantee": 2, "other": 3}
     found = sorted((_classify(contract_id, Ac, Gc, K, parts) + (K,) for K in cores),
                    key=lambda x: (order[x[0]], len(x[2]), x[2]))
     def exact(p):
@@ -547,6 +541,40 @@ def fit_check(data: dict, contract_id: str, scope: str = "both",
     return report
 
 
+def _maximal_sets(Ac: Any, cand: List[str], assume: Dict[str, Any]) -> Optional[List[List[str]]]:
+    """The maximal subsets of ``cand`` whose assumptions hold together with
+    ``Ac``. Each round asks the solver for a valuation that satisfies ``Ac``
+    and the assumptions of a set not contained in any set found so far, and
+    grows that set to a maximal one; the number of solver calls grows with
+    the number of maximal sets times the number of candidates, not with the
+    number of subsets. None if there are more than MAX_SETS."""
+    sel = {d: z3.Bool(f"__in_{i}") for i, d in enumerate(cand)}
+    s = z3.Solver()
+    s.set("timeout", TIMEOUT_MS)
+    s.add(Ac)
+    for d in cand:
+        s.add(z3.Implies(sel[d], assume[d]))
+    sets: List[List[str]] = []
+    while True:
+        if s.check() != z3.sat:
+            break
+        m = s.model()
+        S = [d for d in cand if z3.is_true(m.eval(sel[d], model_completion=True))]
+        for d in cand:          # grow to a maximal set
+            if d not in S and _check(Ac, *[assume[x] for x in S + [d]]) == "sat":
+                S.append(d)
+        S = [d for d in cand if d in S]
+        sets.append(S)
+        if len(sets) > MAX_SETS:
+            return None
+        # The next set must contain a candidate outside S.
+        out = [sel[d] for d in cand if d not in S]
+        if not out:
+            break
+        s.add(z3.Or(out))
+    return sets
+
+
 def _classify(contract_id, Ac, Gc, K, parts):
     """Class of the minimal conflict of the rule with the contracts ``K``
     (Definition 1). Minimal conflicts are unique, so the class does not
@@ -557,8 +585,8 @@ def _classify(contract_id, Ac, Gc, K, parts):
         return ("vacuous", "The destination's guarantees exclude the rule's assumption: the rule "
                 "never applies while these destination contracts are in force")
     if _check(AK, Gc.formula) == "unsat":
-        return ("vacuous", "The rule's guarantees exclude the assumption of destination contracts, "
-                "which never apply while the rule is in force")
+        return ("disabling", "The rule's guarantees exclude the assumption of destination contracts: "
+                "the rule still applies, but they never apply while it is in force")
     if _check(Gc.formula, GK) == "unsat":
         return ("guarantee", "The rule's guarantees contradict the destination's guarantees: the "
                 "rule applies but cannot be met together with them")

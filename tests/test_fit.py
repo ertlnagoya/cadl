@@ -276,6 +276,33 @@ class TestNeighbourhood:
                              {"id": "D", "parties": ["A"], "guarantee": ["x >= 2"]}])
         assert not any("spurious" in f.message for f in fit_check(plain, "RULE").findings)
 
+    def test_rule_that_disables_a_destination_contract_is_not_vacuous(self):
+        data = _sos(["A"], [
+            {"id": "RULE", "parties": ["A"], "guarantee": ["x == 1"]},
+            {"id": "D", "parties": ["A"], "assume": ["x == 0"], "guarantee": ["z >= 0"]},
+        ])
+        r = fit_check(data, "RULE")
+        assert _kinds(r) == [("failed", "disabling")]
+
+    def test_many_modes_are_enumerated(self):
+        # 20 modes, two destination contracts each, plus one for all modes:
+        # 41 neighbours, 20 maximal sets (the old subset search stopped at 14).
+        ds = [{"id": f"M{m:02d}{k}", "parties": ["A"], "assume": [f"mode == {m}"],
+               "guarantee": [f"s{k} >= {m}"]} for m in range(20) for k in "ab"]
+        ds.append({"id": "ALL", "parties": ["A"], "guarantee": ["t >= 0"]})
+        rule = {"id": "RULE", "parties": ["A"], "guarantee": ["sa <= 18"]}
+        r = fit_check(_sos(["A"], [rule] + ds), "RULE")
+        assert r.verdict == "misfit"
+        assert [(f.kind, f.contracts) for f in r.findings if f.condition == "F3"] == [("guarantee", ["M19a"])]
+        ok = fit_check(_sos(["A"], [{"id": "RULE", "parties": ["A"], "guarantee": ["u >= 0"]}] + ds), "RULE")
+        assert ok.verdict == "fits"
+
+    def test_more_maximal_sets_than_the_bound_is_unknown(self):
+        ds = [{"id": f"M{m:02d}", "parties": ["A"], "assume": [f"mode == {m}"],
+               "guarantee": ["t >= 0"]} for m in range(70)]
+        r = fit_check(_sos(["A"], [{"id": "RULE", "parties": ["A"], "guarantee": ["u >= 0"]}] + ds), "RULE")
+        assert r.verdict == "unknown"
+
     def test_exclusion_does_not_depend_on_the_order_of_sets(self):
         modes = [{"id": "D1", "parties": ["A"], "assume": ["mode == 1"], "guarantee": ["s <= 10"]},
                  {"id": "D2", "parties": ["A"], "assume": ["mode == 2"], "guarantee": ["s >= 30"]},
