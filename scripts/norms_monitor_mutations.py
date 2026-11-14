@@ -68,8 +68,10 @@ MUT = [
  ("deep-neg", "deep", "inp.x[k] = flip(lv.neg, inp.x[k]);", "inp.x[k] = flip(false, inp.x[k]);"),
  ("deep-dec-f2", "deep", "if (inp.x[k] == dec && inp.e[k] + 1 > f2) f2 = inp.e[k] + 1;", ""),
  # (not listed: "v = x" in segments, which lets a later undefined run override a decisive one,
- # survives; no trace of the tests nor of 4 x 10^4 random chains of a model has a decisive run
- # before an undefined run whose ranges overlap, and the check is kept)
+ # is equivalent: at every observation the runs fed to a level and to the outer operator have
+ # all their undefined runs before every true or false run (D.5, item 2: an undecided window
+ # reaches G_{n-1} - 1, and the value that decides an earlier true or false observation lies
+ # in the window of a later undefined one too); the check is kept)
  ("deep-old-u", "deep", "uint8 v = j < u1 ? X_U : dec == X_T ? X_F : X_T;", "uint8 v = dec == X_T ? X_F : X_T;"),
  ("deep-next", "deep", "if (a[k] > j) { if (a[k] < next) next = a[k]; continue; }", "if (a[k] > j) continue;"),
  ("deep-u-next", "deep", "uint256 next = j < u1 && u1 < f2 ? u1 : f2;", "uint256 next = f2;"),

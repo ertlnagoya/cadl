@@ -198,14 +198,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   in the content of a norm (`within(5s, throughout(3s, NOT within(1s,
   p)))`), which it refused. A nested operator is now a chain of levels:
   each level turns the runs of decided values fed to it into the runs of
-  its own decided values (at most 2r + 2 runs from r), always those of
-  the first observations, and the last level feeds the outer operator of
-  the segment tree; D.5 proves the result equal to F.5. `until` in a
-  nesting and an operand that combines a nested operator with other
-  parts (`within(5s, throughout(2s, p) AND r)`) stay refused, now with
-  the reason that deciding their values out of order can make one
-  observation change as many ranges of candidates as there are
-  candidates.
+  its own decided values (at most three runs per level at any depth:
+  undefined, then not decisive, then decisive), always those of the
+  first observations, and the last level feeds the outer operator of the
+  segment tree; D.5 proves the result equal to F.5. The gas per level
+  does not depend on the depth. `until` in a nesting stays refused (a
+  later value can be decided first, and no construction with bounded gas
+  is known). An operand that combines a nested operator with other parts
+  (`within(5s, throughout(2s, p) AND r)`) stays refused, now with the
+  reason that deciding its values out of order can make one observation
+  change as many ranges of candidates as there are candidates.
 - The Solidity norms monitor decides contents with five temporal
   operators (four at most before): `CadlNormsEval.table` returns the 4^m
   values of a content in 4^(m - 4) words, and a node of the segment tree
