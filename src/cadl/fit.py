@@ -448,13 +448,13 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
     cores: List[List[str]] = []
     seen: Set[frozenset] = set()
     stack = [list(S) for S in failing_sets]
-    truncated = False
+    truncated = None
     while stack:
         S = stack.pop()
         if frozenset(S) in seen:
             continue
         if len(seen) >= 64 * MAX_CORES:
-            truncated = True
+            truncated = f"after examining {64 * MAX_CORES} sets of contracts"
             break
         seen.add(frozenset(S))
         if _check(Ac.formula, Gc.formula, *conj(S, 0), *conj(S, 1)) != "unsat":
@@ -471,7 +471,7 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
             break
         if K not in cores:
             if len(cores) == MAX_CORES:
-                truncated = True
+                truncated = f"at {MAX_CORES} minimal conflicts"
                 break
             cores.append(K)
         for k in K:
@@ -484,8 +484,11 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
             msg += f" (only jointly: {', '.join(K)})"
         report.findings.append(Finding("F3", "failed", msg, kind=kind, contracts=K))
     if truncated:
-        report.findings.append(Finding("info", "info",
-            f"More than {MAX_CORES} minimal conflicts; only the first are reported"))
+        # The conflicts above are genuine (in the encoding), so the verdict
+        # stays a misfit, but the list is not complete.
+        report.findings.append(Finding("F3", "warning",
+            f"The search for minimal conflicts stopped {truncated}; "
+            "the conflicts reported are not a complete list", kind="truncated"))
     # Exclusions, as on the fit path (neighbours missing from some set),
     # reported as information next to the misfit.
     missing = sorted(d for d in neigh if not all(d in S for S in sets))

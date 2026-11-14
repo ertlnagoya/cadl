@@ -33,7 +33,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   destination, are an exclusion, not a guarantee conflict.
   Every minimal conflict is reported in one run, also when conflicts share
   contracts (the search branches on removing each contract of a minimal
-  core; at most 16 are reported), each classified by its own contracts.
+  core), each classified by its own contracts. The search is bounded:
+  when it stops (16 minimal conflicts, or 1024 sets examined), a warning
+  says that the list is not complete; the verdict stays a misfit.
   Neighbours missing from some set that can be in force with the rule are
   reported as an exclusion, independent of the order of the sets. When the
   rule fits, the assumptions that the guarantees of some such set do not

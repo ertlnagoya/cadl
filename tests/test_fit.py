@@ -200,6 +200,62 @@ class TestNeighbourhood:
         f3 = sorted(f.contracts for f in r.findings if f.condition == "F3")
         assert f3 == [["D1", "D2"], ["D2", "D3"]]
 
+    def test_three_conflicts_sharing_one_contract_are_all_reported(self):
+        # Three minimal conflicts that all contain D1.
+        data = _sos(["A"], [
+            {"id": "RULE", "parties": ["A"], "assume": ["x + y <= 10", "x + z <= 10", "x + w <= 10"]},
+            {"id": "D1", "parties": ["A"], "guarantee": ["x >= 6"]},
+            {"id": "D2", "parties": ["A"], "guarantee": ["y >= 6"]},
+            {"id": "D3", "parties": ["A"], "guarantee": ["z >= 6"]},
+            {"id": "D4", "parties": ["A"], "guarantee": ["w >= 6"]},
+        ])
+        r = fit_check(data, "RULE")
+        f3 = sorted(f.contracts for f in r.findings if f.condition == "F3")
+        assert f3 == [["D1", "D2"], ["D1", "D3"], ["D1", "D4"]]
+
+    def test_more_conflicts_than_the_bound_are_flagged_as_incomplete(self):
+        n = 17
+        rule = {"id": "RULE", "parties": ["A"], "assume": [f"p{i} == true" for i in range(n)]}
+        ds = [{"id": f"D{i:02d}", "parties": ["A"], "guarantee": [f"p{i} == false"]} for i in range(n)]
+        r = fit_check(_sos(["A"], [rule] + ds), "RULE")
+        assert r.verdict == "misfit"
+        assert len([f for f in r.findings if f.condition == "F3" and f.status == "failed"]) == 16
+        trunc = [f for f in r.findings if f.kind == "truncated"]
+        assert trunc and trunc[0].status == "warning" and "not a complete list" in trunc[0].message
+
+    def test_three_exclusive_modes_are_checked_separately(self):
+        modes = [{"id": f"D{m}", "parties": ["A"], "assume": [f"mode == {m}"],
+                  "guarantee": [f"s >= {10 * m}"]} for m in (1, 2, 3)]
+        common = {"id": "D4", "parties": ["A"], "guarantee": ["t >= 0"]}
+        r = fit_check(_sos(["A"], [{"id": "RULE", "parties": ["A"], "guarantee": ["s <= 25"]}]
+                           + modes + [common]), "RULE")
+        assert [(f.kind, f.contracts) for f in r.findings if f.condition == "F3"] == [("guarantee", ["D3"])]
+        assert any(f.condition == "info" and "D1, D2, D3" in f.message for f in r.findings)
+
+    def test_constraint_two_steps_away_is_outside_the_neighbourhood(self):
+        # D2 shares neither a party nor a variable with the rule; the
+        # conflict through D1 is not found (documented limitation).
+        data = _sos(["A", "B"], [
+            {"id": "RULE", "parties": ["A"], "assume": ["x <= 5"]},
+            {"id": "D1", "parties": ["B"], "guarantee": ["x == y"]},
+            {"id": "D2", "parties": ["B"], "guarantee": ["y >= 10"]},
+        ])
+        r = fit_check(data, "RULE")
+        assert r.neighbourhood == ["D1"]
+        assert r.verdict == "fits"
+
+    def test_existential_statements_give_a_failure_to_review(self):
+        # The quantifier is reduced to its body, so two satisfiable
+        # existential statements conflict (spurious); the warning is given.
+        data = _sos(["A", "TAXI[1..N]"], [
+            {"id": "RULE", "parties": ["A", "TAXI[*]"],
+             "assume": ["exists t in TAXI[*]: TAXI[t].speed > 50"]},
+            {"id": "D", "parties": ["A"], "guarantee": ["exists t in TAXI[*]: TAXI[t].speed < 10"]},
+        ])
+        r = fit_check(data, "RULE")
+        assert r.verdict == "misfit"
+        assert any(f.condition == "encoding" and "quantifier" in f.message for f in r.findings)
+
     def test_exclusion_does_not_depend_on_the_order_of_sets(self):
         modes = [{"id": "D1", "parties": ["A"], "assume": ["mode == 1"], "guarantee": ["s <= 10"]},
                  {"id": "D2", "parties": ["A"], "assume": ["mode == 2"], "guarantee": ["s >= 30"]},
