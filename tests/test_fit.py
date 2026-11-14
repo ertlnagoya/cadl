@@ -102,6 +102,20 @@ class TestNeighbourhood:
         ])
         assert _kinds(fit_check(data, "RULE")) == [("failed", "guarantee")]
 
+    def test_class_does_not_depend_on_the_core(self):
+        # The assumptions of RULE and D2 exclude each other, and the guarantees
+        # of RULE and D1 conflict: a guarantee conflict, whichever core the
+        # solver finds.
+        for order in ((1, 2), (2, 1)):
+            ds = {1: {"id": "D1", "parties": ["A"], "guarantee": ["y <= 0"]},
+                  2: {"id": "D2", "parties": ["A"], "assume": ["x <= 0"]}}
+            data = _sos(["A"], [
+                {"id": "RULE", "parties": ["A"], "assume": ["x >= 5"], "guarantee": ["y >= 5"]},
+                ds[order[0]], ds[order[1]]])
+            r = fit_check(data, "RULE")
+            assert _kinds(r) == [("failed", "guarantee")]
+            assert r.verdict == "misfit"
+
     def test_exclusion_is_not_a_misfit(self):
         data = _sos(["A", "B"], [
             {"id": "RULE", "parties": ["A", "B"], "assume": ["mode == 1"], "guarantee": ["x <= 3"]},

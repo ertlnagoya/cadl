@@ -352,18 +352,18 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
         tracked[f"{d}.guarantee"] = parts[d][1].formula
     core = _core(tracked) or []
     involved = sorted({n.split(".")[0] for n in core} - {contract_id})
-    core_g = [parts[d][1].formula for d in involved] or [GN]
-    core_a = [parts[d][0].formula for d in involved] or [AN]
-    if _check(Ac.formula, *core_g) == "unsat" or _check(Ac.formula, GN) == "unsat":
+    # Classified against the whole neighbourhood (Definition 1); the core
+    # only names the contracts to report.
+    if _check(Ac.formula, GN) == "unsat":
         kind = "vacuous"
         msg = "The destination's guarantees exclude the rule's assumption: the rule never applies"
-    elif any(_check(parts[d][0].formula, Gc.formula) == "unsat" for d in involved):
+    elif any(_check(parts[d][0].formula, Gc.formula) == "unsat" for d in neigh):
         kind = "vacuous"
         msg = "The rule's guarantees exclude the assumption of a destination contract, which never applies"
-    elif _check(Gc.formula, *core_g) == "unsat":
+    elif _check(Gc.formula, GN) == "unsat":
         kind = "guarantee"
         msg = "The rule's guarantees contradict the destination's guarantees"
-    elif _check(Ac.formula, *core_a) == "unsat":
+    elif _check(Ac.formula, AN) == "unsat":
         kind = "exclusion"
         msg = "Only the assumptions exclude each other: the contracts govern disjoint situations (need not be a defect)"
     else:
