@@ -448,6 +448,9 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
     if len(involved) > 1:
         msg += f" (only jointly: {', '.join(involved)})"
     report.findings.append(Finding("F3", "failed", msg, kind=kind, contracts=involved))
+    if excluded:
+        report.findings.append(Finding("info", "info",
+            "Set aside as exclusions (assumptions exclude the rule's): " + ", ".join(excluded)))
     return report
 
 

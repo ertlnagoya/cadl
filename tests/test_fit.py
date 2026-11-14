@@ -115,6 +115,7 @@ class TestNeighbourhood:
             r = fit_check(data, "RULE")
             assert _kinds(r) == [("failed", "guarantee")]
             assert r.verdict == "misfit"
+            assert any(f.condition == "info" and "D2" in f.message for f in r.findings)
 
     def test_modes_with_conflicting_guarantees_are_an_exclusion(self):
         data = _sos(["A"], [
