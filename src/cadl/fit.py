@@ -252,6 +252,15 @@ def _review_names(raw: dict, declared: Set[str], contract_id: str) -> List[str]:
     return sorted(names)
 
 
+def _partial(report: "FitReport", abstracted: int) -> None:
+    """A pass over an abstraction is not a pass: with dropped predicates or
+    reduced quantifiers, (F2) and (F3) hold only for what was translated."""
+    if abstracted:
+        report.findings.append(Finding("encoding", "unknown",
+            f"Satisfiable only for the translated fragment: {abstracted} predicate(s) "
+            "were dropped or had a quantifier reduced"))
+
+
 # === main entry ============================================================
 
 def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
@@ -319,8 +328,19 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
         if (scope in ("party", "both") and shares_party) or (scope in ("variable", "both") and shares_var):
             neigh.append(d.id)
     report.neighbourhood = neigh
+    for d in neigh:
+        for label, part in zip(("assume", "guarantee"), parts[d]):
+            for t in part.skipped:
+                report.findings.append(Finding("encoding", "warning",
+                    f"{d}.{label} '{t}' could not be translated and is not checked"))
+            for t in part.quantified:
+                report.findings.append(Finding("encoding", "warning",
+                    f"{d}.{label} '{t}': the quantifier is reduced to its body"))
+    abstracted = sum(len(p.skipped) + len(p.quantified)
+                     for x in [contract_id] + neigh for p in parts[x])
     if not neigh:
         report.findings.append(Finding("F3", "passed", "No destination contract shares a party or a variable"))
+        _partial(report, abstracted)
         return report
 
     AN = z3.And([parts[d][0].formula for d in neigh])
@@ -341,31 +361,45 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
         if _check(GN, z3.Not(Ac.formula)) == "unsat":
             report.findings.append(Finding("info", "info",
                 "The destination's guarantees establish the rule's assumptions"))
+        _partial(report, abstracted)
         return report
     if r == "unknown":
         report.findings.append(Finding("F3", "unknown", "Solver gave no answer"))
         return report
 
+    # Destination contracts whose assumptions exclude the rule's never
+    # hold together with it: their guarantees cannot conflict with it.
+    excluded = [d for d in neigh if _check(Ac.formula, parts[d][0].formula) == "unsat"]
+    active = [d for d in neigh if d not in excluded]
+    AN = z3.And([parts[d][0].formula for d in active]) if active else z3.BoolVal(True)
+    GN = z3.And([parts[d][1].formula for d in active]) if active else z3.BoolVal(True)
+    if _check(Ac.formula, Gc.formula, AN, GN) == "sat":
+        report.findings.append(Finding("F3", "warning",
+            "The assumptions exclude each other: the contracts govern disjoint "
+            "situations (need not be a defect)", kind="exclusion", contracts=excluded))
+        _partial(report, abstracted)
+        return report
+
     tracked = {f"{contract_id}.assume": Ac.formula, f"{contract_id}.guarantee": Gc.formula}
-    for d in neigh:
+    for d in active:
         tracked[f"{d}.assume"] = parts[d][0].formula
         tracked[f"{d}.guarantee"] = parts[d][1].formula
     core = _core(tracked) or []
     involved = sorted({n.split(".")[0] for n in core} - {contract_id})
-    # Classified against the whole neighbourhood (Definition 1); the core
-    # only names the contracts to report.
+    # Classified against the neighbourhood without the excluded contracts
+    # (Definition 1); the core only names the contracts to report.
     if _check(Ac.formula, GN) == "unsat":
         kind = "vacuous"
         msg = "The destination's guarantees exclude the rule's assumption: the rule never applies"
-    elif any(_check(parts[d][0].formula, Gc.formula) == "unsat" for d in neigh):
+    elif any(_check(parts[d][0].formula, Gc.formula) == "unsat" for d in active):
         kind = "vacuous"
         msg = "The rule's guarantees exclude the assumption of a destination contract, which never applies"
+    elif _check(Ac.formula, AN) == "unsat":
+        kind = "exclusion"
+        msg = "The assumptions exclude each other only jointly (need not be a defect)"
     elif _check(Gc.formula, GN) == "unsat":
         kind = "guarantee"
         msg = "The rule's guarantees contradict the destination's guarantees"
-    elif _check(Ac.formula, AN) == "unsat":
-        kind = "exclusion"
-        msg = "Only the assumptions exclude each other: the contracts govern disjoint situations (need not be a defect)"
     else:
         kind = "other"
         msg = "The rule and the destination contracts cannot hold together"

@@ -116,6 +116,15 @@ class TestNeighbourhood:
             assert _kinds(r) == [("failed", "guarantee")]
             assert r.verdict == "misfit"
 
+    def test_modes_with_conflicting_guarantees_are_an_exclusion(self):
+        data = _sos(["A"], [
+            {"id": "RULE", "parties": ["A"], "assume": ["mode == 1"], "guarantee": ["speed <= 10"]},
+            {"id": "D", "parties": ["A"], "assume": ["mode == 2"], "guarantee": ["speed >= 30"]},
+        ])
+        r = fit_check(data, "RULE")
+        assert _kinds(r) == [("warning", "exclusion")]
+        assert r.verdict == "fits"
+
     def test_exclusion_is_not_a_misfit(self):
         data = _sos(["A", "B"], [
             {"id": "RULE", "parties": ["A", "B"], "assume": ["mode == 1"], "guarantee": ["x <= 3"]},
@@ -132,6 +141,21 @@ class TestNeighbourhood:
             {"id": "D2", "parties": ["A"], "guarantee": ["x >= 2"]},
         ])
         assert [s for s, _ in _kinds(fit_check(data, "RULE"))] == ["unknown"]
+
+    def test_pass_over_an_abstraction_is_unknown(self):
+        data = _sos(["A", "TAXI[1..N]"], [
+            {"id": "RULE", "parties": ["A", "TAXI[*]"],
+             "assume": ["for all t in TAXI[*]: TAXI[t].fuel >= 10"]},
+            {"id": "D", "parties": ["A"], "guarantee": ["TAXI[1].fuel < 5"]},
+        ])
+        assert fit_check(data, "RULE").verdict == "unknown"
+
+    def test_map_renames_attributes(self):
+        src = _sos(["A"], [{"id": "RULE", "parties": ["A"], "assume": ["delivery_duration <= 300"]}])
+        dst = _sos(["A"], [{"id": "D", "parties": ["A"], "guarantee": ["delivery_time >= 600"]}])
+        assert fit_check(transplant(src, dst, "RULE", {}), "RULE").verdict == "fits"
+        mapped = transplant(src, dst, "RULE", {"delivery_duration": "delivery_time"})
+        assert _kinds(fit_check(mapped, "RULE")) == [("failed", "vacuous")]
 
     def test_quantifier_is_reported(self):
         data = _sos(["A", "TAXI[1..N]"], [

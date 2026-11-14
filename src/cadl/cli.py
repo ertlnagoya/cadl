@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     fit_cmd.add_argument("--source", type=Path,
                          help="Source CADL file to copy the contract from")
     fit_cmd.add_argument("--map", action="append", default=[], metavar="OLD=NEW",
-                         help="Rename an actor of the source (repeatable)")
+                         help="Rename an actor or attribute name of the source (repeatable)")
     fit_cmd.add_argument("--scope", choices=["party", "variable", "both"], default="both",
                          help="Destination contracts checked with the rule: those sharing a "
                               "party, a variable, or either (default: both)")

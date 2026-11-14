@@ -25,8 +25,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the result. Names in unresolved positions (monitor rules, guards,
   violation strings, incentive rules) that are not declared actors,
   predicates that cannot be translated, and quantifiers reduced to their
-  bodies are reported as warnings. Exit code 0 (fits), 1 (misfit), 2
-  (unknown).
+  bodies are reported as warnings; a pass over such an abstraction is
+  reported as unknown. Destination contracts whose assumptions exclude the
+  rule's are set aside before the failure is classified, so contracts for
+  different operating modes are an exclusion, not a guarantee conflict.
+  `--map` renames attribute names as well as actors. Exit code 0 (fits),
+  1 (misfit), 2 (unknown).
 
 ## [0.3.30] — 2026-11-14
 
