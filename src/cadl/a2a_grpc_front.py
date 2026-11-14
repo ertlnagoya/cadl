@@ -37,12 +37,14 @@ The listener bounds:
   the workers) counts too: `a2a_grpc.hook_rejections` tells `client` of
   it;
 - the age: gRPC sends GOAWAY to a connection at `max_age` (with a jitter
-  of 10 %), after which the connection takes no new call, and closes it
-  when its calls under way have ended. With a finite `age_grace` gRPC
-  closes it at most that long after the GOAWAY, cutting the calls still
-  under way, and a connection still open at `lifetime()` from the end of
-  its wait (the accept, when it did not wait) is reset and recorded
-  (`read_timeout`, reason `grpc age`); without one there is no reset;
+  of 10 %; the final GOAWAY, after which the connection takes no new
+  call, follows within `ping_timeout`), and closes it when its calls
+  under way have ended. A connection still open at `lifetime(keyed)`
+  from the end of its wait (the accept, when it did not wait) is reset
+  and recorded (`read_timeout`, reason `grpc age`): one on which no
+  authenticated call has run (`keyed`, set by the binding) when its
+  calls without a key must have ended, and with a finite `age_grace`
+  every one at the end of the grace;
 - the time a side may refuse the bytes for the other: when the bytes
   that wait for the client (beyond `PENDING`) or for the gRPC server
   (beyond the high-water mark of the transport) do not drain to its
@@ -95,6 +97,7 @@ CLOSE_GRACE = 5.0          # seconds to flush a connection that is closed
 DRAIN_TIMEOUT = 30.0       # seconds for written bytes to go out
 PENDING = 1 << 18          # bytes for the client that may wait while the
                            # gRPC server is read on
+PING_TIMEOUT = 20.0        # seconds: grpc.http2.ping_timeout_ms of the server
 AGE_MARGIN = 10.0          # seconds past the age and its grace before the
                            # listener resets a connection that gRPC kept
 _PLAIN = re.compile(r"[A-Za-z0-9/._-]+")
@@ -146,14 +149,16 @@ def prefix_key(host: str) -> str:
 
 
 class Connection:
-    """An accepted connection: the address of the client, and whether a
-    call on it has reached the gateway (or was refused by gRPC)."""
+    """An accepted connection: the address of the client, whether a call
+    on it has reached the gateway (or was refused by gRPC), and whether an
+    authenticated call has run on it (`keyed`)."""
 
-    __slots__ = ("host", "called", "client", "backend")
+    __slots__ = ("host", "called", "keyed", "client", "backend")
 
     def __init__(self, host: str) -> None:
         self.host = host
         self.called = False
+        self.keyed = False
         self.client: Any = None
         self.backend: Any = None
 
@@ -285,11 +290,13 @@ class Front:
                  max_connections: int = 64, max_per_address: int = 4,
                  max_per_prefix: int = 16, unix: bool | None = None,
                  drain_timeout: float = DRAIN_TIMEOUT, max_age: float | None = None,
-                 age_grace: float | None = None, wait: float = 0.0) -> None:
+                 age_grace: float | None = None, wait: float = 0.0,
+                 ping_timeout: float = PING_TIMEOUT) -> None:
         self.gw = gw
         self.deadline = deadline
         self.max_age = max_age
         self.age_grace = age_grace
+        self.ping_timeout = ping_timeout
         self.wait = wait
         self.waiters: list[_Waiter] = []
         self.waiting_address: dict[str, int] = {}
@@ -350,6 +357,15 @@ class Front:
         if conn is not None:
             conn.called = True
         return conn
+
+    def keyed(self, peer: str) -> None:
+        """Mark the connection of `peer` as one on which an authenticated
+        call has run: the reset at the age without a grace does not apply
+        to it (`lifetime`)."""
+        with self.lock:
+            conn = self.peers.get(peer)
+            if conn is not None:
+                conn.keyed = True
 
     # --- the thread -------------------------------------------------------------
 
@@ -520,16 +536,33 @@ class Front:
             _bump(self.prefix_count, prefix, -1)
         self._grant()
 
-    def lifetime(self) -> float | None:
+    def lifetime(self, keyed: bool) -> float | None:
         """The longest time from the end of its wait (the accept, when it
-        did not wait) that a connection may stay after its first call: the
-        deadline (the handshake), the age at which gRPC sends GOAWAY (with
-        its jitter of 10 %), the grace for the calls under way, and
-        `AGE_MARGIN`. None without `max_age` or without a finite grace:
-        then a connection stays until its last call has ended."""
-        if self.max_age is None or self.age_grace is None:
+        did not wait) that a connection may stay after its first call;
+        None for no limit.
+
+        At its age (with a jitter of 10 %) gRPC sends a first GOAWAY and a
+        PING, and the final GOAWAY, after which no new call is taken, when
+        the PING is answered or at the ping timeout. So the last call of a
+        connection starts at most deadline (the handshake) + 1.1 × age +
+        `ping_timeout` after the end of its wait. A call without a key
+        ends within the deadline (it waits that long for its message, and
+        is refused when it does not authenticate), so a connection on
+        which no authenticated call has run is reset another deadline and
+        `AGE_MARGIN` later; one with an authenticated call is not, so that
+        its calls under way (a held blocking request, a slow answer of the
+        agent, a stream) are not cut. With a finite grace every
+        connection is reset `age_grace` + `AGE_MARGIN` after its last call
+        could start."""
+        if self.max_age is None:
             return None
-        return self.deadline + 1.1 * self.max_age + self.age_grace + AGE_MARGIN
+        last_call = self.deadline + 1.1 * self.max_age + self.ping_timeout
+        bounds = []
+        if self.age_grace is not None:
+            bounds.append(last_call + self.age_grace + AGE_MARGIN)
+        if not keyed:
+            bounds.append(last_call + self.deadline + AGE_MARGIN)
+        return min(bounds) if bounds else None
 
     async def _connect(self):
         """A connection to the gRPC server from an address of its own:
@@ -654,15 +687,17 @@ class Front:
                 if not conn.called:
                     self._refused("read_timeout", "grpc handshake")
                     return
-                lifetime = self.lifetime()
-                left = None if lifetime is None \
-                    else max(0.0, start + lifetime - asyncio.get_running_loop().time())
-                done, _ = await asyncio.wait(tasks, timeout=left,
-                                             return_when=asyncio.FIRST_COMPLETED)
-                if not done:
-                    # gRPC did not close the connection at its age.
-                    self._refused("read_timeout", "grpc age")
-                    return
+                while not done:
+                    lifetime = self.lifetime(conn.keyed)
+                    left = None if lifetime is None \
+                        else start + lifetime - asyncio.get_running_loop().time()
+                    if left is not None and left <= 0:
+                        # Past its age: a connection without an
+                        # authenticated call, or past a finite grace.
+                        self._refused("read_timeout", "grpc age")
+                        return
+                    done, _ = await asyncio.wait(tasks, timeout=left,
+                                                 return_when=asyncio.FIRST_COMPLETED)
             if any(t.done() and not t.cancelled() and t.exception() is None
                    and t.result() == "stalled" for t in (up, down)):
                 self._refused("read_timeout", "grpc stalled")

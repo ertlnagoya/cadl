@@ -66,7 +66,9 @@ class Backend:
             return (conn.host if conn is not None else "unknown").encode()
 
         def hang(request, context):
+            # As an authenticated call of the gateway.
             self.front.client(context.peer())
+            self.front.keyed(context.peer())
             yield b"started"
             while context.is_active():
                 time.sleep(0.05)
@@ -603,7 +605,7 @@ def test_connection_age_without_grace(grpc):
     b = Backend(grpc, deadline=5.0, max_age=1.0, age_grace=None,
                 options=[("grpc.max_connection_age_ms", 1000)])
     try:
-        assert b.front.lifetime() is None
+        assert b.front.lifetime(True) is None
         ch = b.channel()
         stream = ch.unary_stream("/t.T/Hang")(b"", timeout=60)
         assert next(stream) == b"started"
@@ -620,13 +622,14 @@ def test_connection_age_without_grace(grpc):
 
 
 def test_connection_kept_past_its_age_is_reset(grpc, monkeypatch):
-    """When gRPC keeps a connection past its age and grace (here a gRPC
-    server without the age), the Front resets it at `Front.lifetime` and
-    records it (`read_timeout`, `grpc age`)."""
+    """When gRPC keeps a connection past its age and a finite grace (here
+    a gRPC server without the age), the Front resets it at
+    `Front.lifetime` and records it (`read_timeout`, `grpc age`), also
+    with an authenticated call under way."""
     monkeypatch.setattr(F, "AGE_MARGIN", 0.5)
-    b = Backend(grpc, deadline=1.0, max_age=1.0, age_grace=0.5)
+    b = Backend(grpc, deadline=1.0, max_age=1.0, age_grace=0.5, ping_timeout=0.5)
     try:
-        assert b.front.lifetime() == pytest.approx(1.0 + 1.1 + 0.5 + 0.5)
+        assert b.front.lifetime(True) == pytest.approx(1.0 + 1.1 + 0.5 + 0.5 + 0.5)
         ch = b.channel()
         assert b.who(ch) == "127.0.0.1"
         stream = ch.unary_stream("/t.T/Hang")(b"", timeout=60)
@@ -637,6 +640,36 @@ def test_connection_kept_past_its_age_is_reset(grpc, monkeypatch):
         assert e.value.code() == grpc.StatusCode.UNAVAILABLE
         wait_for(lambda: b.gw.count("read_timeout", "grpc age") == 1, "the record")
         ch.close()
+    finally:
+        b.close()
+
+
+def test_without_grace_only_connections_without_a_key_are_reset(grpc, monkeypatch):
+    """Without a grace, the Front resets a connection on which no
+    authenticated call has run once its calls without a key must have
+    ended (deadline + 1.1 × age + ping timeout + deadline + margin; here
+    1 + 1.1 + 0.5 + 1 + 0.5 s, with a gRPC server that keeps it, as a
+    client that reads slowly can make it do), and records it; a
+    connection with an authenticated call (here the stream) is not
+    reset, so its call goes on."""
+    monkeypatch.setattr(F, "AGE_MARGIN", 0.5)
+    b = Backend(grpc, deadline=1.0, max_age=1.0, age_grace=None, ping_timeout=0.5)
+    try:
+        assert b.front.lifetime(False) == pytest.approx(1.0 + 1.1 + 0.5 + 1.0 + 0.5)
+        assert b.front.lifetime(True) is None
+        keyless, keyed = b.channel(), b.channel()
+        assert b.who(keyless) == "127.0.0.1"
+        stream = keyed.unary_stream("/t.T/Hang")(b"", timeout=60)
+        assert next(stream) == b"started"
+        assert b.front.total == 2
+        wait_for(lambda: b.gw.count("read_timeout", "grpc age") == 1, "the reset")
+        wait_for(lambda: b.front.total == 1, "the place of the keyless connection")
+        time.sleep(3.0)
+        assert stream.is_active() and b.front.total == 1
+        assert b.gw.count("read_timeout", "grpc age") == 1
+        stream.cancel()
+        for c in (keyless, keyed):
+            c.close()
     finally:
         b.close()
 

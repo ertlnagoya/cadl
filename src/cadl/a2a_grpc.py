@@ -62,6 +62,7 @@ METHODS = {
                                          "Empty", False),
 }
 MAX_MESSAGE = 1 << 20
+PING_TIMEOUT_MS = 20_000   # the answer to a ping; also ends the staged GOAWAY
 MAX_STREAMS = 16           # grpc.max_concurrent_streams: calls of one connection
 EXTRA = "pip install 'cadl-lang[grpc]'"
 
@@ -347,6 +348,8 @@ class GrpcBinding:
             with gw.lock:
                 gw._unauthenticated(why)
             self._abort(context, None, "Unauthorized", "UNAUTHENTICATED")
+        if self.front is not None:
+            self.front.keyed(context.peer())
 
         def handle():
             from .a2a_gateway import _VERSION_RE, VERSION_NOT_SUPPORTED
@@ -515,7 +518,9 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
     the calls still under way (UNAVAILABLE; a blocking request held for
     approval is withdrawn), and the front listener resets one that is
     still open after that (`Front.lifetime`); None leaves the calls under
-    way to end on their own. A connection that finds every place taken
+    way to end on their own, and the front listener then resets only a
+    connection on which no authenticated call has run, once its calls
+    without a key must have ended. A connection that finds every place taken
     waits up to `connection_wait` seconds (0: none) for one."""
     grpc = modules()[0]
     binding = GrpcBinding(gw, mtls=client_ca is not None, read_timeout=read_timeout,
@@ -529,7 +534,7 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
                       max_per_address=max_connections_per_address,
                       max_per_prefix=max_connections_per_prefix, unix=unix,
                       max_age=max_connection_age, age_grace=max_connection_age_grace,
-                      wait=connection_wait)
+                      wait=connection_wait, ping_timeout=PING_TIMEOUT_MS / 1000)
     except (OSError, ValueError) as e:
         raise GatewayError(f"--grpc-listen: cannot listen on {address}: {e}") from None
     binding.front = front
@@ -557,8 +562,8 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
                      # times the answer with ping_timeout_ms, not
                      # keepalive_timeout_ms, so both are set.
                      ("grpc.keepalive_time_ms", 60_000),
-                     ("grpc.keepalive_timeout_ms", 20_000),
-                     ("grpc.http2.ping_timeout_ms", 20_000),
+                     ("grpc.keepalive_timeout_ms", PING_TIMEOUT_MS),
+                     ("grpc.http2.ping_timeout_ms", PING_TIMEOUT_MS),
                      # The front listener resets a connection without a call
                      # at read_timeout (and records it); this is a backstop.
                      ("grpc.server_handshake_timeout_ms", int(read_timeout * 2000) + 1000),

@@ -10,24 +10,30 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 - `cadl a2a-gateway --grpc-listen`: gRPC sends GOAWAY to each connection
   at `--grpc-max-connection-age` (default 300 s, at least 1 s, with a
-  jitter of 10 %): the connection takes no new call, and the client's
-  channel opens a new connection for its next calls. By default the calls
-  under way go on to their end and the connection closes after the last
-  one; a client without a key thus keeps a connection at most
-  1.1 × 300 + `--read-timeout` + 5 s after its handshake (345 s with the
-  defaults; 30 s instead of 5 when more than 256 KiB wait for a client
-  that does not read). Before, a connection that had carried one call
-  stayed for as long as its client kept calling, so hosts with 16
-  addresses in 4 networks could hold the 64 connections indefinitely. A
-  client with a key still keeps its connection while a call is under way
-  (a blocking request held for approval, an upstream answer within
+  jitter of 10 %; the GOAWAY is staged, and the connection takes new
+  calls until the final GOAWAY, at most the ping timeout of 20 s later),
+  and the client's channel opens a new connection for its next calls. By
+  default the calls under way go on to their end and the connection
+  closes after the last one. A connection on which no authenticated call
+  has run (the gateway marks the connection of each call that
+  authenticates) is reset by the front listener when its calls without a
+  key must have ended, `--read-timeout` + 1.1 × age + 20 s +
+  `--read-timeout` + 10 s after the end of its wait (`read_timeout`,
+  `grpc age`); with the defaults gRPC closes it within 360 s of its
+  handshake and the reset comes at the latest 390 s after its accept,
+  also for a client that keeps answers pending by reading slowly. Before,
+  a connection that had carried one call stayed for as long as its
+  client kept calling, so hosts with 16 addresses in 4 networks could
+  hold the 64 connections indefinitely. A connection with an
+  authenticated call still stays while a call is under way (a blocking
+  request held for approval, an upstream answer within
   `--upstream-timeout`, a stream). `--grpc-max-connection-age-grace
-  SECONDS` (default none) gives a hard bound: gRPC closes the connection
-  at most SECONDS after the GOAWAY and the front listener resets one still
-  open at `--read-timeout` + 1.1 × age + grace + 10 s after the end of its
-  wait (`read_timeout`, `grpc age`); the calls still under way are then
-  cut with `UNAVAILABLE` (a held blocking request is withdrawn, a unary
-  call already processed by the agent gets no answer, a stream ends).
+  SECONDS` (default none) gives a hard bound for every connection: gRPC
+  closes it at most SECONDS after the final GOAWAY and the front listener
+  resets one still open `--read-timeout` + 1.1 × age + 20 s + grace +
+  10 s after the end of its wait; the calls still under way are then cut
+  with `UNAVAILABLE` (a held blocking request is withdrawn, a unary call
+  already processed by the agent gets no answer, a stream ends).
 - `--grpc-connection-wait SECONDS` (default 10; 0 restores the reset at
   once): a connection that finds only the cap in all
   (`--max-grpc-connections`) reached waits for a place instead of being
