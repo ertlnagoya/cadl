@@ -486,9 +486,13 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
     if truncated:
         report.findings.append(Finding("info", "info",
             f"More than {MAX_CORES} minimal conflicts; only the first are reported"))
-    if excluded:
+    # Exclusions, as on the fit path (neighbours missing from some set),
+    # reported as information next to the misfit.
+    missing = sorted(d for d in neigh if not all(d in S for S in sets))
+    if missing:
         report.findings.append(Finding("info", "info",
-            "Set aside as exclusions (assumptions exclude the rule's): " + ", ".join(excluded)))
+            "Set aside as exclusions (never, or only in some situations, in force with the rule): "
+            + ", ".join(missing)))
     return report
 
 

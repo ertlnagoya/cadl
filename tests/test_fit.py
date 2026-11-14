@@ -135,6 +135,7 @@ class TestNeighbourhood:
         bad = fit_check(_sos(["A"], [{"id": "RULE", "parties": ["A"], "guarantee": ["s <= 20"]}] + modes), "RULE")
         assert _kinds(bad) == [("failed", "guarantee")]
         assert [f.contracts for f in bad.findings if f.condition == "F3"] == [["D2"]]
+        assert any(f.condition == "info" and "D1" in f.message for f in bad.findings)
 
     def test_exclusion_is_not_a_misfit(self):
         data = _sos(["A", "B"], [
