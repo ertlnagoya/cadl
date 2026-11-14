@@ -20,8 +20,9 @@ failure is classified:
 
   vacuous           the destination's guarantees exclude ``A_c``, so the
                     transplanted rule never applies
-  disabling         ``G_c`` excludes the assumption of destination
-                    contracts, which then never apply (the rule does)
+  disabling         ``G_c`` excludes the joint assumption of destination
+                    contracts, which then cannot all apply together (the
+                    rule does; each of them may still apply alone)
   guarantee         ``G_c`` contradicts the destination's guarantees
   other             none of the above
 
@@ -585,8 +586,8 @@ def _classify(contract_id, Ac, Gc, K, parts):
         return ("vacuous", "The destination's guarantees exclude the rule's assumption: the rule "
                 "never applies while these destination contracts are in force")
     if _check(AK, Gc.formula) == "unsat":
-        return ("disabling", "The rule's guarantees exclude the assumption of destination contracts: "
-                "the rule still applies, but they never apply while it is in force")
+        return ("disabling", "The rule's guarantees exclude the joint assumption of these destination "
+                "contracts: the rule still applies, but they cannot all apply together while it is in force")
     if _check(Gc.formula, GK) == "unsat":
         return ("guarantee", "The rule's guarantees contradict the destination's guarantees: the "
                 "rule applies but cannot be met together with them")

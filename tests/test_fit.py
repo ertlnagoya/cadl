@@ -297,6 +297,25 @@ class TestNeighbourhood:
         ok = fit_check(_sos(["A"], [{"id": "RULE", "parties": ["A"], "guarantee": ["u >= 0"]}] + ds), "RULE")
         assert ok.verdict == "fits"
 
+    def test_disabling_is_about_the_set_not_each_contract(self):
+        # G_c = not (p and q): D1 and D2 each still apply, but not together.
+        data = _sos(["A"], [
+            {"id": "RULE", "parties": ["A"], "guarantee": ["NOT (p AND q)"]},
+            {"id": "D1", "parties": ["A"], "assume": ["p"], "guarantee": ["z >= 0"]},
+            {"id": "D2", "parties": ["A"], "assume": ["q"], "guarantee": ["w >= 0"]},
+        ])
+        r = fit_check(data, "RULE")
+        assert [(f.kind, f.contracts) for f in r.findings if f.condition == "F3"] == [("disabling", ["D1", "D2"])]
+        assert "cannot all apply together" in [f for f in r.findings if f.condition == "F3"][0].message
+
+    def test_bound_of_maximal_sets_is_exact(self):
+        def modes(n):
+            ds = [{"id": f"M{m:02d}", "parties": ["A"], "assume": [f"mode == {m}"],
+                   "guarantee": ["t >= 0"]} for m in range(n)]
+            return fit_check(_sos(["A"], [{"id": "RULE", "parties": ["A"], "guarantee": ["u >= 0"]}] + ds), "RULE")
+        assert modes(64).verdict == "fits"
+        assert modes(65).verdict == "unknown"
+
     def test_more_maximal_sets_than_the_bound_is_unknown(self):
         ds = [{"id": f"M{m:02d}", "parties": ["A"], "assume": [f"mode == {m}"],
                "guarantee": ["t >= 0"]} for m in range(70)]
