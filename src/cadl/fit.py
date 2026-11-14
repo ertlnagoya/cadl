@@ -5,9 +5,12 @@ A contract ``c`` fits a destination ``D`` if
   (F1) every role reference of ``c`` resolves to an actor of ``D``;
   (F2) ``A_c and G_c`` is satisfiable; and
   (F3) ``A_c and G_c`` is satisfiable together with the assumptions and
-       guarantees of the destination contracts in the neighbourhood of
-       ``c``: those that share a party with ``c`` or mention one of its
-       variables.
+       guarantees of every set of destination contracts in the
+       neighbourhood of ``c`` (those that share a party with ``c`` or
+       mention one of its variables) that can be in force together with
+       ``c``: maximal sets whose assumptions hold together with ``A_c``.
+       Usually this is the whole neighbourhood; destination contracts for
+       different operating modes give one set per mode.
 
 Unlike ``cadl verify``, which checks every pair of contracts that share a
 party, (F3) is checked jointly over the neighbourhood, so a conflict that
@@ -18,9 +21,10 @@ failure is classified:
                     transplanted rule never applies (or ``G_c`` excludes
                     the assumption of a destination contract)
   guarantee         ``G_c`` contradicts the destination's guarantees
-  exclusion         only the assumptions exclude each other: the contracts
-                    govern disjoint situations, which need not be a defect
   other             none of the above
+
+Neighbours whose assumptions exclude the rule's govern other situations and
+are reported as an exclusion, a warning that does not make a misfit.
 
 The encoding is that of the verifier (verifier.expr_to_z3), so the same
 abstraction applies; predicates whose translation fails and quantifiers
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import copy
 import re
+from itertools import combinations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -47,6 +52,7 @@ from .unparse import expr_to_source
 from .verifier import Z3Context, _to_z3_bool
 
 TIMEOUT_MS = 5000
+MAX_ENUM = 14
 
 # Words of the expression language that look like actor names.
 _KEYWORDS = {"AND", "OR", "NOT", "IN", "TRUE", "FALSE", "ALL", "N", "M"}
@@ -343,61 +349,97 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
         _partial(report, abstracted)
         return report
 
-    AN = z3.And([parts[d][0].formula for d in neigh])
-    GN = z3.And([parts[d][1].formula for d in neigh])
-    if _check(AN, GN) == "unsat":
-        core = _core({f"{d}.{k}": parts[d][i].formula for d in neigh
-                      for i, k in ((0, "assume"), (1, "guarantee"))})
-        report.findings.append(Finding("F3", "unknown",
-            "The destination contracts in the neighbourhood already contradict each other",
-            contracts=sorted({n.split(".")[0] for n in core or []})))
-        return report
+    def conj(ds, k):
+        return [parts[d][k].formula for d in ds]
 
-    r = _check(Ac.formula, Gc.formula, AN, GN)
-    if r == "sat":
-        report.findings.append(Finding("F3", "passed",
-            f"Jointly satisfiable with the {len(neigh)} contract(s) of the neighbourhood"))
-        # Informational: does the destination establish the assumption?
+    # Destination contracts whose assumptions exclude the rule's are never in
+    # force together with it; a destination contract inconsistent by itself
+    # makes the check meaningless.
+    excluded = [d for d in neigh if _check(Ac.formula, *conj([d], 0)) == "unsat"]
+    broken = [d for d in neigh if d not in excluded
+              and _check(*conj([d], 0), *conj([d], 1)) == "unsat"]
+    if broken:
+        report.findings.append(Finding("F3", "unknown",
+            "Destination contract(s) inconsistent by themselves", contracts=broken))
+        return report
+    cand = [d for d in neigh if d not in excluded]
+
+    # The sets of destination contracts that can be in force together with
+    # the rule: maximal subsets whose assumptions hold together with A_c.
+    # Usually this is all of them; contracts for different operating modes
+    # give one set per mode.
+    if _check(Ac.formula, *conj(cand, 0)) == "sat":
+        sets = [cand]
+    elif len(cand) > MAX_ENUM:
+        report.findings.append(Finding("F3", "unknown",
+            f"The assumptions of the {len(cand)} neighbours exclude each other in "
+            f"ways too many to enumerate (more than {MAX_ENUM})"))
+        return report
+    else:
+        sets = []
+        for k in range(len(cand), 0, -1):
+            for S in combinations(cand, k):
+                if any(set(S) <= set(T) for T in sets):
+                    continue
+                if _check(Ac.formula, *conj(S, 0)) == "sat":
+                    sets.append(list(S))
+    for S in sets:
+        if _check(*conj(S, 0), *conj(S, 1)) == "unsat":
+            core = _core({f"{d}.{k}": parts[d][i].formula for d in S
+                          for i, k in ((0, "assume"), (1, "guarantee"))})
+            report.findings.append(Finding("F3", "unknown",
+                "Destination contracts that can be in force together contradict each other",
+                contracts=sorted({n.split(".")[0] for n in core or []})))
+            return report
+
+    failing = None
+    for S in sets:
+        r = _check(Ac.formula, Gc.formula, *conj(S, 0), *conj(S, 1))
+        if r == "unknown":
+            report.findings.append(Finding("F3", "unknown", "Solver gave no answer"))
+            return report
+        if r == "unsat":
+            failing = S
+            break
+
+    if failing is None:
+        if excluded or len(sets) > 1:
+            msg = ("The assumptions exclude each other: the contracts govern disjoint "
+                   "situations (need not be a defect)")
+            if len(sets) > 1:
+                msg += f"; checked against {len(sets)} sets of destination contracts that can be in force together"
+            report.findings.append(Finding("F3", "warning", msg, kind="exclusion",
+                                           contracts=sorted(set(neigh) - set(sets[0])) if sets else excluded))
+        else:
+            report.findings.append(Finding("F3", "passed",
+                f"Jointly satisfiable with the {len(neigh)} contract(s) of the neighbourhood"))
+        GN = z3.And(conj(sets[0], 1)) if sets and sets[0] else z3.BoolVal(True)
         if _check(GN, z3.Not(Ac.formula)) == "unsat":
             report.findings.append(Finding("info", "info",
                 "The destination's guarantees establish the rule's assumptions"))
         _partial(report, abstracted)
         return report
-    if r == "unknown":
-        report.findings.append(Finding("F3", "unknown", "Solver gave no answer"))
-        return report
 
-    # Destination contracts whose assumptions exclude the rule's never
-    # hold together with it: their guarantees cannot conflict with it.
-    excluded = [d for d in neigh if _check(Ac.formula, parts[d][0].formula) == "unsat"]
-    active = [d for d in neigh if d not in excluded]
-    AN = z3.And([parts[d][0].formula for d in active]) if active else z3.BoolVal(True)
-    GN = z3.And([parts[d][1].formula for d in active]) if active else z3.BoolVal(True)
-    if _check(Ac.formula, Gc.formula, AN, GN) == "sat":
-        report.findings.append(Finding("F3", "warning",
-            "The assumptions exclude each other: the contracts govern disjoint "
-            "situations (need not be a defect)", kind="exclusion", contracts=excluded))
-        _partial(report, abstracted)
-        return report
-
+    S = failing
+    AS = z3.And(conj(S, 0)) if S else z3.BoolVal(True)
+    GS = z3.And(conj(S, 1)) if S else z3.BoolVal(True)
     tracked = {f"{contract_id}.assume": Ac.formula, f"{contract_id}.guarantee": Gc.formula}
-    for d in active:
+    for d in S:
         tracked[f"{d}.assume"] = parts[d][0].formula
         tracked[f"{d}.guarantee"] = parts[d][1].formula
     core = _core(tracked) or []
     involved = sorted({n.split(".")[0] for n in core} - {contract_id})
-    # Classified against the neighbourhood without the excluded contracts
-    # (Definition 1); the core only names the contracts to report.
-    if _check(Ac.formula, GN) == "unsat":
+    # Classified against the failing set (Definition 1); the core only
+    # names the contracts to report.
+    if _check(Ac.formula, GS) == "unsat":
         kind = "vacuous"
-        msg = "The destination's guarantees exclude the rule's assumption: the rule never applies"
-    elif any(_check(parts[d][0].formula, Gc.formula) == "unsat" for d in active):
+        msg = ("The destination's guarantees exclude the rule's assumption: the rule "
+               "never applies while these destination contracts are in force")
+    elif _check(AS, Gc.formula) == "unsat":
         kind = "vacuous"
-        msg = "The rule's guarantees exclude the assumption of a destination contract, which never applies"
-    elif _check(Ac.formula, AN) == "unsat":
-        kind = "exclusion"
-        msg = "The assumptions exclude each other only jointly (need not be a defect)"
-    elif _check(Gc.formula, GN) == "unsat":
+        msg = ("The rule's guarantees exclude the assumption of destination contracts, "
+               "which never apply while the rule is in force")
+    elif _check(Gc.formula, GS) == "unsat":
         kind = "guarantee"
         msg = "The rule's guarantees contradict the destination's guarantees"
     else:
@@ -405,8 +447,7 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
         msg = "The rule and the destination contracts cannot hold together"
     if len(involved) > 1:
         msg += f" (only jointly: {', '.join(involved)})"
-    report.findings.append(Finding("F3", "failed" if kind != "exclusion" else "warning",
-                                   msg, kind=kind, contracts=involved))
+    report.findings.append(Finding("F3", "failed", msg, kind=kind, contracts=involved))
     return report
 
 

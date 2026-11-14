@@ -27,8 +27,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   predicates that cannot be translated, and quantifiers reduced to their
   bodies are reported as warnings; a pass over such an abstraction is
   reported as unknown. Destination contracts whose assumptions exclude the
-  rule's are set aside before the failure is classified, so contracts for
-  different operating modes are an exclusion, not a guarantee conflict.
+  rule's are set aside, and the rule is checked against every maximal set
+  of destination contracts that can be in force together with it, so
+  contracts for different operating modes, in the rule or in the
+  destination, are an exclusion, not a guarantee conflict.
   `--map` renames attribute names as well as actors. Exit code 0 (fits),
   1 (misfit), 2 (unknown).
 

@@ -125,6 +125,16 @@ class TestNeighbourhood:
         assert _kinds(r) == [("warning", "exclusion")]
         assert r.verdict == "fits"
 
+    def test_destination_modes_are_checked_separately(self):
+        modes = [{"id": "D1", "parties": ["A"], "assume": ["mode == 1"], "guarantee": ["s <= 10"]},
+                 {"id": "D2", "parties": ["A"], "assume": ["mode == 2"], "guarantee": ["s >= 30"]}]
+        ok = fit_check(_sos(["A"], [{"id": "RULE", "parties": ["A"], "assume": ["x <= 5"],
+                                     "guarantee": ["y >= 0"]}] + modes), "RULE")
+        assert ok.verdict == "fits" and _kinds(ok) == [("warning", "exclusion")]
+        bad = fit_check(_sos(["A"], [{"id": "RULE", "parties": ["A"], "guarantee": ["s <= 20"]}] + modes), "RULE")
+        assert _kinds(bad) == [("failed", "guarantee")]
+        assert [f.contracts for f in bad.findings if f.condition == "F3"] == [["D2"]]
+
     def test_exclusion_is_not_a_misfit(self):
         data = _sos(["A", "B"], [
             {"id": "RULE", "parties": ["A", "B"], "assume": ["mode == 1"], "guarantee": ["x <= 3"]},
