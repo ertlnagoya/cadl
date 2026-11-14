@@ -279,12 +279,17 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--grpc-max-connection-age", type=float, default=300.0,
                          metavar="SECONDS",
                          help="gRPC sends GOAWAY to a connection of --grpc-listen after "
-                              "SECONDS (default 300, with a jitter of 10%%); the client "
-                              "opens a new connection for its next calls")
-    a2a_cmd.add_argument("--grpc-max-connection-age-grace", type=float, default=60.0,
+                              "SECONDS (default 300, at least 1, with a jitter of 10%%): "
+                              "it takes no new call, the client opens a new connection for "
+                              "its next calls, and it closes when its calls under way have "
+                              "ended")
+    a2a_cmd.add_argument("--grpc-max-connection-age-grace", type=float, default=None,
                          metavar="SECONDS",
-                         help="After the GOAWAY, the calls under way have SECONDS to end "
-                              "(default 60); then the connection is closed")
+                         help="Close a connection at most SECONDS after its GOAWAY, cutting "
+                              "the calls still under way (UNAVAILABLE; a blocking request "
+                              "held for approval is withdrawn), and reset it if it is still "
+                              "open later. Default: none, the calls under way end on their "
+                              "own")
     a2a_cmd.add_argument("--grpc-connection-wait", type=float, default=10.0,
                          metavar="SECONDS",
                          help="A connection that finds all --max-grpc-connections taken "

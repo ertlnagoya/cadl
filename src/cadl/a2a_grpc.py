@@ -95,7 +95,18 @@ def hook_rejections(front: Front) -> bool:
     peer of the call (as `context.peer()` does) and then refuses the call
     as before. Returns whether the hook is in place: False when `grpcio`
     does not have that function (the calls then do not count, as
-    before)."""
+    before).
+
+    The wrapper runs for every gRPC server of the process and matches the
+    peer against the connections of every registered Front. With Unix
+    sockets a peer is a path in the private directory of one Front, so it
+    can match no other connection. Without them (127.0.0.1 and a port of
+    its own per connection) a call that another gRPC server of the same
+    process refuses, from a client whose port on 127.0.0.1 is that of a
+    connection of a Front to its own server at that moment, would mark
+    that connection as called: it then keeps its connection past the
+    first-call deadline as after any call, until the gRPC server's idle
+    limit or the age. The gateway runs one gRPC server per process."""
     global _HOOKED
     try:
         from grpc import _common, _server
@@ -488,7 +499,7 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
           max_readers_per_prefix: int = 16, max_connections: int = 64,
           max_connections_per_address: int = 4, max_connections_per_prefix: int = 16,
           unix: bool | None = None, max_connection_age: float = 300.0,
-          max_connection_age_grace: float = 60.0, connection_wait: float = 10.0):
+          max_connection_age_grace: float | None = None, connection_wait: float = 10.0):
     """Start the gRPC service of `gw` on `listen`: (Listener, port). The
     connections are accepted by a front listener (`a2a_grpc_front`) under
     the caps `max_connections*` and the deadline `read_timeout` to the
@@ -498,10 +509,14 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
     ones, so that the former cannot take the places of the latter.
 
     gRPC sends GOAWAY to a connection at `max_connection_age` seconds
-    (with a jitter of 10 %) and closes it `max_connection_age_grace`
-    seconds later at most; the front listener resets one that is still
-    open after that (`Front.lifetime`). A connection that finds every
-    place taken waits up to `connection_wait` seconds (0: none) for one."""
+    (with a jitter of 10 %): it takes no new call and is closed when its
+    calls under way have ended. With a finite `max_connection_age_grace`
+    gRPC closes it at most that many seconds after the GOAWAY, cutting
+    the calls still under way (UNAVAILABLE; a blocking request held for
+    approval is withdrawn), and the front listener resets one that is
+    still open after that (`Front.lifetime`); None leaves the calls under
+    way to end on their own. A connection that finds every place taken
+    waits up to `connection_wait` seconds (0: none) for one."""
     grpc = modules()[0]
     binding = GrpcBinding(gw, mtls=client_ca is not None, read_timeout=read_timeout,
                           max_readers=max_readers,
@@ -532,11 +547,10 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
                      ("grpc.http2.min_ping_interval_without_data_ms", 10_000),
                      ("grpc.http2.max_ping_strikes", 2),
                      ("grpc.max_connection_idle_ms", 120_000),
-                     # Every connection ends: GOAWAY at its age, then the
-                     # calls under way have the grace to end.
+                     # GOAWAY at its age: the connection takes no new call
+                     # and closes when its calls under way have ended (or
+                     # at the end of a finite grace, below).
                      ("grpc.max_connection_age_ms", int(max_connection_age * 1000)),
-                     ("grpc.max_connection_age_grace_ms",
-                      int(max_connection_age_grace * 1000)),
                      # A connection with a call open is pinged after 60 s
                      # without data; a peer that does not answer within
                      # 20 s (gone without closing) loses it. grpcio 1.85
@@ -548,7 +562,10 @@ def start(gw, listen: tuple[str, int], tls_cert: Path | None, tls_key: Path | No
                      # The front listener resets a connection without a call
                      # at read_timeout (and records it); this is a backstop.
                      ("grpc.server_handshake_timeout_ms", int(read_timeout * 2000) + 1000),
-                     ("grpc.so_reuseport", 0)])
+                     ("grpc.so_reuseport", 0)]
+            + ([("grpc.max_connection_age_grace_ms",
+                 int(max_connection_age_grace * 1000))]
+               if max_connection_age_grace is not None else []))
         if tls_cert is not None:
             try:
                 creds = grpc.ssl_server_credentials(

@@ -566,8 +566,9 @@ def test_calls_refused_by_grpc_count(grpc):
 
 
 def test_connection_age(grpc):
-    """gRPC sends GOAWAY at the age of a connection (here 1 s, with a
-    jitter of 10 %) and closes it after the grace (1 s): a stream that
+    """With a finite grace: gRPC sends GOAWAY at the age of a connection
+    (here 1 s, with a jitter of 10 %) and closes it after the grace (1 s):
+    a stream that
     lasts longer ends with UNAVAILABLE, a unary call under way ends
     normally, the Front closes its side and the place comes back; the
     client's next call goes on a new connection. Nothing is recorded."""
@@ -588,6 +589,30 @@ def test_connection_age(grpc):
         wait_for(lambda: b.front.total == 0, "the place to come back")
         assert b.who(ch) == "127.0.0.1"
         assert b.front.total == 1
+        ch.close()
+        assert b.gw.got == []
+    finally:
+        b.close()
+
+
+def test_connection_age_without_grace(grpc):
+    """Without a grace (the default of the gateway), a call under way is
+    not cut at the age: after the GOAWAY (1 s here) the connection takes
+    no new call, the client's next calls go on a new connection, and the
+    old one closes when its stream ends. Nothing is recorded."""
+    b = Backend(grpc, deadline=5.0, max_age=1.0, age_grace=None,
+                options=[("grpc.max_connection_age_ms", 1000)])
+    try:
+        assert b.front.lifetime() is None
+        ch = b.channel()
+        stream = ch.unary_stream("/t.T/Hang")(b"", timeout=60)
+        assert next(stream) == b"started"
+        time.sleep(4.0)
+        assert stream.is_active()
+        assert b.who(ch) == "127.0.0.1"
+        assert b.front.total == 2               # the old one holds the stream
+        stream.cancel()
+        wait_for(lambda: b.front.total == 1, "the old connection to close")
         ch.close()
         assert b.gw.got == []
     finally:
@@ -795,34 +820,71 @@ def test_gateway_tls_call_served_while_an_address_holds_its_connections(
     capsys.readouterr()
 
 
-def test_gateway_tls_unknown_method_counts_and_age(tmp_path, grpc, pki, capsys):
+def _states(channel) -> list:
+    """The connectivity states of `channel`, as they come."""
+    got: list = []
+    channel.subscribe(got.append, try_to_connect=False)
+    return got
+
+
+def test_gateway_tls_unknown_method_keeps_its_connection(tmp_path, grpc, pki, capsys):
     """Mutual TLS through the gateway: a connection whose only call is of
-    an unknown method (refused by gRPC with UNIMPLEMENTED) is not reset at
-    the deadline. With an age of 2 s and a grace of 1 s, a client keeps
-    calling across its connections' ends. Nothing is recorded as
-    `read_timeout`."""
+    an unknown method (refused by gRPC itself with UNIMPLEMENTED, before
+    the gateway sees it) is not reset at the deadline (3 s): the channel
+    stays READY past it, nothing is recorded as `read_timeout`, and the
+    next call goes on the same connection. Without `hook_rejections` the
+    connection would be reset at 3 s (`grpc handshake`)."""
     pb = pytest.importorskip("a2a.types.a2a_pb2")
-    r, port = _run(tmp_path, *pki.gateway_args(), "--read-timeout", "3",
-                   "--grpc-max-connection-age", "2", "--grpc-max-connection-age-grace", "1")
+    r, port = _run(tmp_path, *pki.gateway_args(), "--read-timeout", "3")
     key = (pki.dir / "planner.key").read_bytes()
     chain = (pki.dir / "planner.pem").read_bytes()
     creds = grpc.ssl_channel_credentials(pki.ca.read_bytes(), key, chain)
-    unknown = grpc.secure_channel(f"127.0.0.1:{port}", creds, options=[
+    g = GrpcClient(r, grpc, pb, port)
+    g.channel.close()
+    g.channel = grpc.secure_channel(f"127.0.0.1:{port}", creds, options=[
         ("grpc.ssl_target_name_override", "localhost"),
         ("grpc.use_local_subchannel_pool", 1)])
+    states = _states(g.channel)
     with pytest.raises(grpc.RpcError) as e:
-        unknown.unary_unary("/lf.a2a.v1.A2AService/Nope")(b"", timeout=10)
+        g.channel.unary_unary("/lf.a2a.v1.A2AService/Nope")(b"", timeout=10)
     assert e.value.code() == grpc.StatusCode.UNIMPLEMENTED
+    wait_for(lambda: states and states[-1] == grpc.ChannelConnectivity.READY, "READY")
+    seen = len(states)
+    time.sleep(6.0)
+    assert states[seen - 1:] == [grpc.ChannelConnectivity.READY]
+    got = g.call("PLANNER", "SendMessage", grpc_message(pb, "summarize"),
+                 pb.SendMessageResponse)
+    assert got.task.id == "up-task-1"
+    assert states[seen - 1:] == [grpc.ChannelConnectivity.READY]
+    g.channel.close()
+    r.stop()
+    assert events(r.audit, "read_timeout") == []
+    r.replay_check()
+    capsys.readouterr()
+
+
+def test_gateway_age_without_grace(tmp_path, grpc, pki, capsys):
+    """Through the gateway with an age of 1 s and no grace (the default):
+    a client keeps calling across the ends of its connections, and
+    nothing is recorded as `read_timeout`."""
+    pb = pytest.importorskip("a2a.types.a2a_pb2")
+    r, port = _run(tmp_path, *pki.gateway_args(), "--read-timeout", "3",
+                   "--grpc-max-connection-age", "1")
+    key = (pki.dir / "planner.key").read_bytes()
+    chain = (pki.dir / "planner.pem").read_bytes()
+    creds = grpc.ssl_channel_credentials(pki.ca.read_bytes(), key, chain)
     g = GrpcClient(r, grpc, pb, port)
     g.channel.close()
     g.channel = grpc.secure_channel(f"127.0.0.1:{port}", creds, options=[
         ("grpc.ssl_target_name_override", "localhost")])
+    states = _states(g.channel)
     for i in range(3):
         got = g.call("PLANNER", "SendMessage", grpc_message(pb, "summarize"),
                      pb.SendMessageResponse)
         assert got.task.id == f"up-task-{i + 1}"
-        time.sleep(2.5)
-    unknown.close()
+        time.sleep(2.0)
+    # The channel saw its connections end (GOAWAY at the age).
+    assert grpc.ChannelConnectivity.IDLE in states
     g.channel.close()
     r.stop()
     assert events(r.audit, "read_timeout") == []
@@ -843,10 +905,11 @@ def test_gateway_options_must_be_positive(tmp_path, capsys):
                  "0"]) == 2
     assert "must be positive" in capsys.readouterr().err
     for option, value in (("--grpc-max-connection-age", "0"),
+                          ("--grpc-max-connection-age", "0.0004"),
                           ("--grpc-max-connection-age-grace", "-1"),
                           ("--grpc-connection-wait", "-1")):
         assert main(["a2a-gateway", str(CADL), "--agent-actor", "SUMMARIZER", "--upstream",
                      "http://127.0.0.1:9", "--client-keys",
                      str(tmp_path / "clients.json"), "--audit", str(tmp_path / "a.jsonl"),
                      "--grpc-listen", "127.0.0.1:0", option, value]) == 2
-        assert "--grpc-max-connection-age must be positive" in capsys.readouterr().err
+        assert "--grpc-max-connection-age must be at least 1 second"             in capsys.readouterr().err

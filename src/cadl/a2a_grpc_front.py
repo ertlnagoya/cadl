@@ -37,9 +37,12 @@ The listener bounds:
   the workers) counts too: `a2a_grpc.hook_rejections` tells `client` of
   it;
 - the age: gRPC sends GOAWAY to a connection at `max_age` (with a jitter
-  of 10 %) and closes it after `age_grace`; a connection still open at
-  `lifetime()` from the accept (or the end of its wait) is reset and
-  recorded (`read_timeout`, reason `grpc age`);
+  of 10 %), after which the connection takes no new call, and closes it
+  when its calls under way have ended. With a finite `age_grace` gRPC
+  closes it at most that long after the GOAWAY, cutting the calls still
+  under way, and a connection still open at `lifetime()` from the end of
+  its wait (the accept, when it did not wait) is reset and recorded
+  (`read_timeout`, reason `grpc age`); without one there is no reset;
 - the time a side may refuse the bytes for the other: when the bytes
   that wait for the client (beyond `PENDING`) or for the gRPC server
   (beyond the high-water mark of the transport) do not drain to its
@@ -282,7 +285,7 @@ class Front:
                  max_connections: int = 64, max_per_address: int = 4,
                  max_per_prefix: int = 16, unix: bool | None = None,
                  drain_timeout: float = DRAIN_TIMEOUT, max_age: float | None = None,
-                 age_grace: float = 0.0, wait: float = 0.0) -> None:
+                 age_grace: float | None = None, wait: float = 0.0) -> None:
         self.gw = gw
         self.deadline = deadline
         self.max_age = max_age
@@ -472,10 +475,20 @@ class Front:
             _bump(self.waiting_prefix, prefix, 1)
         try:
             await asyncio.wait({w.future}, timeout=self.wait)
-        finally:
+        except BaseException:
+            # Cancelled (the listener stops): a place given just before
+            # goes back, as the caller does not take it.
             with self.lock:
                 if w in self.waiters:
                     self._unwait(w)
+            if w.future.done() and not w.future.cancelled():
+                self._release(key, prefix)
+            else:
+                w.future.cancel()
+            raise
+        with self.lock:
+            if w in self.waiters:
+                self._unwait(w)
         if w.future.done() and not w.future.cancelled():
             return True
         w.future.cancel()
@@ -508,12 +521,13 @@ class Front:
         self._grant()
 
     def lifetime(self) -> float | None:
-        """The longest time from the accept (or the end of its wait) that a
-        connection may stay after its first call: the deadline (the
-        handshake), the age at which gRPC sends GOAWAY (with its jitter of
-        10 %), the grace for the calls under way, and `AGE_MARGIN`; None
-        without `max_age`."""
-        if self.max_age is None:
+        """The longest time from the end of its wait (the accept, when it
+        did not wait) that a connection may stay after its first call: the
+        deadline (the handshake), the age at which gRPC sends GOAWAY (with
+        its jitter of 10 %), the grace for the calls under way, and
+        `AGE_MARGIN`. None without `max_age` or without a finite grace:
+        then a connection stays until its last call has ended."""
+        if self.max_age is None or self.age_grace is None:
             return None
         return self.deadline + 1.1 * self.max_age + self.age_grace + AGE_MARGIN
 
