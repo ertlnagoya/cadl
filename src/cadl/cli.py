@@ -47,6 +47,9 @@ def main(argv: list[str] | None = None) -> int:
     fit_cmd.add_argument("--scope", choices=["party", "variable", "both"], default="both",
                          help="Destination contracts checked with the rule: those sharing a "
                               "party, a variable, or either (default: both)")
+    fit_cmd.add_argument("--reach", choices=["component", "direct"], default="component",
+                         help="Neighbourhood: contracts linked to the rule through any chain "
+                              "of shared parties or variables (default), or directly")
     fit_cmd.add_argument("--output", "-o", type=Path,
                          help="Write the description with the transplanted contract")
     fit_cmd.add_argument("--format", choices=["text", "json"], default="text",
@@ -757,7 +760,7 @@ def _cmd_fit(args: argparse.Namespace) -> int:
         elif args.map:
             print("Error: --map needs --source", file=sys.stderr)
             return 1
-        report = fit_check(dest, args.contract, scope=args.scope)
+        report = fit_check(dest, args.contract, scope=args.scope, reach=args.reach)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

@@ -6,8 +6,9 @@ A contract ``c`` fits a destination ``D`` if
   (F2) ``A_c and G_c`` is satisfiable; and
   (F3) ``A_c and G_c`` is satisfiable together with the assumptions and
        guarantees of every set of destination contracts in the
-       neighbourhood of ``c`` (those that share a party with ``c`` or
-       mention one of its variables) that can be in force together with
+       neighbourhood of ``c`` (the contracts linked to ``c`` through a chain
+       of shared parties or variables; ``reach="direct"`` keeps only those
+       linked to ``c`` itself) that can be in force together with
        ``c``: maximal sets whose assumptions hold together with ``A_c``.
        Usually this is the whole neighbourhood; destination contracts for
        different operating modes give one set per mode.
@@ -45,7 +46,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import yaml
 import z3
 
-from .ast_nodes import ContractDef, QuantifiedExpr, SoSDefinition
+from .ast_nodes import ActorRef, ContractDef, QuantifiedExpr, SoSDefinition
 from .parser import parse
 from .type_checker import type_check
 from .unparse import expr_to_source
@@ -161,6 +162,21 @@ def _has_quantifier(expr: Any) -> bool:
     return False
 
 
+def _indexed(expr: Any) -> bool:
+    """An actor indexed by a variable, ``*`` or a range (``TAXI[i].x``):
+    the term is encoded as one variable for every member, the same in every
+    contract that writes it."""
+    if isinstance(expr, ActorRef):
+        i = expr.index
+        if i is not None and not isinstance(i, int) and not (isinstance(i, str) and i.isdigit()):
+            return True
+    if hasattr(expr, "__dataclass_fields__"):
+        return any(_indexed(getattr(expr, f)) for f in expr.__dataclass_fields__ if f != "loc")
+    if isinstance(expr, list):
+        return any(_indexed(x) for x in expr)
+    return False
+
+
 def _variables(f: Any) -> Set[str]:
     out: Set[str] = set()
     seen: Set[int] = set()
@@ -184,11 +200,14 @@ class _Part:
     skipped: List[str]
     quantified: List[str]
     terms: List[Tuple[str, Any]] = field(default_factory=list)
+    indexed: List[str] = field(default_factory=list)
 
 
 def _translate(preds: List[Any], ctx: Z3Context) -> _Part:
-    parts, skipped, quantified, terms = [], [], [], []
+    parts, skipped, quantified, terms, indexed = [], [], [], [], []
     for p in preds:
+        if _indexed(p) and not _has_quantifier(p):
+            indexed.append(_source(p))
         try:
             z = _to_z3_bool(p, ctx)
         except Exception:
@@ -199,7 +218,7 @@ def _translate(preds: List[Any], ctx: Z3Context) -> _Part:
         if _has_quantifier(p):
             quantified.append(_source(p))
     f = z3.And(parts) if parts else z3.BoolVal(True)
-    return _Part(f, _variables(f), skipped, quantified, terms)
+    return _Part(f, _variables(f), skipped, quantified, terms, indexed)
 
 
 def _source(expr: Any) -> str:
@@ -273,11 +292,17 @@ def _partial(report: "FitReport", abstracted: int) -> None:
 
 # === main entry ============================================================
 
-def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
+def fit_check(data: dict, contract_id: str, scope: str = "both",
+              reach: str = "component") -> FitReport:
     """Check the fit of contract ``contract_id`` in the description ``data``
-    (a loaded YAML mapping). ``scope`` selects the neighbourhood:
+    (a loaded YAML mapping). ``scope`` selects the links between contracts:
     ``party`` (shared parties, as in ``cadl verify``), ``variable`` (shared
-    variables) or ``both``."""
+    variables) or ``both``. ``reach`` selects the neighbourhood: the
+    contracts linked to the rule directly (``direct``) or through any chain
+    of links (``component``, the default). With variable links, contracts
+    outside the component share no variable with the rule or with any
+    contract in it, so they cannot change the satisfiability of (F3) unless
+    they are inconsistent among themselves."""
     sos = parse(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
     report = FitReport(contract=contract_id)
     by_id = {c.id: c for c in sos.contracts}
@@ -326,17 +351,25 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
          "unsat": "Assumptions and guarantees contradict each other"}.get(r, "Solver gave no answer")))
 
     # Neighbourhood
-    cparties = {p.name for p in c.parties}
-    cvars = Ac.variables | Gc.variables
-    neigh = []
-    for d in sos.contracts:
-        if d.id == contract_id:
-            continue
-        shares_party = bool(cparties & {p.name for p in d.parties})
-        Ad, Gd = parts[d.id]
-        shares_var = bool(cvars & (Ad.variables | Gd.variables))
-        if (scope in ("party", "both") and shares_party) or (scope in ("variable", "both") and shares_var):
-            neigh.append(d.id)
+    def linked(x, y):
+        if scope in ("party", "both") and \
+                {p.name for p in x.parties} & {p.name for p in y.parties}:
+            return True
+        return scope in ("variable", "both") and bool(
+            (parts[x.id][0].variables | parts[x.id][1].variables)
+            & (parts[y.id][0].variables | parts[y.id][1].variables))
+
+    others = [d for d in sos.contracts if d.id != contract_id]
+    reached = {contract_id}
+    frontier = [c]
+    while frontier:
+        x = frontier.pop()
+        for d in others:
+            if d.id not in reached and linked(x, d):
+                reached.add(d.id)
+                if reach == "component":
+                    frontier.append(d)
+    neigh = [d.id for d in others if d.id in reached]
     report.neighbourhood = neigh
     for d in neigh:
         for label, part in zip(("assume", "guarantee"), parts[d]):
@@ -479,9 +512,24 @@ def fit_check(data: dict, contract_id: str, scope: str = "both") -> FitReport:
     order = {"vacuous": 0, "guarantee": 1, "other": 2}
     found = sorted((_classify(contract_id, Ac, Gc, K, parts) + (K,) for K in cores),
                    key=lambda x: (order[x[0]], len(x[2]), x[2]))
+    def exact(p):
+        # The translated terms of a part that are not abstracted.
+        bad = set(p.quantified) | set(p.indexed)
+        return [z for t, z in p.terms if t not in bad]
+
+    def abstracted_in(ids):
+        # The conflict depends on the abstraction unless it remains when
+        # the abstracted terms are left out.
+        if not any(p.quantified or p.indexed for x in ids for p in parts[x]):
+            return False
+        return _check(*[z for x in ids for p in parts[x] for z in exact(p)]) != "unsat"
     for kind, msg, K in found:
         if len(K) > 1:
             msg += f" (only jointly: {', '.join(K)})"
+        if abstracted_in([contract_id] + K):
+            # Exact only on the supported fragment: a reduced quantifier or
+            # an index variable can make the conflict spurious.
+            msg += "; involves abstracted predicates (quantifier or index variable), so it can be spurious: review"
         report.findings.append(Finding("F3", "failed", msg, kind=kind, contracts=K))
     if truncated:
         # The conflicts above are genuine (in the encoding), so the verdict

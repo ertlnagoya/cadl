@@ -232,17 +232,23 @@ class TestNeighbourhood:
         assert [(f.kind, f.contracts) for f in r.findings if f.condition == "F3"] == [("guarantee", ["D3"])]
         assert any(f.condition == "info" and "D1, D2, D3" in f.message for f in r.findings)
 
-    def test_constraint_two_steps_away_is_outside_the_neighbourhood(self):
-        # D2 shares neither a party nor a variable with the rule; the
-        # conflict through D1 is not found (documented limitation).
-        data = _sos(["A", "B"], [
-            {"id": "RULE", "parties": ["A"], "assume": ["x <= 5"]},
+    def test_constraint_two_steps_away_is_in_the_component(self):
+        # D2 shares neither a party nor a variable with the rule, but a
+        # variable with D1: the conflict is found through the chain; the
+        # direct neighbourhood misses it.
+        data = _sos(["A", "B", "C"], [
+            {"id": "RULE", "parties": ["A"], "guarantee": ["x <= 0"]},
             {"id": "D1", "parties": ["B"], "guarantee": ["x == y"]},
-            {"id": "D2", "parties": ["B"], "guarantee": ["y >= 10"]},
+            {"id": "D2", "parties": ["C"], "guarantee": ["y >= 1"]},
+            {"id": "D3", "parties": ["C"], "guarantee": ["z >= 1"]},
         ])
         r = fit_check(data, "RULE")
-        assert r.neighbourhood == ["D1"]
-        assert r.verdict == "fits"
+        assert r.neighbourhood == ["D1", "D2", "D3"]
+        assert [(f.kind, f.contracts) for f in r.findings if f.condition == "F3"] == [("guarantee", ["D1", "D2"])]
+        d = fit_check(data, "RULE", reach="direct")
+        assert d.neighbourhood == ["D1"] and d.verdict == "fits"
+        v = fit_check(data, "RULE", scope="variable")
+        assert v.neighbourhood == ["D1", "D2"] and v.verdict == "misfit"
 
     def test_existential_statements_give_a_failure_to_review(self):
         # The quantifier is reduced to its body, so two satisfiable
@@ -255,6 +261,20 @@ class TestNeighbourhood:
         r = fit_check(data, "RULE")
         assert r.verdict == "misfit"
         assert any(f.condition == "encoding" and "quantifier" in f.message for f in r.findings)
+        assert all("can be spurious" in f.message for f in r.findings if f.status == "failed")
+
+    def test_index_variable_conflict_is_marked_for_review(self):
+        data = _sos(["A", "TAXI[1..N]"], [
+            {"id": "RULE", "parties": ["A", "TAXI[*]"], "assume": ["TAXI[i].passengers == 0"]},
+            {"id": "D", "parties": ["TAXI[*]"], "guarantee": ["TAXI[i].passengers >= 1"]},
+            {"id": "E", "parties": ["A"], "guarantee": ["TAXI[1].fuel >= 1"]},
+        ])
+        r = fit_check(data, "RULE")
+        failed = [f for f in r.findings if f.status == "failed"]
+        assert r.verdict == "misfit" and len(failed) == 1 and "can be spurious" in failed[0].message
+        plain = _sos(["A"], [{"id": "RULE", "parties": ["A"], "assume": ["x <= 1"]},
+                             {"id": "D", "parties": ["A"], "guarantee": ["x >= 2"]}])
+        assert not any("spurious" in f.message for f in fit_check(plain, "RULE").findings)
 
     def test_exclusion_does_not_depend_on_the_order_of_sets(self):
         modes = [{"id": "D1", "parties": ["A"], "assume": ["mode == 1"], "guarantee": ["s <= 10"]},

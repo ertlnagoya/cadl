@@ -40,6 +40,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   reported as an exclusion, independent of the order of the sets. When the
   rule fits, the assumptions that the guarantees of some such set do not
   imply are named, since consistent is not established.
+  The neighbourhood is the connected component of the rule: the contracts
+  linked to it through any chain of shared parties or variables, so a
+  conflict through an intermediate contract is found; contracts outside it
+  share no variable with it. `--reach direct` keeps only the contracts
+  linked to the rule itself. A minimal conflict that disappears when
+  reduced quantifiers and terms indexed by a variable, `*`, or a range are
+  left out is marked as possibly spurious.
   `--map` renames attribute names as well as actors. Exit code 0 (fits),
   1 (misfit), 2 (unknown).
 
