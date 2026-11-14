@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.30] — 2026-11-14
+
 ### Fixed
 
 - A norm whose text could never be evaluated was silently left
