@@ -34,6 +34,24 @@ def main(argv: list[str] | None = None) -> int:
     verify_cmd.add_argument("--format", choices=["text", "json"], default="text",
                              help="Output format (default: text)")
 
+    # fit command
+    fit_cmd = subparsers.add_parser(
+        "fit", help="Check whether a contract fits a destination description "
+                    "(transplanted with --source and --map, or already in it)")
+    fit_cmd.add_argument("file", type=Path, help="Destination CADL file")
+    fit_cmd.add_argument("--contract", "-c", required=True, help="Id of the transplanted contract")
+    fit_cmd.add_argument("--source", type=Path,
+                         help="Source CADL file to copy the contract from")
+    fit_cmd.add_argument("--map", action="append", default=[], metavar="OLD=NEW",
+                         help="Rename an actor of the source (repeatable)")
+    fit_cmd.add_argument("--scope", choices=["party", "variable", "both"], default="both",
+                         help="Destination contracts checked with the rule: those sharing a "
+                              "party, a variable, or either (default: both)")
+    fit_cmd.add_argument("--output", "-o", type=Path,
+                         help="Write the description with the transplanted contract")
+    fit_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                         help="Output format (default: text)")
+
     # codegen command
     codegen_cmd = subparsers.add_parser("codegen", help="Generate runtime code from a CADL file")
     codegen_cmd.add_argument("file", type=Path, help="CADL file to generate from")
@@ -606,6 +624,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_verify(args)
     elif args.command == "codegen":
         return _cmd_codegen(args)
+    elif args.command == "fit":
+        return _cmd_fit(args)
     elif args.command == "agents-decide":
         return _cmd_agents_decide(args)
     elif args.command == "regime-map":
@@ -718,6 +738,37 @@ def _cmd_check(args: argparse.Namespace) -> int:
     else:
         print(f"Type check failed: {len(result.errors)} error(s), {len(result.warnings)} warning(s)")
         return 1
+
+
+def _cmd_fit(args: argparse.Namespace) -> int:
+    import json
+    import yaml
+    from .fit import fit_check, format_text, parse_role_map, transplant
+
+    for path in [args.file] + ([args.source] if args.source else []):
+        if not path.exists():
+            print(f"Error: File not found: {path}", file=sys.stderr)
+            return 1
+    try:
+        dest = yaml.safe_load(args.file.read_text(encoding="utf-8"))
+        if args.source:
+            source = yaml.safe_load(args.source.read_text(encoding="utf-8"))
+            dest = transplant(source, dest, args.contract, parse_role_map(args.map))
+        elif args.map:
+            print("Error: --map needs --source", file=sys.stderr)
+            return 1
+        report = fit_check(dest, args.contract, scope=args.scope)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    if args.output:
+        args.output.write_text(yaml.safe_dump(dest, sort_keys=False, allow_unicode=True),
+                               encoding="utf-8")
+    if args.format == "json":
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+    else:
+        print(format_text(report))
+    return {"fits": 0, "misfit": 1}.get(report.verdict, 2)
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
