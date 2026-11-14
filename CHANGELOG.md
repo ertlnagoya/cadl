@@ -193,6 +193,33 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   PD+ or PD− with the Bellman expansion, and no cell was
   `not_well_defined`. New tests in `tests/test_games_ranges.py`.
 
+- The Solidity norms monitor (`cadl codegen -t solidity`, Appendix D,
+  D.5) monitors three and more levels of nested `within` / `throughout`
+  in the content of a norm (`within(5s, throughout(3s, NOT within(1s,
+  p)))`), which it refused. A nested operator is now a chain of levels:
+  each level turns the runs of decided values fed to it into the runs of
+  its own decided values (at most 2r + 2 runs from r), always those of
+  the first observations, and the last level feeds the outer operator of
+  the segment tree; D.5 proves the result equal to F.5. `until` in a
+  nesting and an operand that combines a nested operator with other
+  parts (`within(5s, throughout(2s, p) AND r)`) stay refused, now with
+  the reason that deciding their values out of order can make one
+  observation change as many ranges of candidates as there are
+  candidates.
+- The Solidity norms monitor decides contents with five temporal
+  operators (four at most before): `CadlNormsEval.table` returns the 4^m
+  values of a content in 4^(m - 4) words, and a node of the segment tree
+  has 25 storage words. Six or more stay refused: a node would have 125
+  words and an observation would cost about five times as much (five
+  operators: up to 1.0 × 10^7 gas at one observation per second into
+  1000 s windows), of the order of the gas limit of a block. The runtime estimates of `CadlNormsMulti`,
+  `CadlNormsEval` and `CadlNormsWindows` are 10 120, 11 440 and 5 490
+  bytes (7 490, 10 410 and 5 230). The generated constructor calls
+  `_nested(outer, d, node, p, oneg)` followed by one `_level(mode, neg,
+  d)` per level.
+- scripts/norms_monitor_mutations.py: mutants of the levels and of the
+  words of five operators (sets DEEP and FIVE).
+
 ### Fixed
 
 - Arithmetic (`+`, `-`, `*`, `/`) with an operand that is a list or an

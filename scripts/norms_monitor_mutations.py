@@ -2,7 +2,7 @@
 (tests/test_norms_monitor_targets.py, Appendix D, D.5).
 
 Each mutant of norms_monitor_base.sol runs the traces of one set of
-contents (RELEASE, COMPARE, TWO, THREE, FOUR, NESTED, ZERO, MIX: the boundary traces, N random traces and
+contents (RELEASE, COMPARE, TWO, THREE, FOUR, NESTED, ZERO, MIX, DEEP, FIVE: the boundary traces, N random traces and
 three long ones) on the EVM; it is killed when a trace differs from
 `cadl norms-eval`. Needs the EVM of the tests (CADL_EVM_PYTHON, CADL_SOLC).
 
@@ -48,22 +48,47 @@ MUT = [
  ("four-tag-word", "four", "x[i / 3] |= v << (250 + 2 * (i % 3));", "x[0] |= v << (250 + 2 * (i % 3));"),
  ("four-undecided", "four", "if (w / st % 5 != 0 && x[w] & BITS != 0) return true;",
   "if (w / st % 5 > 1 && x[w] & BITS != 0) return true;"),
- # nested operators: the inner values fed in the order of the observations
- ("nest-split", "nested", "split = op.iu + 1 < b ? op.iu + 1 : b;", "split = op.iu < b ? op.iu : b;"),
- ("nest-no-iu", "nested", "if (pv == X_U) { op.iuSet = true; op.iu = n; }\n            op.fed = b;",
-  "op.fed = b;"),
- ("nest-window-edge", "nested", "uint256 b = firstTime(data, f, n, t - op.id);",
-  "uint256 b = firstTime(data, f, n, t - op.id + 1);"),
- ("nest-final-tau", "nested", "over(mu, op, i, op.fed <= n ? data.obsT[op.fed] : t);", "over(mu, op, i, t);"),
- ("nest-range-lo", "nested", "assignRange(mu, i, y, firstFrom(mu, ts - op.td), firstAfter(mu, true, e));",
-  "assignRange(mu, i, y, firstFrom(mu, data.obsT[e] - op.td), firstAfter(mu, true, e));"),
- ("nest-oneg", "nested", "y = op.oneg && x != X_U ?", "y = false && x != X_U ?"),
- ("nest-now", "nested", "if (y == decisive(op)) now_ = y;", ""),
- ("nest-u-mark", "nested", "else if (y == X_U) { op.uSet = true; op.u = e; }", ""),
+ # nested operators: the values of each level fed in the order of the observations
+ ("nest-split", "nested", "lv.uSet ? lv.u + 1 : 0", "lv.uSet ? lv.u : 0"),
+ ("nest-no-iu", "nested", "if (inp.x[k] == X_U) { lv.uSet = true; lv.u = inp.e[k]; }", ""),
+ ("nest-window-edge", "nested", "a[k] = firstTime(data, f, inp.s[k], data.obsT[inp.s[k]] - lv.d);",
+  "a[k] = firstTime(data, f, inp.s[k], data.obsT[inp.s[k]] - lv.d + 1);"),
+ ("nest-final-tau", "nested", "uint256 x = firstFrom(mu, (g <= n ? data.obsT[g] : t) - op.td);",
+  "uint256 x = firstFrom(mu, t - op.td);"),
+ ("nest-range-lo", "nested", "uint256 lo = firstFrom(mu, data.obsT[r.s[k]] - op.td);",
+  "uint256 lo = firstFrom(mu, data.obsT[r.e[k]] - op.td);"),
+ ("nest-oneg", "nested", "uint8 y = flip(op.oneg, r.x[k]);", "uint8 y = flip(false, r.x[k]);"),
+ ("nest-now", "nested", "if (r.e[k] == r.n) now_ = y;", ""),
+ ("nest-u-mark", "nested", "op.uSet = true;\n                    op.u = r.e[k];", ""),
+ ("nest-old-u", "nested", "assign(mu, i, X_U, a < x ? a : x);\n        assign(mu, i, op.outer",
+  "assign(mu, i, op.outer"),
+ # three and four levels: runs between the levels
+ ("deep-order", "deep", "if (y != (pass == 0 ? dec : X_U)) continue;", "if (y != (pass == 1 ? dec : X_U)) continue;"),
+ ("deep-level-tau", "deep", "r = level(lv, data, r, g <= n ? data.obsT[g] : t);", "r = level(lv, data, r, t);"),
+ ("deep-neg", "deep", "inp.x[k] = flip(lv.neg, inp.x[k]);", "inp.x[k] = flip(false, inp.x[k]);"),
+ ("deep-dec-f2", "deep", "if (inp.x[k] == dec && inp.e[k] + 1 > f2) f2 = inp.e[k] + 1;", ""),
+ # (not listed: "v = x" in segments, which lets a later undefined run override a decisive one,
+ # survives; no trace of the tests nor of 4 x 10^4 random chains of a model has a decisive run
+ # before an undefined run whose ranges overlap, and the check is kept)
+ ("deep-old-u", "deep", "uint8 v = j < u1 ? X_U : dec == X_T ? X_F : X_T;", "uint8 v = dec == X_T ? X_F : X_T;"),
+ ("deep-next", "deep", "if (a[k] > j) { if (a[k] < next) next = a[k]; continue; }", "if (a[k] > j) continue;"),
+ ("deep-u-next", "deep", "uint256 next = j < u1 && u1 < f2 ? u1 : f2;", "uint256 next = f2;"),
+ # (not listed: dropping the reset of lv.f at a new activation is equivalent: the candidates are
+ # at n or later, and a value of a level at j depends only on the values below at j or later)
+ # five operators: the values of the content in four words, nodes of 25 words
+ ("five-digits", "five", "if (i >= 4) return (w >> (2 * (i - 4))) & 3 == c", "if (i >= 4) return (w >> (2 * (i - 3))) & 3 == c"),
+ ("five-leaf-word", "five", "uint256 bits = (ts[e / 256] >> (e % 256) & 1)", "uint256 bits = (ts[0] >> (e % 256) & 1)"),
+ # (not listed: reading the entry of cur in word 0, "ts[0] | ds[0]", is equivalent: that entry
+ # takes the fifth operator as undecided, and a content decided and not true with an operator
+ # undecided is so for every value of it)
+ ("five-words", "five", "uint256 words = ops.length > 4 ? 1 << (2 * (ops.length - 4)) : 1;",
+  "uint256 words = ops.length > 4 ? 2 : 1;"),
+ ("five-entries", "five", "out[v * words + w] |= both;", "out[v * words] |= both;"),
 ]
 SETS = {"release": (T.RELEASE, 20261301), "compare": (T.COMPARE, 20261302), "two": (T.TWO, 20261303),
         "three": (T.THREE, 20261304), "four": (T.FOUR, 20261305), "nested": (T.NESTED, 20261306),
-        "zero": (T.ZERO, 20261307), "mix": (T.MIX, 20261308)}
+        "zero": (T.ZERO, 20261307), "mix": (T.MIX, 20261308), "deep": (T.DEEP, 20261309),
+        "five": (T.FIVE, 20261310)}
 base = M.BASE.read_text()
 names = sys.argv[4:]
 for name, st, old, new in MUT:

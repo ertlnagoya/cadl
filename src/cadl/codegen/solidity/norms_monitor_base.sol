@@ -282,47 +282,58 @@ library CadlNormsEval {
     }
 
     /// The truth of `root` at observation n for every combination of the
-    /// values of the temporal operators ops (at most four): entry e reads
-    /// operator i as the digit i of e in base 4 (X_D, X_T, X_F, X_U).
-    /// Returns the entries at which the content is true and those at which
-    /// it is undecided (bit e). The rest of the content is read once.
+    /// values of the temporal operators ops (at most five): entry e reads
+    /// operator i as the digit i of e in base 4 (X_D, X_T, X_F, X_U), and
+    /// is bit e % 256 of word e / 256 (one word up to four operators, four
+    /// for five). Returns the entries at which the content is true and
+    /// those at which it is undecided. The rest of the content is read once.
     function table(EvalData storage data, uint256 root, uint256 n, uint256[] memory ops)
-            public returns (uint256 ts, uint256 ds) {
-        Vt memory r = vt(data, root, n, ops);
-        if (r.x) return (r.c[X_T], r.c[X_D]);
-        uint8 c = code(truth(r.s));
-        return (c == X_T ? type(uint256).max : 0, c == X_D ? type(uint256).max : 0);
+            public returns (uint256[] memory ts, uint256[] memory ds) {
+        uint256 words = ops.length > 4 ? 1 << (2 * (ops.length - 4)) : 1;
+        Vt memory r = vt(data, root, n, ops, words);
+        ts = new uint256[](words);
+        ds = new uint256[](words);
+        uint8 c = r.x ? 0 : code(truth(r.s));
+        for (uint256 w = 0; w < words; w++) {
+            if (r.x) { ts[w] = r.c[X_T * words + w]; ds[w] = r.c[X_D * words + w]; }
+            else { ts[w] = c == X_T ? type(uint256).max : 0; ds[w] = c == X_D ? type(uint256).max : 0; }
+        }
     }
 
     /// A node as one value s (no operator below it), or (x) as the entries
-    /// c[v] at which its truth value is v (a value with an operator below
-    /// it is a truth value).
-    struct Vt { bool x; Val s; uint256[4] c; }
+    /// c[v * words + w] at which its truth value is v (a value with an
+    /// operator below it is a truth value).
+    struct Vt { bool x; Val s; uint256[] c; }
 
-    function vt(EvalData storage data, uint256 id, uint256 n, uint256[] memory ops) internal returns (Vt memory r) {
+    function vt(EvalData storage data, uint256 id, uint256 n, uint256[] memory ops, uint256 words)
+            internal returns (Vt memory r) {
         for (uint256 i = 0; i < ops.length; i++) {
             if (id != ops[i]) continue;
             r.x = true;
-            for (uint256 c = 0; c < 4; c++) r.c[c] = digits(i, c);
+            r.c = new uint256[](4 * words);
+            for (uint256 c = 0; c < 4; c++) {
+                for (uint256 w = 0; w < words; w++) r.c[c * words + w] = digits(i, c, w);
+            }
             return r;
         }
         Node storage nd = data.nodes[id];
         uint8 op = nd.op;
         if (op == OP_NOT || op == OP_AND || op == OP_OR || op == OP_BIN) {
-            Vt memory l = vt(data, nd.a, n, ops);
+            Vt memory l = vt(data, nd.a, n, ops, words);
             Vt memory q;
-            if (op != OP_NOT) q = vt(data, nd.b, n, ops);
+            if (op != OP_NOT) q = vt(data, nd.b, n, ops, words);
             if (!l.x && !q.x) { r.s = combine(op, nd.bop, l.s, q.s); return r; }
             r.x = true;
-            r.c = entries(op, nd.bop, l, q);
+            r.c = entries(op, nd.bop, l, q, words);
             return r;
         }
-        if (op == OP_IN) return inVec(data, nd, n, ops);
+        if (op == OP_IN) return inVec(data, nd, n, ops, words);
         r.s = ev(data, id, n, n);
     }
 
-    /// The entries whose digit i (base 4) is c.
-    function digits(uint256 i, uint256 c) internal pure returns (uint256 v) {
+    /// The entries of word w whose digit i (base 4) is c.
+    function digits(uint256 i, uint256 c, uint256 w) internal pure returns (uint256 v) {
+        if (i >= 4) return (w >> (2 * (i - 4))) & 3 == c ? type(uint256).max : 0;
         uint256 b = 1 << (2 * i);                      // 4^i
         v = ((1 << b) - 1) << (c * b);
         for (uint256 s = 4 * b; s < 256; s *= 2) v |= v << s;
@@ -330,14 +341,17 @@ library CadlNormsEval {
 
     /// The node op of l and r: the operands take one value each (s) or
     /// four classes of entries, so at most 16 combinations are read.
-    function entries(uint8 op, uint8 bop, Vt memory l, Vt memory r) internal pure returns (uint256[4] memory out) {
+    function entries(uint8 op, uint8 bop, Vt memory l, Vt memory r, uint256 words)
+            internal pure returns (uint256[] memory out) {
+        out = new uint256[](4 * words);
         for (uint256 cl = 0; cl < (l.x ? 4 : 1); cl++) {
-            uint256 ml = l.x ? l.c[cl] : type(uint256).max;
-            if (ml == 0) continue;
             for (uint256 cr = 0; cr < (r.x ? 4 : 1); cr++) {
-                uint256 both = ml & (r.x ? r.c[cr] : type(uint256).max);
-                if (both == 0) continue;
-                out[code(truth(combine(op, bop, l.x ? codeVal(cl) : l.s, r.x ? codeVal(cr) : r.s)))] |= both;
+                uint8 v = code(truth(combine(op, bop, l.x ? codeVal(cl) : l.s, r.x ? codeVal(cr) : r.s)));
+                for (uint256 w = 0; w < words; w++) {
+                    uint256 both = (l.x ? l.c[cl * words + w] : type(uint256).max)
+                        & (r.x ? r.c[cr * words + w] : type(uint256).max);
+                    out[v * words + w] |= both;
+                }
             }
         }
     }
@@ -351,28 +365,29 @@ library CadlNormsEval {
         return andOr(op == OP_OR, truth(l), truth(r));
     }
 
-    function inVec(EvalData storage data, Node storage nd, uint256 n, uint256[] memory ops)
+    function inVec(EvalData storage data, Node storage nd, uint256 n, uint256[] memory ops, uint256 words)
             internal returns (Vt memory out) {
         uint256 m = nd.items.length;
         Vt[] memory xs = new Vt[](m + 1);
         bool any = false;
         for (uint256 j = 0; j <= m; j++) {
-            xs[j] = vt(data, j == 0 ? nd.a : nd.items[j - 1], n, ops);
+            xs[j] = vt(data, j == 0 ? nd.a : nd.items[j - 1], n, ops, words);
             any = any || xs[j].x;
         }
         uint256 count = any ? 1 << (2 * ops.length) : 1;
+        if (any) out.c = new uint256[](4 * words);
         for (uint256 e = 0; e < count; e++) {
             Val[] memory items = new Val[](m);
-            for (uint256 j = 1; j <= m; j++) items[j - 1] = xs[j].x ? codeVal(classOf(xs[j], e)) : xs[j].s;
-            Val memory r = inVals(xs[0].x ? codeVal(classOf(xs[0], e)) : xs[0].s, items);
+            for (uint256 j = 1; j <= m; j++) items[j - 1] = xs[j].x ? codeVal(classOf(xs[j], e, words)) : xs[j].s;
+            Val memory r = inVals(xs[0].x ? codeVal(classOf(xs[0], e, words)) : xs[0].s, items);
             if (!any) { out.s = r; return out; }
-            out.c[code(truth(r))] |= 1 << e;
+            out.c[code(truth(r)) * words + e / 256] |= 1 << (e % 256);
         }
         out.x = true;
     }
 
-    function classOf(Vt memory v, uint256 e) internal pure returns (uint256) {
-        for (uint256 c = 0; c < 3; c++) if (v.c[c] >> e & 1 != 0) return c;
+    function classOf(Vt memory v, uint256 e, uint256 words) internal pure returns (uint256) {
+        for (uint256 c = 0; c < 3; c++) if (v.c[c * words + e / 256] >> (e % 256) & 1 != 0) return c;
         return 3;
     }
 
@@ -781,7 +796,9 @@ library CadlNormsWindows {
         if (tm.root == tm.node) return C_LIVE;
         uint256[] memory ops = new uint256[](1);
         ops[0] = tm.node;
-        (uint256 ts, uint256 ds) = CadlNormsEval.table(data, tm.root, n, ops);
+        (uint256[] memory tw, uint256[] memory dw) = CadlNormsEval.table(data, tm.root, n, ops);
+        uint256 ts = tw[0];
+        uint256 ds = dw[0];
         if (ts & 1 != 0) return C_HIT;
         if (ds & 1 == 0) return C_DROP;
         bool l = ts >> X_T & 1 != 0;
@@ -889,20 +906,29 @@ library CadlNormsWindows {
 // decided for the undecided candidates below, or 0.
 //
 // A nested operator (W_NESTED) is an operator `outer` (within or
-// throughout, duration td) whose operand is throughout(id, p) or its
-// negation; within(id, p) is NOT throughout(id, NOT p). The inner value
-// at an observation becomes known later; the observations whose inner
-// value is decided are always the first ones, so these values are fed to
-// the outer operator in the order of the observations (D.5).
+// throughout, duration td) whose operand is a chain of levels: each level
+// is within or throughout (duration d) over the values of the level below
+// (negated when neg), the first one over p (tp). The value of a level at
+// an observation becomes known later; the observations whose value is
+// decided are always the first ones, so the values of each level are fed
+// to the level above, and the last to the outer operator, in the order of
+// the observations, in runs of equal values (D.5).
+struct Lvl {
+    uint8 mode; bool neg; int256 d;
+    uint256 f;                   // the value of the level is decided before observation f
+    bool uSet; uint256 u;        // the last observation with an undefined value below
+}
+
 struct MOp {
     uint8 mode; uint256 tp; uint256 tq; int256 td; uint256 node;
     bool uSet; uint256 u;        // the candidates at or before u have seen an undefined operand
     bool puSet; uint256 pu;      // until: the last observation with p undefined
-    uint8 outer; bool ineg; bool oneg; int256 id;    // W_NESTED: p is tp, negated when ineg;
-                                                     // the inner value is negated when oneg
-    uint256 fed;                 // W_NESTED: the inner value is decided before observation fed
-    bool iuSet; uint256 iu;      // W_NESTED: the last observation with p undefined
+    uint8 outer; bool oneg;      // W_NESTED: the outer operator, the last level negated when oneg
+    Lvl[] lv;                    // W_NESTED: the levels, from the one over p
 }
+
+// Runs of values fed to a level: [s[r], e[r]] with value x[r], in order.
+struct Runs { uint256 c; uint256[] s; uint256[] e; uint8[] x; uint256 n; }
 
 uint8 constant W_NESTED = 5;
 
@@ -1029,63 +1055,121 @@ library CadlNormsMulti {
         return X_D;
     }
 
-    /// What observation n decides about the nested operator i. The inner
-    /// value throughout(id, p) is decided for the observations [fed, b)
-    /// whose window is over: undefined up to the last observation with p
-    /// undefined, true after it (each of these windows ends at n - 1); and
-    /// for [b, n] when p is false at n. Each run is fed to the outer
-    /// operator in the order of the observations.
+    /// What observation n decides about the nested operator i. Each level
+    /// turns the runs of values fed to it into the runs of its own values
+    /// that n decides (`level`); the runs of the last level are fed to the
+    /// outer operator: a decisive value decides the candidates whose window
+    /// has one of these observations, an undefined one makes the candidates
+    /// whose window has one undefined when their window is over. The
+    /// candidates whose window ends before tau have every value fed and are
+    /// decided.
     function nested(Multi storage mu, MOp storage op, uint256 i, EvalData storage data, uint256 n, int256 t)
             internal returns (uint8 now_) {
-        if (mu.tail == 0) { op.fed = n; op.iuSet = false; op.uSet = false; }
-        uint8 pv = code(CadlNormsEval.evaluate(data, op.tp, n, n));
-        if (op.ineg && pv != X_U) pv = pv == X_T ? X_F : X_T;
-        uint256 f = op.fed;
-        uint256 b = firstTime(data, f, n, t - op.id);
-        if (b > f) {
-            uint256 split = f;
-            if (op.iuSet && op.iu >= f) split = op.iu + 1 < b ? op.iu + 1 : b;
-            if (split > f) feed(mu, op, i, data, f, split - 1, X_U);
-            if (b > split) feed(mu, op, i, data, split, b - 1, X_T);
-        }
-        if (pv == X_F) {
-            uint8 y = feed(mu, op, i, data, b, n, X_F);
-            if (y == decisive(op)) now_ = y;
-            op.fed = n + 1;
-        } else {
-            if (pv == X_U) { op.iuSet = true; op.iu = n; }
-            op.fed = b;
-        }
-        over(mu, op, i, op.fed <= n ? data.obsT[op.fed] : t);
-    }
-
-    /// The inner value x at the observations [s, e], fed to the outer
-    /// operator: a decisive value decides the candidates whose window has
-    /// one of these observations; an undefined one marks the candidates up
-    /// to e. A run of undefined values starts at the first observation not
-    /// fed before, so a candidate whose window ended before it was decided
-    /// at the previous observation, and every other candidate up to e has
-    /// that observation or itself in its window.
-    function feed(Multi storage mu, MOp storage op, uint256 i, EvalData storage data, uint256 s, uint256 e, uint8 x)
-            internal returns (uint8 y) {
-        y = op.oneg && x != X_U ? (x == X_T ? X_F : X_T) : x;
-        int256 ts = data.obsT[s];
-        if (y == decisive(op)) assignRange(mu, i, y, firstFrom(mu, ts - op.td), firstAfter(mu, true, e));
-        else if (y == X_U) { op.uSet = true; op.u = e; }
-    }
-
-    /// The candidates whose outer window ends before time tau: every value
-    /// of their window has been fed, so they are decided.
-    function over(Multi storage mu, MOp storage op, uint256 i, int256 tau) internal {
-        uint256 x = firstFrom(mu, tau - op.td);
-        if (x == 0) return;
+        if (mu.tail == 0) op.uSet = false;
+        (Runs memory r, uint256 g) = chain(op, data, n, t, mu.tail == 0);
+        uint256 x = firstFrom(mu, (g <= n ? data.obsT[g] : t) - op.td);
         uint256 a = firstAfter(mu, op.uSet, op.u);
+        now_ = outer(mu, op, i, data, r, x);
         assign(mu, i, X_U, a < x ? a : x);
-        assign(mu, i, op.outer == W_THROUGHOUT ? X_T : X_F, x);
+        assign(mu, i, op.outer == W_WITHIN ? X_F : X_T, x);
     }
 
-    function decisive(MOp storage op) internal view returns (uint8) {
-        return op.outer == W_WITHIN ? X_T : X_F;
+    /// The runs of the last level that observation n decides, and the
+    /// observation before which its values are decided.
+    function chain(MOp storage op, EvalData storage data, uint256 n, int256 t, bool fresh)
+            internal returns (Runs memory r, uint256 g) {
+        r = Runs(1, new uint256[](1), new uint256[](1), new uint8[](1), n);
+        r.s[0] = n; r.e[0] = n;
+        r.x[0] = code(CadlNormsEval.evaluate(data, op.tp, n, n));
+        g = n + 1;
+        for (uint256 l = 0; l < op.lv.length; l++) {
+            Lvl storage lv = op.lv[l];
+            if (fresh) lv.f = n;        // an older u is before n, so it marks nothing
+            r = level(lv, data, r, g <= n ? data.obsT[g] : t);
+            g = lv.f;
+        }
+    }
+
+    /// The runs r fed to the outer operator at observation r.n; the
+    /// candidates before x have their window over and every value of it fed.
+    function outer(Multi storage mu, MOp storage op, uint256 i, EvalData storage data, Runs memory r,
+                   uint256 x) internal returns (uint8 now_) {
+        uint8 dec = op.outer == W_WITHIN ? X_T : X_F;
+        // the decisive values first: a candidate with both in its window is decisive
+        for (uint256 pass = 0; pass < 2; pass++) {
+            for (uint256 k = 0; k < r.c; k++) {
+                uint8 y = flip(op.oneg, r.x[k]);
+                if (y != (pass == 0 ? dec : X_U)) continue;
+                uint256 lo = firstFrom(mu, data.obsT[r.s[k]] - op.td);
+                uint256 hi = firstAfter(mu, true, r.e[k]);
+                if (pass == 0) {
+                    assignRange(mu, i, y, lo, hi);
+                    if (r.e[k] == r.n) now_ = y;
+                } else {
+                    assignRange(mu, i, X_U, lo, hi < x ? hi : x);
+                    op.uSet = true;
+                    op.u = r.e[k];
+                }
+            }
+        }
+    }
+
+    function flip(bool neg, uint8 v) internal pure returns (uint8) {
+        return neg && v != X_U ? (v == X_T ? X_F : X_T) : v;
+    }
+
+    /// The runs of values of level lv that observation n decides, from the
+    /// runs `inp` of the values below it fed at n (tau: the time of the
+    /// first observation whose value below is not fed, or of n). Its values are decided before lv.f: an
+    /// observation j from lv.f on is decided when a decisive value is fed
+    /// in its window (j in [a, e] for such a run [s, e], with a the first
+    /// observation at or after t_s - d), or when its window ends before
+    /// tau (every value of its window is fed and the window is over). A
+    /// decided value is decisive when one in its window is, else undefined
+    /// when one in its window is (an earlier one at or after j, or j in
+    /// [a, e] for a run [s, e] of undefined values), else not decisive.
+    function level(Lvl storage lv, EvalData storage data, Runs memory inp, int256 tau)
+            internal returns (Runs memory) {
+        uint256 f = lv.f;
+        uint8 dec = lv.mode == W_WITHIN ? X_T : X_F;
+        uint256[] memory a = new uint256[](inp.c);
+        uint256 f2 = firstTime(data, f, inp.n + 1, tau - lv.d);
+        for (uint256 k = 0; k < inp.c; k++) {
+            inp.x[k] = flip(lv.neg, inp.x[k]);
+            a[k] = firstTime(data, f, inp.s[k], data.obsT[inp.s[k]] - lv.d);
+            if (inp.x[k] == dec && inp.e[k] + 1 > f2) f2 = inp.e[k] + 1;
+        }
+        Runs memory out = segments(inp, a, f, f2, dec, lv.uSet ? lv.u + 1 : 0);
+        for (uint256 k = 0; k < inp.c; k++) {
+            if (inp.x[k] == X_U) { lv.uSet = true; lv.u = inp.e[k]; }
+        }
+        lv.f = f2;
+        return out;
+    }
+
+    /// The runs of values of [f, f2): decisive (dec) at j in [a[k], e] for
+    /// an input run [s, e] of decisive values, else undefined before u1 or
+    /// at j in [a[k], e] for a run of undefined values, else not decisive.
+    function segments(Runs memory inp, uint256[] memory a, uint256 f, uint256 f2, uint8 dec, uint256 u1)
+            internal pure returns (Runs memory out) {
+        uint256 cap = 2 * inp.c + 3;
+        out = Runs(0, new uint256[](cap), new uint256[](cap), new uint8[](cap), inp.n);
+        for (uint256 j = f; j < f2;) {
+            // the class of j, and the next observation where it can change
+            uint8 v = j < u1 ? X_U : dec == X_T ? X_F : X_T;
+            uint256 next = j < u1 && u1 < f2 ? u1 : f2;
+            for (uint256 k = 0; k < inp.c; k++) {
+                uint8 x = inp.x[k];
+                if (x != dec && x != X_U) continue;
+                if (a[k] > j) { if (a[k] < next) next = a[k]; continue; }
+                if (inp.e[k] < j) continue;
+                if (inp.e[k] + 1 < next) next = inp.e[k] + 1;
+                if (x == dec || v != dec) v = x;
+            }
+            if (out.c > 0 && out.x[out.c - 1] == v) out.e[out.c - 1] = next - 1;
+            else { out.s[out.c] = j; out.e[out.c] = next - 1; out.x[out.c] = v; out.c++; }
+            j = next;
+        }
     }
 
     /// The first observation in [lo, hi) at or after time x, or hi.
@@ -1101,17 +1185,20 @@ library CadlNormsMulti {
     function add(Multi storage mu, EvalData storage data, uint256 n, int256 t) internal {
         uint256[] memory ops = new uint256[](mu.ops.length);
         for (uint256 i = 0; i < ops.length; i++) ops[i] = mu.ops[i].node;
-        (uint256 ts, uint256 ds) = CadlNormsEval.table(data, mu.root, n, ops);
-        if ((ts | ds) >> mu.cur & 1 == 0) return;     // decided, and not true
-        insert(mu, n, t, leaf(ts, ds, mu.cur, ops.length, mu.words));
+        (uint256[] memory ts, uint256[] memory ds) = CadlNormsEval.table(data, mu.root, n, ops);
+        uint256 cur = mu.cur;
+        if ((ts[cur / 256] | ds[cur / 256]) >> (cur % 256) & 1 == 0) return;     // decided, and not true
+        ts = leaf(ts, ds, cur, ops.length, mu.words);
+        insert(mu, n, t, ts);
     }
 
     /// The leaf of a candidate whose operators are s now (2 bits each).
-    function leaf(uint256 ts, uint256 ds, uint256 s, uint256 m, uint256 words) internal pure returns (uint256[] memory x) {
+    function leaf(uint256[] memory ts, uint256[] memory ds, uint256 s, uint256 m, uint256 words)
+            internal pure returns (uint256[] memory x) {
         x = new uint256[](words);
         uint256 count = 1 << (2 * m);
         for (uint256 e = 0; e < count; e++) {
-            uint256 bits = (ts >> e & 1) | (ds >> e & 1) << 1;
+            uint256 bits = (ts[e / 256] >> (e % 256) & 1) | (ds[e / 256] >> (e % 256) & 1) << 1;
             if (bits == 0) continue;
             (bool ok, uint256 p) = state(e, s, m);
             if (ok) x[p / 125] |= bits << (2 * (p % 125));
@@ -2104,12 +2191,21 @@ abstract contract CadlNormsMonitorBase {
         op.mode = mode; op.tp = tp; op.tq = tq; op.td = td; op.node = node;
     }
 
-    /// outer (within or throughout) with duration td on throughout(id, p)
-    /// (p negated when ineg), the inner value negated when oneg.
-    function _nested(uint8 outer, int256 td, uint256 node, uint256 tp, bool ineg, bool oneg, int256 id) internal {
+    /// outer (within or throughout) with duration td on the levels that
+    /// the calls of _level add (the last one negated when oneg), the first
+    /// over p.
+    function _nested(uint8 outer, int256 td, uint256 node, uint256 tp, bool oneg) internal {
         MOp storage op = m.multis[m.normDefs.length - 1].ops.push();
         op.mode = W_NESTED; op.outer = outer; op.td = td; op.node = node;
-        op.tp = tp; op.ineg = ineg; op.oneg = oneg; op.id = id;
+        op.tp = tp; op.oneg = oneg;
+    }
+
+    /// A level of the last nested operator: within or throughout with
+    /// duration d over the level added before (negated when neg), or over p.
+    function _level(uint8 mode, bool neg, int256 d) internal {
+        MOp[] storage ops = m.multis[m.normDefs.length - 1].ops;
+        Lvl storage lv = ops[ops.length - 1].lv.push();
+        lv.mode = mode; lv.neg = neg; lv.d = d;
     }
 
     function _actor(string memory name, bool isIndexed_, bool hasLo, int256 lo, bool hasHi, int256 hi) internal {
