@@ -1306,13 +1306,15 @@ EDGES = [
           {"t": 2, "values": {"A.done": True}},
           {"t": 2.5, "values": {"A.x": 9}, "messages": _RESUME}, {"t": 9}),
     # q of an until true at an observation decides at once the windows of
-    # the earlier observations with p true since them (UNTILN: u1 holds at
-    # the resumption at t = 4 through the value of until at t = 2.5, decided
-    # true at t = 3.5 while the norm is suspended)
+    # the earlier observations with p true since them (UNTILN: u1, whose
+    # only candidate before the suspension is at t = 0, holds at the
+    # resumption at t = 4 through the values of until at t = 2.5 and 3,
+    # decided true at t = 3.5)
     _edge({"t": 0, "values": {"A.ok": True, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0},
            "messages": _START + _GO},
+          {"t": 1, "messages": _PAUSE},
           {"t": 1.5, "values": {"A.ok": False}}, {"t": 2.5, "values": {"A.ok": True}},
-          {"t": 3, "messages": _PAUSE}, {"t": 3.5, "values": {"A.done": True}},
+          {"t": 3}, {"t": 3.5, "values": {"A.done": True}},
           {"t": 4, "values": {"A.done": False}, "messages": _RESUME}, {"t": 9}),
     # q true after p undefined makes until undefined, not true (UNTILN: the
     # value of u3 at t = 0 stays undecided at the resumption at t = 2.5)
