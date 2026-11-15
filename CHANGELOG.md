@@ -102,8 +102,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- `cadl norms-check`: the elimination (F.12) keeps fewer states, each
-  reduction leaving the combinations of predicate values the same, and
+- `cadl norms-check`: when the elimination (F.12) of 0.3.31 needs more
+  than 50 000 states at one step, it runs again with reductions that
+  keep fewer states (a component within that limit gets the same
+  combinations and valuations as with 0.3.31). Each reduction leaves the
+  combinations of predicate values the same, and
   every combination still comes with a valuation that the evaluator of
   `cadl norms-eval` confirms. States that a permutation of the members of
   a set maps to each other are merged, when the leaves that read the

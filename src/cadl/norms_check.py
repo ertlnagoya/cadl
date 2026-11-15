@@ -92,11 +92,6 @@ MAX_VALUATIONS = 50000
 # linear arrangement (F.12): --max-states, at most MAX_STATES_BOUND.
 DEFAULT_MAX_STATES = 50000
 MAX_STATES_BOUND = 1000000
-_MAX_STATES: list = [None]
-
-
-def _max_states() -> int:
-    return _MAX_STATES[0] if _MAX_STATES[0] is not None else DEFAULT_MAX_STATES
 MAX_ATOMS = 16
 MAX_INSTANCES = 4
 MAX_COMMANDS = 32768
@@ -1960,8 +1955,10 @@ class Environment:
     Translator per instance translates its norms; the environment then
     numbers the message events and predicates of all of them."""
 
-    def __init__(self, trs: list, step_ms: int | None, horizon: int | None) -> None:
+    def __init__(self, trs: list, step_ms: int | None, horizon: int | None,
+                 limit: int = DEFAULT_MAX_STATES) -> None:
         self.trs = trs
+        self.limit = limit
         self.notes: list[str] = []
         # predicates: one list, each predicate evaluated with the bindings of
         # its instance
@@ -2270,7 +2267,7 @@ class Environment:
         """The vectors of a component with too many valuations by types and
         patterns, found by elimination of its quantities (F.12)."""
         el = _Elimination(self, ids, keys, linear)
-        limit = _max_states()
+        limit = getattr(self, "limit", DEFAULT_MAX_STATES)
         got = el.run(limit)
         if got is None:
             what = (f"the leaves that read numbers of the linear arrangement needed more than "
@@ -2618,8 +2615,10 @@ class Environment:
 # vector comes with a valuation, and every vector is checked on it with
 # the evaluator of norms-eval.
 #
-# From cadl 0.3.32 three reductions keep fewer states, each leaving the set
-# of vectors the same (see the sections below): states equal up to a
+# From cadl 0.3.32, when the elimination above exceeds 50 000 states at one
+# step, it runs again with three reductions that keep fewer states, each
+# leaving the set of vectors the same (a component within that limit keeps
+# the vectors and valuations of 0.3.31; see the sections below): states equal up to a
 # permutation of members that keeps the remaining expressions are merged
 # (symmetry of a state); a state whose remaining expressions can only give
 # vectors already found, by descents that add the quantities along one
@@ -2684,6 +2683,7 @@ class _Elimination:
     LOCAL = True        # symmetry of a state
     PRUNE = True        # states that can only give vectors already found
     FOLD = True         # leaves that read min or max of a set
+    reduced = True      # run() sets it: False for the elimination of 0.3.31
 
     def __init__(self, env: Any, ids: list, keys: list, linear: bool = False) -> None:
         self.env, self.ids, self.keys = env, ids, keys
@@ -3391,6 +3391,8 @@ class _Elimination:
         for r, lids in reps.items():
             if r in other or r in self.sorted_keys or len(lids) != 1:
                 continue
+            if P[r] == ("s", "list"):
+                continue        # its outcomes bound the lists still to add
             c = self._fold_class(lids[0], r, P[r])
             if c == "num":
                 nums.setdefault(lids[0], []).append(r)
@@ -3471,7 +3473,7 @@ class _Elimination:
     # predicates treat alike keep the sorted valuations above instead.
 
     def _local_setup(self) -> None:
-        self.local = not self.linear and self.LOCAL
+        self.local = not self.linear and self.LOCAL and self.reduced
         self.member_keys: dict = {}     # set -> member -> {field: key}
         global_sets = {re.match(r"([A-Za-z_]\w*)\[", ks[0]).group(1) for ks in self.symmetric}
         for k in self.keys:
@@ -3644,6 +3646,19 @@ class _Elimination:
         when a kept pattern cannot be extended, the elimination is run
         again keeping every added list of a group in the states as long as
         the group has quantities to add."""
+        # the elimination of 0.3.31 first, so that a component within its
+        # limit gets the same vectors and valuations; the reductions only
+        # when it exceeds that limit
+        self.reduced = False
+        got = self._run_lists(min(limit, DEFAULT_MAX_STATES))
+        if got is not None or self.linear or not (self.LOCAL or self.PRUNE or self.FOLD):
+            if got is None and limit > DEFAULT_MAX_STATES:
+                return self._run_lists(limit)
+            return got
+        self.reduced = True
+        return self._run_lists(limit)
+
+    def _run_lists(self, limit: int) -> list | None:
         self.kept_lists = False
         self.exceeded = None
         try:
@@ -3668,7 +3683,7 @@ class _Elimination:
         const = {lid: self.leaves[lid][0]._scoped_value(self.leaves[lid][1], self.leaves[lid][2], {})
                  for lid in range(len(self.leaves)) if not self.leaves[lid][3]}
         res = tuple(self._simp(r, const) for r in res)
-        self.folds = {} if self.linear or not self.FOLD else {
+        self.folds = {} if self.linear or not (self.FOLD and self.reduced) else {
             lid: f for lid in range(len(self.leaves)) for f in [self._fold_of(lid)] if f}
         self._fold_classes: dict = {}
         if self.folds:
@@ -3681,7 +3696,7 @@ class _Elimination:
         self.symmetric = self._symmetric_sets()
         # a set read only by fold nodes needs no sorted valuations: which
         # member is a representative is not kept (_loose)
-        self.symmetric = [keys for keys in self.symmetric if not all(
+        self.symmetric = [keys for keys in self.symmetric if not self.folds or not all(
             lid in self.folds for lid in range(len(self.leaves))
             if set(self.leaves[lid][3]) & set(keys))]
         self.sorted_keys = {k for keys in self.symmetric for k in keys}
@@ -3703,13 +3718,15 @@ class _Elimination:
         out: dict = {}
         self.points = 0
         self.pruned = 0
-        self.prune = not self.linear and self.PRUNE
+        self.prune = not self.linear and self.PRUNE and self.reduced
         if self.prune:
             self._descents(start, out, limit)
         self.peak = 1
         for step, x in enumerate(order):
             new: dict = {}
             self._ext_cache.clear()
+            self._poss_cache.clear()
+            self._poss_exact.clear()
             for state in states.values():
                 _generation_time()
                 for canon, (res2, make, _kind) in self._successors(state, step):
@@ -3803,8 +3820,8 @@ class _Elimination:
 
     # --- vectors found early (from cadl 0.3.32) ----------------------------------
     #
-    # Only the set of vectors of the component is needed. Before the states
-    # of a step are kept, a few descents add the quantities along one
+    # Only the set of vectors of the component is needed. Before the first
+    # step, a few descents add the quantities along one
     # extension at a time (chosen to reach a vector not yet found) and keep
     # the vector of each completed descent with its valuation, checked by
     # the evaluator. A state whose remaining expressions can only give
@@ -5724,17 +5741,13 @@ def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=Non
     if max_states is not None and not (
             isinstance(max_states, int) and 1 <= max_states <= MAX_STATES_BOUND):
         raise NormsCheckError(f"--max-states must be an integer from 1 to {MAX_STATES_BOUND}")
-    saved = _MAX_STATES[0]
-    _MAX_STATES[0] = max_states
-    try:
-        return _build_model(sos, contract_id, bindings, members, step, horizon, domains,
-                            instances, versions, starts)
-    finally:
-        _MAX_STATES[0] = saved
+    return _build_model(sos, contract_id, bindings, members, step, horizon, domains,
+                        instances, versions, starts,
+                        DEFAULT_MAX_STATES if max_states is None else max_states)
 
 
 def _build_model(sos: SoSDefinition, contract_id, bindings, members, step, horizon, domains,
-                 instances, versions, starts: str) -> NormsModel:
+                 instances, versions, starts: str, limit: int) -> NormsModel:
     if not norms_declared(sos):
         raise NormsCheckError("the file does not declare 'norms: 0.1' under extensions:")
     contract = select_contract(sos, contract_id)
@@ -5760,17 +5773,17 @@ def _build_model(sos: SoSDefinition, contract_id, bindings, members, step, horiz
             # observation: each instance has the same sequence of versions
             vts = [_version_translators(t, sos, contract, versions, {**bindings, **b}, members,
                                         step_ms, horizon, domains) for t, b in zip(trs, sets)]
-            Environment(trs + [v for vt in vts for v in vt], step_ms, horizon)
+            Environment(trs + [v for vt in vts for v in vt], step_ms, horizon, limit)
             return NormsModel(trs, versions=vts, starts=starts)
-        Environment(trs, step_ms, horizon)
+        Environment(trs, step_ms, horizon, limit)
         return NormsModel(trs, starts=starts)
     tr = Translator(sos, contract, bindings, members, step_ms, horizon, domains)
     if versions:
         vtrs = _version_translators(tr, sos, contract, versions, bindings, members, step_ms,
                                     horizon, domains)
-        Environment([tr] + vtrs, step_ms, horizon)
+        Environment([tr] + vtrs, step_ms, horizon, limit)
         return NormsModel(tr, versions=vtrs)
-    Environment([tr], step_ms, horizon)
+    Environment([tr], step_ms, horizon, limit)
     return NormsModel(tr)
 
 

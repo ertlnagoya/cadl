@@ -2547,7 +2547,8 @@ def _vectors_without(env, ids, keys, monkeypatch, off=_REDUCTIONS, keep=False):
         setattr(_Elimination, name, False)
     try:
         el = _Elimination(env, ids, keys)
-        got = el._run(10 ** 6, True) if keep else el.run(10 ** 6)
+        el.reduced = True           # the reductions also within the limit
+        got = el._run(10 ** 6, True) if keep else el._run_lists(10 ** 6)
     finally:
         for name in _REDUCTIONS:
             setattr(_Elimination, name, True)
@@ -2563,15 +2564,28 @@ MAXES = ("max(r.load for r in R) > D.load", "max(R[*].load) >= min(r.load for r 
     (PAIRS,), (PAIRS, "for all j in R: for all k in R: j >= k OR R[j].load >= R[k].load"),
     (PAIRS, "R[1].load == D.load"),
     ("for all j in R: for all k in R: k != j + 1 OR R[j].load < R[k].load",
-     "exists j in R: R[j].load == D.load")] + [(m,) for m in MAXES] + [(MAXES[0], PAIRS)],
+     "exists j in R: R[j].load == D.load")] + [(m,) for m in MAXES] + [(MAXES[0], PAIRS)] + [
+    # representatives that are lists of an ordered group (the outcomes of
+    # a list bound the lists still to add, so they stay in the key)
+    ("max(r.load for r in R) > D.load", "D.v < D.w", "D.load < D.v OR D.w < D.load"),
+    ("min(r.load for r in R) < D.load", "D.load < D.v", "D.v > D.w AND D.w > D.load"),
+    ("max(r.load for r in R) >= D.load", "R[1].v < D.load", "R[1].v > D.w OR D.w < D.load"),
+    ("for all j in R: for all k in R: j >= k OR R[j].load < R[k].load", "D.load < R[2].load"),
+    # two fields of the members, which a permutation moves together
+    ("for all j in R: for all k in R: j == k OR R[j].load != R[k].load OR R[j].v < R[k].v",
+     "R[1].v > R[2].v AND R[1].load == R[2].load")],
     ids=["pairs", "updown", "pairs-literal", "neighbours", "max", "max-min", "min-literal",
-         "max-pairs"])
+         "max-pairs", "max-lists", "min-lists", "max-member-lists", "pairs-member",
+         "two-fields"])
 def test_reductions_find_the_same_vectors(contents, monkeypatch):
     """The symmetry of a state, the states left out because their vectors
     were found, and the fold nodes of min and max (F.12, 0.3.32) give the
     vectors of the elimination without them and of the classes, each
-    alone and together, also keeping the lists, for four members."""
-    m = build_model(_members_sos(*contents), members=["R=4"])
+    alone and together, also keeping the lists, for four members (three
+    for the groups with lists in the key, whose elimination without the
+    reductions is long)."""
+    m = build_model(_members_sos(*contents), members=["R=3" if "D.load" in contents[-1]
+                                                       or "R[j].v" in contents[0] else "R=4"])
     tr, env = _env_of(m)
     for ids, vecs in tr.components:
         keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
@@ -2620,7 +2634,8 @@ def test_fold_nodes_keep_representatives():
     assert {v for v, _ in vecs} == {("T",), ("U",)}
     keys = sorted(tr.preds[ids[0]].keys)
     el = _Elimination(env, ids, keys)
-    assert {v for v, _ in el.run(10 ** 6)} == {("T",), ("U",)}
+    el.reduced = True
+    assert {v for v, _ in el._run_lists(10 ** 6)} == {("T",), ("U",)}
     assert el.folds and el.peak < 1000
 
 
@@ -2680,6 +2695,48 @@ def test_reductions_on_random_predicates(monkeypatch):
                 assert tuple(tr._oracle(exprs, vals)) in want, (contents, vals)
             checked += 1
     assert checked
+
+
+TWO_SETS_HEAD = MEMBERS_HEAD.replace('    - {id: "R[1..N]", role: r}\n',
+                                     '    - {id: "R[1..N]", role: r}\n'
+                                     '    - {id: "T[1..N]", role: t}\n').replace(
+    'parties: [D, "R[*]"]', 'parties: [D, "R[*]", "T[*]"]')
+
+
+def test_symmetry_over_two_sets_indexed_by_one_variable(monkeypatch):
+    """R[j] and T[j] read through one variable: exchanging two members of
+    R alone does not keep the predicates, so the symmetry of a state does
+    not merge such states; the vectors are those without the reductions
+    and of the classes."""
+    contents = ("for all j in R: R[j].load <= T[j].load",
+                "exists j in R: R[j].load > T[j].load OR R[j].load == D.load")
+    body = "norms:\n" + "".join(
+        f"  - id: p{i}\n    kind: prohibition\n    bearer: D\n    content: \"{c}\"\n"
+        for i, c in enumerate(contents))
+    sos = parse(TWO_SETS_HEAD + textwrap.indent(body, "      "))
+    assert type_check(sos).ok
+    m = build_model(sos, members=["R=2", "T=2"])
+    tr, env = _env_of(m)
+    for ids, vecs in tr.components:
+        keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+        want = _vectors_without(env, ids, keys, monkeypatch)
+        assert want == {v for v, _ in vecs}
+        for off in ((), ("PRUNE",)):
+            assert _vectors_without(env, ids, keys, monkeypatch, off) == want, off
+
+
+def test_within_the_limit_of_0_3_31_the_witnesses_stay_the_same():
+    """A component that the elimination of 0.3.31 translates within 50 000
+    states gets the same vectors and valuations (witnesses): the
+    reductions run only when it exceeds the limit. Every pair of five
+    members ordered by their indices gives the valuations of 0.3.31."""
+    m = build_model(_members_sos(PAIRS), members=["R=5"])
+    (ids, vecs), = m.trs[0].components
+    got = {v: vals for v, vals in vecs}
+    keys = [f"R[{i}].load" for i in range(1, 6)]
+    assert got[("F",)] == dict(zip(keys, [None, None, None, True, False]))
+    assert got[("T",)] == dict(zip(keys, [True] * 5))
+    assert got[("U",)] == dict(zip(keys, [None] * 5))
 
 
 def test_max_states_sets_the_limit():
