@@ -17,7 +17,15 @@ literal (``string(hex"...")``) and every number as an integer literal.
 Numbers are fixed-point with 6 decimals (SCALE = 10**6), so a literal
 with more decimals, and the operators ``*`` and ``/`` (whose results the
 fixed point would round), are not supported; neither is a contract the
-IR refuses (quantifiers, aggregates, wildcard references).
+IR refuses (quantifiers, aggregates, wildcard references), nor a
+temporal operator inside another one outside the content of a norm.
+
+The content of a norm with temporal operators goes to the queues of
+CadlNormsWindows (one operator), to the segment tree of CadlNormsMulti
+(two to five, or a nested `within` / `throughout` fed in the order of the
+observations), or, from cadl 0.3.32, to `General` in CadlNormsMulti, which
+decides it per observation (six or more operators, `until` in a nesting,
+an operand that combines a nested operator with other parts).
 """
 
 from __future__ import annotations
@@ -55,9 +63,9 @@ SOLC_CHECKED = ("0.8.24", "0.8.37")
 # the constructor). Measured with the versions above, the optimizer with 1
 # and with 200 runs, plus 3 %; tests/test_norms_monitor_targets.py checks
 # them against solc.
-RUNTIME_ESTIMATE = {"monitor": 16670, "CadlNormsValues": 7810, "CadlNormsEval": 11440,
-                    "CadlNormsItems": 2370, "CadlNormsWindows": 5490, "CadlNormsActs": 12080,
-                    "CadlNormsMulti": 10120}
+RUNTIME_ESTIMATE = {"monitor": 17180, "CadlNormsValues": 7810, "CadlNormsEval": 11540,
+                    "CadlNormsItems": 2370, "CadlNormsWindows": 5490, "CadlNormsActs": 12190,
+                    "CadlNormsMulti": 15830}
 
 
 def estimated_initcode(text: str) -> int:
@@ -180,20 +188,22 @@ def _top_temporal(nodes: list[dict], root: int) -> list[int]:
     return [x for c in _children(nodes[k]) for x in _top_temporal(nodes, c)]
 
 
-# The most temporal operators in one content (D.5). CadlNormsEval.table
-# keeps the 4^m values of a content in 4^(m - 4) words of 256 bits for
-# m > 4, and a node of the segment tree has 5^(m - 3) storage words for
-# m > 3: 25 for five operators. With six, a node would have 125 words and
-# an observation would cost about five times as much as with five (up to
-# 10^7 gas measured), of the order of the gas limit of a block.
+# The most temporal operators in one content that the segment tree decides
+# (D.5). CadlNormsEval.table keeps the 4^m values of a content in 4^(m - 4)
+# words of 256 bits for m > 4, and a node of the segment tree has
+# 5^(m - 3) storage words for m > 3: 25 for five operators. With six, a
+# node would have 125 words and an observation would cost about five times
+# as much as with five (up to 10^7 gas measured), of the order of the gas
+# limit of a block; from cadl 0.3.32 such a content is decided per
+# observation (General), whose cost grows linearly with the operators.
 MAX_TEMPORAL = 5
 
 
 def _nesting(nodes: list[dict], k: int) -> tuple[dict | None, str | None]:
     """A temporal operator k of a content with a temporal operator inside:
     its record for `_nested` (the outer operator and its levels, the first
-    over an operand p without a temporal operator), or why the monitor
-    refuses it."""
+    over an operand p without a temporal operator), or why the segment
+    tree cannot decide it (the content is then decided per observation)."""
     outer = nodes[k]
     if outer["op"] == "until":
         return None, ("until with a temporal operator in an operand (the decided values of "
@@ -275,7 +285,7 @@ def solidity_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
     contents = {nd["content"]["expr"] for nd in ir["norms"]
                 if nd.get("content") and nd["content"].get("kind") == "predicate" and not nd["content"].get("error")}
     ir = apply_limits(ir, lambda nodes, root: _problem(nodes, root, root in contents))
-    reasons = []
+
     nodes = ir["exprs"]
     for nd in ir["norms"]:
         c = nd.get("content")
@@ -284,34 +294,51 @@ def solidity_ir(sos: SoSDefinition, contract: ContractDef) -> dict:
         ops = sorted(_top_temporal(nodes, c["expr"]))
         if not ops:
             continue
-        where = f"norm '{nd['id']}', content"
-        if len(ops) > MAX_TEMPORAL:
-            reasons.append(
-                f"{where}: {len(ops)} temporal operators (the Solidity monitor decides the "
-                f"candidates of a content from at most {MAX_TEMPORAL}: a node of its segment "
-                f"tree has 5^(m - 3) storage words, 125 for six operators, and the gas of an "
-                f"observation would be about five times that of five operators, of the order "
-                f"of the gas limit of a block)")
-            continue
-        specs, nested = [], False
+        specs, nested, general = [], False, len(ops) > MAX_TEMPORAL
         for k in ops:
+            if general:
+                break
             if any(_temporal_inside(nodes, ch) for ch in _children(nodes[k])):
                 spec, why = _nesting(nodes, k)
                 if why:
-                    reasons.append(f"{where}: {why}")
+                    # until in a nesting, or an operand that combines a
+                    # nested operator with other parts (from cadl 0.3.32)
+                    general = True
                     break
                 specs.append(spec)
                 nested = True
             else:
                 specs.append({"node": k})
+        if general:
+            nd["general"] = _general_spec(nodes, c["expr"])
+        elif len(ops) >= 2 or nested:
+            nd["multi"] = specs
         else:
-            if len(ops) >= 2 or nested:
-                nd["multi"] = specs
-            else:
-                nd["temporal"] = {"node": ops[0]}
-    if reasons:
-        raise NormsTargetUnsupported(reasons)
+            nd["temporal"] = {"node": ops[0]}
     return ir
+
+
+def _general_spec(nodes: list[dict], root: int) -> dict:
+    """The temporal operators of a content decided per observation
+    (`General` of the base contract): each after those inside it, with the
+    operators directly inside its operands, and those of the content that
+    are not inside another."""
+    order: list[int] = []
+    kids: dict[int, list[int]] = {}
+
+    def visit(k: int) -> None:
+        inner = [x for c in _children(nodes[k]) for x in _top_temporal(nodes, c)]
+        for x in inner:
+            visit(x)
+        order.append(k)
+        kids[k] = inner
+
+    tops = sorted(_top_temporal(nodes, root))
+    for k in tops:
+        visit(k)
+    pos = {k: i for i, k in enumerate(order)}
+    return {"ops": [{"node": k, "kids": [pos[x] for x in kids[k]]} for k in order],
+            "tops": [pos[k] for k in tops]}
 
 
 _WINDOW_MODES = {"within": 1, "throughout": 2, "until": 3}
@@ -324,6 +351,13 @@ def _op_args(ir: dict, k: int) -> str:
     return (f"{_WINDOW_MODES[node['op']]}, {p}, {q}, {scaled(node['d'], 'a duration')}, {k}")
 
 
+def _op_args_general(ir: dict, k: int) -> str:
+    """mode, node, p, q and duration of a temporal operator of a General content."""
+    node = ir["exprs"][k]
+    p, q = (node["p"], node["q"]) if node["op"] == "until" else (node["x"], 0)
+    return f"{_WINDOW_MODES[node['op']]}, {k}, {p}, {q}, {scaled(node['d'], 'a duration')}"
+
+
 def node_words(m: int) -> int:
     """The storage words of a node of the segment tree for m operators."""
     return 1 if m <= 3 else 5 ** (m - 3)
@@ -332,6 +366,14 @@ def node_words(m: int) -> int:
 def _window_lines(ir: dict, nd: dict) -> list[str]:
     """The temporal operators of the content of a norm: one (`_temporal`),
     or two or more, or a nested one (`_multi`)."""
+    if nd.get("general"):
+        spec = nd["general"]
+        out = [f"        _general({nd['content']['expr']});"]
+        for op in spec["ops"]:
+            out.append(f"        _gop({_op_args_general(ir, op['node'])});")
+            out += [f"        _gkid({j});" for j in op["kids"]]
+        out += [f"        _gtop({j});" for j in spec["tops"]]
+        return out
     if nd.get("multi"):
         specs = nd["multi"]
         out = [f"        _multi({nd['content']['expr']}, {node_words(len(specs))});"]

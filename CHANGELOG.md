@@ -100,6 +100,59 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   at most 1 000 000). The refusal names the limit, its value, and how far
   it may be raised.
 
+- The Solidity norms monitor decides the contents of norms it refused
+  (Appendix D, D.5): six or more temporal operators in one content,
+  `until` in a nesting (`within(5s, until(p, q, 3s))`, `until(p,
+  within(2s, q), 3s)`), and an operand that combines a nested operator
+  with other parts (`within(5s, throughout(2s, p) AND r)`). Such a
+  content is decided per observation (`General`, in `CadlNormsMulti`):
+  from the first candidate of an activation on, each temporal operator
+  of the content keeps the truth values of its operands and its own
+  value at every observation, two bits each and 128 to a storage word,
+  each operator after those inside it; its value at an observation is
+  that of F.4 over the operand values of its window, found with a few
+  masks per word. An observation reads again only the operands at the
+  observations whose value inside them it decided, the windows that hold
+  an operand decided now (all of them for a decisive value of `within`
+  or `throughout` and for `until`), and the windows that it ends; a
+  window of `within` or `throughout` that is over and still waits for an
+  undecided operand is read again when its last undecided operand is
+  decided. The content is read again at the candidates whose operators
+  the observation decided. The contents that 0.3.31 decided are
+  generated and decided as before. The gas of an observation does not
+  grow with the number of earlier observations; it grows linearly with
+  the operators and, for these contents, can grow with the number of
+  observations inside a window (after a gap in time one observation can
+  decide the values of a whole window). Measured at one observation per
+  second into 1000 s windows, at the 320th and the 1000th observation:
+  `within(1000s, throughout(500s, …) AND …)` 5.4 × 10^5 and 6.4 × 10^5
+  gas, `within(1000s, until(…, …, 500s))` 5.3 × 10^5 and 6.8 × 10^5
+  (each rises once, when the inner windows end from the 500th second
+  on), six operators 9.8 × 10^5 and 9.9 × 10^5 (at most 1.3 × 10^6; five
+  operators in the tree cost 6.7 × 10^6), twelve operators 1.6 × 10^6
+  (120th observation); `within(100s, NOT throughout(50s, …) OR …)`,
+  whose windows wait for their operands, 5.4 × 10^5 before the 100th
+  second and 7.4 × 10^5 from the 150th on. The first observation of a content with 6, 12, 24 and 48
+  operators (`within(1s, …) OR …`) costs 1.3 × 10^6, 2.2 × 10^6,
+  4.1 × 10^6 and 7.7 × 10^6 gas. What limits the size of such a content
+  is the deployment: the constructor stores the model, about 5.5 × 10^5
+  gas per operator of this form (7.4 × 10^6 gas for 6 operators,
+  1.7 × 10^7 for 24, 3.1 × 10^7 for 48, the creation code 21 646,
+  30 688 and 42 760 bytes); the estimate of the creation code refuses a
+  monitor above the limit of EIP-3860 as before. The generated
+  constructor calls `_general(root)`, then per operator, inner ones
+  first, `_gop(mode, node, p, q, d)` and `_gkid(j)` for each operator
+  directly inside its operands, and `_gtop(j)` for the operators of the
+  content not inside another.
+- tests/test_norms_monitor_targets.py: the sets UNTILN, MIXED and SIX on
+  the EVM and on OPA, five boundary traces of `until` (q true deciding
+  earlier windows at once, q true after p undefined, also under `NOT`,
+  after p undecided and after p false), random contents with temporal operators inside
+  others (until anywhere, mixed operands, comparisons) on both, the gas
+  of the new contents, and of windows that wait for their operands.
+  scripts/norms_monitor_mutations.py: 15 mutants of `General`, all
+  killed.
+
 ### Changed
 
 - `cadl norms-check`: when the elimination (F.12) of 0.3.31 needs more
@@ -128,6 +181,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   its values never occurs, linear arithmetic over many ordered quantities,
   and predicates that read the same members through `max` and by their
   indices.
+
+- The runtime estimates of `CadlNormsMulti`, `CadlNormsEval`,
+  `CadlNormsActs` and the main contract are 15 830, 11 540, 12 190 and
+  17 180 bytes (10 120, 11 440, 12 080 and 16 670).
 
 
 ## [0.3.31] — 2026-11-14
