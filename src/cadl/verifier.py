@@ -65,6 +65,7 @@ class VerificationResult:
             "failed": "FAIL",
             "unknown": "UNKNOWN",
             "info": "INFO",
+            "warning": "WARN",
             "not_supported": "SKIP",
         }.get(self.status, self.status.upper())
         s = f"[{icon}] {self.check_name}: {self.message}"
@@ -393,6 +394,35 @@ def _check_cross_contract_consistency(
             status="unknown",
             message="Solver could not determine (timeout or undecidable)",
         )
+
+
+def _apart_under_bindings(
+    result: VerificationResult, bindings: list, id1: str, id2: str,
+) -> VerificationResult:
+    """The result for a pair of contracts that no regime has in force
+    together under the regime bindings of A.7.1: a conflict is a warning,
+    anything else an info line."""
+    def where(cid: str) -> str:
+        names = [b.name for b in bindings if cid in b.active]
+        return ", ".join(names) if names else "no regime"
+    regimes = (f"'{id1}' is in force in {where(id1)}, '{id2}' in {where(id2)}; "
+               f"no regime has both in force under the regime bindings of A.7.1")
+    if result.status == "failed":
+        return VerificationResult(
+            check_name=result.check_name,
+            status="warning",
+            message=f"Contracts are contradictory when combined ({regimes}; a "
+                    f"warning, not a failure, since A.7.1 leaves open at which step of "
+                    f"a transition the bindings switch, so both may be in force then)",
+            counterexample=result.counterexample,
+        )
+    verdict = {"passed": "jointly satisfiable",
+               "unknown": "not decided by the solver"}.get(result.status, result.status)
+    return VerificationResult(
+        check_name=result.check_name,
+        status="info",
+        message=f"Contracts are {verdict} ({regimes})",
+    )
 
 
 def _check_transition_exclusivity(sos: SoSDefinition) -> List[VerificationResult]:
@@ -882,23 +912,20 @@ def verify(sos: SoSDefinition) -> List[VerificationResult]:
         results.append(_check_guarantee_entailment(contract, emptied))
 
     # 2. Check cross-contract consistency for contracts sharing parties.
-    # With `regimes:` (Appendix A, A.7.1) only contracts that are active
-    # together in some regime must be consistent with each other.
+    # With `regimes:` (Appendix A, A.7.1), a pair that no regime has in force
+    # together is still checked, but a conflict is a warning: the bindings
+    # do not say at which step of a transition they switch. A file without
+    # regimes has every contract in force at all times.
     from .regimes import checked as checked_regimes, co_active
-    bindings = checked_regimes(sos)
+    bindings = checked_regimes(sos) or None
     for c1, c2 in combinations(contracts, 2):
         parties1 = {p.name for p in c1.parties}
         parties2 = {p.name for p in c2.parties}
         if parties1 & parties2:  # shared parties
+            result = _check_cross_contract_consistency(c1, c2)
             if bindings is not None and not co_active(bindings, c1.id, c2.id):
-                results.append(VerificationResult(
-                    check_name=f"Cross-contract '{c1.id}' x '{c2.id}'",
-                    status="info",
-                    message="Not checked: no regime of regimes: has both contracts "
-                            "active, so they never hold together",
-                ))
-                continue
-            results.append(_check_cross_contract_consistency(c1, c2))
+                result = _apart_under_bindings(result, bindings, c1.id, c2.id)
+            results.append(result)
 
     # 3. Check transition condition mutual exclusivity
     results.extend(_check_transition_exclusivity(sos))

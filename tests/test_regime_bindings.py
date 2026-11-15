@@ -204,6 +204,8 @@ class TestRegimeBindingsCheck(unittest.TestCase):
         self._one("regimes:\n  CENTRALIZED: { contracts: { active: [ROUTING], "
                   "suspended: [FREE_PASSAGE] } }\n", "gives both 'active' and 'suspended'")
         self._one("regimes:\n  CENTRALIZED: { contracts: { paused: [ROUTING] } }\n", "(R-5)")
+        self._one("regimes:\n  CENTRALIZED: { contracts: {} }\n", "one of the keys", "(R-5)")
+        self._one("regimes:\n  CENTRALIZED: { contracts: null }\n", "one of the keys", "(R-5)")
 
     def test_conflicts(self):
         self._one("regimes:\n  CENTRALIZED:\n    parameters: { ROUTING.beta: 0.7 }\n"
@@ -250,15 +252,43 @@ class TestRegimeBindingsUse(unittest.TestCase):
         self.assertNotIn("regimes", json.loads(generate_config(plain, "go")))
         self.assertNotIn("regimeBindings", json.loads(generate_config(plain, "unity")))
 
-    def test_verify_skips_pairs_never_active_together(self):
+    def test_verify_warns_for_pairs_apart_under_bindings(self):
         results = {r.check_name: r for r in verify(parse(GOOD))}
         pair = results["Cross-contract 'BAY_ASSIGNMENT' x 'FREE_PASSAGE'"]
-        self.assertEqual(pair.status, "info")
+        self.assertEqual(pair.status, "warning")
+        self.assertIn("under the regime bindings of A.7.1", pair.message)
+        self.assertIn("'BAY_ASSIGNMENT' is in force in CENTRALIZED", pair.message)
+        self.assertIn("'FREE_PASSAGE' in DISTRIBUTED", pair.message)
+        self.assertIn("[WARN]", str(pair))
         self.assertEqual(results["Cross-contract 'ROUTING' x 'BAY_ASSIGNMENT'"].status, "passed")
         # without the block the contradictory pair is checked and fails
         plain = {r.check_name: r for r in verify(parse(BASE))}
         self.assertEqual(plain["Cross-contract 'BAY_ASSIGNMENT' x 'FREE_PASSAGE'"].status,
                          "failed")
+
+    def test_verify_info_for_consistent_pair_apart(self):
+        src = GOOD.replace('"waiting_on_road >= 1"', '"waiting_on_road >= 0"')
+        results = {r.check_name: r for r in verify(parse(src))}
+        pair = results["Cross-contract 'BAY_ASSIGNMENT' x 'FREE_PASSAGE'"]
+        self.assertEqual(pair.status, "info")
+        self.assertIn("jointly satisfiable", pair.message)
+        self.assertIn("under the regime bindings of A.7.1", pair.message)
+
+    def test_verify_empty_block_without_transitions_checks_all_pairs(self):
+        src = textwrap.dedent("""\
+            sos:
+              name: Empty
+              actors:
+                - { id: A, role: a }
+                - { id: B, role: b }
+              contracts:
+                - { id: C1, parties: [A, B], guarantee: ["x >= 5"] }
+                - { id: C2, parties: [A, B], guarantee: ["x <= 2"] }
+              regimes: {}
+            """)
+        self.assertEqual(_errors(src), [])
+        results = {r.check_name: r for r in verify(parse(src))}
+        self.assertEqual(results["Cross-contract 'C1' x 'C2'"].status, "failed")
 
     def test_verify_checks_pair_active_together(self):
         src = _with_regimes("regimes:\n  CENTRALIZED: { contracts: { suspended: [ROUTING] } }\n")

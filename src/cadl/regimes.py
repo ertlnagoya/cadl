@@ -152,8 +152,8 @@ def _analyse(sos: SoSDefinition) -> tuple[list[str], list[RegimeBinding] | None]
         # -- contracts (R-5) --
         contracts = entry.get("contracts")
         active = list(contract_ids)
-        if contracts is not None:
-            if not isinstance(contracts, dict) or any(
+        if "contracts" in entry:
+            if not isinstance(contracts, dict) or not contracts or any(
                     k not in ("active", "suspended") for k in contracts):
                 err(f"{where}.contracts must be a mapping with one of the keys "
                     f"'active' or 'suspended'", "R-5")
