@@ -816,7 +816,7 @@ class _GameAnalyser(_Analyser):
                 continue
             if key in assigned:
                 self.error(f"'over' of {where} lists '{key}', which a regime of "
-                           f"model.regimes assigns", "I-9")
+                           f"{self.assigned_by(key)} assigns", "I-9")
                 continue
             q.over[key] = (lo, hi)
             p.open_in_equilibria = True

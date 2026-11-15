@@ -296,6 +296,9 @@ class TransitionSpec:
     to_regime: str
     condition: str | None = None
     protocol: str | None = None
+    # The predicate of `safety_invariant:`, as written (like `condition`).
+    # Serialized only when the transition has one.
+    safety_invariant: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +321,7 @@ class SimIR:
         task_arbitration: optional FCFS task arbitration config (→ Unity taskArbitration).
         motivation: optional agent motivation / wandering-goal config (→ Unity motivationConfig).
         motivation_block: the `motivation:` block of the source, kept verbatim (Appendix C).
+        regimes: per-regime parameter values and active contracts (A.7.1).
     """
     name: str
     sos_type: str = ""
@@ -346,3 +350,9 @@ class SimIR:
     # 0.1` with `norms: 0.1`). Not serialized: the fields of Appendix J
     # (J.10) are part of the serialized IR only when it is set.
     grounding_extension: bool = False
+    # Regime bindings (`sos.regimes:`, Appendix A, A.7.1): one entry per
+    # regime, {name, parameters, active_contracts, suspended_contracts}, or
+    # None when the block breaks a rule. Serialized only for a file that has
+    # the block (`regimes_declared`).
+    regimes: Any = None
+    regimes_declared: bool = False

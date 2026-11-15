@@ -881,11 +881,23 @@ def verify(sos: SoSDefinition) -> List[VerificationResult]:
             "guarantee" in lost and not contract.guarantee)
         results.append(_check_guarantee_entailment(contract, emptied))
 
-    # 2. Check cross-contract consistency for contracts sharing parties
+    # 2. Check cross-contract consistency for contracts sharing parties.
+    # With `regimes:` (Appendix A, A.7.1) only contracts that are active
+    # together in some regime must be consistent with each other.
+    from .regimes import checked as checked_regimes, co_active
+    bindings = checked_regimes(sos)
     for c1, c2 in combinations(contracts, 2):
         parties1 = {p.name for p in c1.parties}
         parties2 = {p.name for p in c2.parties}
         if parties1 & parties2:  # shared parties
+            if bindings is not None and not co_active(bindings, c1.id, c2.id):
+                results.append(VerificationResult(
+                    check_name=f"Cross-contract '{c1.id}' x '{c2.id}'",
+                    status="info",
+                    message="Not checked: no regime of regimes: has both contracts "
+                            "active, so they never hold together",
+                ))
+                continue
             results.append(_check_cross_contract_consistency(c1, c2))
 
     # 3. Check transition condition mutual exclusivity

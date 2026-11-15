@@ -310,6 +310,7 @@ class TypeChecker:
         self._check_contracts(sos)
         self._check_protocols(sos)
         self._check_transitions(sos)
+        self._check_regime_bindings(sos)
         self._check_algorithms(sos)
         self._check_metrics(sos)
         self._check_codegen(sos)
@@ -2293,6 +2294,12 @@ class TypeChecker:
                 self.result.add_warning(
                     f"Regime '{name}' is a dead-end (no outgoing transitions)",
                 )
+
+    def _check_regime_bindings(self, sos: SoSDefinition) -> None:
+        """Rules R-1 to R-6 for `regimes:` (Appendix A, A.7.1)."""
+        from .regimes import check
+        for message in check(sos):
+            self.result.add_error(message, sos.loc)
 
     def _check_algorithms(self, sos: SoSDefinition) -> None:
         """Check algorithm definitions for duplicates."""

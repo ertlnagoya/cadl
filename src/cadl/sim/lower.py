@@ -70,6 +70,7 @@ def lower_to_ir(sos: SoSDefinition) -> SimIR:
                 to_regime=t.to_regime,
                 condition=t.condition,
                 protocol=t.protocol,
+                safety_invariant=t.safety_invariant,
             )
             for t in sos.transitions
         ],
@@ -80,9 +81,24 @@ def lower_to_ir(sos: SoSDefinition) -> SimIR:
         ),
         agents_extension=_agents_active(sos),
         stochastic_model=_lower_stochastic_model(sos),
+        regimes=_lower_regimes(sos),
+        regimes_declared=_regimes_declared(sos),
     )
     ir.grounding_extension = _lower_grounding(sos, ir.institution)
     return ir
+
+
+def _regimes_declared(sos: SoSDefinition) -> bool:
+    from ..regimes import declared
+    return declared(sos)
+
+
+def _lower_regimes(sos: SoSDefinition) -> Any:
+    """The `regimes` field (Appendix A, A.7.1): the resolved binding of every
+    regime, or None when the file has no `regimes:` block or the block
+    breaks a rule; `cadl check` reports why."""
+    from ..regimes import to_ir
+    return to_ir(sos)
 
 
 def _agents_active(sos: SoSDefinition) -> bool:

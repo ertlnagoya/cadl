@@ -16,6 +16,11 @@ def generate_runtime_module(sos: SoSDefinition) -> str:
         clean_name = sanitize_id(sos.name)
     sos_class_name = clean_name + "Runtime"
 
+    from ..regimes import checked as checked_regimes
+    # With `regimes:` (Appendix A, A.7.1) the regime controller decides
+    # which contract monitors run; without it the module is unchanged.
+    bound = bool(sos.transitions) and checked_regimes(sos) is not None
+
     lines = []
     lines.append(f'"""Generated runtime orchestrator for {sos.name}."""')
     lines.append("")
@@ -108,6 +113,8 @@ def generate_runtime_module(sos: SoSDefinition) -> str:
     if sos.transitions:
         lines.append("        # Regime controller")
         lines.append("        self.regime_controller = RegimeController()")
+        if bound:
+            lines.append("        self.regime_controller.apply_bindings(self.ctx)")
         lines.append("")
 
     # Instantiate metrics
@@ -122,7 +129,12 @@ def generate_runtime_module(sos: SoSDefinition) -> str:
     lines.append("        all_violations = []")
     for contract in sos.contracts:
         var = snake_case(contract.id) + "_monitor"
-        lines.append(f"        all_violations.extend(self.{var}.run_checks(self.ctx))")
+        if bound:
+            # A contract suspended in the current regime is not monitored (A.7.1).
+            lines.append(f"        if self.regime_controller.contract_active({contract.id!r}):")
+            lines.append(f"            all_violations.extend(self.{var}.run_checks(self.ctx))")
+        else:
+            lines.append(f"        all_violations.extend(self.{var}.run_checks(self.ctx))")
     lines.append("        for v in all_violations:")
     lines.append("            self.ctx.record_violation(v)")
     lines.append("        return all_violations")

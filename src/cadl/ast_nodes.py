@@ -769,4 +769,8 @@ class SoSDefinition:
     # on_fulfilment: and on_violation.magnitude as written
     # (`cadl.grounding.GroundingRaw`), or None when the file uses none.
     grounding: Any = None
+    # `regimes:` (Appendix A, A.7.1): parameter values and active contracts
+    # per regime, as written; None when the file has no such block.
+    # Checked and resolved by `cadl.regimes`.
+    regimes_raw: Any = None
     loc: SourceLocation | None = None

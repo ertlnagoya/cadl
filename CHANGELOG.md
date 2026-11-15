@@ -6,6 +6,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `regimes:` under `sos:` (Appendix A, A.7.1): per regime of
+  `transitions:`, values of declared parameters (`C.alpha`, `C.beta`,
+  `C.lambda` of a contract that writes the value, `environment.X` of
+  `context.environment`) and the contracts in force (`contracts:` with
+  `active:` or `suspended:`). `cadl check` reports an unknown regime,
+  entry key, parameter or contract, a value of the wrong type or outside
+  `[0, 1]`, both `active:` and `suspended:`, a contract listed twice, a
+  parameter bound twice, and a parameter of a suspended contract (R-1 to
+  R-6). `cadl sim-ir` writes the resolved bindings of every regime under
+  the key `regimes` (only for a file with the block; `null` when it breaks
+  a rule), and `cadl sim-gen` passes them to the python, go (`regimes`)
+  and unity (`regimeBindings`) targets. `cadl verify` checks two contracts
+  that share a party only when some regime has both in force, and reports
+  the other pairs as `info`. The Python code of `cadl codegen` gets
+  `RegimeController.parameters()`, `contract_active()` and
+  `apply_bindings()`; the current values are in `ctx.parameters` (a new
+  attribute of `RuntimeContext`) and a suspended contract is not
+  monitored. With `stochastic: 0.1`, a bound value is the value of the
+  model parameter bound to the same source under the design of the
+  regime, and a different value in `model.regimes:` is an error (R-7).
+  A file without `regimes:` gives the same results as in 0.3.31.
+- `cadl sim-ir` writes the `safety_invariant` of a transition, as
+  written (the key is absent for a transition without one), and
+  `cadl sim-gen` passes it on (`safety_invariant`, unity
+  `safetyInvariant`). Up to 0.3.31 it was checked but not in the IR.
+
 ## [0.3.31] — 2026-11-14
 
 ### Added

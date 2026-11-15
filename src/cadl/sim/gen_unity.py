@@ -75,6 +75,16 @@ def _build_config(ir: SimIR) -> dict:
             _transition_unity(t) for t in ir.transitions
         ]
 
+    # Regime bindings (A.7.1): parameter values and active contracts per regime
+    if ir.regimes_declared and ir.regimes is not None:
+        cfg["regimeBindings"] = [
+            {"regime": r["name"],
+             "parameters": [{"key": k, "value": v} for k, v in r["parameters"].items()],
+             "activeContracts": list(r["active_contracts"]),
+             "suspendedContracts": list(r["suspended_contracts"])}
+            for r in ir.regimes
+        ]
+
     # Task arbitration (FCFS / DELIVERY_ASSIGNMENT)
     if ir.task_arbitration is not None:
         ta = ir.task_arbitration
@@ -194,4 +204,6 @@ def _transition_unity(t) -> dict:
         d["condition"] = t.condition
     if t.protocol:
         d["triggerProtocol"] = t.protocol
+    if t.safety_invariant:
+        d["safetyInvariant"] = t.safety_invariant
     return d

@@ -1215,6 +1215,13 @@ def _ir_to_dict(ir) -> dict:
     # the source has a `motivation:` block.
     if d.get("motivation_block") is None:
         d.pop("motivation_block", None)
+    # From cadl 0.3.32: a transition's safety_invariant only when it has
+    # one, and the regime bindings only for a file with `regimes:` (A.7.1).
+    for t in d.get("transitions", []):
+        if t.get("safety_invariant") is None:
+            t.pop("safety_invariant", None)
+    if not d.pop("regimes_declared", False):
+        d.pop("regimes", None)
     return d
 
 

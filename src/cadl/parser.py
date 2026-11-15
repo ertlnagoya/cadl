@@ -1331,6 +1331,10 @@ def _build_sos(data: dict) -> SoSDefinition:
                     safety_invariant=_get(t, 'safety_invariant'),
                 ))
 
+    # Regime bindings (Appendix A, A.7.1), kept as written; checked and
+    # resolved by cadl.regimes.
+    sos.regimes_raw = _get(sos_data, 'regimes')
+
     # Metrics
     metrics_data = _get(sos_data, 'metrics', [])
     if isinstance(metrics_data, list):
