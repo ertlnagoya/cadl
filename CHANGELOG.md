@@ -21,8 +21,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   a rule), and `cadl sim-gen` passes them to the python, go (`regimes`)
   and unity (`regimeBindings`) targets. `cadl verify` still checks every
   pair of contracts that share a party; a conflict between two contracts
-  that no regime has in force together is a warning, not a failure, and
-  a consistent such pair gets an `info` line. A file with `regimes:` but
+  that no regime has in force together is a warning, not a failure, a
+  consistent such pair gets an `info` line, and an undecided one stays
+  `unknown`. A file with `regimes:` but
   no regimes (no `transitions:`) has every contract in force. The Python
   code of `cadl codegen` gets `RegimeController.parameters()`,
   `contract_active()` and `apply_bindings()`; the current values are in

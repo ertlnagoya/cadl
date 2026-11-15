@@ -588,7 +588,7 @@ cadl sim-gen examples/c_sos_taxi_fleet.cadl --target go -o sim_config.json
       contracts: { active: [ROUTING, BAY_ASSIGNMENT] }
 ```
 
-パラメータは、その値を書いている契約の `C.alpha`、`C.beta`、`C.lambda`、または `context.environment` の `environment.X` です。エントリの無いレジームや、レジームが束縛しないパラメータは宣言された値のままで、契約はレジームが停止しない限り有効です。`cadl sim-ir` は全レジームの解決済みの束縛を `regimes`（`parameters`、`active_contracts`、`suspended_contracts`）に書き出し、`cadl sim-gen` は3つのターゲットに渡します。`cadl verify` は、当事者を共有する2つの契約の整合性をすべて検査します。両方が有効なレジームが無い組では、矛盾は失敗ではなく `WARN` 行になり、矛盾の無い組には `INFO` 行を出します。`cadl codegen` が生成する Python コードは、現在のレジームの値を `ctx.parameters` に置き（生成されるモニタはこの値を読みません）、契約のモニタをその契約が有効なレジームでだけ実行します。`stochastic: 0.1` を宣言したファイルでは、束縛した値は、同じソースに束縛されたモデルパラメータの、そのレジームの設計での値になります。`model.regimes:` は同じ値を書くことはできますが、別の値は書けません（R-7）。`regimes:` の無いファイルの結果は、IR の `safety_invariant` を除いて変わりません。
+パラメータは、その値を書いている契約の `C.alpha`、`C.beta`、`C.lambda`、または `context.environment` の `environment.X` です。エントリの無いレジームや、レジームが束縛しないパラメータは宣言された値のままで、契約はレジームが停止しない限り有効です。`cadl sim-ir` は全レジームの解決済みの束縛を `regimes`（`parameters`、`active_contracts`、`suspended_contracts`）に書き出し、`cadl sim-gen` は3つのターゲットに渡します。`cadl verify` は、当事者を共有する2つの契約の整合性をすべて検査します。両方が有効なレジームが無い組では、矛盾は失敗とせず `WARN` 行として報告し、矛盾の無い組には `INFO` 行を出し、判定できない組は `UNKNOWN` のままです。`cadl codegen` が生成する Python コードは、現在のレジームの値を `ctx.parameters` に置き（生成されるモニタはこの値を読みません）、契約のモニタをその契約が有効なレジームでだけ実行します。`stochastic: 0.1` を宣言したファイルでは、束縛した値は、同じソースに束縛されたモデルパラメータの、そのレジームの設計での値になります。`model.regimes:` は同じ値を書くことはできますが、別の値は書けません（R-7）。`regimes:` の無いファイルの結果は、IR の `safety_invariant` を除いて変わりません。
 
 #### A-SoS vs C-SoS の比較
 

@@ -274,6 +274,26 @@ class TestRegimeBindingsUse(unittest.TestCase):
         self.assertIn("jointly satisfiable", pair.message)
         self.assertIn("under the regime bindings of A.7.1", pair.message)
 
+    def test_verify_unknown_pair_apart_stays_unknown(self):
+        import z3
+        from unittest import mock
+        real = z3.Solver.check
+        with mock.patch.object(z3.Solver, "check", lambda self, *a: z3.unknown):
+            results = {r.check_name: r for r in verify(parse(GOOD))}
+        self.assertIs(z3.Solver.check, real)
+        pair = results["Cross-contract 'BAY_ASSIGNMENT' x 'FREE_PASSAGE'"]
+        self.assertEqual(pair.status, "unknown")
+        self.assertIn("under the regime bindings of A.7.1", pair.message)
+
+    def test_verify_conflict_with_contract_in_force_nowhere(self):
+        src = GOOD.replace("suspended: [BAY_ASSIGNMENT]",
+                           "suspended: [BAY_ASSIGNMENT, FREE_PASSAGE]")
+        results = {r.check_name: r for r in verify(parse(src))}
+        pair = results["Cross-contract 'BAY_ASSIGNMENT' x 'FREE_PASSAGE'"]
+        self.assertEqual(pair.status, "warning")
+        self.assertIn("'FREE_PASSAGE' is in force in no regime", pair.message)
+        self.assertNotIn("both may be in force", pair.message)
+
     def test_verify_empty_block_without_transitions_checks_all_pairs(self):
         src = textwrap.dedent("""\
             sos:

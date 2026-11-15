@@ -401,27 +401,40 @@ def _apart_under_bindings(
 ) -> VerificationResult:
     """The result for a pair of contracts that no regime has in force
     together under the regime bindings of A.7.1: a conflict is a warning,
-    anything else an info line."""
-    def where(cid: str) -> str:
-        names = [b.name for b in bindings if cid in b.active]
-        return ", ".join(names) if names else "no regime"
-    regimes = (f"'{id1}' is in force in {where(id1)}, '{id2}' in {where(id2)}; "
-               f"no regime has both in force under the regime bindings of A.7.1")
+    a satisfiable pair an info line, and an undecided pair stays unknown."""
+    def regimes_of(cid: str) -> list:
+        return [b.name for b in bindings if cid in b.active]
+    where = {cid: regimes_of(cid) for cid in (id1, id2)}
+    note = (f"'{id1}' is in force in {', '.join(where[id1]) or 'no regime'}, "
+            f"'{id2}' in {', '.join(where[id2]) or 'no regime'}; no regime has both "
+            f"in force under the regime bindings of A.7.1")
     if result.status == "failed":
+        idle = [cid for cid in (id1, id2) if not where[cid]]
+        if idle:
+            reason = (f"a warning, not a failure, since "
+                      f"{' and '.join(repr(c) for c in idle)} "
+                      f"{'is' if len(idle) == 1 else 'are'} in force in no regime and "
+                      f"so never holds")
+        else:
+            reason = ("a warning, not a failure, since A.7.1 leaves open at which step "
+                      "of a transition the bindings switch, so both may be in force then")
         return VerificationResult(
             check_name=result.check_name,
             status="warning",
-            message=f"Contracts are contradictory when combined ({regimes}; a "
-                    f"warning, not a failure, since A.7.1 leaves open at which step of "
-                    f"a transition the bindings switch, so both may be in force then)",
+            message=f"Contracts are contradictory when combined ({note}; {reason})",
             counterexample=result.counterexample,
         )
-    verdict = {"passed": "jointly satisfiable",
-               "unknown": "not decided by the solver"}.get(result.status, result.status)
+    if result.status == "passed":
+        return VerificationResult(
+            check_name=result.check_name,
+            status="info",
+            message=f"Contracts are jointly satisfiable ({note})",
+        )
     return VerificationResult(
         check_name=result.check_name,
-        status="info",
-        message=f"Contracts are {verdict} ({regimes})",
+        status=result.status,
+        message=f"{result.message} ({note})",
+        counterexample=result.counterexample,
     )
 
 
