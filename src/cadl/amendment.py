@@ -1293,7 +1293,12 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
                                  "the old version does not declare 'amendment: 0.1'; no "
                                  "parameter is amendable, so every change is unexplained"))
     # Versions
-    if na.previous is not None and na.previous != oa.version:
+    if na.previous is not None and oa.version is None:
+        findings.append(_finding(
+            "warning", "previous_unchecked",
+            f"the new version names '{na.previous}' as previous, but the old version has "
+            f"no sos.version, so previous: cannot be checked"))
+    elif na.previous is not None and na.previous != oa.version:
         findings.append(_finding(
             "error", "previous_mismatch",
             f"the new version names '{na.previous}' as previous, but the old version is "

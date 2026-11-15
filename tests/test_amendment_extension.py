@@ -642,3 +642,10 @@ class TestReview:
         text = edit(V1, ("        min: 0.0\n        max: 1.0", "        min: 0.0\n        max: 2.0"))
         assert has(result(text).warnings, "in [0, 1]", "K-8")
         assert not has(result(V1).warnings, "K-8")
+
+
+def test_previous_unchecked_without_old_version(tmp_path):
+    old = edit(V1, ("    - amendment: 0.1\n", ""), ('  version: "1"\n', ""))
+    r = diff(old, V2, tmp_path)
+    assert "previous_unchecked" in kinds(r, "warning")
+    assert "previous_mismatch" not in kinds(r)
