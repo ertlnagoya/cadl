@@ -182,6 +182,10 @@ cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
 # ある版から次の版への改正が規範に及ぼす効果
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
 
+# 改正拡張：規則の二つのバージョンのあいだで変わったパラメータと、
+# それぞれの変更が宣言した改正の範囲に収まるか
+cadl amend-diff examples/amendment_robot_town_v1.cadl examples/amendment_robot_town_v2.cadl
+
 # 1つの契約インスタンスの規範を、すべての振る舞いについて設計時に検査（PATH上にPRISMが必要）：
 # 違反されうる規範、衝突、行使されない権能を、証拠のトレースとともに報告
 cadl norms-check examples/norms_check_conflict.cadl --bindings i=1 --export /tmp/norms-check
@@ -854,6 +858,43 @@ JSONには `file`、`grounding`、`contracts[]`（`id`、`items`、`tolerance` �
 
 **戦略モデル向け。** 戦略モデル（付録I。後述の「戦略モデル」を参照）では、利得の項に重みを書く代わりに規範を名指せます：`{ reward: shortcuts, sanction_of: "DELIVERY.no_shortcut" }`。その項の重みは −m · ℓ（`reward_of:` では +m′ · ℓ）です。m は規範の `on_violation.magnitude`（m′ は `on_fulfilment.magnitude`）、ℓ は `from: "C.lambda"` で束縛したパラメータです（J.7）。`cadl.grounding.norm_payoff_link(sos, "C.n", "sanction_of" | "reward_of")` は参照を解決し、大きさ（正確な値）、担い手、出所の名前 `C.lambda`、または参照を使えない理由の説明を返します。例は `examples/games_grounding_robot_delivery.cadl` です。
 
+### 改正できるパラメータ、バージョン、測定方法を定めた指標（amendment 0.1）
+
+0.3.32から、改正拡張（仕様の付録K）で、コースDのハンズオンが `constitution.yaml`、`# @amend:` のコメント、`kpi.md`、`gsn.yaml` に置いていた内容をモデルの中に書けます。ファイルは `amendment: 0.1` を宣言し、`sos.version` を書きます。
+
+```yaml
+amendment:
+  previous: "1"                         # このバージョンが置き換えるバージョン
+  effective: { period: 2 }              # または { at: 2026-12-01T09:00:00+09:00 }
+  transitional:                         # その時点で動いている契約インスタンス
+    default: keep                       # 始まったときのバージョンのまま終える
+    contracts:
+      - { contract: ROAD_USE, rule: switch }   # すぐに新しいバージョンに従う
+  decisions:                            # 人間の判断の記録
+    - { id: D1, ref: "decisions.md#d1", kind: record }
+  layers:
+    rule:     { decided_by: COUNCIL, procedure: vote, quorum: 2 }
+    contract: { decided_by: OPERATOR }
+  parameters:
+    - id: block_k
+      layer: rule
+      value: 2
+      min: 1
+      max: 4
+      step: 1                           # 1回の改正で動かせるのは max_steps（1）ステップまで
+      decision: D1
+      at: [contracts.ROAD_USE.monitors.blocking_guard.rule]
+metrics:
+  - id: on_time_deliveries
+    formula: "count(Delivered)"
+    target: ">= 0.9 * count(orders)"
+    measure: { window: 3600s, runs: 5, across_runs: mean }
+    schedule:
+      - { from: { period: 5 }, target: ">= 0.85 * count(orders)", decision: K5 }
+```
+
+`cadl check` は規則K-1からK-13を適用します。モデルのアクターでも役割でもない `decided_by:` や投票者、`min`〜`max` の外やステップに乗らない値、存在しないか値を持たない `at:` の場所、宣言されていない判断、順に並んでいないスケジュール、未知の契約や終端状態を指す経過規定、形の誤った値はエラーです。`cadl sim-ir` は、拡張を宣言したファイルに限り、IRに最上位のキー `amendment` を加えます。`cadl amend-diff OLD NEW` は、変わったパラメータとそれが変えた契約を挙げ、それぞれの変更を古いバージョンの宣言（範囲、ステップ、`max_steps` ステップまで）と照らし合わせます。そのほかの規則の変更（アクター、契約、プロトコル、遷移）はエラー、指標の変更は警告です。動いているインスタンスが切り替わる契約については、規範がどうなるか（`on_amendment:`、F.6。`cadl norms-diff` と同じ）も報告し、古いライフサイクルの状態がなくなる切り替えを拒否します。終了コードは、変更が宣言に収まるとき0、そうでないとき1です。これらのキーは宣言であり、どの判定も変えません。キーのないファイルは0.3.31と同じ結果になります。
+
 ### 確率モデル（PRISMへの出力）
 
 `extensions:` で `stochastic: 0.1` を宣言したファイルには、`model:` ブロック（仕様書の付録H）を書けます。これは、有限の状態変数の上のガード付き確率コマンドで書くパラメトリック離散時間マルコフ連鎖で、パラメータを契約の `alpha`・`beta`・`lambda` に束縛できます。`transitions:` の各運用モードが、固有のパラメータ値とコマンドを持つ一つの「設計」になります。例は `examples/stochastic_robot_delivery.cadl` にあります。
@@ -951,6 +992,7 @@ cadl model-export examples/games_robot_delivery.cadl --output prism_out/
 15. **根拠付け拡張の静的意味論**（付録J、J.8。`grounding: 0.1` を宣言したファイルのみ） — ファイルが `norms: 0.1` も宣言していること（J-1）。`grounding.items` のキーが識別子であって予約語でなく、値が契約の当事者を指すアクター参照であること、`tolerance:` が `[0, 1]` の数であること（J-2）。`shares:` が、内容がメッセージ事象である義務または許可にあり、宣言された項目を一つ以上、重複なく挙げていること（J-3）。大きさが有限で負でない数であること、`on_fulfilment:` が義務または禁止にあり、`reward:`（文言）か `magnitude:` を持つこと（J-4）。次は警告であり、エラーにはなりません。項目をその出所に与える共有規範、当事者でない宛先やアクター集合の添字なしの名前である宛先、宣言されていない項目を持つ共有エントリ、項目が二つ以上あるか引数を持つために対を与えない共有エントリ（J-3）。制裁や報酬の文言と並ぶ大きさ0（J-4）。与えられた対がある（指標が未定義のときは共有エントリがある）のに `alpha: 0`、与えられていない対があるのに `alpha: 1`、最も多くの権限を担う単一アクターが担っていない権限があるのに `beta: 1`、均等な割合を超えて権限を担う単一アクターがいるのに `beta: 0`（J-6）。0でも1でもない宣言された `alpha` または `beta` が指標から許容差を超えて離れていること、決定権者の権限がほかのアクターより少ないこと（J-7）。規範を持つ契約で、制裁も報酬も持つ義務・禁止がないのに `lambda` が0より大きいこと、持つものがあるのに `lambda: 0` であること（J-8）。`stochastic: 0.1` も宣言したファイルでは、`C.alpha` または `C.beta` に束縛されたパラメータが指標から許容差を超えて離れている設計を、J-6かJ-7が同じ宣言値をすでに報告している場合を除き、情報として報告します（J-9）。比較は正確です（小数は書かれたとおり、比は分数で扱います）。宣言がない場合、`grounding:`、`shares:`、`on_fulfilment:`、`on_violation.magnitude` は未宣言の拡張キーとして警告を一つ出し、解釈せず、指標も計算しません（J.12）。戦略モデル（付録I）では、項が `weight:`・`sanction_of:`・`reward_of:` のうち一つ以下を持つこと、参照が定義済みの契約の義務または禁止を指し、その鍵に対応する大きさが0より大きいこと、`C.lambda` に束縛したパラメータがちょうど一つあること、規範の担い手を代表する（担い手を覆うアクター参照を持つ）プレイヤーの利得であること、一つの規範を鍵ごとに一度しか名指さないこと（J-10、誤り）。警告：結び付けた契約の、大きさを持ち、担い手をプレイヤーが代表するのに、どの項も名指さない規範、`C.lambda` に束縛したパラメータを含む書かれた重み（J-11）。情報：各 `sanction_of:`・`reward_of:` の項の、遵守プロファイルのもとでの期待回数（設計ごと、J-12）。J-14は `cadl game-check --certify` が使います
 
 16. **レジームへの束縛**（付録A、A.7.1。`cadl` 0.3.32 から） — `regimes:` のキーが `transitions:` のレジームであること（R-1）。エントリが `parameters:` と `contracts:` だけを持つこと（R-2）。パラメータが、宣言された契約でその値を書いているものの `C.alpha`、`C.beta`、`C.lambda`、または `context.environment` のエントリを指す `environment.X` であること（R-3）。制度パラメータの値が `[0, 1]` の数であり、環境の値がエントリと同じ型（真偽値、整数、数、文字列）であること（R-4）。`contracts:` が `active:` と `suspended:` のどちらか一方だけを持ち、宣言された契約を重複なく挙げていること（R-5）。一つのレジームが同じパラメータを二度束縛せず、停止した契約のパラメータを束縛しないこと（R-6）。`stochastic: 0.1` では、同じソースに束縛されたパラメータに `model.regimes:` が別の値を与えないこと（R-7）
+17. **改正拡張の静的意味論**（付録K、K.6。`amendment: 0.1` を宣言したファイルだけ） — ファイルが `sos.version` を書くこと（K-2）。`effective:` が `period:`（正の整数）と `at:`（ISO 8601の日付か日時）のどちらか一方を持つこと（K-3）。経過規定がファイルの契約を指し、`keep` か `switch` で、`in_states:` がそのライフサイクルの終端でない状態だけを挙げること（K-4）。判断のidが一意な識別子で、URI参照を持つこと（K-5）。`decided_by:` と `voters:` がモデルのアクターか役割を指し、`procedure: vote` が `quorum:` を持つこと（K-6）。パラメータが層（`rule`、`contract`、`regulation`）と、数か時間の値を持ち（K-7）、その値が `min`〜`max` に収まり、`min` からのステップに乗ること（K-8）。`at:` の各場所が存在し、パラメータの値か名前を持つこと。同じ場所に同じ値を持つ二つのパラメータには警告を出します（K-9）。`decision:` が宣言された判断を指すこと（K-10）。`schedule:` の項目が一つの形の `from:` を持ち、順に並ぶこと（K-11）。`measure:` の時間が正で、集約が一覧のどれかで、`every:` が `window:` より長くないこと（K-12）。拡張を宣言していないファイルが拡張のキーを使うと、警告を1つ出します（K-13）。
 
 このほか、検査を失敗させずに次を報告します。`cadl codegen` が出力できない `codegen:` のターゲット（警告）、未知の拡張名、`motivation:` ブロック（情報）。`motivation:` ブロックは解釈しませんが、保持して `cadl sim-ir` の出力に引き渡します。
 
@@ -999,6 +1041,7 @@ IR JSON と Unity C# ツリーが生成され、後者が [cadl-raspimouse-simul
 | `sos_dsl_robot_delivery.cadl` | SoS-DSL拡張を使ったロボット配送 | 認知型 | 契約ライフサイクル（7状態）、3つのモニタ。ハンズオン講座で使うサンプル |
 | `agents_tool_governance.cadl` | LLMプランナ、サブエージェント、2つのツールサーバ（agents 0.1） | — | 執行対象の契約、人へのエスカレーション、来歴つきの委任。サンプル入力は `agents_inputs/`、`cadl agents-run` 用のトレースは `traces/` |
 | `grounding_robot_delivery.cadl` | 規範と根拠付け拡張を使ったロボット配送（grounding 0.1） | 認知型 | 付録J、J.9の例。情報項目、`shares:`、制裁の大きさ。`cadl norms-indices` で指標5/8、1/2、被覆率1/3 |
+| `amendment_robot_town_v1.cadl`、`amendment_robot_town_v2.cadl` | コースDのハンズオンのロボットの街と、その規則の二つのバージョン（amendment 0.1） | 協調型 | 層ごとの改正できるパラメータ（委員会の投票か運営者が判断）、経過規定、5回の実行で測り期ごとに目標を変えるKPI。`cadl amend-diff` で `block_k` 3 → 2 |
 | `agents_change_control.cadl` | 所有者、リードエージェント、2つのワーカー、リポジトリ（agents 0.1） | — | トリガから `until:` までの間だけ発効する禁止、`max_depth: 1` と `until:` を持つ委任。`cadl agents-run` 用のトレースは `traces/` |
 
 ### デモスクリプト
@@ -1046,6 +1089,7 @@ src/cadl/
   a2a_grpc_front.py    gRPCのバインディングの前段の待ち受け：接続の上限、最初の呼び出しまでの期限、中継
   norms_diff.py        改正が規範に及ぼす効果（二つの版の比較）
   grounding.py         根拠付け拡張：導出指標、規則J-1からJ-9とJ-13
+  amendment.py         改正拡張：規則K-1からK-13、IR、二つのバージョンの比較
   cli.py               コマンドラインインタフェース
   codegen/
     __init__.py        公開generate() API（マルチターゲット対応）
@@ -1190,6 +1234,7 @@ CADLはアルファ版です（[CHANGELOG.md](CHANGELOG.md)を参照）。言語
 | 規範拡張：生成したRego（ステップ関数）とSolidityのモニタ | 量化子、集約、ワイルドカード参照、改正を除いて利用可能（生成時に警告して拒否する）。Unity C#は規範を監視しない |
 | 規範拡張：PRISMによる1つの契約インスタンスの設計時の検査（`cadl norms-check`） | 利用可能（互いに比べる量のまとまりで、消去の状態が50,000を超えるものは拒否する） |
 | 根拠付け拡張（grounding 0.1）の規範側：導出指標とインセンティブ被覆率（`cadl norms-indices`）、規則J-1からJ-9、IR、二つの版の比較（`cadl norms-diff` のJ-13） | 利用可能 |
+| 改正拡張（amendment 0.1）：層、判断するアクター、範囲とステップを持つ改正できるパラメータ、バージョン、効力の発生時点と経過規定、測定方法とスケジュールを持つ指標、判断の記録（規則K-1からK-13、IR、`cadl amend-diff`） | 利用可能（宣言のみ。バージョンを適用する実行時の仕組みはありません） |
 | 戦略モデル拡張（games 0.1）：均衡検査と保証付きの均衡マップ（`cadl game-check`）、付録Jの規範との結び付け（`sanction_of:` / `reward_of:`、J-10からJ-12、J-14） | 利用可能（出力はPRISM-games 3.2.4と比較済み） |
 | エージェントガバナンス拡張（agents 0.1）：検査、判定関数、記録済みトレースに対するランタイム（保留、委任、ハッシュ連鎖つきの監査記録。`cadl agents-run`、`cadl audit-verify`）、MCPのstdioゲートウェイ（`cadl mcp-gateway`）、JSON-RPC、HTTP+JSON、gRPCによるA2Aゲートウェイ（`cadl a2a-gateway`）、Rego / Cedarの境界ポリシー | 利用可能（ゲートウェイは参照実装で、偽のサーバ、エージェント、クライアントと、公式のMCPとA2AのSDKで試験している） |
 | 検証メソッド `model_check` / `simulation` / `proof` | 未対応（未対応である旨を明示的に報告） |

@@ -346,6 +346,11 @@ class SimIR:
     # `model:` block, or None (serialized as null) when the file has none
     # or does not declare `stochastic: 0.1`.
     stochastic_model: Any = None
+    # Amendment extension (Appendix K, K.8): amendable parameters, the
+    # version, its transitional provisions, decision records and how the
+    # metrics are measured. Absent from the serialized IR when the file
+    # does not declare `amendment: 0.1` or uses none of its keys.
+    amendment: Any = None
     # True when the source declares the grounding extension (`grounding:
     # 0.1` with `norms: 0.1`). Not serialized: the fields of Appendix J
     # (J.10) are part of the serialized IR only when it is set.

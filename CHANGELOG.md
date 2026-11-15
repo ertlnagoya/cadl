@@ -38,6 +38,50 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   written (the key is absent for a transition without one), and
   `cadl sim-gen` passes it on (`safety_invariant`, unity
   `safetyInvariant`). Up to 0.3.31 it was checked but not in the IR.
+- Amendment extension (`amendment: 0.1`, Appendix K of the
+  specification). `amendment.parameters` declares which values of the
+  model may be amended: the layer (`rule`, `contract`, `regulation`), who
+  decides (`decided_by:` an actor or a role of the model, alone or with
+  `procedure: vote`, `quorum:` and `voters:`; defaults per layer under
+  `amendment.layers`), `min`, `max`, `step`, `max_steps` (the largest
+  change of one amendment, in steps), `unit`, `safety`, and `at:`, the
+  places of the model that hold the value (paths such as
+  `contracts.ROAD_USE.lifecycle.transitions.release.deadline`). The
+  identity of a version is `sos.version`; `amendment.previous` names the
+  version it replaces, `amendment.effective` when it takes effect
+  (`period:` or an ISO 8601 `at:`), and `amendment.transitional` what
+  contract instances running at that time do: `keep` (finish under the
+  version they started in), `switch` (follow the new version, from the
+  effective time or when the instance is in one of `in_states:`), with a
+  default and an entry per contract. `switch` is the case to which the
+  `on_amendment:` of the norms (F.6) applies; under `keep` it does not.
+  `amendment.decisions` lists records of human decisions (`id`, a URI
+  reference `ref` such as `gsn.yaml#S2`, `kind: gsn | record`), which a
+  parameter, a schedule entry and a measurement method name with
+  `decision:`. A metric gets `schedule:` (targets from a period, a time
+  or a version on) and `measure:` (`window`, `every`, `aggregate`,
+  `runs`, `across_runs`, `description`). `cadl check` applies the rules
+  K-1 to K-13 (unknown actors and roles, values outside the range or off
+  the steps, locations that do not exist or do not hold the value,
+  undeclared decisions, schedules out of order, transitional rules for
+  unknown contracts or terminal states, malformed values; keys used
+  without the declaration get one warning), and `cadl sim-ir` adds the
+  top-level key `amendment` for a file that declares the extension.
+- `cadl amend-diff OLD NEW`: compares two versions of a model under the
+  declaration of the old one. It lists the parameters that changed and
+  the contracts they changed, checks each change against the range, the
+  steps and `max_steps`, reports a change of the declaration itself
+  (warning), a change of the rules that no parameter explains (error;
+  metrics, verification, codegen and texts: warning), an effective time
+  that is not later than the old one, and for a contract whose running
+  instances switch, a removed lifecycle state (error) and the findings of
+  `cadl norms-diff` for its norms. Equal values written differently
+  (`60s` and `1min`, `0.5` and `0.50`) are equal. Exit status 0 when the
+  changes respect the declaration, 1 when they do not or the new version
+  is invalid, 2 on a usage error.
+- `examples/amendment_robot_town_v1.cadl` and `_v2.cadl`: the robot town
+  of the Course D hands-on with the amendment extension, two versions of
+  its rules (`block_k` 3 → 2).
 
 ## [0.3.31] — 2026-11-14
 

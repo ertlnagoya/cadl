@@ -1,0 +1,220 @@
+# =====================================================================
+# amendment_robot_town_v2.cadl -- version 2 of the rules of
+# amendment_robot_town_v1.cadl (Appendix K).
+#
+# Three delivery companies share one road network. The parameters that
+# the hands-on marks with `# @amend:<name>` comments and whose layer,
+# range and step it keeps in constitution.yaml are declared here under
+# `amendment.parameters`; `at:` names the places that hold each value.
+# After period 1 the operator adopted block_k 3 -> 2 against the vote of
+# two companies (decision D1); the version takes effect in period 2.
+#   cadl amend-diff amendment_robot_town_v1.cadl amendment_robot_town_v2.cadl
+# =====================================================================
+
+sos:
+  name: "RobotTown"
+  type: Collaborative
+  version: "2"
+
+  extensions:
+    - sos-dsl: 0.1
+    - amendment: 0.1
+
+  actors:
+    - id: TOWN_STEWARD
+      role: "road_steward"
+      autonomy: low
+      capabilities: [assign_order, record_violation, evict]
+    - id: "ROBOT[1..N]"
+      role: "delivery_robot"
+      autonomy: high
+      capabilities: [move, park, pickup, dropoff]
+    - id: COUNCIL
+      role: "rule_amendment_body"
+      autonomy: medium
+      capabilities: [propose_amendment, tally_ballots]
+    - id: OPERATOR
+      role: "service_operator"        # the human who runs the service
+      autonomy: high
+      capabilities: [decide_amendment]
+
+  contracts:
+    # The promise to customers: one instance per order (contract layer).
+    - id: DELIVERY_SLA
+      parties: [TOWN_STEWARD, "ROBOT[*]"]
+      guarantee:
+        - "pickup_time <= 120s"
+        - "dropoff_time <= 120s"
+      lifecycle:
+        states: [Assigned, PickedUp, Delivered, Late]
+        initial: Assigned
+        terminal: [Delivered, Late]
+        transitions:
+          - id: pickup
+            from: Assigned
+            to: PickedUp
+            on: "ROBOT[i].status == PickedUp"
+            deadline: 120s
+            on_violation: { transition: Late, severity: Major }
+          - id: dropoff
+            from: PickedUp
+            to: Delivered
+            on: "ROBOT[i].status == Delivered"
+            deadline: 120s
+            on_violation: { transition: Late, severity: Major }
+
+    # Use of the road: one instance each time a robot stops on it (rule layer).
+    - id: ROAD_USE
+      parties: [TOWN_STEWARD, "ROBOT[*]", COUNCIL]
+      guarantee:
+        - "hold_time <= hold_limit"
+      authority:
+        decision_holder: COUNCIL
+        beta: 0.5
+        mode: "collective"
+      incentives:
+        type: sanction
+        lambda: 0.5
+      lifecycle:
+        states: [Holding, Overstay, Released, Evicted]
+        initial: Holding
+        terminal: [Released, Evicted]
+        transitions:
+          - id: release
+            from: [Holding, Overstay]
+            to: Released
+            on: "ROBOT[i] -> TOWN_STEWARD : node_released"
+            deadline: 60s
+            on_violation: { transition: Overstay, severity: Minor }
+      monitors:
+        - id: blocking_guard
+          observe: ["ROBOT[i].blocking"]
+          sampling: periodic(1000ms)
+          rule: "ROBOT.blocking >= 2 AND state IN [Holding, Overstay]"
+          on_match: { transition: Evicted, severity: Major }
+
+  transitions:
+    - from: DISTRIBUTED
+      to: CENTRALIZED
+      condition: "orders_in_window < 22"
+      protocol: SWITCH
+      safety_invariant: "robots_on_road == 0"
+    - from: CENTRALIZED
+      to: DISTRIBUTED
+      condition: "orders_in_window >= 26"
+      protocol: SWITCH
+
+  protocols:
+    - id: SWITCH
+      trigger: "regime_condition_holds"
+      steps:
+        - "TOWN_STEWARD -> ROBOT[*] : regime_notice"
+        - "ROBOT[*] -> TOWN_STEWARD : node_released"
+    - id: AMEND
+      trigger: "period_end"
+      steps:
+        - "COUNCIL -> ROBOT[*] : amendment_proposal"
+        - "ROBOT[*] -> COUNCIL : ballot"
+        - "COUNCIL -> TOWN_STEWARD : rule_update"
+
+  metrics:
+    - id: on_time_deliveries
+      formula: "count(Delivered)"
+      target: ">= 0.9 * count(orders)"
+      measure:
+        window: 3600s                 # one period
+        runs: 5                       # the same five random seeds
+        across_runs: mean
+        decision: K1
+      schedule:                       # the KPI written by the human, by period
+        - from: { period: 5 }
+          target: ">= 0.85 * count(orders)"
+          decision: K5
+    - id: blocked_time
+      formula: "sum(blocked_robot_seconds)"
+      target: "<= 600s"
+
+  amendment:
+    previous: "1"
+    effective: { period: 2 }
+    transitional:
+      default: keep                   # running instances finish under their version
+      contracts:
+        - contract: ROAD_USE
+          rule: switch                # a robot waiting on the road follows the new rule at once
+    decisions:
+      - id: K1
+        ref: "decisions.md#k1"
+        kind: record
+        text: "how on-time deliveries are measured (option 1)"
+      - id: K5
+        ref: "gsn.yaml#G5"
+        kind: gsn
+      - id: D1
+        ref: "decisions.md#d1"
+        kind: record
+        text: "block_k 3 -> 2 adopted against the vote of B and C"
+    layers:
+      rule:     { decided_by: COUNCIL, procedure: vote, quorum: 2 }
+      contract: { decided_by: OPERATOR }
+    parameters:
+      - id: hold_limit                # seconds a robot may stop on the road
+        layer: rule
+        value: 60s
+        min: 10s
+        max: 120s
+        step: 10s
+        at: [contracts.ROAD_USE.lifecycle.transitions.release.deadline]
+      - id: block_k                   # robots waiting behind it before eviction
+        layer: rule
+        value: 2
+        min: 1
+        max: 4
+        step: 1
+        decision: D1
+        at: [contracts.ROAD_USE.monitors.blocking_guard.rule]
+      - id: sanction_lambda
+        layer: rule
+        value: 0.5
+        min: 0.0
+        max: 2.0
+        step: 0.5
+        at: [contracts.ROAD_USE.incentives.lambda]
+      - id: to_central                # orders per 5 minutes below which the town centralizes
+        layer: rule
+        safety: true
+        decided_by: OPERATOR          # a switching condition is decided by the human
+        value: 22
+        min: 10
+        max: 30
+        step: 2
+        unit: orders
+        at: ["transitions.DISTRIBUTED->CENTRALIZED.condition"]
+      - id: to_distributed
+        layer: rule
+        safety: true
+        decided_by: OPERATOR
+        value: 26
+        min: 14
+        max: 40
+        step: 2
+        unit: orders
+        at: ["transitions.CENTRALIZED->DISTRIBUTED.condition"]
+      - id: pickup_deadline           # the promise to customers
+        layer: contract
+        value: 120s
+        min: 60s
+        max: 180s
+        step: 30s
+        at:
+          - contracts.DELIVERY_SLA.lifecycle.transitions.pickup.deadline
+          - contracts.DELIVERY_SLA.guarantee.0
+      - id: dropoff_deadline
+        layer: contract
+        value: 120s
+        min: 60s
+        max: 180s
+        step: 30s
+        at:
+          - contracts.DELIVERY_SLA.lifecycle.transitions.dropoff.deadline
+          - contracts.DELIVERY_SLA.guarantee.1

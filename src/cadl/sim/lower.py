@@ -85,6 +85,8 @@ def lower_to_ir(sos: SoSDefinition) -> SimIR:
         regimes_declared=_regimes_declared(sos),
     )
     ir.grounding_extension = _lower_grounding(sos, ir.institution)
+    from ..amendment import ir as _amendment_ir
+    ir.amendment = _amendment_ir(sos)
     return ir
 
 

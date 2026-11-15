@@ -1387,6 +1387,11 @@ def _build_sos(data: dict) -> SoSDefinition:
     if 'model' in sos_data:
         sos.model = _build_model(sos_data['model'])
 
+    # Amendment extension (Appendix K): its keys are kept as written and
+    # interpreted only when it is declared (K-13).
+    from .amendment import read_raw as _read_amendment
+    sos.amendment = _read_amendment(sos_data)
+
     return sos
 
 

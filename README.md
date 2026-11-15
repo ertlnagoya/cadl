@@ -183,6 +183,10 @@ cadl codegen examples/norms_robot_delivery.cadl -o /tmp/gen/robot_delivery_norms
 # What an amendment from one version to the next does to the norms
 cadl norms-diff examples/norms_amendment_v1.cadl examples/norms_amendment_v2.cadl
 
+# Amendment extension: which parameters changed between two versions of the
+# rules, and whether each change stays within the declared amendability
+cadl amend-diff examples/amendment_robot_town_v1.cadl examples/amendment_robot_town_v2.cadl
+
 # Design-time check of the norms of one contract instance over all behaviours
 # (needs PRISM on PATH): violable norms, conflicts, powers never exercised, with witness traces
 cadl norms-check examples/norms_check_conflict.cadl --bindings i=1 --export /tmp/norms-check
@@ -860,6 +864,43 @@ The indices are evidence about the norms, not the meaning of the parameters: `ca
 
 **For strategic models.** In a strategic model (Appendix I; see Strategic Model below), a payoff term may name a norm instead of giving a weight: `{ reward: shortcuts, sanction_of: "DELIVERY.no_shortcut" }`. Its weight is then −m · ℓ (`reward_of:`: +m′ · ℓ), with m the `on_violation.magnitude` (m′ the `on_fulfilment.magnitude`) of the norm and ℓ the parameter bound by `from: "C.lambda"` (J.7). `cadl.grounding.norm_payoff_link(sos, "C.n", "sanction_of" | "reward_of")` resolves the reference: the magnitude (exact), the bearer, the source name `C.lambda`, or a description of why the reference cannot be used. See `examples/games_grounding_robot_delivery.cadl`.
 
+### Amendable Parameters, Versions and Measured Metrics (amendment 0.1)
+
+From 0.3.32, the amendment extension (Appendix K of the specification) states in the model what the Course D hands-on keeps in `constitution.yaml`, `# @amend:` comments, `kpi.md` and `gsn.yaml`. A file declares `amendment: 0.1` and gives `sos.version`:
+
+```yaml
+amendment:
+  previous: "1"                         # the version this one replaces
+  effective: { period: 2 }              # or { at: 2026-12-01T09:00:00+09:00 }
+  transitional:                         # contract instances running at that time
+    default: keep                       # finish under the version they started in
+    contracts:
+      - { contract: ROAD_USE, rule: switch }   # follow the new version at once
+  decisions:                            # records of human decisions
+    - { id: D1, ref: "decisions.md#d1", kind: record }
+  layers:
+    rule:     { decided_by: COUNCIL, procedure: vote, quorum: 2 }
+    contract: { decided_by: OPERATOR }
+  parameters:
+    - id: block_k
+      layer: rule
+      value: 2
+      min: 1
+      max: 4
+      step: 1                           # one amendment moves it by at most max_steps (1) steps
+      decision: D1
+      at: [contracts.ROAD_USE.monitors.blocking_guard.rule]
+metrics:
+  - id: on_time_deliveries
+    formula: "count(Delivered)"
+    target: ">= 0.9 * count(orders)"
+    measure: { window: 3600s, runs: 5, across_runs: mean }
+    schedule:
+      - { from: { period: 5 }, target: ">= 0.85 * count(orders)", decision: K5 }
+```
+
+`cadl check` applies the rules K-1 to K-13: a `decided_by:` or voter that is no actor and no role of the model, a value outside `min`–`max` or off the steps, a location of `at:` that does not exist or does not hold the value, a decision that is not declared, a schedule whose entries are not in order, a transitional rule for an unknown contract or in a terminal state, and malformed values are errors. `cadl sim-ir` adds the top-level key `amendment` to the IR (only for a file that declares the extension). `cadl amend-diff OLD NEW` lists the parameters that changed and the contracts they changed, and checks each change against the declaration of the old version (range, steps, at most `max_steps` steps); any other change of the rules (actors, contracts, protocols, transitions) is an error, a change of the metrics a warning. For a contract whose running instances switch, it also reports what the norms do (`on_amendment:`, F.6, as `cadl norms-diff`) and refuses a switch when a state of the old lifecycle is gone. Exit status 0 when the changes respect the declaration, 1 otherwise. The keys are declarations: no verdict depends on them, and a file without them gives the same results as in 0.3.31.
+
 ### Stochastic Model (PRISM Export)
 
 A file that declares `stochastic: 0.1` under `extensions:` may carry a `model:` block (Appendix H of the specification): a parametric discrete-time Markov chain written as guarded probabilistic commands over finite state variables, in which parameters can be bound to `alpha`, `beta`, or `lambda` of a contract. Each regime of `transitions:` is a *design* with its own parameter values and commands. See `examples/stochastic_robot_delivery.cadl`.
@@ -957,6 +998,7 @@ The type checker (`cadl check`) validates:
 15. **Grounding static semantics** (Appendix J, J.8; only when the file declares `grounding: 0.1`) — the file also declares `norms: 0.1` (J-1); the keys of `grounding.items` are identifiers, not reserved words, and their values actor references to a party of the contract, and `tolerance:` is a number in `[0, 1]` (J-2); `shares:` belongs to an obligation or a permission whose content is a message event and lists at least one declared item, each once (J-3); a magnitude is a finite number that is not negative, and `on_fulfilment:` belongs to an obligation or a prohibition and has a `reward:` (a text) or a `magnitude:` (J-4). Warnings, never errors: a sharing norm that gives an item to its origin, a target that is not a party or is the bare name of an actor set, a sharing entry with an undeclared item, and a sharing entry with more than one item or with arguments, which gives no pair (J-3); a magnitude of zero next to a sanction or reward text (J-4); `alpha: 0` with a given pair or, when the index is undefined, with a sharing entry, `alpha: 1` with a pair that is not given, `beta: 1` with a power that the single actor with the most powers does not bear, `beta: 0` with a single actor that bears more than an even share (J-6); a declared `alpha` or `beta` other than 0 and 1 farther from its index than the tolerance, and a decision holder with fewer powers than another actor (J-7); for a contract with norms, `lambda` greater than zero while no obligation or prohibition carries a sanction or a reward, and `lambda: 0` while one does (J-8). Informational, in a file that also declares `stochastic: 0.1`: a design in which a parameter bound to `C.alpha` or `C.beta` is farther from the index than the tolerance, unless J-6 or J-7 already reports the same declared value (J-9). The comparisons are exact (decimals as written, ratios as fractions). Without the declaration, `grounding:`, `shares:`, `on_fulfilment:` and `on_violation.magnitude` get one warning as undeclared extension keys, are not interpreted, and no index is computed (J.12). In a strategic model (Appendix I): a term has at most one of `weight:`, `sanction_of:`, `reward_of:`; the reference names an obligation or a prohibition of a declared contract with a magnitude greater than zero for the key; the model has exactly one parameter bound to `C.lambda`; a player that stands for the bearer of the norm owns the payoff (an actor reference that covers the bearer); and a norm is named at most once per key (J-10, errors). Warnings: a norm of a linked contract with a magnitude, a bearer that a player stands for, and no term that names it; a written weight with the parameter bound to `C.lambda` (J-11). Informational: the expected count of each `sanction_of:` and `reward_of:` term under the compliance profile, per design (J-12). J-14 is used by `cadl game-check --certify`
 
 16. **Regime bindings** (Appendix A, A.7.1; from `cadl` 0.3.32) — the keys of `regimes:` are regimes of `transitions:` (R-1); an entry has only `parameters:` and `contracts:` (R-2); a parameter is `C.alpha`, `C.beta` or `C.lambda` of a declared contract that writes it, or `environment.X` of an entry of `context.environment` (R-3); an institutional value is a number in `[0, 1]` and an environment value has the type of the entry (boolean, integer, number or string) (R-4); `contracts:` gives one of `active:` and `suspended:`, which list declared contracts once (R-5); a regime binds a parameter once and binds no parameter of a contract it suspends (R-6); with `stochastic: 0.1`, `model.regimes:` gives a parameter bound to the same source the same value (R-7)
+17. **Amendment static semantics** (Appendix K, K.6; only when the file declares `amendment: 0.1`) — the file gives `sos.version` (K-2); `effective:` has one of `period:` (a positive integer) and `at:` (an ISO 8601 date or date-time) (K-3); a transitional rule names a contract of the file, `keep` or `switch`, and `in_states:` only non-terminal states of its lifecycle (K-4); decision ids are unique identifiers with a URI reference (K-5); `decided_by:` and `voters:` name actors or roles of the model, and `procedure: vote` has a `quorum:` (K-6); a parameter has a layer (`rule`, `contract`, `regulation`) and a number or duration value (K-7) within `min`–`max` and on the steps from `min` (K-8); each location of `at:` exists and holds the value or the name of the parameter, and two parameters with the same value at the same place are warned about (K-9); `decision:` names a declared decision (K-10); a `schedule:` has entries of one form of `from:` in order (K-11); `measure:` has positive durations, an aggregate from the list, and `every:` no longer than `window:` (K-12). Keys of the extension in a file that does not declare it get one warning (K-13).
 
 It also reports, without failing the check, a `codegen:` target that `cadl codegen` cannot emit (warning), an extension name it does not know, and a `motivation:` block, which it keeps and passes on in `cadl sim-ir` but does not interpret (informational).
 
@@ -1005,6 +1047,7 @@ This generates the IR JSON, the Unity C# tree, and drops the latter into the Uni
 | `sos_dsl_robot_delivery.cadl` | Robot delivery with the SoS-DSL extension | Acknowledged | Contract lifecycle (7 states), 3 monitors; the example used by the hands-on course |
 | `agents_tool_governance.cadl` | LLM planner, sub-agent and two tool servers (agents 0.1) | — | Enforced contract, escalation to a human, delegation with provenance; sample inputs in `agents_inputs/`, traces for `cadl agents-run` in `traces/` |
 | `grounding_robot_delivery.cadl` | Robot delivery with norms and the grounding extension (grounding 0.1) | Acknowledged | The example of Appendix J, J.9: information items, `shares:`, a sanction magnitude; indices 5/8, 1/2 and coverage 1/3 with `cadl norms-indices` |
+| `amendment_robot_town_v1.cadl`, `amendment_robot_town_v2.cadl` | The robot town of the Course D hands-on, two versions of its rules (amendment 0.1) | Collaborative | Amendable parameters by layer, decided by a council vote or by the operator; transitional rules; a KPI measured over five runs with a target by period; `cadl amend-diff` shows `block_k` 3 → 2 |
 | `agents_change_control.cadl` | Owner, lead agent, two workers and a repository (agents 0.1) | — | A prohibition in force between a trigger and an `until:`, delegation with `max_depth: 1` and `until:`; traces for `cadl agents-run` in `traces/` |
 
 ### Demo Scripts
@@ -1052,6 +1095,7 @@ src/cadl/
   a2a_grpc_front.py    Front listener of the gRPC binding: caps on connections, deadline to the first call, splice
   norms_diff.py        Effect of an amendment on the norms (two versions compared)
   grounding.py         Grounding extension: derived indices, rules J-1 to J-9 and J-13
+  amendment.py         Amendment extension: rules K-1 to K-13, IR, comparison of two versions
   cli.py               Command-line interface
   codegen/
     __init__.py        Public generate() API (multi-target dispatch)
@@ -1196,6 +1240,7 @@ CADL is alpha software (see [CHANGELOG.md](CHANGELOG.md)); the language and the 
 | Norms extension: monitors in generated Rego (step function) and Solidity | Available without quantifiers, aggregates, wildcard references and amendments (refused at generation, with a warning); Unity C# does not monitor norms |
 | Norms extension: design-time checking of one contract instance with PRISM (`cadl norms-check`) | Available (groups of compared quantities beyond 50,000 states of the elimination are refused) |
 | Grounding extension (grounding 0.1), norms side: derived indices and incentive coverage (`cadl norms-indices`), rules J-1 to J-9, IR, comparison of two versions (J-13 in `cadl norms-diff`) | Available |
+| Amendment extension (amendment 0.1): amendable parameters with layer, deciding actor, range and steps; version, effective time and transitional rule; measured and scheduled metrics; decision records (rules K-1 to K-13, IR, `cadl amend-diff`) | Available (declarations; no runtime applies the versions) |
 | Strategic model extension (games 0.1): equilibrium checks and certified equilibrium maps (`cadl game-check`), with the link to norms of Appendix J (`sanction_of:` / `reward_of:`, J-10 to J-12, J-14) | Available (the export is compared with PRISM-games 3.2.4) |
 | Agent governance extension (agents 0.1): checks, decision function, runtime on a recorded trace (holds, delegations, hash-chained audit records; `cadl agents-run`, `cadl audit-verify`), MCP stdio gateway (`cadl mcp-gateway`), A2A gateway over JSON-RPC, HTTP+JSON and gRPC (`cadl a2a-gateway`), Rego / Cedar boundary policies | Available (the gateways are references, tested with fake servers, agents and clients and with the official MCP and A2A SDKs) |
 | `model_check` / `simulation` / `proof` verification methods | Not supported yet (reported explicitly) |

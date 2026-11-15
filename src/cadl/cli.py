@@ -510,6 +510,14 @@ def main(argv: list[str] | None = None) -> int:
     diff_cmd.add_argument("--format", choices=["text", "json"], default="text",
                           help="Output format (default: text)")
 
+    # amend-diff command (amendment extension, Appendix K)
+    adiff_cmd = subparsers.add_parser("amend-diff",
+        help="Compare two versions of a model under the declared amendability (Appendix K, K.7)")
+    adiff_cmd.add_argument("old", type=Path, help="Old version of the CADL file")
+    adiff_cmd.add_argument("new", type=Path, help="New version of the CADL file")
+    adiff_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                           help="Output format (default: text)")
+
     # norms-indices command (grounding extension, Appendix J)
     nidx_cmd = subparsers.add_parser("norms-indices",
         help="Report the derived indices of information sharing and concentration of "
@@ -661,6 +669,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_norms_check(args)
     elif args.command == "norms-diff":
         return _cmd_norms_diff(args)
+    elif args.command == "amend-diff":
+        return _cmd_amend_diff(args)
     elif args.command == "norms-indices":
         return _cmd_norms_indices(args)
     elif args.command == "model-export":
@@ -1222,6 +1232,9 @@ def _ir_to_dict(ir) -> dict:
             t.pop("safety_invariant", None)
     if not d.pop("regimes_declared", False):
         d.pop("regimes", None)
+    # Likewise the addition of the amendment extension (Appendix K, K.8).
+    if d.get("amendment") is None:
+        d.pop("amendment", None)
     return d
 
 
@@ -1465,6 +1478,48 @@ def _cmd_norms_diff(args: argparse.Namespace) -> int:
             return 2
     result = {"old": str(args.old), "new": str(args.new), **result}
 
+    if args.format == "json":
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_diff_text(result))
+    return 0 if result["ok"] else 1
+
+
+def _cmd_amend_diff(args: argparse.Namespace) -> int:
+    """Exit status: 0 when the changes respect the declared amendability,
+    1 when they do not or the new version is invalid, 2 on a usage error
+    (a missing or invalid old version)."""
+    from .amendment import diff_versions, format_diff_text, load
+    from .type_checker import type_check
+
+    def read(path):
+        if not path.exists():
+            return None, f"File not found: {path}"
+        try:
+            sos = load(path)
+        except Exception as e:  # noqa: BLE001
+            return None, f"Parse error: {path}: {e}"
+        result = type_check(sos)
+        if not result.ok:
+            errors = "\n".join(f"  {e}" for e in result.errors)
+            return None, f"{path} has {len(result.errors)} type-check error(s):\n{errors}"
+        return sos, None
+
+    old, why = read(args.old)
+    if old is None:
+        print(f"Error: {why}", file=sys.stderr)
+        return 2
+    if not args.new.exists():
+        print(f"Error: File not found: {args.new}", file=sys.stderr)
+        return 2
+    new, why = read(args.new)
+    if new is None:
+        result = {"parameters": [], "contracts": [], "findings": [], "invalid": [why],
+                  "errors": [why], "ok": False}
+    else:
+        result = diff_versions(old, new)
+    result = {"old": str(args.old), "new": str(args.new), **result}
     if args.format == "json":
         import json
         print(json.dumps(result, indent=2, ensure_ascii=False))

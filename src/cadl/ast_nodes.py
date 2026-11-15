@@ -773,4 +773,8 @@ class SoSDefinition:
     # per regime, as written; None when the file has no such block.
     # Checked and resolved by `cadl.regimes`.
     regimes_raw: Any = None
+    # Amendment extension (Appendix K): the keys amendment:, schedule: and
+    # measure: as written (`cadl.amendment.AmendmentRaw`), or None when the
+    # file uses none of them.
+    amendment: Any = None
     loc: SourceLocation | None = None
