@@ -42,11 +42,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   specification). `amendment.parameters` declares which values of the
   model may be amended: the layer (`rule`, `contract`, `regulation`), who
   decides (`decided_by:` an actor or a role of the model, alone or with
-  `procedure: vote`, `quorum:` and `voters:`; defaults per layer under
+  `procedure: vote`, `quorum:` and `voters:`, which are actors; defaults per layer under
   `amendment.layers`), `min`, `max`, `step`, `max_steps` (the largest
   change of one amendment, in steps), `unit`, `safety`, and `at:`, the
   places of the model that hold the value (paths such as
-  `contracts.ROAD_USE.lifecycle.transitions.release.deadline`). The
+  `contracts.ROAD_USE.lifecycle.transitions.release.deadline`; a quoted
+  segment may contain dots, as in
+  `regimes.CENTRALIZED.parameters."ROUTING.beta"`). The
   identity of a version is `sos.version`; `amendment.previous` names the
   version it replaces, `amendment.effective` when it takes effect
   (`period:` or an ISO 8601 `at:`), and `amendment.transitional` what
@@ -68,17 +70,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   without the declaration get one warning), and `cadl sim-ir` adds the
   top-level key `amendment` for a file that declares the extension.
 - `cadl amend-diff OLD NEW`: compares two versions of a model under the
-  declaration of the old one. It lists the parameters that changed and
-  the contracts they changed, checks each change against the range, the
-  steps and `max_steps`, reports a change of the declaration itself
-  (warning), a change of the rules that no parameter explains (error;
-  metrics, verification, codegen and texts: warning), an effective time
-  that is not later than the old one, and for a contract whose running
-  instances switch, a removed lifecycle state (error) and the findings of
-  `cadl norms-diff` for its norms. Equal values written differently
-  (`60s` and `1min`, `0.5` and `0.50`) are equal. Exit status 0 when the
-  changes respect the declaration, 1 when they do not or the new version
-  is invalid, 2 on a usage error.
+  declaration of the old one (an old version without the declaration
+  declares no parameter). It lists the parameters that changed and the
+  contracts they changed, and checks each change against the range, the
+  steps and `max_steps`. The new values of all changed parameters are put
+  into the old version in one pass; a location that holds the old value
+  more than once, or two parameters that change the same value at one
+  place differently, is an error, and the index of an actor reference is
+  never a parameter. A change of the rules that no parameter explains is
+  an error, including `verification:`, `regimes:`, and the order of the
+  actors and of the norms of a contract; a change of metrics, codegen and
+  texts, and of the order of other lists, is a warning, as is a change of
+  the declaration itself. A `previous:` that is not the old version, the
+  same version on both sides, and an effective time that is not later are
+  errors; a period and a time cannot be compared (warning). For every
+  contract with norms whose running instances switch, it includes the
+  findings of `cadl norms-diff`, and it warns when a switching instance
+  could be in a state that the new version removed. Equal values written
+  differently (`60s` and `1min`, `0.5` and `0.50`) are equal. Exit status
+  0 when the changes respect the declaration, 1 when they do not or the
+  new version is invalid, 2 on a usage error.
 - `examples/amendment_robot_town_v1.cadl` and `_v2.cadl`: the robot town
   of the Course D hands-on with the amendment extension, two versions of
   its rules (`block_k` 3 → 2).

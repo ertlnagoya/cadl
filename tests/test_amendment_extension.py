@@ -274,7 +274,7 @@ class TestRules:
         later = (two[0], two[1].replace("{ period: 3 }", "{ period: 6 }"))
         assert not errors(edit(V1, later))
         assert has(errors(edit(V1, ('target: ">= 0.85 * count(orders)"', "target: [1, 2]"))),
-                   "target must be a scalar", "K-11")
+                   "target must be a string or a number", "K-11")
 
     def test_k11_by_version(self):
         text = edit(V1, ("- from: { period: 5 }", '- from: { version: "3" }'))
@@ -301,8 +301,7 @@ class TestAmendDiff:
     def test_identical(self, tmp_path):
         r = diff(V1, V1, tmp_path)
         assert not r["contracts"] and not any(p["changed"] for p in r["parameters"])
-        assert "same_version" in kinds(r, "warning")
-        assert kinds(r) == {"effective_not_later"}
+        assert kinds(r) == {"effective_not_later", "same_version"}
 
     def test_two_steps_at_once(self, tmp_path):
         new = edit(V2, ('"ROBOT.blocking >= 2 AND', '"ROBOT.blocking >= 1 AND'),
@@ -365,7 +364,7 @@ class TestAmendDiff:
 
     def test_previous_mismatch(self, tmp_path):
         new = edit(V2, ('previous: "1"', 'previous: "0"'))
-        assert "previous_mismatch" in kinds(diff(V1, new, tmp_path), "warning")
+        assert "previous_mismatch" in kinds(diff(V1, new, tmp_path))
 
     def test_switch_with_a_removed_state(self, tmp_path):
         def drop_overstay(t):
@@ -376,14 +375,16 @@ class TestAmendDiff:
                         ("state IN [Holding, Overstay]", "state IN [Holding]"))
         new = drop_overstay(V2)
         r = diff(V1, new, tmp_path)
-        assert "state_removed" in kinds(r)
+        # L5: the removal is one unexplained change; the switch adds a warning.
+        assert "state_removed" in kinds(r, "warning") and "state_removed" not in kinds(r)
+        assert has(r["errors"], "lifecycle.states")
         # Switching only in a state that remains is allowed (the other
         # changes are still unexplained).
         new2 = edit(new, ("rule: switch    ", "rule: switch\n          in_states: [Holding]\n         "))
-        assert "state_removed" not in kinds(diff(V1, new2, tmp_path))
+        assert "state_removed" not in kinds(diff(V1, new2, tmp_path), "warning")
         new3 = edit(new, ("rule: switch    ", "rule: keep      "))
         r3 = diff(V1, new3, tmp_path)
-        assert "state_removed" not in kinds(r3)
+        assert "state_removed" not in kinds(r3, "warning")
         assert r3["contracts"][0]["transitional"]["rule"] == "keep"
 
     def test_parameter_dropped_from_the_declaration(self, tmp_path):
@@ -391,7 +392,7 @@ class TestAmendDiff:
         layer: rule
         value: 0.5
         min: 0.0
-        max: 2.0
+        max: 1.0
         step: 0.5
         at: [contracts.ROAD_USE.incentives.lambda]
 ''', ""))
@@ -402,6 +403,9 @@ class TestAmendDiff:
         r = diff(old, V2, tmp_path)
         assert "no_declaration" in kinds(r, "warning")
         assert not r["ok"]
+        # H1: the keys of an undeclared old version declare nothing.
+        assert r["parameters"] == []
+        assert has(r["errors"], "blocking_guard.rule", "no declared parameter")
 
     def test_cli_exit_codes(self, tmp_path, capsys):
         bad = tmp_path / "bad.cadl"
@@ -479,3 +483,162 @@ class TestNorms:
         r = diff(NORMS_V1, new, tmp_path)
         texts = [f["text"] for f in r["contracts"][0]["findings"]]
         assert not has(texts, "norms (F.6)") and has(texts, "on_amendment")
+
+
+# --- Regression tests of the review of 0.3.32 ------------------------------------------
+
+NV = (('version: "1"', 'version: "2"'), ("effective: { period: 1 }", "effective: { period: 2 }"))
+
+
+class TestReview:
+    def test_m1_order_of_norms_is_an_error(self, tmp_path):
+        old = edit(NORMS_V1, ("          on_amendment: carry_over\n", """          on_amendment: carry_over
+        - id: ping
+          kind: obligation
+          bearer: R
+          counterparty: D
+          content: "R -> D : ping"
+          deadline: 30s
+"""))
+        new = edit(old, ('version: "1"', 'version: "2"'))
+        a, b = old.index("        - id: report"), old.index("        - id: ping")
+        new = new.replace(new[new.index("        - id: report"):new.index("  amendment:")],
+                          old[b:old.index("  amendment:")] + old[a:b])
+        r = diff(old, new, tmp_path)
+        assert "reordered" in kinds(r) and has(r["errors"], "contracts.JOB.norms")
+
+    def test_m1_order_of_other_lists_is_a_warning(self, tmp_path):
+        new = edit(V1, *NV)
+        a = new.index("    - from: DISTRIBUTED"); b = new.index("    - from: CENTRALIZED"); c = new.index("  protocols:")
+        new = new[:a] + new[b:c] + new[a:b] + new[c:]
+        r = diff(V1, new, tmp_path)
+        assert r["ok"] and "reordered" in kinds(r, "warning")
+
+    def test_m1_order_of_actors_is_an_error(self, tmp_path):
+        new = edit(V1, *NV)
+        a = new.index("    - id: TOWN_STEWARD"); b = new.index('    - id: "ROBOT[1..N]"'); c = new.index("  contracts:")
+        new = new[:a] + new[b:c] + new[a:b] + new[c:]
+        r = diff(V1, new, tmp_path)
+        assert has(r["errors"], "the order of actors")
+
+    def test_m2_one_pass_chain(self, tmp_path):
+        old = edit(V1, ('"ROBOT.blocking >= 3 AND', '"ROBOT.blocking >= 3 AND ROBOT.queue <= 4 AND'),
+                   ("      - id: sanction_lambda\n", """      - id: queue_q
+        layer: rule
+        value: 4
+        min: 1
+        max: 5
+        step: 1
+        at: [contracts.ROAD_USE.monitors.blocking_guard.rule]
+      - id: sanction_lambda
+"""))
+        new = edit(old, *NV, ("ROBOT.blocking >= 3 AND ROBOT.queue <= 4", "ROBOT.blocking >= 4 AND ROBOT.queue <= 5"),
+                   ("        value: 3\n        min: 1\n        max: 4", "        value: 4\n        min: 1\n        max: 4"),
+                   ("        value: 4\n        min: 1\n        max: 5", "        value: 5\n        min: 1\n        max: 5"))
+        r = diff(old, new, tmp_path)
+        assert r["ok"], r["errors"]
+
+    def test_m2_clash_is_ambiguous(self, tmp_path):
+        old = edit(V1, ('"ROBOT.blocking >= 3 AND', '"ROBOT.blocking >= 3 AND ROBOT.queue <= 3 AND'),
+                   ("      - id: sanction_lambda\n", """      - id: queue_q
+        layer: rule
+        value: 3
+        min: 1
+        max: 5
+        step: 1
+        at: [contracts.ROAD_USE.monitors.blocking_guard.rule]
+      - id: sanction_lambda
+"""))
+        r0 = result(old)
+        assert r0.ok and has(r0.warnings, "'block_k' and 'queue_q'")
+        new = edit(old, *NV, ("ROBOT.blocking >= 3 AND ROBOT.queue <= 3", "ROBOT.blocking >= 2 AND ROBOT.queue <= 4"),
+                   ("        value: 3\n        min: 1\n        max: 4", "        value: 2\n        min: 1\n        max: 4"),
+                   ("        value: 3\n        min: 1\n        max: 5", "        value: 4\n        min: 1\n        max: 5"))
+        r = diff(old, new, tmp_path)
+        assert "ambiguous_location" in kinds(r)
+
+    def test_m3_broad_location_is_warned_and_ambiguous(self, tmp_path):
+        old = edit(V1, ("at: [contracts.ROAD_USE.incentives.lambda]", "at: [contracts.ROAD_USE]"))
+        assert has(result(old).warnings, "not a scalar or a single expression", "K-9")
+        new = edit(old, *NV, ("lambda: 0.5", "lambda: 1.0"), ("beta: 0.5", "beta: 1.0"),
+                   ("        value: 0.5\n        min: 0.0", "        value: 1.0\n        min: 0.0"))
+        r = diff(old, new, tmp_path)
+        assert not r["ok"] and "ambiguous_location" in kinds(r)
+
+    def test_m3_repeated_value_is_warned(self):
+        text = edit(V1, ('"ROBOT.blocking >= 3 AND', '"ROBOT.blocking >= 3 AND ROBOT.load <= 3 AND'))
+        assert has(result(text).warnings, "holds the value 3 2 times", "K-9")
+
+    def test_m3_index_is_not_substituted(self, tmp_path):
+        old = edit(V1, ('observe: ["ROBOT[i].blocking"]', 'observe: ["ROBOT[3].blocking"]'),
+                   ('"ROBOT.blocking >= 3 AND', '"ROBOT[3].blocking >= 3 AND'))
+        assert not errors(old)
+        new = edit(old, *NV, ('"ROBOT[3].blocking >= 3 AND', '"ROBOT[2].blocking >= 2 AND'),
+                   ("        value: 3\n        min: 1\n        max: 4", "        value: 2\n        min: 1\n        max: 4"))
+        r = diff(old, new, tmp_path)
+        assert has(r["errors"], "blocking_guard.rule", "no declared parameter")
+
+    def test_m4_unchanged_contract_with_norms_that_switches(self, tmp_path):
+        old = edit(NORMS_V1, ("rule: keep", "rule: switch"), ("on_amendment: carry_over", "on_amendment: discharge"))
+        new = edit(old, ('version: "1"', 'version: "2"'))
+        r = diff(old, new, tmp_path)
+        c = {x["id"]: x for x in r["contracts"]}
+        assert c["JOB"]["status"] == "unchanged"
+        assert has([f["text"] for f in c["JOB"]["findings"]], "norms (F.6)", "discharge")
+        # kept: not listed
+        r2 = diff(edit(old, ("rule: switch", "rule: keep")), edit(new, ("rule: switch", "rule: keep")), tmp_path)
+        assert not r2["contracts"]
+
+    def test_m5_quoted_segment(self):
+        text = edit(V1, ("  metrics:\n", """  regimes:
+    CENTRALIZED:
+      parameters: { "ROAD_USE.beta": 0.9 }
+  metrics:
+"""), ("      - id: sanction_lambda\n", """      - id: central_beta
+        layer: rule
+        value: 0.9
+        min: 0.5
+        max: 1.0
+        step: 0.1
+        at: ['regimes.CENTRALIZED.parameters."ROAD_USE.beta"']
+      - id: sanction_lambda
+"""))
+        r = result(text)
+        assert r.ok, r.errors
+        bad = edit(text, ("""parameters."ROAD_USE.beta\"']""", """parameters."ROAD_USE.beta']"""))
+        assert has(errors(bad), "quote", "K-9")
+
+    def test_m6_target_types_and_ir(self):
+        for value in ("2026-01-01", "true", "{a: 1}", "null"):
+            text = edit(V1, ('target: ">= 0.85 * count(orders)"', f"target: {value}"))
+            assert has(errors(text), "target must be a string or a number", "K-11")
+            json.dumps(_ir_to_dict(lower_to_ir(parse(text))))
+        assert not errors(edit(V1, ('target: ">= 0.85 * count(orders)"', "target: 0.85")))
+
+    def test_l1_voters_are_actors_only(self):
+        assert has(errors(edit(V1, ("procedure: vote, quorum: 2 }", "procedure: vote, quorum: 1, voters: [delivery_robot] }"))),
+                   "is not an actor", "K-6")
+
+    def test_l2_effective_forms(self, tmp_path):
+        new = edit(V2, ("effective: { period: 2 }", 'effective: { at: "1999-01-01" }'))
+        r = diff(V1, new, tmp_path)
+        assert r["ok"] and "effective_not_comparable" in kinds(r, "warning")
+        old_at = edit(V1, ("effective: { period: 1 }", 'effective: { at: "2026-12-01" }'))
+        r = diff(old_at, new, tmp_path)
+        assert "effective_not_later" in kinds(r)
+        new_none = edit(V2, ("    effective: { period: 2 }\n", ""))
+        r = diff(V1, new_none, tmp_path)
+        assert r["ok"] and "no_effective" in kinds(r, "info")
+
+    def test_l3_verification_change_is_an_error(self, tmp_path):
+        add = ("  metrics:\n", "  verification:\n    - { id: v1, type: consistency, method: smt, expr: \"true\" }\n  metrics:\n")
+        old = edit(V1, add)
+        new = edit(V2, (add[0], add[1].replace('\"true\"', '\"false OR true\"')))
+        r = diff(old, new, tmp_path)
+        assert has(r["errors"], "verification")
+
+    def test_l4_range_of_lambda(self):
+        assert "max: 1.0" in V1
+        text = edit(V1, ("        min: 0.0\n        max: 1.0", "        min: 0.0\n        max: 2.0"))
+        assert has(result(text).warnings, "in [0, 1]", "K-8")
+        assert not has(result(V1).warnings, "K-8")

@@ -70,8 +70,7 @@ _UNIT_MS = {"ms": 1, "s": 1000, "min": 60_000, "h": 3_600_000}
 # other section (actors, contracts, protocols, transitions, regimes, ...)
 # is an error. `version:` and `amendment:` describe the version itself and
 # are not compared.
-_OTHER_SECTIONS = ("name", "description", "metrics", "verification", "codegen",
-                   "motivation")
+_OTHER_SECTIONS = ("name", "description", "metrics", "codegen", "motivation")
 _NOT_COMPARED = ("version", "amendment")
 # The short names of A.7.1 and H.3: C.alpha, C.beta, C.lambda of a contract,
 # and environment.X.
@@ -259,7 +258,8 @@ def _count(node, key: tuple, name: str) -> int:
     in a normalized value."""
     if node == key:
         return 1
-    if isinstance(node, tuple) and len(node) == 2 and node[0] == "ActorRef":
+    if _is_actor_ref(node):
+        # The name of the parameter counts; an index is not an occurrence.
         f = dict(node[1])
         return 1 if f.get("name") == name and f.get("index") is None else 0
     if isinstance(node, dict):
@@ -269,16 +269,61 @@ def _count(node, key: tuple, name: str) -> int:
     return 0
 
 
-def _replace(node, old: tuple, new: tuple):
-    if node == old:
-        return new
-    if isinstance(node, dict):
-        return {k: _replace(v, old, new) for k, v in node.items()}
-    if isinstance(node, list):
-        return [_replace(v, old, new) for v in node]
-    if isinstance(node, tuple):
-        return tuple(_replace(v, old, new) for v in node)
-    return node
+def _is_actor_ref(node) -> bool:
+    return isinstance(node, tuple) and len(node) == 2 and node[0] == "ActorRef"
+
+
+def _substitute(tree, subs: list):
+    """Replace, in one pass over the old tree, the old literal of each
+    changed parameter by its new literal below each of its paths. Returns
+    the new tree and the clashes: two parameters that map the same old
+    literal at the same place to different new literals. The index of an
+    actor reference is never replaced."""
+    clashes: list = []
+    by_path: dict = {}
+    for pid, path, old, new in subs:
+        by_path.setdefault(path, []).append((pid, old, new))
+
+    prefixes = {path[:i] for path in by_path for i in range(len(path) + 1)}
+
+    def walk(node, path: tuple, active: dict):
+        here = by_path.get(path)
+        if here:
+            active = dict(active)
+            for pid, old, new in here:
+                prev = active.get(old)
+                if prev is not None and prev[1] != new:
+                    clashes.append((prev[0], pid, ".".join(str(x) for x in path)))
+                active[old] = (pid, new)
+        if not active and path not in prefixes:
+            return node
+        if isinstance(node, tuple) and node in active:
+            return active[node][1]
+        if _is_actor_ref(node):
+            return node
+        if isinstance(node, dict):
+            return {k: walk(v, path + (k,), active) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(v, path + (i,), active) for i, v in enumerate(node)]
+        if isinstance(node, tuple):
+            # Inside an expression the paths of `at:` end; keep the mapping.
+            return tuple(walk(v, path + ("~",), active) for v in node)
+        return node
+
+    seen = set()
+    uniq = []
+    for c in clashes:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return walk(tree, (), {}), uniq
+
+
+# Lists whose order the semantics use: the norms of a contract (processed in
+# declaration order, F.5 step 2) and the actors (file order, Appendix J).
+def _order_matters(path: list) -> bool:
+    p = [str(x) for x in path]
+    return p == ["actors"] or (len(p) == 3 and p[0] == "contracts" and p[2] == "norms")
 
 
 # --- Locations (K.3) -----------------------------------------------------------
@@ -291,6 +336,37 @@ def _item_label(item) -> Optional[str]:
     if item.get("from") is not None and item.get("to") is not None:
         return f"{item['from']}->{item['to']}"
     return None
+
+
+def _split_location(text: str) -> Optional[list]:
+    """The segments of a location. A segment in double quotes is taken as
+    written, dots included (``regimes.CENTRALIZED.parameters."ROUTING.beta"``).
+    None when a quote is not closed or does not span a whole segment."""
+    segs, cur, i, quoted = [], "", 0, False
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            if cur.strip():
+                return None
+            j = text.find('"', i + 1)
+            if j < 0:
+                return None
+            cur, i, quoted = text[i + 1:j], j + 1, True
+            rest = text[i:].lstrip()
+            if rest and not rest.startswith("."):
+                return None
+            continue
+        if ch == ".":
+            segs.append(cur if quoted else cur.strip())
+            cur, quoted = "", False
+        else:
+            if quoted and not ch.isspace():
+                return None
+            if not quoted:
+                cur += ch
+        i += 1
+    segs.append(cur if quoted else cur.strip())
+    return segs
 
 
 def resolve(sos_raw: Any, location: str):
@@ -306,7 +382,11 @@ def resolve(sos_raw: Any, location: str):
     ``context.environment``, as in the regime bindings (A.7.1)."""
     if not isinstance(location, str) or not location.strip():
         return None, None, "a location must be a non-empty string"
-    segs = [x.strip() for x in location.strip().split(".")]
+    segs = _split_location(location.strip())
+    if segs is None:
+        return None, None, "an unclosed or misplaced quote"
+    if any(not x for x in segs):
+        return None, None, "an empty segment"
     if isinstance(sos_raw, dict) and segs[0] not in sos_raw:
         # The short names: C.alpha, C.beta, C.lambda and environment.X.
         if len(segs) == 2 and segs[0] == "environment":
@@ -905,9 +985,29 @@ class _Checker:
             seen.add(tuple(path))
             p.at.append(str(loc).strip())
             p.paths.append(path)
-            if p.value is not None and _count(normalize(node), _literal_key(p.value), p.id) == 0:
+            if p.value is None:
+                continue
+            norm = normalize(node)
+            n_val = _count(norm, _literal_key(p.value), "\0")
+            if _count(norm, _literal_key(p.value), p.id) == 0:
                 self.err("K-9", f"{where}: location {label} holds neither the value "
                                 f"{p.value.text()} nor the name '{p.id}'")
+            elif isinstance(node, (dict, list)):
+                self.warn("K-9", f"{where}: location {label} is not a scalar or a single "
+                                 f"expression; every literal {p.value.text()} in it counts as "
+                                 f"the parameter")
+            elif n_val > 1:
+                self.warn("K-9", f"{where}: location {label} holds the value "
+                                 f"{p.value.text()} {n_val} times; every one counts as the "
+                                 f"parameter")
+            unit = [str(x) for x in path]
+            if len(unit) == 4 and unit[0] == "contracts" and (unit[2], unit[3]) in (
+                    ("information", "alpha"), ("authority", "beta"), ("incentives", "lambda")):
+                lo, hi = p.min, p.max
+                if (lo is not None and lo.value < 0) or (hi is not None and hi.value > 1) \
+                        or p.value.kind != "number":
+                    self.warn("K-8", f"{where}: {label} is a parameter in [0, 1], but the "
+                                     f"declared range is outside it")
 
     def overlaps(self) -> None:
         """Two parameters with the same value at the same place, or one
@@ -955,8 +1055,10 @@ class _Checker:
             self.unknown_keys(e, _SCHEDULE_KEYS, w)
             frm = self.time_form(e.get("from"), _FROM_FORMS, f"{w}.from", "K-11")
             target = e.get("target")
-            if target is None or isinstance(target, (dict, list)):
-                self.err("K-11", f"{w}: target must be a scalar, as the target: of a metric")
+            if isinstance(target, bool) or not isinstance(target, (str, int, float)) or (
+                    isinstance(target, float) and target != target):
+                self.err("K-11", f"{w}: target must be a string or a number, as the target: "
+                                 f"of a metric, not {target!r}")
                 frm = None
             decision = self.decision_ref(e.get("decision"), f"{w}.decision")
             if frm is None:
@@ -1137,6 +1239,10 @@ def _diff_paths(ra, rb, na, nb, path: list, out: list, limit: int = 50) -> None:
         lb = [_item_label(x) for x in rb]
         if all(x is not None for x in la + lb) and len(set(la)) == len(la) \
                 and len(set(lb)) == len(lb):
+            common_a = [x for x in la if x in lb]
+            common_b = [x for x in lb if x in la]
+            if common_a != common_b and len(out) < limit:
+                out.append((path, "reordered"))
             for i, label in enumerate(la):
                 if label not in lb:
                     out.append((path + [label], "removed"))
@@ -1172,6 +1278,9 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
     parameter at the places of its ``at:``; every other change of the
     rules is an error."""
     oa, na = analyse(old), analyse(new)
+    if not amendment_declared(old):
+        # Without the declaration nothing of the old version is amendable.
+        oa.parameters, oa.layers = [], {}
     oraw = getattr(old, "amendment", None)
     nraw = getattr(new, "amendment", None)
     import copy
@@ -1184,13 +1293,13 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
                                  "the old version does not declare 'amendment: 0.1'; no "
                                  "parameter is amendable, so every change is unexplained"))
     # Versions
-    if na.previous is not None and oa.version is not None and na.previous != oa.version:
+    if na.previous is not None and na.previous != oa.version:
         findings.append(_finding(
-            "warning", "previous_mismatch",
-            f"the new version names '{na.previous}' as previous, the old version is "
-            f"'{oa.version}'; the changes are checked as one amendment"))
+            "error", "previous_mismatch",
+            f"the new version names '{na.previous}' as previous, but the old version is "
+            f"'{oa.version}'"))
     if oa.version is not None and na.version == oa.version:
-        findings.append(_finding("warning", "same_version",
+        findings.append(_finding("error", "same_version",
                                  f"both versions are '{oa.version}'"))
     if na.effective is None:
         findings.append(_finding("info", "no_effective",
@@ -1205,12 +1314,18 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
                     "error", "effective_not_later",
                     f"the new version takes effect at {kn} {vn}, not after the old one "
                     f"({ko} {vo})"))
+        else:
+            findings.append(_finding(
+                "warning", "effective_not_comparable",
+                f"the old version takes effect from {ko} {vo} and the new one from {kn} {vn}; "
+                f"a period and a time cannot be compared, so their order is not checked"))
 
     # Parameters, under the declaration of the old version
     old_params = {p.id: p for p in oa.parameters}
     new_params = {p.id: p for p in na.parameters}
     norm_old = normalize(o_sos)
     params_out = []
+    subs: list = []      # (parameter id, path, old literal, new literal)
     touched: dict = {}   # contract id -> [parameter ids]
     for pid, p in old_params.items():
         q = new_params.get(pid)
@@ -1265,11 +1380,17 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
                                      f"{what}: {'; '.join(bad)}", parameter=pid))
         else:
             findings.append(_finding("info", "parameter_changed", what, parameter=pid))
-        # Apply the change at the places of the old declaration.
+        # The change applies at the places of the old declaration.
         for path in p.paths:
-            sub = _replace(_get_path(norm_old, path), _literal_key(p.value),
-                           _literal_key(q.value))
-            norm_old = _set_path(norm_old, path, sub)
+            subs.append((pid, tuple(path), _literal_key(p.value), _literal_key(q.value)))
+            n_occ = _count(_get_path(norm_old, path), _literal_key(p.value), "\0")
+            if n_occ > 1:
+                label = ".".join(str(x) for x in _labels(o_sos, path))
+                findings.append(_finding(
+                    "error", "ambiguous_location",
+                    f"parameter '{pid}': {label} holds {p.value.text()} {n_occ} times; the "
+                    f"change of the other occurrences is not explained by it",
+                    parameter=pid, location=label))
             labels = _labels(o_sos, path)
             cid = _contract_of(labels)
             if cid is not None:
@@ -1289,6 +1410,14 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
             findings.append(_finding("warning", "amendability_changed",
                                      "amendment.layers changes"))
 
+    # Apply every change at once, from the old tree as it is written.
+    norm_old, clashes = _substitute(norm_old, subs)
+    for a, b, label in clashes:
+        findings.append(_finding(
+            "error", "ambiguous_location",
+            f"parameters '{a}' and '{b}' have the same old value at {label} and change it "
+            f"differently; the change cannot be attributed", location=label))
+
     # Every other change
     norm_new = normalize(n_sos)
     for key in _NOT_COMPARED:
@@ -1301,9 +1430,18 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
         label = ".".join(str(x) for x in path) or "sos"
         section = str(path[0]) if path else ""
         level = "warning" if section in _OTHER_SECTIONS else "error"
-        findings.append(_finding(
-            level, "unexplained_change",
-            f"{label} is {how} and no declared parameter explains it", location=label))
+        if how == "reordered":
+            if not _order_matters(path):
+                level = "warning"
+            findings.append(_finding(
+                level, "reordered",
+                f"the order of {label} changes" + (
+                    "; the semantics use this order" if level == "error" else ""),
+                location=label))
+        else:
+            findings.append(_finding(
+                level, "unexplained_change",
+                f"{label} is {how} and no declared parameter explains it", location=label))
         cid = _contract_of(path)
         if cid is not None:
             changed_contracts.setdefault(cid, []).append(label)
@@ -1318,16 +1456,19 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
         status = ("removed" if cid not in new_ids else "added" if cid not in old_ids
                   else "changed" if cid in touched or cid in changed_contracts
                   else "unchanged")
-        if status == "unchanged":
-            continue
         rule, in_states = na.transitional.get(cid, (na.transitional_default, []))
+        has_norms = any(c.id == cid and c.norms for c in list(old.contracts) + list(new.contracts))
+        # A contract with norms whose instances switch is amended (F.6) even
+        # when its text does not change, so it is listed for its norms.
+        if status == "unchanged" and not (both_norms and has_norms and rule == "switch"):
+            continue
         c_find: list = []
         entry = {"id": cid, "status": status, "by": touched.get(cid, []),
                  "unexplained": changed_contracts.get(cid, []),
                  "transitional": {"rule": rule, "in_states": in_states},
                  "findings": c_find}
         contracts_out.append(entry)
-        if status != "changed":
+        if status not in ("changed", "unchanged"):
             continue
         oc = next(c for c in old.contracts if c.id == cid)
         nc = next(c for c in new.contracts if c.id == cid)
@@ -1339,14 +1480,15 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
                    if oc.norms else "")))
             continue
         # switch: the instance must be in a state of the new version (F.6).
-        if oc.lifecycle is not None:
+        if oc.lifecycle is not None and status == "changed":
             new_states = set(nc.lifecycle.states) if nc.lifecycle is not None else set()
             terminal = set(oc.lifecycle.terminal or [])
             candidates = in_states or [s for s in oc.lifecycle.states if s not in terminal]
             gone = [s for s in candidates if s not in new_states]
             if gone:
+                # The removal itself is an unexplained change (an error above).
                 c_find.append(_finding(
-                    "error", "state_removed",
+                    "warning", "state_removed",
                     f"rule switch: a running instance in {', '.join(gone)} cannot switch, "
                     f"because the new version has no such state (F.6); keep it, or switch "
                     f"only in_states that remain", states=gone))
