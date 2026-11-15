@@ -160,12 +160,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   unchanged; its observations cost 0.03 % to 0.2 % more gas in the tests
   (the larger dispatch of `CadlNormsMulti` and one flag).
 - tests/test_norms_monitor_targets.py: the sets UNTILN, MIXED and SIX on
-  the EVM and on OPA, five boundary traces of `until` (q true deciding
+  the EVM and on OPA, six boundary traces of `until` (q true deciding
   earlier windows at once, q true after p undefined, also under `NOT`,
-  after p undecided and after p false), random contents with temporal operators inside
+  after p undecided, and after p false, also when p is decided late) and
+  two of windows that wait for their operands, random contents with temporal operators inside
   others (until anywhere, mixed operands, comparisons) on both, the gas
   of the new contents, and of windows that wait for their operands.
-  scripts/norms_monitor_mutations.py: 15 mutants of `General`, all
+  scripts/norms_monitor_mutations.py: 17 mutants of `General`, all
   killed.
 
 ### Changed

@@ -1341,6 +1341,13 @@ EDGES = [
     _edge({"t": 0, "values": {"A.ok": True, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0}},
           {"t": 1}, {"t": 1.8, "values": {"A.ok": False}}, {"t": 2.3, "values": {"A.x": 9}},
           {"t": 3}, {"t": 9}),
+    # q true after p false, both known only when p is decided late, does not
+    # make until true (UNTILN: u4, suspended after its candidate at t = 0,
+    # is not violated at the resumption at t = 1)
+    _edge({"t": 0, "values": {"A.ok": False, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0},
+           "messages": _START + _GO},
+          {"t": 0.3, "messages": _PAUSE}, {"t": 0.5, "values": {"A.z": 1}},
+          {"t": 0.8, "values": {"A.y": 0, "A.z": 0}}, {"t": 1, "messages": _RESUME}, {"t": 9}),
     # windows that are over and wait for their last undecided operand, and
     # wait again after it (MIXED: x5 is fulfilled at t = 50; x6, whose
     # windows move from one list to another, stays bounded in gas)
