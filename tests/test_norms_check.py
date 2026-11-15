@@ -2431,6 +2431,8 @@ def test_elimination_keeps_the_lists_when_a_pattern_cannot_be_extended(monkeypat
 
     body = _chain(5, "<", " OR R[1].q0 == R[1].q3")
     want = {v for v, _vals in build_model(make_sos(body)).trs[0].components[0][1]}
+    # every state is kept (none left out because its vectors were found)
+    monkeypatch.setattr(_Elimination, "PRUNE", False)
     monkeypatch.setattr(_Elimination, "_run", run_)
     monkeypatch.setattr(_Elimination, "_amalgamate", amalgamate_)
     got = {v for v, _vals in build_model(make_sos(body)).trs[0].components[0][1]}
@@ -2511,23 +2513,204 @@ def test_ordered_quantities_with_linear_arithmetic(n):
                           [0, 0.5, 1, 1.5, 2, 2.5, 3, -1, "a"])
 
 
+COUNT_NEVER_FALSE = "count(r.load > D.load for r in R) >= 0"
+
+
 def test_large_groups_are_refused_with_the_reason():
     """A group whose elimination keeps more than 50 000 patterns is
-    refused, within seconds and with the hint about --members: every
-    pair of eight members ordered by their indices (no symmetry), and the
-    maximum of eight members compared with a quantity (one leaf reads all
-    nine)."""
+    refused, within seconds and with the limit and the hint about
+    --members: count of six members compared with a quantity (one leaf
+    reads all seven, and the value F that no valuation gives keeps every
+    state). Every pair of eight members ordered by their indices and the
+    maximum of eight members, refused by 0.3.31, are translated from
+    0.3.32 (test_groups_of_eight_members_are_translated)."""
     import time
-    for content in ("for all j in R: for all k in R: j >= k OR R[j].load <= R[k].load",
-                    "max(r.load for r in R) > D.load"):
-        t = time.monotonic()
-        with pytest.raises(NormsCheckError) as e:
-            build_model(_members_sos(content), members=["R=8"])
-        assert time.monotonic() - t < 120
-        text = str(e.value)
-        assert "valuations by types and patterns" in text and "more than 50000" in text, text
-        assert "adding the quantities one at a time" in text, text
-        assert "Use fewer --members (R)" in text, text
+    t = time.monotonic()
+    with pytest.raises(NormsCheckError) as e:
+        build_model(_members_sos(COUNT_NEVER_FALSE), members=["R=6"])
+    assert time.monotonic() - t < 120
+    text = str(e.value)
+    assert "valuations by types and patterns" in text and "more than 50000" in text, text
+    assert "adding the quantities one at a time" in text, text
+    assert "the limit of --max-states, 50000, which may be raised up to 1000000" in text, text
+    assert "Use fewer --members (R)" in text, text
+
+
+# === Reductions of the elimination (F.12, from cadl 0.3.32) =================
+
+_REDUCTIONS = ("LOCAL", "PRUNE", "FOLD")
+
+
+def _vectors_without(env, ids, keys, monkeypatch, off=_REDUCTIONS, keep=False):
+    from cadl.norms_check import _Elimination
+    for name in off:
+        setattr(_Elimination, name, False)
+    try:
+        el = _Elimination(env, ids, keys)
+        got = el._run(10 ** 6, True) if keep else el.run(10 ** 6)
+    finally:
+        for name in _REDUCTIONS:
+            setattr(_Elimination, name, True)
+    return {v for v, _ in got}
+
+
+PAIRS = "for all j in R: for all k in R: j >= k OR R[j].load <= R[k].load"
+MAXES = ("max(r.load for r in R) > D.load", "max(R[*].load) >= min(r.load for r in R)",
+         "min(r.load for r in R) < 1 OR R[1].load == D.load")
+
+
+@pytest.mark.parametrize("contents", [
+    (PAIRS,), (PAIRS, "for all j in R: for all k in R: j >= k OR R[j].load >= R[k].load"),
+    (PAIRS, "R[1].load == D.load"),
+    ("for all j in R: for all k in R: k != j + 1 OR R[j].load < R[k].load",
+     "exists j in R: R[j].load == D.load")] + [(m,) for m in MAXES] + [(MAXES[0], PAIRS)],
+    ids=["pairs", "updown", "pairs-literal", "neighbours", "max", "max-min", "min-literal",
+         "max-pairs"])
+def test_reductions_find_the_same_vectors(contents, monkeypatch):
+    """The symmetry of a state, the states left out because their vectors
+    were found, and the fold nodes of min and max (F.12, 0.3.32) give the
+    vectors of the elimination without them and of the classes, each
+    alone and together, also keeping the lists, for four members."""
+    m = build_model(_members_sos(*contents), members=["R=4"])
+    tr, env = _env_of(m)
+    for ids, vecs in tr.components:
+        keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+        want = _vectors_without(env, ids, keys, monkeypatch)
+        if len(keys) <= 4:
+            assert want == {v for v, _ in vecs}
+        for off in ((), ("LOCAL",), ("PRUNE",), ("FOLD",), ("LOCAL", "PRUNE")):
+            assert _vectors_without(env, ids, keys, monkeypatch, off) == want, off
+            assert _vectors_without(env, ids, keys, monkeypatch, off, True) == want, off
+
+
+@pytest.mark.parametrize("contents", [
+    (PAIRS,), (PAIRS, "R[1].load == D.load"), (MAXES[0], "R[1].load < 0"), (MAXES[1],),
+    ("for all j in R: for all k in R: j >= k OR R[j].load <= R[k].load OR "
+     "R[j].load > R[k].load",)],
+    ids=["pairs", "pairs-literal", "max-literal", "max-min", "never-false"])
+def test_groups_of_eight_members_are_translated(contents):
+    """Groups that 0.3.31 refused (more than 50 000 states): every pair of
+    eight members ordered by their indices, and min and max of eight
+    members with a member named by its index; the values of random
+    valuations are vectors of the model."""
+    import random as _random
+    import time
+    t = time.monotonic()
+    m = build_model(_members_sos(*contents), members=["R=8"])
+    assert time.monotonic() - t < 120
+    tr = m.trs[0]
+    assert all(n.status == "model" for n in tr.norms)
+    _values_reach_choices(tr, _random.Random(8), 300 if LONG else 100,
+                          [0, 0.5, 1, 2, -1, "a", True, None])
+
+
+def test_fold_nodes_keep_representatives():
+    """A leaf that reads max of eight members keeps at most one member of
+    each sort of element and the largest number in the frontier, so the
+    states stay few even when a vector is never found (max >= min is
+    never false)."""
+    from cadl.norms_check import _Elimination
+    m = build_model(_members_sos(MAXES[1]), members=["R=3"])
+    tr, env = _env_of(m)
+    (ids, vecs), = tr.components
+    assert {v for v, _ in vecs} == {("T",), ("U",)}
+    m = build_model(_members_sos(MAXES[1]), members=["R=8"])
+    tr, env = _env_of(m)
+    (ids, vecs), = tr.components
+    assert {v for v, _ in vecs} == {("T",), ("U",)}
+    keys = sorted(tr.preds[ids[0]].keys)
+    el = _Elimination(env, ids, keys)
+    assert {v for v, _ in el.run(10 ** 6)} == {("T",), ("U",)}
+    assert el.folds and el.peak < 1000
+
+
+def test_reductions_on_random_predicates(monkeypatch):
+    """Random predicates over three members (comparisons of fields, of
+    D.load, of literals, min and max, quantifiers, pairs): the vectors
+    with the reductions are those of the classes and of the elimination
+    without them, and random valuations give vectors of the model."""
+    import random as _random
+    import cadl.norms_check as nc
+    monkeypatch.setattr(nc, "MAX_VALUATIONS", 400000)
+    rng = _random.Random(32)
+    ops = ["<", "<=", ">", ">=", "==", "!="]
+
+    def operand(inq):
+        r = rng.random()
+        if r < 0.35:
+            return f"R[{rng.randint(1, 3)}].{rng.choice(['load', 'load', 'v'])}"
+        if r < 0.5:
+            return "D.load"
+        if r < 0.62:
+            return rng.choice(["0", "1", "2.5", "'a'", "true"])
+        if r < 0.85:
+            return f"{rng.choice(['max', 'min'])}(r.load for r in R)"
+        return "R[j].load" if inq else "R[2].load"
+
+    def pred(depth=0, inq=False):
+        r = rng.random()
+        if depth > 1 or r < 0.4:
+            return f"{operand(inq)} {rng.choice(ops)} {operand(inq)}"
+        if r < 0.6:
+            return f"({pred(depth + 1, inq)} AND {pred(depth + 1, inq)})"
+        if r < 0.8:
+            return f"({pred(depth + 1, inq)} OR {pred(depth + 1, inq)})"
+        if inq:
+            return f"NOT ({pred(depth + 1, inq)})"
+        q = rng.choice(["exists j in R:", "for all j in R:"])
+        return f"({q} {pred(depth + 1, True)})"
+
+    values = [None, True, False, 0, 1, 2.5, -1, 3, "a", "", {}, [0]]
+    checked = 0
+    for _case in range(12 if LONG else 5):
+        contents = [pred() for _ in range(rng.randint(1, 2))]
+        if rng.random() < 0.3:
+            contents.append(PAIRS.replace("<=", rng.choice(ops)))
+        m = build_model(_members_sos(*contents), members=["R=3"])
+        tr, env = _env_of(m)
+        for ids, vecs in tr.components:
+            keys = sorted(set().union(*(tr.preds[i].keys for i in ids)))
+            want = {v for v, _ in vecs}
+            for off in (_REDUCTIONS, ()):
+                assert _vectors_without(env, ids, keys, monkeypatch, off) == want, contents
+                assert _vectors_without(env, ids, keys, monkeypatch, off, True) == want
+            exprs = [tr.preds[i].expr for i in ids]
+            for _ in range(100):
+                vals = {k: rng.choice(values) for k in keys}
+                assert tuple(tr._oracle(exprs, vals)) in want, (contents, vals)
+            checked += 1
+    assert checked
+
+
+def test_max_states_sets_the_limit():
+    """--max-states (1 to 1 000 000) is the limit on the states of one
+    step; the refusal names it, its value and how far it may be raised."""
+    content = COUNT_NEVER_FALSE
+    m = build_model(_members_sos(content), members=["R=4"], max_states=10000)
+    assert {v for v, _ in m.trs[0].components[0][1]} == {("T",)}
+    with pytest.raises(NormsCheckError) as e:
+        build_model(_members_sos(content), members=["R=4"], max_states=100)
+    text = str(e.value)
+    assert "more than 100 patterns" in text and "the limit of --max-states, 100, which may be " \
+        "raised up to 1000000" in text, text
+    for bad in (0, 1000001, "5"):
+        with pytest.raises(NormsCheckError, match="--max-states must be an integer"):
+            build_model(_members_sos(content), members=["R=2"], max_states=bad)
+
+
+def test_max_states_on_the_command_line(tmp_path, capsys):
+    from cadl.cli import main
+    path = tmp_path / "m.cadl"
+    path.write_text(MEMBERS_HEAD + textwrap.indent(
+        "norms:\n  - id: p0\n    kind: prohibition\n    bearer: D\n"
+        f"    content: \"{COUNT_NEVER_FALSE}\"\n", "      "))
+    argv = sys.argv
+    try:
+        sys.argv = ["cadl", "norms-check", str(path), "--members", "R=4", "--max-states", "100"]
+        assert main() == 2
+        assert "--max-states, 100" in capsys.readouterr().err
+    finally:
+        sys.argv = argv
 
 
 # === Finite decimal points of the faces (F.12) ==============================

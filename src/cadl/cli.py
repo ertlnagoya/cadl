@@ -491,6 +491,11 @@ def main(argv: list[str] | None = None) -> int:
                                "numbers for it are such integers. Linear arithmetic needs none; "
                                "for other arithmetic without it a domain is assumed from the "
                                "literals and reported; may be repeated")
+    nchk_cmd.add_argument("--max-states", dest="max_states", type=int, default=None,
+                          metavar="N",
+                          help="Patterns that the elimination of quantities compared with each "
+                               "other may keep at one step (F.12; default: 50000, at most "
+                               "1000000); a larger group is refused with the limit it hit")
     nchk_cmd.add_argument("--timeout", type=float, default=600, metavar="SECONDS",
                           help="Time for all runs of the model checker together; exit status 2 "
                                "when it is exceeded (default: 600)")
@@ -1346,7 +1351,8 @@ def _norms_check_run(args: argparse.Namespace) -> int:
                             args.step, args.horizon, args.export, timeout=args.timeout,
                             domains=args.domain,
                             instances=args.instance or args.instances,
-                            versions=args.versions, starts=args.starts)
+                            versions=args.versions, starts=args.starts,
+                            max_states=args.max_states)
     except NormsEvalError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

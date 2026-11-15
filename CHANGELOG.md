@@ -94,6 +94,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   of the Course D hands-on with the amendment extension, two versions of
   its rules (`block_k` 3 → 2).
 
+- `cadl norms-check --max-states N`: the limit on the states that the
+  elimination of a group of compared quantities keeps at one step, and on
+  the points of the faces of its linear arrangement (F.12; default 50 000,
+  at most 1 000 000). The refusal names the limit, its value, and how far
+  it may be raised.
+
+### Changed
+
+- `cadl norms-check`: the elimination (F.12) keeps fewer states, each
+  reduction leaving the combinations of predicate values the same, and
+  every combination still comes with a valuation that the evaluator of
+  `cadl norms-eval` confirms. States that a permutation of the members of
+  a set maps to each other are merged, when the leaves that read the
+  moved members use them only through variables and the remainders are
+  the same up to the order of the operands of `AND` and `OR`; this covers
+  predicates that order every pair of members by their indices. A state
+  whose remainders can only give combinations already found (by a few
+  runs that add the quantities along one extension at a time; the values
+  of a remainder are bounded by Kleene's tables, exactly for parts that
+  read at most two quantities) is left out. A leaf that reads a set only
+  through `min` and `max` of one field keeps one member of each sort of
+  element (a number, a value of a wrong kind, no value, as `_elements` of
+  the evaluator tells them apart) and the members with the smallest and
+  largest number, named in the state by their role. Every pair of 6, 7 or
+  8 members ordered by their indices, refused by 0.3.31, takes less than
+  a second, and so does `max(r.load for r in R) > D.load` over 8 members
+  (0.3.31: refused from 6 members, 40 to 50 s for 5). Still refused within the default
+  limit: a leaf that reads many quantities through `count` when one of
+  its values never occurs, linear arithmetic over many ordered quantities,
+  and predicates that read the same members through `max` and by their
+  indices.
+
+
 ## [0.3.31] — 2026-11-14
 
 ### Added
