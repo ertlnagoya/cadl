@@ -63,9 +63,9 @@ SOLC_CHECKED = ("0.8.24", "0.8.37")
 # the constructor). Measured with the versions above, the optimizer with 1
 # and with 200 runs, plus 3 %; tests/test_norms_monitor_targets.py checks
 # them against solc.
-RUNTIME_ESTIMATE = {"monitor": 17180, "CadlNormsValues": 7810, "CadlNormsEval": 11540,
-                    "CadlNormsItems": 2370, "CadlNormsWindows": 5490, "CadlNormsActs": 12190,
-                    "CadlNormsMulti": 15830}
+RUNTIME_ESTIMATE = {"monitor": 17250, "CadlNormsValues": 7810, "CadlNormsEval": 11550,
+                    "CadlNormsItems": 2370, "CadlNormsWindows": 5490, "CadlNormsActs": 12200,
+                    "CadlNormsMulti": 16270}
 
 
 def estimated_initcode(text: str) -> int:
@@ -392,7 +392,15 @@ def _window_lines(ir: dict, nd: dict) -> list[str]:
     return [f"        _temporal({_op_args(ir, tm['node'])}, {nd['content']['expr']});"]
 
 
-def _node_lines(nodes: list[dict], skip: set) -> list[str]:
+# The operator code of a temporal operator of a content decided per
+# observation (OP_GVAL of the base contract: its value is read from the
+# values that `General` keeps).
+_OP_GVAL = 13
+
+
+def _node_lines(nodes: list[dict], skip: set, general: frozenset = frozenset()) -> list[str]:
+    """The `_node` calls of the expressions; `general`: the temporal
+    operators of contents decided per observation."""
     out = []
     for k, nd in enumerate(nodes):
         where = f"node {k}"
@@ -438,7 +446,8 @@ def _node_lines(nodes: list[dict], skip: set) -> list[str]:
             a, d = nd["x"], scaled(nd["d"], where)
         elif op == "until":
             a, b, d = nd["p"], nd["q"], scaled(nd["d"], where)
-        out.append(f"        _node({_OPS[op]}, {bop}, {a}, {b}, {d}, {ik}, {s1}, {s2}, {s3}, "
+        code = _OP_GVAL if k in general else _OPS[op]
+        out.append(f"        _node({code}, {bop}, {a}, {b}, {d}, {ik}, {s1}, {s2}, {s3}, "
                    f"{lk}, {ln}, {ls});")
         out += [f"        _item({i});" for i in items]
     return out
@@ -465,7 +474,9 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
             body.append(f"        m.lcStates[keccak256(bytes({_s(s)}))] = true;")
         for s in lc["terminal"]:
             body.append(f"        m.lcTerminal[keccak256(bytes({_s(s)}))] = true;")
-    body += _node_lines(ir["exprs"], skip)
+    general = frozenset(op["node"] for nd in ir["norms"] if nd.get("general")
+                        for op in nd["general"]["ops"])
+    body += _node_lines(ir["exprs"], skip, general)
     for name in temporal_names(ir, skip):
         body.append(f"        m.temporalName[keccak256(bytes({_s(name)}))] = true;")
 

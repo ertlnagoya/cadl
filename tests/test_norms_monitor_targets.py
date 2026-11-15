@@ -266,6 +266,7 @@ class TestGeneration:
         text = generate_norms_monitor_sol(sos, sos.contracts[0])
         text = text.split("is CadlNormsMonitorBase {", 1)[1]
         assert "_general(" in text and "_multi(" not in text and "_temporal(" not in text
+        assert "_node(13, " in text          # OP_GVAL: the value is read from General
         for call in ops:
             assert call in text, call
 
@@ -1201,10 +1202,15 @@ MIXED = """\
            content: "within(3s, throughout(2s, within(1s, A.y == 1) OR A.x > 1))", deadline: 6s}
         - {id: x4, kind: prohibition, bearer: A, trigger: "B -> A : go",
            content: "within(2s, NOT throughout(1s, A.ok == true) AND within(1s, A.x > 5) OR A.z == 1)", deadline: 4s}
+        - {id: x5, kind: obligation, bearer: A,
+           content: "throughout(1s, throughout(0s, A.ok == true) OR within(2s, A.y == 1) OR within(100s, A.z == 1))",
+           deadline: 100ms}
+        - {id: x6, kind: obligation, bearer: A,
+           content: "throughout(1s, throughout(1500ms, A.y == 1) OR throughout(100s, A.x == 1))"}
         - {id: pa, kind: power, bearer: B, content: "B -> A : pause",
-           effects: {suspend: [x1, x2, x3, x4]}}
+           effects: {suspend: [x1, x2, x3, x4, x5, x6]}}
         - {id: re, kind: power, bearer: B, content: "B -> A : resume",
-           effects: {resume: [x1, x2, x3, x4]}}
+           effects: {resume: [x1, x2, x3, x4, x5, x6]}}
 """
 
 SIX = """\
@@ -1333,6 +1339,15 @@ EDGES = [
     _edge({"t": 0, "values": {"A.ok": True, "A.done": False, "A.x": 3, "A.y": 1, "A.z": 0}},
           {"t": 1}, {"t": 1.8, "values": {"A.ok": False}}, {"t": 2.3, "values": {"A.x": 9}},
           {"t": 3}, {"t": 9}),
+    # windows that are over and wait for their last undecided operand, and
+    # wait again after it (MIXED: x5 is fulfilled at t = 50; x6, whose
+    # windows move from one list to another, stays bounded in gas)
+    _edge({"t": 0, "values": {"A.ok": True, "A.y": 0, "A.z": 0}}, {"t": 0.5, "values": {"A.ok": False}},
+          {"t": 1}, {"t": 1.5, "values": {"A.ok": True}}, {"t": 2}, {"t": 2.5},
+          {"t": 3, "values": {"A.y": 1}}, {"t": 3.5, "values": {"A.y": 0}},
+          {"t": 50, "values": {"A.z": 1}}, {"t": 200}),
+    _edge({"t": 0, "values": {"A.y": 1, "A.x": 1}}, {"t": 1, "values": {"A.y": 0}},
+          {"t": 2, "values": {"A.y": 1}}, {"t": 3}, {"t": 4}, {"t": 5}, {"t": 200}),
 ]
 
 
@@ -1518,6 +1533,25 @@ def test_evm_gas_of_waiting_windows_is_bounded(tmp_path):
     gas = [r["gas"] for r in raw]
     early, late = sum(gas[160:210]) / 50, sum(gas[-50:]) / 50
     assert late < 1.05 * early and max(gas) < 1_000_000, (early, late, max(gas))
+
+
+@needs_evm
+def test_evm_gas_of_late_until_operands_is_linear(tmp_path):
+    """until whose p is decided false at all observations of its windows
+    at once (the observation at the 60th second): the windows that hold
+    these late values are read again once, as one range, so the cost is
+    linear in the observations of a window (it was quadratic, and above
+    the gas limit of a block)."""
+    content = "until(throughout(60s, A.x >= 0), within(60s, A.z == 1), 60s)"
+    sos = _small("      norms:\n        - {id: p, kind: prohibition, bearer: A, "
+                 f"content: \"{content}\"}}\n")
+    lines = [json.dumps({"t": 0, "values": {"A.x": 0, "A.z": 0}})]
+    lines += [json.dumps({"t": k}) for k in range(1, 60)]
+    lines += [json.dumps({"t": 60, "values": {"A.x": -1}}), json.dumps({"t": 61})]
+    refs, got = _evm(sos, [lines], tmp_path)
+    assert S.compare(refs, got) == []
+    gas = [r["gas"] for r in _RAW[-1][0] if "gas" in r]
+    assert max(gas) < 6_000_000, max(gas)
 
 
 # === The range of exact numbers, exact deadlines, runtime size =======================

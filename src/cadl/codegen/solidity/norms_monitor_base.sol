@@ -58,6 +58,9 @@ uint8 constant OP_IN = 9;
 uint8 constant OP_WITHIN = 10;
 uint8 constant OP_THROUGHOUT = 11;
 uint8 constant OP_UNTIL = 12;
+// an operator of a content decided per observation (General): its value
+// is read from EvalData.gw
+uint8 constant OP_GVAL = 13;
 // the index of an actor reference
 uint8 constant I_NONE = 0;
 uint8 constant I_LIT = 1;
@@ -488,8 +491,7 @@ library CadlNormsEval {
         if (op == OP_AND || op == OP_OR) return andOr(op == OP_OR, truth(ev(data, nd.a, p, n)), truth(ev(data, nd.b, p, n)));
         if (op == OP_BIN) return CadlNormsValues.binop(nd.bop, ev(data, nd.a, p, n), ev(data, nd.b, p, n));
         if (op == OP_IN) return inList(data, nd, p, n);
-        uint256 gt = data.gtag[id];
-        if (gt != 0) return codeVal(gget(data, gt, p));
+        if (op == OP_GVAL) return codeVal(gget(data, data.gtag[id], p));
         if (op == OP_WITHIN || op == OP_THROUGHOUT) return temporal(data, id, nd, p, n);
         return untilOp(data, id, nd, p, n);
     }
@@ -1515,7 +1517,12 @@ library CadlNormsMulti {
         uint256 ov1 = firstTime(data, ov0, n + 1, data.obsT[n] - op.td);
         op.ov = ov1;
         recheck(g, op, data, vv, ov0, ov1, n, out);
-        for (uint256 j = 0; j < nx.c; j++) decideAt(g, op, data, nx.a[j], n, ov1, out);
+        // until: the windows that hold an operand decided after its
+        // observation, read once as one range [late[0], late[1]]
+        uint256[] memory late = new uint256[](2);
+        late[0] = NONE;
+        for (uint256 j = 0; j < nx.c; j++) decideAt(g, op, data, nx.a[j], n, out, late);
+        if (late[0] != NONE) recheck(g, op, data, vv, late[0], late[1] + 1, n, out);
         if (gget(data, vv, n) == X_D) recheck(g, op, data, vv, n, n + 1, n, out);
         // the operands decided so far
         uint256 pp = gpre(g.gen, op.node, 1);
@@ -1526,9 +1533,10 @@ library CadlNormsMulti {
     }
 
     /// The values of op that the operands at observation x, decided at n,
-    /// decide (ov: the windows before it are over).
+    /// decide; for until, a value decided after its observation widens
+    /// late, the range read again once (see gop).
     function decideAt(General storage g, GOp storage op, EvalData storage data, uint256 x, uint256 n,
-                      uint256 ov, Vec memory out) internal {
+                      Vec memory out, uint256[] memory late) internal {
         uint256 vv = gpre(g.gen, op.node, 0);
         uint256 pp = gpre(g.gen, op.node, 1);
         uint256 a = firstTime(data, g.start, x, data.obsT[x] - op.td);
@@ -1554,7 +1562,8 @@ library CadlNormsMulti {
                 recheck(g, op, data, vv, b == NONE ? a : b + 1, n + 1, n, out);
             }
         } else {
-            recheck(g, op, data, vv, a, x + 1, n, out);
+            if (a < late[0]) late[0] = a;
+            if (x > late[1]) late[1] = x;
         }
     }
 
@@ -1606,7 +1615,11 @@ library CadlNormsMulti {
         data.gw[hk] = 0;
         uint256 vv = gpre(g.gen, op.node, 0);
         uint256 nk = gpre(g.gen, op.node, 5);
-        for (; h != 0; h = data.gw[nk | (h - 1)]) recheck(g, op, data, vv, h - 1, h, n, out);
+        // the list first: a window that waits again is put on another
+        // list, which overwrites its link
+        Vec memory ys;
+        for (; h != 0; h = data.gw[nk | (h - 1)]) push(ys, h - 1);
+        for (uint256 k = 0; k < ys.c; k++) recheck(g, op, data, vv, ys.a[k], ys.a[k] + 1, n, out);
     }
 
     /// The window [y, e] of y waits for its last undecided operand.
@@ -1873,6 +1886,7 @@ struct Monitor {
     int256 lastT;
     bool hasLastT;
     bool ended;
+    bool hasGeneral;           // a norm has a content decided per observation (same slot as ended)
     uint256 ignored;           // observations after the end
     bool begun;
     string lc;                 // lifecycle state after the last observation
@@ -1899,7 +1913,7 @@ function setSt(Monitor storage m, uint256 i, uint8 st, uint256 n, int256 t) {
     if (st >= FULFILLED) {
         CadlNormsWindows.clear(m.windows[i]);
         CadlNormsMulti.clear(m.multis[i]);
-        CadlNormsMulti.gclear(m.generals[i]);
+        if (m.hasGeneral) CadlNormsMulti.gclear(m.generals[i]);
     }
 }
 
@@ -2247,7 +2261,7 @@ abstract contract CadlNormsMonitorBase {
         uint256 keep = n > 0 && CadlNormsItems.pending(m.assumeItems, m.assumeRecs, m.guaranteeItems,
                                                        m.guaranteeRecs) ? 0 : n;
         // and the first observation that a General content reads again
-        for (uint256 i = 0; i < m.normDefs.length; i++) {
+        for (uint256 i = 0; m.hasGeneral && i < m.normDefs.length; i++) {
             if (m.normDefs[i].tmode != 3) continue;
             General storage g = m.generals[i];
             if (g.on && g.low < keep) keep = g.low;
@@ -2464,7 +2478,7 @@ abstract contract CadlNormsMonitorBase {
             bool inForce = r.state == ACTIVE || r.state == SUSPENDED;
             if (inForce && r.act == int256(n)) { setSt(m, i, DISCHARGED, n, t); continue; }
             if (inForce && (d.kind == OBLIGATION || d.kind == PROHIBITION)
-                && (CadlNormsWindows.pending(m.windows[i]) || m.multis[i].pend || m.generals[i].pend)) continue;
+                && (CadlNormsWindows.pending(m.windows[i]) || m.multis[i].pend || (m.hasGeneral && m.generals[i].pend))) continue;
             if (inForce && d.kind == OBLIGATION) {
                 if (!d.hasDeadline) { setSt(m, i, VIOLATED, n, t); late[c++] = i; }
                 else if (elapsed(m, i, t) <= d.deadline) setSt(m, i, DISCHARGED, n, t);
@@ -2573,6 +2587,7 @@ abstract contract CadlNormsMonitorBase {
     function _general(uint256 root) internal {
         uint256 i = m.normDefs.length - 1;
         m.normDefs[i].tmode = 3;
+        m.hasGeneral = true;
         m.generals[i].root = root;
         m.generals[i].gen = 1;
     }

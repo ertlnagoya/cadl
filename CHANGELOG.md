@@ -132,7 +132,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   operators in the tree cost 6.7 × 10^6), twelve operators 1.6 × 10^6
   (120th observation); `within(100s, NOT throughout(50s, …) OR …)`,
   whose windows wait for their operands, 5.4 × 10^5 before the 100th
-  second and 7.4 × 10^5 from the 150th on. The first observation of a content with 6, 12, 24 and 48
+  second and 7.4 × 10^5 from the 150th on. An observation costs at most
+  in proportion to the observations of the windows it decides or reads
+  again (`until` reads the windows of its late operand values once per
+  observation, as one range): `until(throughout(60s, …), within(60s, …),
+  60s)` with p decided false at all 61 observations at once costs
+  4.0 × 10^6 gas (7.6 × 10^6 with 120 s windows); six `within(10s, …)`
+  with an observation every 0.01 s and then a gap to t = 100 cost
+  6.7 × 10^6 at that observation after 50 observations and 2.2 × 10^7
+  after 150, and about 200 reach the 3 × 10^7 gas of a block in the
+  tests. `cadl codegen` does not refuse such contents (the bound depends
+  on the trace); a deployment should bound the observations inside a
+  window. The first observation of a content with 6, 12, 24 and 48
   operators (`within(1s, …) OR …`) costs 1.3 × 10^6, 2.2 × 10^6,
   4.1 × 10^6 and 7.7 × 10^6 gas. What limits the size of such a content
   is the deployment: the constructor stores the model, about 5.5 × 10^5
@@ -143,7 +154,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   constructor calls `_general(root)`, then per operator, inner ones
   first, `_gop(mode, node, p, q, d)` and `_gkid(j)` for each operator
   directly inside its operands, and `_gtop(j)` for the operators of the
-  content not inside another.
+  content not inside another; these operators get the node code 13
+  (`OP_GVAL`), whose value `CadlNormsEval.ev` reads from the stored
+  values. The constructor of a monitor without such a content is
+  unchanged; its observations cost 0.03 % to 0.2 % more gas in the tests
+  (the larger dispatch of `CadlNormsMulti` and one flag).
 - tests/test_norms_monitor_targets.py: the sets UNTILN, MIXED and SIX on
   the EVM and on OPA, five boundary traces of `until` (q true deciding
   earlier windows at once, q true after p undefined, also under `NOT`,
@@ -183,8 +198,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   indices.
 
 - The runtime estimates of `CadlNormsMulti`, `CadlNormsEval`,
-  `CadlNormsActs` and the main contract are 15 830, 11 540, 12 190 and
-  17 180 bytes (10 120, 11 440, 12 080 and 16 670).
+  `CadlNormsActs` and the main contract are 16 270, 11 550, 12 200 and
+  17 250 bytes (10 120, 11 440, 12 080 and 16 670).
 
 
 ## [0.3.31] — 2026-11-14
