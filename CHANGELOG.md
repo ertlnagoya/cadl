@@ -4,6 +4,151 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.33] — 2026-11-17
+
+### Added
+
+- Regime bindings at run time (Appendix A, A.7.1, "Runs"): every step of
+  a run is in one regime, a run starts in the initial regime (the first
+  `from:` that is no `to:`, the initial state of `cadl regime-map`), the
+  first transition whose condition holds is taken after the evaluations
+  of a step, and the bindings change with the regime between two steps.
+- `cadl norms-eval` and the norms monitor of the Python target read the
+  key `regime` of an observation (only for a file with a `regimes:`
+  block; the value must be a regime of the file). A contract instance
+  whose contract the current regime does not have in force sees nothing
+  of the observation: messages there do not count, values given there
+  are seen from the next observation in force, and deadlines, the time
+  spent suspended and the intervals of the temporal operators run on the
+  clock of the contract, which stops while it is not in force (F.5,
+  "Contracts not in force"). Reported times are those of the trace. An
+  instance that ends while its contract is not in force is only settled
+  there, on the stopped clock. The monitor gets `in_force`, and
+  `next_deadline()` / `next_check()` are `None` while the contract is not
+  in force. Before the first `regime` key a trace is in the initial
+  regime. A trace that names a regime, or one for a contract that the
+  initial regime does not have in force, cannot also amend the contract.
+- `cadl regime-map` shows the bindings of each regime: a section of the
+  text output, node labels in DOT, and the key `regimes` in JSON (`null`
+  for a block that breaks R-1 to R-6).
+- A transition whose safety invariant does not hold, or cannot be
+  evaluated, is not taken and is reported: the Python controller of a
+  file with `regimes:` checks it explicitly (no `assert`) and records it
+  in `refused_transitions`, and the Solidity `RegimeController` emits
+  `RegimeTransitionRefused`; it records which values were set, per type
+  (`isSetUint`, `isSetBool`),
+  and an invariant that reads a value never set, or that Solidity cannot
+  express (`len(queue)`, an actor field, a text), refuses the transition.
+  The Python controller raises `ValueError` for a name that is not a
+  regime.
+- Solidity: `RegimeController.contractActive(id)`; a contract that some
+  regime suspends takes the controller in its constructor and skips
+  `runMonitorCycle()` while it is not in force, and `ALPHA`, `BETA`,
+  `LAMBDA` of a contract whose value a regime binds are view functions
+  that return the value of the current regime.
+- Rego: each contract policy reads `input.regime` (`regimes`,
+  `regime_error`, `in_force`); a contract that is not in force is allowed
+  and has no violation, `alpha`, `beta`, `lambda_` have the value of the
+  regime, and a missing or unknown regime allows nothing. `main.rego`
+  gives `regimes`, `initial_regime` and `parameters` (undefined without
+  a regime of the file).
+
+### Changed
+
+- `cadl verify`: a pair of contracts that no regime has in force
+  together gets an `info` line also when the two contradict each other
+  (a warning in 0.3.32), since they are never in force at the same step.
+- A.7.1 "Runs" applies to every file with `transitions:`, with or without
+  `regimes:`: the Python regime controller and the Solidity
+  `RegimeController` start in the initial regime of A.7.1 (before: the
+  `from:` of the first transition, and the first regime in alphabetical
+  order), as `cadl regime-map` and `cadl verify` already did. In
+  Solidity one step is one `runMonitorCycle()` of the orchestrator: its
+  deployer (the reporter) alone calls it and sets the observed state
+  (`setUint`, `setBool`, passed to every contract and the controller),
+  and only the orchestrator runs the steps of the contracts and the
+  controller. The bindings (parameter values, contracts in force,
+  `ValueError` for an unknown regime, Rego `input.regime`) apply only to a
+  file with the block.
+- What cannot read the current regime is refused instead of generated
+  without it: the norms monitors of the `opa` and `solidity` targets for
+  a contract that some regime does not have in force (a warning names the
+  regimes; the python target monitors the contract), `cadl codegen -t
+  unity-csharp` for a file in which a regime suspends a contract with
+  `lifecycle:` or `monitors:`, and the boundary policy of the agent
+  governance extension (`agent-rego`, `agent-cedar`, `agents-decide`,
+  `agents-run`, the gateways) for a file in which a regime suspends an
+  enforced contract. For a contract in force in every regime these
+  outputs are those of the file without `regimes:`.
+- A file with transitions and an empty `regimes: {}` counts as a file
+  with the block: its controllers start in the initial regime of A.7.1
+  and its Rego contract policies require `input.regime`.
+- A file without `regimes:` gives the same output as 0.3.32 for every
+  command and target, apart from the generated code of a file with
+  `transitions:` (above and below) and the `opa` corrections below, and a trace
+  without `regime` the same result (checked on all files of `examples/`
+  and `tests/data/`).
+
+### Fixed
+
+- `cadl codegen -t opa`: `all_violations` of `main.rego` assigned `msg`
+  once per contract, so `opa check` rejected the policy of a file with two
+  or more contracts; it is now one rule per contract.
+- `cadl codegen -t opa`: a function call that Rego does not have was
+  written as is, so `opa check` rejected it (`all_routes_conflict_free()`
+  of `examples/robot_delivery.cadl` as an unsafe variable,
+  `length(goal_sequence)` as an undefined function). It is now a value of
+  the input that the host gives: `input.NAME` without arguments,
+  `input.calls["TEXT"]` with them; `count`, `sum`, `max`, `min` and `abs`
+  stay Rego functions. A test runs `opa check` on the output of every
+  example.
+- The generator functions of the Rego and Solidity norms monitors refuse a
+  contract that a regime suspends, as `cadl codegen` already did.
+- `cadl codegen -t python`: the regime controller checked the safety
+  invariant of a transition with `assert`, so a failing invariant raised
+  `AssertionError`, and under `python -O` the transition was taken. In
+  every file it is now checked explicitly: a transition whose invariant
+  does not hold, cannot be evaluated or cannot be compiled is not taken,
+  the regime stays, and the refusal is recorded in `refused_transitions`
+  and the log (A.7.1). `transitions.py` changes for every file with
+  `transitions:`.
+- A transition `condition:` that cannot be evaluated does not hold, and
+  the run goes on: the Python controller raised `KeyError` out of the
+  event loop for a value missing from `ctx.state`, and the Solidity
+  controller read an unset value as 0. Solidity now reads a condition, as
+  an invariant, only with values set (`isSetUint`, `isSetBool`), and a
+  condition it cannot express is `false`.
+- `cadl codegen -t solidity`, a file with `transitions:`: the
+  `RegimeController` did not check the safety invariant, had no setter of
+  the observed state (so a condition read 0), and its
+  `evaluateTransitions()` and the contracts' `runMonitorCycle()` could be
+  called by anyone. It now checks the invariant with the values set and
+  refuses a failing transition (`RegimeTransitionRefused`); the
+  orchestrator sets the state and alone runs the steps.
+- `cadl codegen -t opa`: an `assume:` or `guarantee:` item with a
+  quantifier or a comprehension was written as Rego that OPA rejects
+  (`not` inside an expression, a comprehension as a comment;
+  `tests/data/norms_wildcards_quantified.cadl`) or that ranged over no
+  member. It is now a truth value that the host gives,
+  `input.items["TEXT"] == true`. The `opa check` test covers every file
+  of `examples/` and `tests/data/` that `cadl codegen -t opa` accepts.
+- `cadl codegen -t opa`: `A OR B` in an `assume:` or `guarantee:` item was
+  written as `(A) # OR (B)`, which drops `B`, so a guarantee that held by
+  `B` alone was reported violated; `NOT (A AND B)` was written as
+  `not A; B`. Such an item is now a rule with one body per disjunct of its
+  disjunctive normal form (NOT pushed to the comparisons; more than 64
+  disjuncts: a value the host gives). A text item (an opaque predicate)
+  was a string, which Rego reads as true; it is now
+  `input.items["TEXT"] == true`, as is an item with `IN` or a list, and a
+  text that is an operand of `AND`, `OR` or `NOT`.
+- `cadl codegen -t opa`: a negated literal (`NOT ok`, `NOT (y == 3)`) held
+  when a value it reads was missing, since OPA's `not input.y == 3` holds
+  then. Each input reference is now bound before the negation
+  (`neg_1 := input.y; not neg_1 == 3`), so a negation never holds on a
+  missing value, and `flag != true` and `NOT (flag == true)` agree. A
+  value that the host does not give leaves a guarantee violated and makes
+  an assumption fail.
+
 ## [0.3.32] — 2026-11-16
 
 ### Added

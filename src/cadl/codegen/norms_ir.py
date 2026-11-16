@@ -80,6 +80,23 @@ class NormsTargetUnsupported(ValueError):
         super().__init__("; ".join(self.reasons))
 
 
+def check_regimes(sos: SoSDefinition, contract: ContractDef, target: str) -> None:
+    """Raise `NormsTargetUnsupported` for a contract that some regime of
+    `regimes:` does not have in force (Appendix A, A.7.1): the monitors of
+    the Rego and Solidity targets do not read the current regime, so they
+    could not leave out the observations at which the contract is not in
+    force (F.5)."""
+    if not sos.transitions:
+        return
+    from ..regimes import checked, suspended_somewhere
+    apart = suspended_somewhere(checked(sos), contract.id)
+    if apart:
+        raise NormsTargetUnsupported([
+            f"the regime(s) {', '.join(apart)} do not have the contract in force "
+            f"(regimes:, Appendix A, A.7.1), and the norms monitor of the {target} "
+            f"target does not read the current regime"])
+
+
 def _number(value: float, what: str) -> float:
     if isinstance(value, float) and not math.isfinite(value):
         raise NormsTargetUnsupported([f"{what}: the number {value!r} is not finite"])

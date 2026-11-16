@@ -41,6 +41,7 @@ def generate_unity_csharp(
     Returns the list of files written. Existing files at the target
     paths are overwritten.
     """
+    check_regimes(sos)
     output_dir = Path(output_dir)
     runtime_dir = output_dir / "Runtime"
     generated_dir = output_dir / "Generated"
@@ -70,6 +71,27 @@ def generate_unity_csharp(
     written.append(readme)
 
     return written
+
+
+def check_regimes(sos: SoSDefinition) -> None:
+    """Refuse a file whose regime bindings (`regimes:`, Appendix A, A.7.1)
+    take a generated contract out of force in some regime: the Unity
+    runtime has no regime controller, so the generated code would monitor
+    the contract in every regime. The values a regime binds (alpha, beta,
+    lambda, environment entries) are not part of the generated code."""
+    if not sos.transitions:
+        return
+    from ...regimes import checked, suspended_somewhere
+    bindings = checked(sos)
+    for c in _eligible_contracts(sos):
+        apart = suspended_somewhere(bindings, c.id)
+        if apart:
+            raise ValueError(
+                f"target 'unity-csharp' cannot apply the regime bindings: the regime(s) "
+                f"{', '.join(apart)} do not have the contract '{c.id}' in force (regimes:, "
+                f"Appendix A, A.7.1), and the generated Unity runtime has no regime "
+                f"controller, so it would monitor the contract in every regime; the python "
+                f"target applies the bindings")
 
 
 def _eligible_contracts(sos: SoSDefinition) -> Iterable[ContractDef]:

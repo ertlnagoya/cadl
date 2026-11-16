@@ -138,14 +138,14 @@ class TestRegoExpr:
     def test_unary_not(self):
         expr = UnaryOp("NOT", Identifier("x"))
         result = expr_to_rego(expr)
-        assert result == "not input.x"
+        # 0.3.33: the reference is bound first, so a missing x is not "not x"
+        assert result == "neg_1 := input.x; not neg_1"
 
     def test_unary_not_nested(self):
         inner = BinaryOp("==", Identifier("a"), IntLiteral(0))
         expr = UnaryOp("NOT", inner)
         result = expr_to_rego(expr)
-        assert result.startswith("not ")
-        assert "input.a == 0" in result
+        assert result == "neg_1 := input.a; not neg_1 == 0"
 
     # -- MemberAccess --
 
@@ -162,9 +162,15 @@ class TestRegoExpr:
     # -- FunctionCall --
 
     def test_function_call_no_args(self):
+        # 0.3.33: a value of the input (a bare name is unsafe in OPA)
         expr = FunctionCall(name="all_routes_ok", args=[])
         result = expr_to_rego(expr)
-        assert result == "all_routes_ok"
+        assert result == "input.all_routes_ok"
+
+    def test_function_call_rego_does_not_have(self):
+        # 0.3.33: the host gives the value of the call, keyed by its text
+        expr = FunctionCall(name="length", args=[Identifier("goal_sequence")])
+        assert expr_to_rego(expr) == 'input.calls["length(goal_sequence)"]'
 
     def test_function_call_with_args(self):
         expr = FunctionCall(name="max", args=[IntLiteral(1), IntLiteral(2)])
@@ -494,7 +500,7 @@ class TestRegoGen:
         sos = self._make_sos(contracts=[c1])
         code = generate_main_rego(sos)
         assert "all_violations contains msg if {" in code
-        assert "data.cadl.c1.violation[_]" in code
+        assert "some msg in data.cadl.c1.violation" in code
 
     def test_main_no_contracts_violations(self):
         sos = self._make_sos(contracts=[])

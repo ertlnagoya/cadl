@@ -1295,9 +1295,10 @@ class TestSelfCheck:
     def test_m1_helper_outside_the_copied_region(self):
         sources = _mutated("norms_eval", "# >>> monitor-runtime\n# Numbers are exact", _HELPERS.lstrip("\n") + "# Numbers are exact")
         old = "open_ = norm.deadline is None or elapsed <= norm.deadline"
-        assert sources["norms_eval"].count(old) == 1
+        # the first is in the engine; the part for regimes has a copy
+        assert sources["norms_eval"].count(old) == 2
         sources["norms_eval"] = sources["norms_eval"].replace(
-            old, "open_ = _rv_open(elapsed, norm.deadline)")
+            old, "open_ = _rv_open(elapsed, norm.deadline)", 1)
         self._refused(sources, "does not define: _rv_open")
 
     def test_m2_helper_used_on_a_rare_path(self):

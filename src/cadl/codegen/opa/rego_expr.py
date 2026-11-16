@@ -5,6 +5,8 @@ Analogous to expr_compiler.py (Python) but emits OPA Rego source strings.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import Set
 
@@ -26,11 +28,41 @@ from ...ast_nodes import (
 )
 
 
+# Functions of A.10 predicates that Rego has with the same meaning.
+_REGO_FUNCTIONS = frozenset({"count", "sum", "max", "min", "abs"})
+
+
 @dataclass
 class RegoContext:
     """Compilation context for Rego expression translation."""
     input_prefix: str = "input"
     locals: Set[str] = field(default_factory=set)
+    # counter of the variables that negate_rego binds
+    fresh: int = 0
+
+
+# A reference to the input in generated Rego: input.a.b, input.r[x],
+# input.calls["TEXT"] (the key a JSON string).
+_INPUT_REF_RE = re.compile(r'input(?:\.[A-Za-z_][A-Za-z0-9_]*|\[(?:"(?:[^"\\]|\\.)*"|[^\]"]*)\])+')
+
+
+def negate_rego(literal: str, ctx: RegoContext) -> str:
+    """`not literal`, with every input reference bound to a variable first,
+    so that the negation does not hold when a value is missing (an
+    undefined reference makes the binding, and so the rule body, fail;
+    a bare `not input.y == 3` holds when y is missing). Several literals
+    joined by "; " in one body."""
+    refs: dict = {}
+
+    def bind(m: "re.Match") -> str:
+        ref = m.group(0)
+        if ref not in refs:
+            ctx.fresh += 1
+            refs[ref] = f"neg_{ctx.fresh}"
+        return refs[ref]
+    body = _INPUT_REF_RE.sub(bind, literal)
+    binds = [f"{var} := {ref}" for ref, var in refs.items()]
+    return "; ".join(binds + [f"not {body}"])
 
 
 def expr_to_rego(expr: Expression, ctx: RegoContext | None = None) -> str:
@@ -83,9 +115,21 @@ def expr_to_rego(expr: Expression, ctx: RegoContext | None = None) -> str:
 
     if isinstance(expr, FunctionCall):
         args = ", ".join(expr_to_rego(a, ctx) for a in expr.args)
-        if args:
+        if args and expr.name in _REGO_FUNCTIONS:
             return f"{expr.name}({args})"
-        return f"{expr.name}"
+        if args:
+            # A function that Rego does not have (`length(goal_sequence)`,
+            # `collision_resolved_within(30s)`): the host gives the value of
+            # the call, keyed by its text. Up to 0.3.32 the call was written
+            # as is, which OPA rejects as an undefined function.
+            import json
+            from ...unparse import expr_to_source
+            return f"{ctx.input_prefix}.calls[{json.dumps(expr_to_source(expr))}]"
+        # A function without arguments that A.10 does not define, such as
+        # all_routes_conflict_free(): a value the host gives in the input, as
+        # for a name. Up to 0.3.32 it was written as a bare variable, which
+        # OPA rejects as unsafe.
+        return f"{ctx.input_prefix}.{expr.name}"
 
     if isinstance(expr, BinaryOp):
         left = expr_to_rego(expr.left, ctx)
@@ -116,8 +160,7 @@ def expr_to_rego(expr: Expression, ctx: RegoContext | None = None) -> str:
 
     if isinstance(expr, UnaryOp):
         if expr.op == "NOT":
-            operand = expr_to_rego(expr.operand, ctx)
-            return f"not {operand}"
+            return negate_rego(expr_to_rego(expr.operand, ctx), ctx)
         operand = expr_to_rego(expr.operand, ctx)
         return f"{expr.op} {operand}"
 

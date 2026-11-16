@@ -33,32 +33,81 @@ def generate_solidity(sos: SoSDefinition, output_dir: Path) -> None:
     with declared_actors(a.id.name for a in sos.actors):
         # Generate a contract for each ContractDef
         for contract in sos.contracts:
-            code = generate_contract_sol(contract, sos)
+            code = generate_contract_sol(contract, sos, _bindings(sos))
             filename = f"{sanitize_id(contract.id)}.sol"
             (output_dir / filename).write_text(code, encoding="utf-8")
 
         # Generate regime controller if transitions exist
         if sos.transitions:
-            code = generate_regime_sol(sos)
+            code = generate_regime_sol(sos, _bindings(sos))
             (output_dir / "RegimeController.sol").write_text(code, encoding="utf-8")
 
         # Generate main orchestrator
-        code = generate_main_sol(sos)
+        code = generate_main_sol(sos, _bindings(sos))
         (output_dir / f"{sanitize_id(sos.name)}.sol").write_text(code, encoding="utf-8")
 
 
-def generate_contract_sol(contract: ContractDef, sos: SoSDefinition) -> str:
-    """Generate a Solidity contract for a CADL ContractDef."""
+def _bindings(sos: SoSDefinition) -> list | None:
+    """The regime bindings of `regimes:` (Appendix A, A.7.1), or None for a
+    file without the block or without transitions: the code is then the
+    same as before the block existed."""
+    if not sos.transitions:
+        return None
+    from ...regimes import checked
+    return checked(sos)
+
+
+def _bound_institutional(contract: ContractDef, bindings: list | None) -> dict:
+    """attr ("alpha", "beta", "lambda") -> {regime: value} for each value of
+    the contract that some regime binds."""
+    out: dict = {}
+    for b in bindings or []:
+        for key, value in b.parameters.items():
+            owner, attr = key.split(".", 1)
+            if owner == contract.id:
+                out.setdefault(attr, {})[b.name] = value
+    return out
+
+
+def _needs_controller(contract: ContractDef, bindings: list | None) -> bool:
+    """Whether the Solidity contract reads the regime controller: some regime
+    does not have it in force or binds one of its values."""
+    if bindings is None:
+        return False
+    return (any(contract.id not in b.active for b in bindings)
+            or bool(_bound_institutional(contract, bindings)))
+
+
+def generate_contract_sol(contract: ContractDef, sos: SoSDefinition,
+                          bindings: list | None = None) -> str:
+    """Generate a Solidity contract for a CADL ContractDef. With the regime
+    bindings of `regimes:` (A.7.1), a contract that some regime does not
+    have in force, or whose value some regime binds, reads the regime
+    controller it is given in its constructor."""
     name = sanitize_id(contract.id)
     ctx = SolidityContext()
+    regimed = _needs_controller(contract, bindings)
+    bound = _bound_institutional(contract, bindings) if regimed else {}
+    stepped = bool(sos.transitions)     # a step is one call of the orchestrator (A.7.1)
 
     lines: list[str] = []
     lines.append("// SPDX-License-Identifier: Apache-2.0")
     lines.append(f"// Generated from CADL contract: {contract.id}")
     lines.append("pragma solidity ^0.8.20;")
     lines.append("")
+    if regimed:
+        lines.append('import "./RegimeController.sol";')
+        lines.append("")
     lines.append(f"contract {name} {{")
     lines.append("")
+    if regimed:
+        lines.append("    // The regime controller: the bindings of the current regime apply")
+        lines.append("    // (regimes:, Appendix A, A.7.1)")
+        lines.append("    RegimeController public regimeController;")
+        lines.append("")
+    if stepped:
+        _orchestrated(lines, "RegimeController controller" if regimed else "",
+                      "regimeController = controller;" if regimed else None)
 
     # Party addresses
     for party in contract.parties:
@@ -79,14 +128,23 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition) -> str:
 
     # Institutional parameters
     if contract.authority and contract.authority.beta is not None:
-        beta_scaled = int(contract.authority.beta * 1000)
-        lines.append(f"    uint256 public constant BETA = {beta_scaled}; // {contract.authority.beta} * 1000")
+        if "beta" in bound:
+            _regime_value(lines, "BETA", contract.authority.beta, bound["beta"])
+        else:
+            beta_scaled = int(contract.authority.beta * 1000)
+            lines.append(f"    uint256 public constant BETA = {beta_scaled}; // {contract.authority.beta} * 1000")
     if contract.information and contract.information.alpha is not None:
-        alpha_scaled = int(contract.information.alpha * 1000)
-        lines.append(f"    uint256 public constant ALPHA = {alpha_scaled}; // {contract.information.alpha} * 1000")
+        if "alpha" in bound:
+            _regime_value(lines, "ALPHA", contract.information.alpha, bound["alpha"])
+        else:
+            alpha_scaled = int(contract.information.alpha * 1000)
+            lines.append(f"    uint256 public constant ALPHA = {alpha_scaled}; // {contract.information.alpha} * 1000")
     if contract.incentives and contract.incentives.lambda_ is not None:
-        lambda_scaled = int(contract.incentives.lambda_ * 1000)
-        lines.append(f"    uint256 public constant LAMBDA = {lambda_scaled}; // {contract.incentives.lambda_} * 1000")
+        if "lambda" in bound:
+            _regime_value(lines, "LAMBDA", contract.incentives.lambda_, bound["lambda"])
+        else:
+            lambda_scaled = int(contract.incentives.lambda_ * 1000)
+            lines.append(f"    uint256 public constant LAMBDA = {lambda_scaled}; // {contract.incentives.lambda_} * 1000")
     lines.append("")
 
     # Events
@@ -126,7 +184,11 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition) -> str:
     lines.append("")
 
     # runMonitorCycle
-    lines.append("    function runMonitorCycle() public {")
+    lines.append("    function runMonitorCycle() public {" if not stepped
+                 else "    function runMonitorCycle() public onlyOrchestrator {")
+    if regimed and any(contract.id not in b.active for b in bindings):
+        lines.append("        // not checked in a regime that does not have the contract in force")
+        lines.append(f'        if (!regimeController.contractActive("{contract.id}")) return;')
     lines.append("        if (checkAssumptions() && !checkGuarantees()) {")
     lines.append(f'            emit ViolationDetected("{contract.id}", "Guarantee violated");')
     lines.append("            violationCount++;")
@@ -162,8 +224,68 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition) -> str:
     return "\n".join(lines)
 
 
-def generate_regime_sol(sos: SoSDefinition) -> str:
-    """Generate a Solidity contract for regime transitions."""
+def _orchestrated(lines: list, params: str, init: str | None, track: bool = False) -> None:
+    """With regime bindings (A.7.1) one step of a run is one call of the
+    orchestrator: the contract it deploys is driven only by it, and it
+    sets the observed state that the predicates read."""
+    lines.append("    // Only the orchestrator that deploys this contract runs its step and")
+    lines.append("    // sets the observed state (Appendix A, A.7.1)")
+    lines.append("    address public orchestrator;")
+    lines.append("")
+    lines.append("    modifier onlyOrchestrator() {")
+    lines.append('        require(msg.sender == orchestrator, "only the orchestrator");')
+    lines.append("        _;")
+    lines.append("    }")
+    lines.append("")
+    lines.append(f"    constructor({params}) {{")
+    lines.append("        orchestrator = msg.sender;")
+    if init:
+        lines.append(f"        {init}")
+    lines.append("    }")
+    lines.append("")
+    if track:
+        lines.append("    // Whether a value was set, per type: a safety invariant that reads a")
+        lines.append("    // value never set cannot be evaluated, and its transition is refused (A.7.1)")
+        lines.append("    mapping(string => bool) public isSetUint;")
+        lines.append("    mapping(string => bool) public isSetBool;")
+        lines.append("")
+    lines.append("    function setUint(string calldata key, uint256 value) external onlyOrchestrator {")
+    lines.append("        stateUint[key] = value;")
+    if track:
+        lines.append("        isSetUint[key] = true;")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    function setBool(string calldata key, bool value) external onlyOrchestrator {")
+    lines.append("        stateBool[key] = value;")
+    if track:
+        lines.append("        isSetBool[key] = true;")
+    lines.append("    }")
+    lines.append("")
+
+
+def _hex_string(text: str) -> str:
+    """A text of the file as a Solidity hex literal (no text is code)."""
+    return f'string(hex"{text.encode("utf-8").hex()}")'
+
+
+def _regime_value(lines: list, name: str, declared: float, per_regime: dict) -> None:
+    """A value of the contract that some regime binds, as a view function
+    with the name of the constant it replaces (same getter)."""
+    lines.append(f"    // {name} in the current regime (regimes:, Appendix A, A.7.1), * 1000;")
+    lines.append(f"    // declared {declared}")
+    lines.append(f"    function {name}() public view returns (uint256) {{")
+    lines.append("        RegimeController.Regime r = regimeController.currentRegime();")
+    for regime, value in per_regime.items():
+        lines.append(f"        if (r == RegimeController.Regime.{sanitize_id(regime)}) "
+                     f"return {int(value * 1000)}; // {value} * 1000")
+    lines.append(f"        return {int(declared * 1000)}; // {declared} * 1000")
+    lines.append("    }")
+
+
+def generate_regime_sol(sos: SoSDefinition, bindings: list | None = None) -> str:
+    """Generate a Solidity contract for regime transitions. With the regime
+    bindings of `regimes:` (A.7.1) it starts in the initial regime and
+    answers which contracts are in force."""
     regimes = sorted({t.from_regime for t in sos.transitions} | {t.to_regime for t in sos.transitions})
     ctx = SolidityContext()
 
@@ -182,11 +304,15 @@ def generate_regime_sol(sos: SoSDefinition) -> str:
         lines.append(f"        {sanitize_id(r)}{comma}")
     lines.append("    }")
     lines.append("")
-    lines.append(f"    Regime public currentRegime = Regime.{sanitize_id(regimes[0])};")
+    from ...regimes import initial_regime
+    lines.append("    // The initial regime (Appendix A, A.7.1)")
+    lines.append(f"    Regime public currentRegime = Regime.{sanitize_id(initial_regime(sos))};")
     lines.append("")
 
     # Events
     lines.append("    event RegimeTransition(Regime from_, Regime to_);")
+    lines.append("    // a transition whose safety invariant does not hold is not taken (A.7.1)")
+    lines.append("    event RegimeTransitionRefused(Regime from_, Regime to_, string invariant);")
     lines.append("")
 
     # State for conditions
@@ -194,22 +320,32 @@ def generate_regime_sol(sos: SoSDefinition) -> str:
     lines.append("    mapping(string => bool) public stateBool;")
     lines.append("")
 
-    # evaluateTransitions
-    lines.append("    function evaluateTransitions() public {")
-    for t in sos.transitions:
-        from_id = sanitize_id(t.from_regime)
-        to_id = sanitize_id(t.to_regime)
-        if t.condition:
-            cond = _compile_condition(t.condition, ctx)
-            lines.append(f"        if (currentRegime == Regime.{from_id} && ({cond})) {{")
-        else:
-            lines.append(f"        if (currentRegime == Regime.{from_id}) {{")
-        lines.append(f"            emit RegimeTransition(currentRegime, Regime.{to_id});")
-        lines.append(f"            currentRegime = Regime.{to_id};")
-        lines.append("            return;")
-        lines.append("        }")
-    lines.append("    }")
-    lines.append("")
+    if sos.transitions:          # A.7.1, "Runs": every file with transitions
+        _orchestrated(lines, "", None, track=True)
+        lines.append("    function evaluateTransitions() public onlyOrchestrator {")
+        for t in sos.transitions:
+            from_id = sanitize_id(t.from_regime)
+            to_id = sanitize_id(t.to_regime)
+            if t.condition:
+                # as an invariant: only with values set, `false` when inexpressible
+                cond = _compile_invariant(t.condition, ctx)
+                lines.append(f"        if (currentRegime == Regime.{from_id} && ({cond})) {{")
+            else:
+                lines.append(f"        if (currentRegime == Regime.{from_id}) {{")
+            if t.safety_invariant:
+                inv = _compile_invariant(t.safety_invariant, ctx)
+                lines.append(f"            // safety_invariant: {_comment(t.safety_invariant)}")
+                lines.append(f"            if (!({inv})) {{")
+                lines.append(f"                emit RegimeTransitionRefused(currentRegime, Regime.{to_id}, "
+                             f"{_hex_string(t.safety_invariant)});")
+                lines.append("                return;")
+                lines.append("            }")
+            lines.append(f"            emit RegimeTransition(currentRegime, Regime.{to_id});")
+            lines.append(f"            currentRegime = Regime.{to_id};")
+            lines.append("            return;")
+            lines.append("        }")
+        lines.append("    }")
+        lines.append("")
 
     # getCurrentRegime
     lines.append("    function getCurrentRegime() public view returns (Regime) {")
@@ -217,12 +353,26 @@ def generate_regime_sol(sos: SoSDefinition) -> str:
     lines.append("    }")
     lines.append("")
 
+    if bindings is not None:
+        lines.append("    /// Whether a contract is in force in the current regime (regimes:,")
+        lines.append("    /// Appendix A, A.7.1).")
+        lines.append("    function contractActive(string memory contractId) public view returns (bool) {")
+        lines.append("        bytes32 h = keccak256(bytes(contractId));")
+        for b in bindings:
+            if not b.suspended:
+                continue
+            ids = " || ".join(f'h == keccak256("{c}")' for c in b.suspended)
+            lines.append(f"        if (currentRegime == Regime.{sanitize_id(b.name)}) return !({ids});")
+        lines.append("        return true;")
+        lines.append("    }")
+        lines.append("")
+
     lines.append("}")
     lines.append("")
     return "\n".join(lines)
 
 
-def generate_main_sol(sos: SoSDefinition) -> str:
+def generate_main_sol(sos: SoSDefinition, bindings: list | None = None) -> str:
     """Generate the main orchestrator Solidity contract."""
     name = sanitize_id(sos.name)
 
@@ -252,19 +402,44 @@ def generate_main_sol(sos: SoSDefinition) -> str:
         lines.append("    RegimeController public regimeController;")
     lines.append("")
 
+    if sos.transitions:
+        lines.append("    // One step of a run (Appendix A, A.7.1) is one call of runMonitorCycle()")
+        lines.append("    // by the reporter, the deployer; it also sets the observed state.")
+        lines.append("    address public reporter;")
+        lines.append("")
+        lines.append("    modifier onlyReporter() {")
+        lines.append('        require(msg.sender == reporter, "only the reporter");')
+        lines.append("        _;")
+        lines.append("    }")
+        lines.append("")
+
     # Constructor
     lines.append("    constructor() {")
+    if sos.transitions:
+        lines.append("        reporter = msg.sender;")
+        # the controller first: the contracts that read it get it
+        lines.append("        regimeController = new RegimeController();")
     for contract in sos.contracts:
         cname = sanitize_id(contract.id)
         var_name = snake_case(contract.id)
-        lines.append(f"        {var_name} = new {cname}();")
-    if sos.transitions:
-        lines.append("        regimeController = new RegimeController();")
+        arg = "regimeController" if _needs_controller(contract, bindings) else ""
+        lines.append(f"        {var_name} = new {cname}({arg});")
     lines.append("    }")
     lines.append("")
 
+    if sos.transitions:
+        for fn, typ in (("setUint", "uint256"), ("setBool", "bool")):
+            lines.append(f"    /// The observed value of a quantity, for every contract and the controller")
+            lines.append(f"    function {fn}(string calldata key, {typ} value) external onlyReporter {{")
+            for contract in sos.contracts:
+                lines.append(f"        {snake_case(contract.id)}.{fn}(key, value);")
+            lines.append(f"        regimeController.{fn}(key, value);")
+            lines.append("    }")
+            lines.append("")
+
     # runMonitorCycle
-    lines.append("    function runMonitorCycle() public {")
+    lines.append("    function runMonitorCycle() public {" if not sos.transitions
+                 else "    function runMonitorCycle() public onlyReporter {")
     for contract in sos.contracts:
         var_name = snake_case(contract.id)
         lines.append(f"        {var_name}.runMonitorCycle();")
@@ -283,17 +458,53 @@ def _compile_predicate(expr: Expression, ctx: SolidityContext) -> str:
     return predicate_to_solidity(expr, ctx)
 
 
-def _compile_condition(cond_str: str, ctx: SolidityContext) -> str:
-    """Compile a condition string to Solidity."""
+def _compile_invariant(text: str, ctx: SolidityContext) -> str:
+    """A safety invariant, or a transition condition, in Solidity: true only
+    when every value it reads
+    was set (`isSet`); `false` when it uses what the observed state of the
+    controller cannot give (a function such as `len(queue)`, an actor
+    field, a text, a fraction), so that the transition is refused rather
+    than taken unchecked, as in the Python target (A.7.1). A bare name
+    (`Idle` in `mode == Idle`) is a quantity of the observed state in both
+    targets."""
     from ...parser import parse_expr
     try:
-        expr = parse_expr(cond_str)
-        return predicate_to_solidity(expr, ctx)
+        expr = parse_expr(text)
+        names: list = []
+        if not _state_only(expr, ctx, names):
+            return "false"
+        compiled = predicate_to_solidity(expr, ctx)
     except Exception:
-        # Fallback: use as boolean state variable
-        sanitized = cond_str.replace(" ", "_").replace(".", "_")[:40]
-        sanitized = "".join(c for c in sanitized if c.isalnum() or c == "_")
-        return f"stateBool[\"{sanitized}\"]"
+        return "false"
+    import re
+    # each value read is guarded by the flag of its own type
+    reads = re.findall(r'state(Uint|Bool)\["([A-Za-z_][A-Za-z0-9_]*)"\]', compiled)
+    guards = [f'isSet{kind}["{name}"]' for kind, name in dict.fromkeys(reads)]
+    return " && ".join(guards + [f"({compiled})"])
+
+
+_INVARIANT_OPS = {"==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "AND", "OR"}
+
+
+def _state_only(expr, ctx: SolidityContext, names: list) -> bool:
+    """Whether an invariant reads only the observed state of the controller
+    (names it collects) with integers, booleans and the operators of A.10."""
+    from ...ast_nodes import ActorRef, BinaryOp, BoolLiteral, IntLiteral, UnaryOp
+    from .solidity_expr import _is_state_name
+    if isinstance(expr, (BoolLiteral, IntLiteral)):
+        return True
+    if isinstance(expr, ActorRef) and _is_state_name(expr, ctx):
+        names.append(expr.name)
+        return True
+    if isinstance(expr, UnaryOp) and expr.op == "NOT":
+        return _state_only(expr.operand, ctx, names)
+    if isinstance(expr, BinaryOp) and expr.op in _INVARIANT_OPS:
+        return _state_only(expr.left, ctx, names) and _state_only(expr.right, ctx, names)
+    return False
+
+
+def _comment(text: str) -> str:
+    return " ".join(text.split()).replace("*/", "* /")
 
 
 def _predicate_label(expr: Expression) -> str:

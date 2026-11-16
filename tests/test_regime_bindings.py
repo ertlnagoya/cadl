@@ -252,14 +252,18 @@ class TestRegimeBindingsUse(unittest.TestCase):
         self.assertNotIn("regimes", json.loads(generate_config(plain, "go")))
         self.assertNotIn("regimeBindings", json.loads(generate_config(plain, "unity")))
 
-    def test_verify_warns_for_pairs_apart_under_bindings(self):
+    def test_verify_info_for_conflicting_pair_apart(self):
+        # 0.3.33: every step of a run has the bindings of one regime (A.7.1),
+        # so a conflict of a pair that no regime has in force is not a failure
         results = {r.check_name: r for r in verify(parse(GOOD))}
         pair = results["Cross-contract 'BAY_ASSIGNMENT' x 'FREE_PASSAGE'"]
-        self.assertEqual(pair.status, "warning")
+        self.assertEqual(pair.status, "info")
+        self.assertIn("contradictory when combined", pair.message)
         self.assertIn("under the regime bindings of A.7.1", pair.message)
         self.assertIn("'BAY_ASSIGNMENT' is in force in CENTRALIZED", pair.message)
         self.assertIn("'FREE_PASSAGE' in DISTRIBUTED", pair.message)
-        self.assertIn("[WARN]", str(pair))
+        self.assertIn("never in force at the same step", pair.message)
+        self.assertIn("[INFO]", str(pair))
         self.assertEqual(results["Cross-contract 'ROUTING' x 'BAY_ASSIGNMENT'"].status, "passed")
         # without the block the contradictory pair is checked and fails
         plain = {r.check_name: r for r in verify(parse(BASE))}
@@ -290,9 +294,9 @@ class TestRegimeBindingsUse(unittest.TestCase):
                            "suspended: [BAY_ASSIGNMENT, FREE_PASSAGE]")
         results = {r.check_name: r for r in verify(parse(src))}
         pair = results["Cross-contract 'BAY_ASSIGNMENT' x 'FREE_PASSAGE'"]
-        self.assertEqual(pair.status, "warning")
+        self.assertEqual(pair.status, "info")
         self.assertIn("'FREE_PASSAGE' is in force in no regime", pair.message)
-        self.assertNotIn("both may be in force", pair.message)
+        self.assertNotIn("never in force at the same step", pair.message)
 
     def test_verify_empty_block_without_transitions_checks_all_pairs(self):
         src = textwrap.dedent("""\

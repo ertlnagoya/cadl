@@ -429,6 +429,7 @@ def build_policy(sos: SoSDefinition) -> dict:
             "the file does not declare the agent governance extension: add "
             "'norms: 0.1' and 'agents: 0.1' under extensions: (Appendix G)"
         )
+    _refuse_regimes(sos)
     contracts = []
     for c in sos.contracts:
         if c.enforcement is None:
@@ -485,6 +486,25 @@ def build_policy(sos: SoSDefinition) -> dict:
         "actors": {a.id.name: _actor_entry(a) for a in sos.actors},
         "contracts": contracts,
     }
+
+
+def _refuse_regimes(sos: SoSDefinition) -> None:
+    """The boundary policy does not read the current regime. A file whose
+    regime bindings (`regimes:`, Appendix A, A.7.1) take an enforced
+    contract out of force in some regime is refused: the policy would
+    enforce the contract in every regime."""
+    if not sos.transitions:
+        return
+    from .regimes import checked, suspended_somewhere
+    bindings = checked(sos)
+    for c in sos.contracts:
+        apart = suspended_somewhere(bindings, c.id) if c.enforcement is not None else []
+        if apart:
+            raise ValueError(
+                f"the boundary policy cannot apply the regime bindings: the regime(s) "
+                f"{', '.join(apart)} do not have the enforced contract '{c.id}' in force "
+                f"(regimes:, Appendix A, A.7.1), and the policy does not read the current "
+                f"regime, so it would enforce the contract in every regime")
 
 
 def _party_ref(ref) -> dict:

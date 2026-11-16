@@ -189,6 +189,8 @@ def generate_norms_monitor_rego(sos: SoSDefinition, contract: ContractDef) -> st
     """The Rego text of the monitor of one contract. Raises
     `NormsTargetUnsupported` for a contract that cannot be monitored."""
     check_contract_id(contract.id)
+    from ..norms_ir import check_regimes
+    check_regimes(sos, contract, 'opa')
     ir = rego_ir(sos, contract)
     model = rego_model(ir)
     nodes = ir["exprs"]

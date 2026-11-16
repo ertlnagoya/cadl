@@ -75,11 +75,12 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
     file that declares norms 0.1 (Appendix F, F.5; Appendix D), one entry
     per contract: ``{"contract", "file", "text", "reasons", "left_out"}``.
     ``text`` is None when the contract cannot be monitored (``reasons``
-    says why); ``left_out`` lists the (key, position, text, reason) of the
+    says why), also when a regime of `regimes:` does not have the contract
+    in force (A.7.1); ``left_out`` lists the (key, position, text, reason) of the
     items the monitor leaves out. An empty list for other files and
     targets."""
     from ..norms import norms_declared
-    from .norms_ir import NormsTargetUnsupported, build_ir, unsupported_items
+    from .norms_ir import NormsTargetUnsupported, build_ir, check_regimes, unsupported_items
     if target not in ("opa", "solidity") or not norms_declared(sos):
         return []
     ir_of = build_ir
@@ -97,6 +98,8 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
         entry = {"contract": contract.id, "file": monitor_filename(contract.id),
                  "text": None, "reasons": [], "left_out": []}
         try:
+            # first: a contract that a regime does not have in force (A.7.1)
+            check_regimes(sos, contract, target)
             ir = ir_of(sos, contract)
             entry["left_out"] = unsupported_items(ir)
             entry["text"] = gen(sos, contract)
@@ -178,14 +181,15 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
         if sos.protocols:
             _write(output_dir / "protocols.py", generate_protocols_module(sos.protocols))
 
-        from ..regimes import checked as checked_regimes, declared_value
+        from ..regimes import checked as checked_regimes, declared_value, initial_regime
         bindings = checked_regimes(sos)
         declared_params = {
             key: declared_value(sos, key)
             for b in (bindings or []) for key in b.parameters
         }
         _write(output_dir / "transitions.py",
-               generate_transitions_module(sos.transitions, bindings, declared_params))
+               generate_transitions_module(sos.transitions, bindings, declared_params,
+                                           initial_regime(sos)))
         _write(output_dir / "metrics.py", generate_metrics_module(sos.metrics))
         _write(output_dir / "runtime.py", generate_runtime_module(sos))
 

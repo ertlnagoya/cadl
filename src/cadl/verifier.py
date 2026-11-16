@@ -400,8 +400,10 @@ def _apart_under_bindings(
     result: VerificationResult, bindings: list, id1: str, id2: str,
 ) -> VerificationResult:
     """The result for a pair of contracts that no regime has in force
-    together under the regime bindings of A.7.1: a conflict is a warning,
-    a satisfiable pair an info line, and an undecided pair stays unknown."""
+    together under the regime bindings of A.7.1. Every step of a run has
+    the bindings of one regime (A.7.1, "Runs"), so the two are never in
+    force at the same step: a conflict between them is an info line, as is
+    a satisfiable pair, and an undecided pair stays unknown."""
     def regimes_of(cid: str) -> list:
         return [b.name for b in bindings if cid in b.active]
     where = {cid: regimes_of(cid) for cid in (id1, id2)}
@@ -411,16 +413,16 @@ def _apart_under_bindings(
     if result.status == "failed":
         idle = [cid for cid in (id1, id2) if not where[cid]]
         if idle:
-            reason = (f"a warning, not a failure, since "
+            reason = (f"not a failure, since "
                       f"{' and '.join(repr(c) for c in idle)} "
                       f"{'is' if len(idle) == 1 else 'are'} in force in no regime and "
                       f"so never holds")
         else:
-            reason = ("a warning, not a failure, since A.7.1 leaves open at which step "
-                      "of a transition the bindings switch, so both may be in force then")
+            reason = ("not a failure, since every step of a run has the bindings of one "
+                      "regime (A.7.1), so the two are never in force at the same step")
         return VerificationResult(
             check_name=result.check_name,
-            status="warning",
+            status="info",
             message=f"Contracts are contradictory when combined ({note}; {reason})",
             counterexample=result.counterexample,
         )
@@ -926,9 +928,10 @@ def verify(sos: SoSDefinition) -> List[VerificationResult]:
 
     # 2. Check cross-contract consistency for contracts sharing parties.
     # With `regimes:` (Appendix A, A.7.1), a pair that no regime has in force
-    # together is still checked, but a conflict is a warning: the bindings
-    # do not say at which step of a transition they switch. A file without
-    # regimes has every contract in force at all times.
+    # together is still checked, but a conflict is an info line: every step
+    # of a run has the bindings of one regime, so the two are never in force
+    # at the same step. A file without regimes has every contract in force
+    # at all times.
     from .regimes import checked as checked_regimes, co_active
     bindings = checked_regimes(sos) or None
     for c1, c2 in combinations(contracts, 2):
