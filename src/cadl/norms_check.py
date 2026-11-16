@@ -5787,6 +5787,29 @@ def _build_model(sos: SoSDefinition, contract_id, bindings, members, step, horiz
     return NormsModel(tr)
 
 
+def _check_transitional(name: str, vs: SoSDefinition, contract_id: str) -> None:
+    """The model amends every instance at one observation, which is the
+    rule `switch` without `in_states:` of the amendment extension; refuse a
+    version whose transitional rule for the contract is another (Appendix
+    K, K.11). A file without the extension switches (F.6)."""
+    from .amendment import amendment_declared, analyse
+    raw = getattr(vs, "amendment", None)
+    if not amendment_declared(vs) or raw is None or not raw.has_block:
+        return
+    a = analyse(vs)
+    rule, states = a.transitional.get(contract_id, (a.transitional_default, []))
+    if rule == "keep":
+        raise NormsCheckError(
+            f"--version {name}: its transitional rule for {contract_id} is keep, so a running "
+            f"instance is not amended (Appendix K, K.4); the model amends every instance, so "
+            f"check each version on its own instead")
+    if states:
+        raise NormsCheckError(
+            f"--version {name}: its transitional rule for {contract_id} switches only in the "
+            f"states {', '.join(states)} (in_states, Appendix K, K.4); the model amends every "
+            f"instance at any observation, which norms-check does not restrict to these states")
+
+
 def _version_translators(tr: Translator, sos: SoSDefinition, contract: ContractDef,
                          versions: list, bindings: dict, members: dict, step_ms, horizon,
                          domains) -> list:
@@ -5810,6 +5833,7 @@ def _version_translators(tr: Translator, sos: SoSDefinition, contract: ContractD
         new = next((c for c in vs.contracts if c.id == contract.id), None)
         if new is None:
             raise NormsCheckError(f"--version {name}: it has no contract {contract.id}")
+        _check_transitional(name, vs, contract.id)
         if declared_actors(vs) != declared_actors(prev):
             raise NormsCheckError(f"--version {name}: the actors differ from the previous "
                                   f"version; amendments are translated only between versions "

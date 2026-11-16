@@ -97,6 +97,46 @@ def check_regimes(sos: SoSDefinition, contract: ContractDef, target: str) -> Non
             f"target does not read the current regime"])
 
 
+def switching_contracts(sos: SoSDefinition) -> dict:
+    """The contracts whose running instances switch to this version when it
+    takes effect (Appendix K, K.4 and K.11), with their rule: empty unless
+    the file declares amendment 0.1 and names the version it replaces
+    (`previous:`), since only then can an instance be running under
+    another version."""
+    from ..amendment import amendment_declared, analyse
+    raw = getattr(sos, "amendment", None)
+    if not amendment_declared(sos) or raw is None or not raw.has_block:
+        return {}
+    a = analyse(sos)
+    if a.previous is None:
+        return {}
+    out = {}
+    for c in sos.contracts:
+        rule, states = a.transitional.get(c.id, (a.transitional_default, []))
+        if rule == "switch":
+            out[c.id] = (f"switch in {', '.join(states)}" if states else "switch")
+    return out
+
+
+def check_versions(sos: SoSDefinition, contract: ContractDef, target: str) -> None:
+    """Raise `NormsTargetUnsupported` for a contract whose running instances
+    switch to this version (Appendix K, K.11): the monitors of the Rego and
+    Solidity targets do not apply amendments (F.6), so they could not take
+    over an instance that started under the version this one replaces."""
+    rule = switching_contracts(sos).get(contract.id)
+    if rule is not None:
+        raise NormsTargetUnsupported([
+            f"this version replaces version {_previous(sos)} and its transitional rule for "
+            f"{contract.id} is {rule} (Appendix K, K.4), and the norms monitor of the "
+            f"{target} target cannot take over a running instance of the old version "
+            f"(it does not apply amendments, F.6); the python target does (K.11)"])
+
+
+def _previous(sos: SoSDefinition) -> str:
+    from ..amendment import analyse
+    return str(analyse(sos).previous)
+
+
 def _number(value: float, what: str) -> float:
     if isinstance(value, float) and not math.isfinite(value):
         raise NormsTargetUnsupported([f"{what}: the number {value!r} is not finite"])

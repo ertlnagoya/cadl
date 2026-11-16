@@ -3054,6 +3054,449 @@ def run_regime_trace(contract: ContractDef, trace: Trace, bindings: RegimeBindin
 # <<< monitor-regimes
 
 
+# >>> monitor-versions
+# === Versions while a system runs (Appendix K, K.11) =======================
+#
+# The versions of a run are files that declare `amendment: 0.1` and form one
+# sequence by `previous:`. The version in force at an observation is given
+# by the effective times on a time base (the length of a period and the
+# time at which period 1 starts, or time stamps in seconds since
+# 1970-01-01T00:00:00Z), or named by the observation with the key
+# ``version``, or both, and then they must agree. A contract instance
+# follows the version in force at its first observation; when a version
+# takes effect, the instance follows the transitional rule of its contract
+# in that version: `keep` leaves it as it is, `switch` amends it (F.6) at
+# that observation, and `switch` with `in_states:` at the first observation
+# at which its state is one of them. The amendment itself is the one of
+# `_Engine._amend`. The norms monitor of the Python target contains this
+# part only when the file declares `amendment: 0.1` with an `amendment:`
+# block.
+
+VERSION_KEY = "version"
+_VERSIONS_NO_AMEND = (
+    "a run with versions cannot also amend the contract with 'amend': the transitional "
+    "rules decide when an instance is amended (Appendix K, K.11)")
+_VERSIONS_NO_REGIMES = (
+    "versions cannot be applied to a run that names a regime ('regime') or whose initial "
+    "regime does not have the contract in force: Appendix K, K.11 does not settle how "
+    "versions and regime bindings combine")
+
+
+def _version_label(name: str) -> str:
+    return f"version {name}"
+
+
+def _epoch_seconds(text: str) -> Fraction:
+    """An ISO 8601 date or date-time as exact seconds since
+    1970-01-01T00:00:00Z; a date is 00:00 UTC, a date-time without an
+    offset is UTC (K.4)."""
+    import datetime as _dt
+    try:
+        t = _dt.datetime.fromisoformat(text)
+    except ValueError:
+        t = _dt.datetime.combine(_dt.date.fromisoformat(text), _dt.time())
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=_dt.timezone.utc)
+    d = t - _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+    return Fraction(d.days * 86400 + d.seconds) + Fraction(d.microseconds, 1000000)
+
+
+class TimeBase:
+    """The time base of a run (K.11): `period` the length of a period in
+    seconds and `origin` the time at which period 1 starts, and `epoch`
+    true when time stamps are seconds since 1970-01-01T00:00:00Z."""
+
+    def __init__(self, period: Any = None, origin: Any = 0, epoch: bool = False) -> None:
+        for name, v in (("period", period), ("origin", origin)):
+            if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float, Fraction))
+                                  or not math.isfinite(v)):
+                raise NormsEvalError(f"the {name} of the time base must be a finite number "
+                                     f"of seconds")
+        if period is not None and period <= 0:
+            raise NormsEvalError("the length of a period must be positive")
+        self.period = None if period is None else _exact(period)
+        self.origin = _exact(origin if origin is not None else 0)
+        self.epoch = bool(epoch)
+
+    @property
+    def given(self) -> bool:
+        return self.period is not None or self.epoch
+
+    def time_of(self, effective: Any) -> Any:
+        """The time stamp of an effective time ({"period": k} or {"at":
+        text}), or None when the base has nothing for its form."""
+        if not effective:
+            return None
+        (form, v), = effective.items()
+        if form == "period":
+            return None if self.period is None else self.origin + (int(v) - 1) * self.period
+        if form == "at":
+            return _epoch_seconds(str(v)) if self.epoch else None
+        return None
+
+
+def _describe_effective(effective: Any) -> str:
+    (form, v), = effective.items()
+    return f"period {v}" if form == "period" else f"{v}"
+
+
+class VersionInfo:
+    """What a run needs of one version: its identity, the version it
+    replaces, its effective time and its transitional rules (K.4)."""
+
+    def __init__(self, data: dict, sos: Any = None) -> None:
+        self.name = data["version"]
+        self.previous = data.get("previous")
+        self.effective = data.get("effective")
+        self.default = data.get("default") or "switch"
+        self.rules = {c: (r, list(s)) for c, (r, s) in dict(data.get("contracts") or {}).items()}
+        self.sos = sos                 # the parsed file or the model
+
+    def rule_for(self, contract_id: str) -> tuple:
+        """(rule, in_states or None) of the contract in this version."""
+        rule, states = self.rules.get(contract_id, (self.default, []))
+        return rule, (list(states) or None)
+
+
+class VersionChain:
+    """The versions of a run, in the order of the sequence (K.11)."""
+
+    def __init__(self, infos: list, base: TimeBase | None = None) -> None:
+        names = [i.name for i in infos]
+        for name in names:
+            if not isinstance(name, str) or names.count(name) > 1:
+                raise NormsEvalError(
+                    f"two versions of the run have the version '{name}'; the versions of a "
+                    f"run have distinct sos.version (Appendix K, K.11)")
+        by_name = {i.name: i for i in infos}
+        heads = [i for i in infos if i.previous not in by_name]
+        if len(heads) != 1:
+            raise NormsEvalError(
+                "the versions do not form one sequence by previous: (Appendix K, K.11): "
+                + ("every version but the first must name the version before it with previous:"
+                   if len(heads) > 1 else "previous: goes round in a circle"))
+        order = [heads[0]]
+        while len(order) < len(infos):
+            nxt = [i for i in infos if i.previous == order[-1].name]
+            if len(nxt) != 1:
+                raise NormsEvalError(
+                    f"the versions do not form one sequence by previous: (Appendix K, K.11): "
+                    f"{len(nxt) or 'no'} version(s) name version {order[-1].name} as previous")
+            order.append(nxt[0])
+        for i in order[1:]:
+            if not i.effective:
+                raise NormsEvalError(
+                    f"version {i.name} gives no effective:; every version of a run but the "
+                    f"first says when it takes effect (Appendix K, K.11)")
+        self.infos = order
+        self.base = base if base is not None and base.given else None
+        self.times: list = [None] * len(order)
+        if self.base is not None:
+            for k, i in enumerate(order):
+                t = self.base.time_of(i.effective)
+                if t is None and i.effective:
+                    form = next(iter(i.effective))
+                    raise NormsEvalError(
+                        f"version {i.name} takes effect at {_describe_effective(i.effective)}, "
+                        f"and the time base has no "
+                        + ("length of a period" if form == "period"
+                           else "epoch for a date or date-time")
+                        + " (Appendix K, K.11)")
+                self.times[k] = t
+            for k in range(1, len(order)):
+                prev = self.times[k - 1]
+                if prev is not None and not self.times[k] > prev:
+                    raise NormsEvalError(
+                        f"version {order[k].name} takes effect at t={_fmt_t(self.times[k])}, "
+                        f"not after version {order[k - 1].name} (t={_fmt_t(prev)}); effective "
+                        f"times increase along the sequence (Appendix K, K.11)")
+
+    @property
+    def timed(self) -> bool:
+        return self.base is not None
+
+    def names(self) -> list:
+        return [i.name for i in self.infos]
+
+    def index(self, name: str) -> int:
+        return self.names().index(name)
+
+    def check_name(self, value: Any, where: str) -> str:
+        if not isinstance(value, str) or value not in self.names():
+            got = f"'{value}'" if isinstance(value, str) else "a value that is not a string"
+            raise TraceError(f"{where}: 'version' must name a version of the run "
+                             f"({', '.join(self.names())}), got {got}")
+        return value
+
+    def by_time(self, t: Any) -> int:
+        k = None
+        for j, tj in enumerate(self.times):
+            if tj is None or tj <= t:
+                k = j
+        if k is None:
+            raise TraceError(
+                f"no version is in force at t={_fmt_t(t)}: version {self.infos[0].name} takes "
+                f"effect at t={_fmt_t(self.times[0])} (Appendix K, K.11)")
+        return k
+
+    def sos_of(self, label: str) -> Any:
+        for i in self.infos:
+            if _version_label(i.name) == label:
+                return i.sos
+        raise NormsEvalError(f"no {label} in the run")
+
+
+class VersionTracker:
+    """The version that a contract instance follows (K.11), observation by
+    observation. `step` is called once per observation, in order, and is
+    remembered, so that a second call for the same observation returns the
+    same amendments."""
+
+    def __init__(self, chain: VersionChain, contract_id: str) -> None:
+        self.chain = chain
+        self.contract_id = contract_id
+        self.current: Any = None       # index of the version in force
+        self.follows: Any = None       # index of the version the instance follows
+        self.pending: Any = None       # (index, states) of a waiting switch
+        self.started: Any = None       # index of the version at the start
+        self.memo: dict = {}
+        self.events: list = []
+
+    def save(self) -> tuple:
+        return (self.current, self.follows, self.pending, self.started, dict(self.memo),
+                list(self.events))
+
+    def restore(self, saved: tuple) -> None:
+        (self.current, self.follows, self.pending, self.started, memo, events) = saved
+        self.memo, self.events = dict(memo), list(events)
+
+    def in_force(self, t: Any, named: Any) -> int:
+        cur = self.current
+        if named is not None:
+            k = self.chain.index(named)
+            if cur is not None and k < cur:
+                raise TraceError(
+                    f"at t={_fmt_t(t)} the trace names version {named}, which comes before "
+                    f"version {self.chain.infos[cur].name}, in force before (Appendix K, K.11)")
+            if self.chain.timed:
+                c = self.chain.by_time(t)
+                if c != k:
+                    raise TraceError(
+                        f"at t={_fmt_t(t)} the trace names version {named}, but by the "
+                        f"effective times version {self.chain.infos[c].name} is in force "
+                        f"(Appendix K, K.11)")
+            return k
+        if self.chain.timed:
+            return self.chain.by_time(t)
+        return 0 if cur is None else cur
+
+    def start(self, t: Any, named: Any) -> int:
+        """The version in force at the first observation, which the instance follows."""
+        self.current = self.follows = self.started = self.in_force(t, named)
+        return self.follows
+
+    def _event(self, t: Any, v: int, kind: str, text: str) -> dict:
+        return {"t": t, "version": self.chain.infos[v].name, "event": kind, "text": text}
+
+    def step(self, n: int, t: Any, named: Any, state: Any) -> tuple:
+        """(the labels of the versions the instance is amended to at
+        observation n, in order; the events of observation n)."""
+        if n in self.memo:
+            return self.memo[n]
+        k = self.in_force(t, named)
+        names: list = []
+        events: list = []
+        infos = self.chain.infos
+
+        def switch(v: int, why: str) -> None:
+            events.append(self._event(
+                t, v, "switch", f"{why}the instance switches from version "
+                                f"{infos[self.follows].name} to version {infos[v].name}"))
+            names.append(_version_label(infos[v].name))
+            self.follows = v
+            self.pending = None
+
+        tried = False
+        for v in range(self.current + 1, k + 1):
+            rule, states = infos[v].rule_for(self.contract_id)
+            if self.pending is not None:
+                p = self.pending[0]
+                events.append(self._event(
+                    t, p, "dropped", f"the waiting switch to version {infos[p].name} is "
+                                     f"dropped: version {infos[v].name} takes effect first"))
+                self.pending = None
+            head = f"version {infos[v].name} takes effect"
+            if rule == "keep":
+                events.append(self._event(
+                    t, v, "keep", f"{head}; the instance keeps version "
+                                  f"{infos[self.follows].name} (transitional: keep)"))
+            elif states is None:
+                switch(v, f"{head} (transitional: switch); ")
+            elif state in states:
+                switch(v, f"{head} (transitional: switch, in_states: {', '.join(states)}); "
+                          f"in state {state}, ")
+            else:
+                self.pending = (v, states)
+                events.append(self._event(
+                    t, v, "wait", f"{head} (transitional: switch, in_states: "
+                                  f"{', '.join(states)}); the instance is in state {state} "
+                                  f"and switches at the first observation in one of them"))
+            tried = True
+        if self.pending is not None and not tried and state in self.pending[1]:
+            switch(self.pending[0], f"in state {state}, ")
+        self.current = k
+        self.events.extend(events)
+        self.memo[n] = (names, events)
+        return names, events
+
+
+class _VersionEngine(_Engine):
+    """The engine of a run with versions (K.11): before the steps of an
+    observation, the instance is amended to the versions that the tracker
+    gives, one after the other (F.6)."""
+
+    def __init__(self, contract: ContractDef, trace: Trace, chain: VersionChain,
+                 tracker: VersionTracker, actors: dict | None = None) -> None:
+        super().__init__(contract, trace, chain.sos_of, actors)
+        self.tracker = tracker
+        self._logged: set = set()
+
+    def decide(self, n: int) -> tuple:
+        """(the versions to amend to at observation n, the events); sets
+        ``amend`` of the observation. Logs nothing: `_step` does."""
+        o = self.obs[n]
+        if n == 0:
+            return [], []
+        state = o.state if self.lifecycle is not None else None
+        if self.lifecycle is not None and state is None:
+            state = self.lifecycle.initial
+        names, events = self.tracker.step(n, o.t, getattr(o, "version", None), state)
+        o.amend = tuple(names) or None
+        return names, events
+
+    def _step(self, n: int, is_last: bool) -> bool:
+        _, events = self.decide(n)
+        if n not in self._logged:
+            self._logged.add(n)
+            for e in events:
+                self._log(n, "version", e["text"], version=e["version"])
+        return super()._step(n, is_last)
+
+    def _amend(self, n: int, name: Any) -> None:
+        for label in name:
+            super()._amend(n, label)
+
+
+def parse_trace_versions(lines, path: str | None = None, chain: Any = None,
+                         bindings: Any = None) -> Trace:
+    """`parse_trace` for a trace that may name versions (and regimes):
+    each observation gets the attributes ``version`` and ``regime``, the
+    version and the regime it names or None."""
+    trace = Trace(observations=[], path=path)
+    reader = _TraceReader(trace)
+    for lineno, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        where = f"line {lineno}"
+        try:
+            rec = loads_strict(line)
+        except NumberRangeError as e:
+            raise TraceError(f"{where}: {e}") from None
+        except json.JSONDecodeError as e:
+            raise TraceError(f"{where}: not JSON ({e.msg})") from None
+        except ValueError as e:
+            raise TraceError(f"{where}: not JSON ({e})") from None
+        rec, named = split_version(rec, where, chain)
+        rec, regime = split_regime(rec, where, bindings)
+        o = reader.add(rec, where)
+        o.version, o.regime = named, regime
+    if not trace.observations:
+        raise TraceError("the trace has no observation")
+    return trace
+
+
+def split_version(rec: Any, where: str, chain: Any) -> tuple:
+    """(the observation without its key ``version``, the version it names or None)."""
+    if not isinstance(rec, dict) or VERSION_KEY not in rec:
+        return rec, None
+    if chain is None:
+        raise TraceError(f"{where}: 'version' names the version in force, but the file does not "
+                         f"declare 'amendment: 0.1' with an amendment: block (Appendix K, K.11)")
+    named = chain.check_name(rec[VERSION_KEY], where)
+    return {k: v for k, v in rec.items() if k != VERSION_KEY}, named
+
+
+def names_version(trace: Trace) -> bool:
+    return any(getattr(o, "version", None) is not None for o in trace.observations)
+
+
+def run_version_trace(contract_id: str, trace: Trace, chain: VersionChain, actors_of) -> dict:
+    """`run_trace` for a run with versions (K.11). `actors_of(sos)` gives the
+    declared actors of a version."""
+    if any(o.amend for o in trace.observations):
+        raise NormsEvalError(_VERSIONS_NO_AMEND)
+
+    def once(observations: list) -> Any:
+        part = Trace(observations=observations, bindings=trace.bindings,
+                     request=trace.request, path=trace.path)
+        tracker = VersionTracker(chain, contract_id)
+        first = observations[0]
+        start = chain.infos[tracker.start(first.t, getattr(first, "version", None))]
+        contract = next((c for c in start.sos.contracts if c.id == contract_id), None)
+        if contract is None:
+            raise NormsEvalError(f"version {start.name}, in force at the start of the instance, "
+                                 f"has no contract '{contract_id}'")
+        for o in observations:
+            o.amend = None
+        eng = _VersionEngine(contract, part, chain, tracker, actors_of(start.sos))
+        eng.run()
+        return eng
+
+    engine = once(trace.observations)
+    after = len(trace.observations) - 1 - (engine.ended_at or 0)
+    if engine.ended_at is not None and after > 0:
+        engine = once(trace.observations[:engine.ended_at + 1])
+        engine.warnings.append(engine._ignored_warning(after))
+    return version_result(engine)
+
+
+def version_result(engine: Any) -> dict:
+    """The result of the engine, with the key ``versions``."""
+    result = engine.result()
+    result["versions"] = versions_of(engine.tracker)
+    return result
+
+
+def versions_of(tracker: VersionTracker) -> dict:
+    """The key ``versions`` of a result: the sequence, the version the
+    instance started under and the one it follows, and the events."""
+    infos = tracker.chain.infos
+    return _plain({
+        "sequence": [i.name for i in infos],
+        "start": None if tracker.started is None else infos[tracker.started].name,
+        "follows": None if tracker.follows is None else infos[tracker.follows].name,
+        "events": [dict(e) for e in tracker.events],
+    })
+
+
+def format_text_versions(result: dict, text: str) -> str:
+    """The text report with a section on the versions of the run."""
+    v = result.get("versions")
+    if not v:
+        return text
+    lines = ["Versions",
+             f"  sequence: {', '.join(v['sequence'])}; the instance started under version "
+             f"{v['start']} and follows version {v['follows']}"]
+    for e in v["events"]:
+        lines.append(f"  t={_fmt_t(e['t'])}  {e['text']}")
+    head, sep, tail = text.rpartition("\n\nResult: ")
+    if not sep:
+        return text + "\n\n" + "\n".join(lines)
+    return head + "\n\n" + "\n".join(lines) + sep + tail
+
+# <<< monitor-versions
+
+
 def load_version(path) -> SoSDefinition:
     """Parse and type-check a CADL file that declares norms 0.1."""
     from .parser import parse_file
@@ -3075,12 +3518,15 @@ def load_version(path) -> SoSDefinition:
 
 
 def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
-             versions: dict | None = None) -> dict:
+             versions: dict | None = None, chain: VersionChain | None = None) -> dict:
     """Compute the verdicts of one contract instance on a trace (F.5),
     applying the amendments the trace names (F.6).
 
     `versions` maps the value of an ``amend`` key to a parsed file; a value
     that is not in it is read as a path relative to the trace file.
+    `chain` is the sequence of versions of the run (Appendix K, K.11), whose
+    first version is `sos` or comes before it; it applies when it has
+    several versions or a time base, or when the trace names a version.
     Returns a JSON-serializable dict; see the README for its keys."""
     if not norms_declared(sos):
         raise NormsEvalError("the file does not declare 'norms: 0.1' under extensions:")
@@ -3099,11 +3545,71 @@ def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
     if names_regime(trace) and bindings is None:
         raise NormsEvalError("the trace names a regime ('regime'), but the file has no "
                              "regimes: block (Appendix A, A.7.1)")
+    if chain is not None and (len(chain.infos) > 1 or chain.timed or names_version(trace)):
+        _check_version_regimes(chain, contract.id, trace)
+        return run_version_trace(contract.id, trace, chain, declared_actors)
     if bindings is not None and (names_regime(trace)
                                  or not bindings.in_force(contract.id, bindings.initial)):
         # before the first `regime` the trace is in the initial regime (A.7.1)
         return run_regime_trace(contract, trace, bindings, declared_actors(sos))
     return run_trace(contract, trace, loader, declared_actors(sos))
+
+
+def _check_version_regimes(chain: VersionChain, contract_id: str, trace: Trace) -> None:
+    """Versions are applied only to a run that is judged as one of a file
+    without `regimes:` (Appendix K, K.11, "Regimes")."""
+    if names_regime(trace):
+        raise NormsEvalError(_VERSIONS_NO_REGIMES)
+    for info in chain.infos:
+        b = regime_bindings(info.sos)
+        if b is not None and not b.in_force(contract_id, b.initial):
+            raise NormsEvalError(f"{_VERSIONS_NO_REGIMES} (the initial regime {b.initial} of "
+                                 f"version {info.name} does not have {contract_id} in force)")
+
+
+def version_info(sos: SoSDefinition, path: Any = None) -> VersionInfo:
+    """The version of a run that a parsed file is (Appendix K, K.11)."""
+    from .amendment import amendment_declared, analyse
+    raw = getattr(sos, "amendment", None)
+    where = path if path is not None else "the file"
+    if not amendment_declared(sos) or raw is None or not raw.has_block:
+        raise NormsEvalError(
+            f"{where} does not declare 'amendment: 0.1' with an amendment: block; a version "
+            f"of a run gives sos.version, previous: and effective: (Appendix K, K.11)")
+    a = analyse(sos)
+    if a.errors:
+        raise NormsEvalError(f"{where} has {len(a.errors)} error(s) of the amendment "
+                             f"extension; see cadl check")
+    if a.version is None:
+        raise NormsEvalError(f"{where} gives no sos.version (Appendix K, K-2)")
+    return VersionInfo({"version": a.version, "previous": a.previous,
+                        "effective": a.effective, "default": a.transitional_default,
+                        "contracts": dict(a.transitional)}, sos)
+
+
+def version_chain(sos: SoSDefinition, path: Any = None, version_paths: Any = (),
+                  base: TimeBase | None = None) -> VersionChain | None:
+    """The versions of a run: the file and the later versions (paths), or
+    None for a file without an amendment: block when no version and no
+    time base is given."""
+    version_paths = list(version_paths or ())
+    raw = getattr(sos, "amendment", None)
+    from .amendment import amendment_declared
+    has_block = amendment_declared(sos) and raw is not None and raw.has_block
+    if not has_block and not version_paths and (base is None or not base.given):
+        return None
+    infos = [version_info(sos, path)]
+    for vp in version_paths:
+        infos.append(version_info(load_version(vp), vp))
+    return VersionChain(infos, base)
+
+
+def parse_duration_seconds(text: Any) -> Fraction:
+    """A duration (`3600s`, `1h`, `500ms`) or a number of seconds, exactly."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(ms|s|min|h)?\s*", str(text))
+    if not m:
+        raise NormsEvalError(f"not a duration: {text!r} (write it as 3600s, 60min, 1h or 500ms)")
+    return Fraction(Decimal(m.group(1))) * Fraction(_UNIT_SECONDS[m.group(2) or "s"])
 
 
 def regime_bindings(sos: SoSDefinition) -> RegimeBindings | None:
@@ -3220,17 +3726,25 @@ def format_text(result: dict) -> str:
 
 # <<< monitor-runtime
 
-def evaluate_files(cadl_path, trace_path, contract_id: str | None = None) -> dict:
-    """Parse and type-check a CADL file, read a trace and evaluate it."""
+def evaluate_files(cadl_path, trace_path, contract_id: str | None = None,
+                   version_paths: Any = (), base: TimeBase | None = None) -> dict:
+    """Parse and type-check a CADL file, read a trace and evaluate it.
+    `version_paths` are the later versions of the run and `base` its time
+    base (Appendix K, K.11)."""
     if not Path(trace_path).exists():
         raise NormsEvalError(f"File not found: {trace_path}")
     sos = load_version(cadl_path)
     bindings = regime_bindings(sos)
-    if bindings is None:
+    chain = version_chain(sos, cadl_path, version_paths, base)
+    if chain is not None:
+        with open(trace_path, encoding="utf-8") as f:
+            trace = parse_trace_versions(f, path=str(trace_path), chain=chain,
+                                         bindings=bindings)
+    elif bindings is None:
         trace = load_trace(trace_path)
     else:
         with open(trace_path, encoding="utf-8") as f:
             trace = parse_trace_regimes(f, path=str(trace_path), bindings=bindings)
-    result = evaluate(sos, trace, contract_id)
+    result = evaluate(sos, trace, contract_id, chain=chain)
     result["file"] = str(cadl_path)
     return result

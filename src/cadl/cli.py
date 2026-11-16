@@ -443,6 +443,22 @@ def main(argv: list[str] | None = None) -> int:
                            help="Contract to evaluate (default: the only one with norms)")
     norms_cmd.add_argument("--format", choices=["text", "json"], default="text",
                            help="Output format (default: text)")
+    _add_version_options(norms_cmd, "the run")
+
+    # metrics-eval command (amendment extension, Appendix K, K.11)
+    meval_cmd = subparsers.add_parser("metrics-eval",
+        help="Judge measured values of metrics against their targets and schedules "
+             "(Appendix K, K.11)",
+        description="Judge each measurement under the declaration of the metric in the "
+                    "version in force at the start of its window, against the target in "
+                    "force then. Exit status: 0 when no measurement fails its target, 1 "
+                    "otherwise, 2 on a usage error.")
+    meval_cmd.add_argument("file", type=Path, help="CADL file that declares the metrics")
+    meval_cmd.add_argument("--measurements", type=Path, required=True,
+                           help="Measurements (JSON Lines; see the README)")
+    meval_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                           help="Output format (default: text)")
+    _add_version_options(meval_cmd, "the model")
 
     # norms-check command
     nchk_cmd = subparsers.add_parser("norms-check",
@@ -670,6 +686,8 @@ def main(argv: list[str] | None = None) -> int:
         return cli_message(args)
     elif args.command == "norms-eval":
         return _cmd_norms_eval(args)
+    elif args.command == "metrics-eval":
+        return _cmd_metrics_eval(args)
     elif args.command == "norms-check":
         return _cmd_norms_check(args)
     elif args.command == "norms-diff":
@@ -1292,13 +1310,51 @@ def _cmd_sim_gen(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_version_options(cmd: argparse.ArgumentParser, what: str) -> None:
+    """--version, --period, --origin and --epoch (Appendix K, K.11)."""
+    cmd.add_argument("--version", dest="version_files", action="append", default=[],
+                     type=Path, metavar="FILE",
+                     help=f"Another version of {what} (amendment 0.1); the versions form one "
+                          f"sequence by previous: (Appendix K, K.11); may be repeated")
+    cmd.add_argument("--period", default=None, metavar="DURATION",
+                     help="Length of a period of the time stamps, e.g. 3600s, for "
+                          "effective: { period: k } (K.11)")
+    cmd.add_argument("--origin", default=None, metavar="SECONDS",
+                     help="Time stamp at which period 1 starts (default: 0)")
+    cmd.add_argument("--epoch", action="store_true",
+                     help="Time stamps are seconds since 1970-01-01T00:00:00Z, for "
+                          "effective: { at: ... } (K.11)")
+
+
+def _time_base(args: argparse.Namespace):
+    """The time base of --period, --origin and --epoch, or None."""
+    from .norms_eval import NormsEvalError, TimeBase, parse_duration_seconds
+    if args.period is None and args.origin is not None:
+        raise NormsEvalError("--origin needs --period")
+    if args.period is None and not args.epoch:
+        return None
+    origin = 0
+    if args.origin is not None:
+        try:
+            from decimal import Decimal, InvalidOperation
+            from fractions import Fraction
+            origin = Fraction(Decimal(args.origin))
+        except (InvalidOperation, ValueError):
+            raise NormsEvalError(f"--origin must be a number of seconds, not {args.origin!r}") \
+                from None
+    period = None if args.period is None else parse_duration_seconds(args.period)
+    return TimeBase(period, origin, args.epoch)
+
+
 def _cmd_norms_eval(args: argparse.Namespace) -> int:
     """Exit status: 0 when no norm or guarantee is `violated` (`excused`
     and `pending` do not fail), 1 otherwise, 2 on a usage error."""
-    from .norms_eval import NormsEvalError, TraceError, evaluate_files, format_text
+    from .norms_eval import (NormsEvalError, TraceError, evaluate_files, format_text,
+                             format_text_versions)
 
     try:
-        result = evaluate_files(args.file, args.trace, args.contract)
+        result = evaluate_files(args.file, args.trace, args.contract,
+                                args.version_files, _time_base(args))
     except TraceError as e:
         print(f"Trace error: {args.trace}: {e}", file=sys.stderr)
         return 2
@@ -1306,6 +1362,29 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 2
 
+    if args.format == "json":
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_text_versions(result, format_text(result)))
+    return 0 if result["ok"] else 1
+
+
+def _cmd_metrics_eval(args: argparse.Namespace) -> int:
+    """Exit status: 0 when no measurement fails its target (`not judged`
+    does not fail), 1 otherwise, 2 on a usage error."""
+    from .metrics_eval import evaluate_files, format_text
+    from .norms_eval import NormsEvalError, TraceError
+
+    try:
+        result = evaluate_files(args.file, args.measurements, args.version_files,
+                                _time_base(args))
+    except TraceError as e:
+        print(f"Measurement error: {args.measurements}: {e}", file=sys.stderr)
+        return 2
+    except NormsEvalError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
     if args.format == "json":
         import json
         print(json.dumps(result, indent=2, ensure_ascii=False))

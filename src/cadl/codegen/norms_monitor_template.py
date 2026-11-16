@@ -795,3 +795,269 @@ def replay(lines: Any, contract: str | None = None, versions: dict | None = None
     return m.result()
 
 # <<< part 3
+
+# >>> part 4
+# === Versions while a system runs (Appendix K, K.11) =========================
+# This part is in the generated module only when the file declares
+# `amendment: 0.1` with an `amendment:` block. It replaces `NormsMonitor`
+# and `replay` above by versions that apply the versions of a run.
+
+# the data of part 3, in a module that has it
+_REGIMES_DATA = globals().get("_REGIMES")
+_REGIMES_PART = _REGIMES_DATA is not None
+
+
+def _version_infos(own: dict, versions: Any) -> list:
+    """The versions of a run: this model and the models among `versions`
+    that carry the data of a version."""
+    def info(model: dict) -> Any:
+        m = _Model(model)
+        m.regimes = model.get("regimes")
+        return VersionInfo(model["amendment"], m)
+
+    infos = [info(own)]
+    for model in dict(versions or {}).values():
+        if isinstance(model, dict) and isinstance(model.get("amendment"), dict):
+            infos.append(info(model))
+    return infos
+
+
+class NormsMonitor(NormsMonitor):
+    __doc__ = (NormsMonitor.__doc__ or "") + """
+    Versions (Appendix K, K.11). The ``MODEL`` of the monitor generated
+    from another version of the file, given in `versions`, is a version of
+    the run when that file declares ``amendment: 0.1``; the versions form
+    one sequence by ``previous:``. `period` (seconds), `origin` (the time
+    stamp at which period 1 starts) and `epoch` (time stamps are seconds
+    since 1970-01-01T00:00:00Z) give the time base of the effective times.
+    An observation may name the version in force with the key
+    ``version``. With several versions, a time base, or a named version,
+    the instance follows the version in force at its first observation,
+    and when a version takes effect it follows the transitional rule of
+    its contract in that version: ``keep`` leaves it as it is, ``switch``
+    amends it (F.6), and ``switch`` with ``in_states`` amends it at the
+    first observation in one of those states. Such a monitor refuses an
+    observation with ``amend``, and one that names a regime.
+    """
+
+    def __init__(self, contract: str | None = None, bindings: dict | None = None,
+                 request: dict | None = None, quantities: Any = None,
+                 versions: dict | None = None, _option: str = "contract=",
+                 period: Any = None, origin: Any = 0, epoch: bool = False) -> None:
+        super().__init__(contract, bindings, request, quantities, versions, _option)
+        base = TimeBase(period, origin, epoch)
+        self._chain = VersionChain(_version_infos(MODEL, versions), base)
+        self._active = len(self._chain.infos) > 1 or self._chain.timed
+        self._tracker: Any = None
+        self._next_named: Any = None
+        self._named_regime = False
+        if self._active:
+            self._check_regimes()
+
+    def _check_regimes(self) -> None:
+        if self._named_regime:
+            raise ObservationError(_VERSIONS_NO_REGIMES)
+        for info in self._chain.infos:
+            regimes = info.sos.regimes
+            if regimes is not None and self._contract.id in regimes["suspended"].get(
+                    regimes["initial"], ()):
+                raise MonitorError(f"{_VERSIONS_NO_REGIMES} (the initial regime "
+                                   f"{regimes['initial']} of version {info.name} does not have "
+                                   f"{self._contract.id} in force)")
+
+    @property
+    def version(self) -> str | None:
+        """The version that the contract instance follows, or None before
+        its first observation (or when no version applies)."""
+        if self._tracker is None or self._tracker.follows is None:
+            return None
+        return self._chain.infos[self._tracker.follows].name
+
+    def observe(self, observation: dict, where: str | None = None) -> list:
+        named = None
+        if isinstance(observation, dict):
+            observation = copy.deepcopy(observation)
+            n = len(self._trace.observations) + self._ignored
+            spot = where or f"observation {n + 1}"
+            if VERSION_KEY in observation and not self.ended:
+                named = self._chain.check_name(observation[VERSION_KEY], spot)
+            observation = {k: v for k, v in observation.items() if k != VERSION_KEY}
+            if not self.ended:
+                regime = _REGIMES_PART and observation.get("regime") is not None
+                active = self._active or named is not None
+                if active and observation.get("amend") is not None:
+                    raise ObservationError(_VERSIONS_NO_AMEND)
+                if active and (regime or self._named_regime):
+                    raise ObservationError(_VERSIONS_NO_REGIMES)
+                if named is not None and not self._active:
+                    self._activate()
+        self._next_named = named
+        before = (self._named_regime, self._tracker.save() if self._tracker else None)
+        try:
+            changes = super().observe(observation, where)
+        except Exception:
+            self._named_regime = before[0]
+            if self._tracker is not None and before[1] is not None:
+                self._tracker.restore(before[1])
+            raise
+        if isinstance(observation, dict) and observation.get("regime") is not None:
+            self._named_regime = True
+        return changes
+
+    def _activate(self) -> None:
+        """Apply the versions from now on, as from the first observation
+        (`cadl norms-eval` does so for a trace that names a version)."""
+        self._check_regimes()
+        self._active = True
+        if self._engine is not None:
+            try:
+                self._engine = self._rebuilt()
+            except Exception:
+                self._active = False
+                self._engine = self._rebuilt()
+                raise
+
+    def result(self) -> dict:
+        result = super().result()
+        if self._active and self._tracker is not None:
+            result["versions"] = versions_of(self._tracker)
+        return result
+
+    def _prepare(self, eng: Any, n: int) -> Any:
+        o = self._trace.observations[n]
+        if not hasattr(o, "version"):
+            o.version = self._next_named
+        if not self._active:
+            return super()._prepare(eng, n)
+        if eng is None:
+            tracker = VersionTracker(self._chain, self._contract.id)
+            start = self._chain.infos[tracker.start(o.t, o.version)]
+            contract = next((c for c in start.sos.contracts if c.id == self._contract.id), None)
+            if contract is None:
+                raise ObservationError(f"version {start.name}, in force at the start of the "
+                                       f"instance, has no contract '{self._contract.id}'")
+            o.amend = None
+            eng = _VersionEngine(contract, self._trace, self._chain, tracker,
+                                 declared_actors(start.sos))
+            self._tracker = tracker
+            self._check_parsed()
+            if _STATE_IGNORED in eng.warnings:   # said in _step, see there
+                eng.warnings.remove(_STATE_IGNORED)
+            eng._check_state(n)
+            eng.ev.known.update(self._quantities)
+            return eng
+        self._tracker = eng.tracker
+        if eng.lifecycle is not None:
+            eng._fill_states(n)
+        eng.decide(n)            # sets o.amend; the events are logged by its _step
+        if not o.amend:
+            eng._check_state(n)
+        eng.ev.known.update(o.values)
+        return eng
+
+    def _rebuilt(self) -> Any:
+        eng = super()._rebuilt()
+        self._tracker = None if eng is None else getattr(eng, "tracker", None)
+        return eng
+
+
+def replay(lines: Any, contract: str | None = None, versions: dict | None = None,
+           path: str | None = None, _option: str = "contract=", period: Any = None,
+           origin: Any = 0, epoch: bool = False) -> dict:
+    """As above, for a run that may have versions (Appendix K, K.11)."""
+    lines = list(lines)
+    kw = {"versions": versions, "_option": _option, "period": period, "origin": origin,
+          "epoch": epoch}
+    probe = NormsMonitor(contract, **kw)
+    regimes = None
+    if _REGIMES_PART:
+        regimes = RegimeBindings(_REGIMES_DATA["regimes"], _REGIMES_DATA["suspended"],
+                                 _REGIMES_DATA["initial"])
+    trace = parse_trace_versions(lines, path=path, chain=probe._chain, bindings=regimes)
+    records = [loads_strict(line) for line in lines if line.strip()]
+    where = [f"line {i}" for i, line in enumerate(lines, start=1) if line.strip()]
+    count = 0
+    for rec, w in zip(records, where):
+        probe.observe(rec, where=w)
+        count += 1
+        if probe.ended:
+            break
+    if not probe.ended and records[-1].get("end") is not False:
+        probe.end()
+    if not probe.started:
+        raise NormsEvalError(
+            f"the contract {probe.contract} is not in force at any observation of the trace, "
+            f"which does not end the contract instance: there is nothing to judge")
+    inside = trace.observations[:count]
+    m = NormsMonitor(contract, quantities=inside[-1].values, **kw)
+    m._trace.path = path
+    m._warn_state = not any(o.amend for o in inside)
+    for rec, w in zip(records, where):
+        m.observe(rec, where=w)
+    if not m.ended and records[-1].get("end") is not False:
+        m.end()
+    return m.result()
+
+
+def main(argv: list | None = None) -> int:
+    """As above, with --period, --origin and --epoch for the time base of
+    the versions (Appendix K, K.11); give the other versions with
+    --model-version NAME=MODEL.json."""
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="norms_monitor",
+        description="Replay a recorded trace of one contract instance through the "
+                    "generated norms monitor (norms 0.1).")
+    ap.add_argument("trace", nargs="?", help="trace file (JSON Lines)")
+    ap.add_argument("--contract", help="contract id, when the file has several")
+    ap.add_argument("--format", choices=["json", "text"], default="json")
+    ap.add_argument("--model-version", action="append", default=[], metavar="NAME=MODEL.json",
+                    help="the model of another version of the file (write it with "
+                         "--dump-model of the monitor generated from that version)")
+    ap.add_argument("--period", default=None, metavar="SECONDS",
+                    help="length of a period, for effective: { period: k }")
+    ap.add_argument("--origin", default="0", metavar="SECONDS",
+                    help="time stamp at which period 1 starts (default: 0)")
+    ap.add_argument("--epoch", action="store_true",
+                    help="time stamps are seconds since 1970-01-01T00:00:00Z")
+    ap.add_argument("--dump-model", action="store_true",
+                    help="print the model of this monitor as JSON and exit")
+    args = ap.parse_args(argv)
+    if args.dump_model:
+        print(json.dumps(MODEL, ensure_ascii=True, allow_nan=False))
+        return 0
+    if args.trace is None:
+        ap.error("the trace file is required")
+    versions = {}
+    try:
+        for spec in args.model_version:
+            name, sep, file = spec.partition("=")
+            if not sep:
+                raise NormsEvalError(f"--model-version needs NAME=MODEL.json, not '{spec}'")
+            with open(file, encoding="utf-8") as f:
+                versions[name] = json.load(f)
+        try:
+            period = None if args.period is None else Fraction(Decimal(args.period))
+            origin = Fraction(Decimal(args.origin))
+        except ArithmeticError:
+            raise NormsEvalError("--period and --origin are numbers of seconds") from None
+        try:
+            with open(args.trace, encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            raise NormsEvalError(f"File not found: {args.trace}") from None
+        result = replay(lines, args.contract, versions, path=str(args.trace),
+                        _option="--contract", period=period, origin=origin, epoch=args.epoch)
+    except TraceError as e:
+        print(f"Trace error: {args.trace}: {e}", file=sys.stderr)
+        return 2
+    except (NormsEvalError, MonitorError, OSError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_text_versions(result, format_text(result)))
+    return 0 if result["ok"] else 1
+
+# <<< part 4
