@@ -902,3 +902,29 @@ def test_rego_main_parameters_need_a_regime(tmp_path):
     assert params({"regime": "CENTRALIZED"})["ROUTING.beta"] == 0.9
     assert params({"regime": "DISTRIBUTED"})["ROUTING.beta"] == 0.2
     assert params({}) is None and params({"regime": "CALM"}) is None
+
+
+def test_python_controller_checks_the_invariant_without_regimes(tmp_path):
+    """0.3.33 (Fixed): also without regimes:, a transition whose safety
+    invariant does not hold is not taken, under `python -O` too (up to
+    0.3.32 it was an assert, which -O removes)."""
+    pkg = tmp_path / "town_plain"
+    generate(parse(BASE), pkg)
+    text = (pkg / "transitions.py").read_text()
+    assert "assert " not in text and "apply_bindings" not in text
+    script = textwrap.dedent("""
+        import sys
+        sys.path.insert(0, sys.argv[1])
+        from town_plain.runtime import RobotTownRuntime
+        rt = RobotTownRuntime()
+        rc = rt.regime_controller
+        rt.ctx.state.update(orders_in_window=10, robots_on_road=3)
+        print(rc.execute_transition("CENTRALIZED", rt.ctx), rc.current_regime,
+              len(rc.refused_transitions))
+        rt.ctx.state["robots_on_road"] = 0
+        print(rc.execute_transition("CENTRALIZED", rt.ctx), rc.current_regime)
+    """)
+    proc = subprocess.run([sys.executable, "-O", "-c", script, str(tmp_path)],
+                          capture_output=True, text=True, env={"PYTHONPATH": str(ROOT / "src")})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == ["False DISTRIBUTED 1", "True CENTRALIZED"]

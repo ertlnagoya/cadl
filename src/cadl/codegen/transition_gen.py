@@ -59,10 +59,9 @@ def generate_transitions_module(
                      "({\", \".join(self.REGIMES)})')")
     lines.append("        self.current_regime = initial_regime")
     lines.append("        self.transition_history: list[tuple[str, str]] = []")
-    if bindings is not None:
-        lines.append("        # (from, to, reason) of each transition not taken because its")
-        lines.append("        # safety invariant did not hold or could not be checked (A.7.1)")
-        lines.append("        self.refused_transitions: list[tuple[str, str, str]] = []")
+    lines.append("        # (from, to, reason) of each transition not taken because its")
+    lines.append("        # safety invariant did not hold or could not be checked (A.7.1)")
+    lines.append("        self.refused_transitions: list[tuple[str, str, str]] = []")
     lines.append("")
 
     # Evaluate transitions
@@ -86,36 +85,7 @@ def generate_transitions_module(
     lines.append("        return None")
     lines.append("")
 
-    if bindings is not None:
-        _emit_checked_execute(lines, transitions)
-        content = "\n".join(lines)
-        return content if content.endswith("\n") else content + "\n"
-
-    # Execute transition
-    lines.append("    def execute_transition(self, target_regime: str, ctx: RuntimeContext) -> bool:")
-    lines.append('        """Execute a regime transition, checking safety invariants."""')
-    lines.append("        old = self.current_regime")
-
-    # Safety invariants
-    has_invariants = any(t.safety_invariant for t in transitions)
-    if has_invariants:
-        lines.append("        # Check safety invariants")
-        for t in transitions:
-            if t.safety_invariant:
-                py_inv = _compile_expr_str(t.safety_invariant)
-                lines.append(f"        if old == '{t.from_regime}' and target_regime == '{t.to_regime}':")
-                if py_inv:
-                    lines.append(f"            assert {py_inv}, 'Safety invariant violated: {t.safety_invariant}'")
-                else:
-                    lines.append(f"            # safety_invariant: {t.safety_invariant} (could not compile)")
-
-    lines.append("        self.current_regime = target_regime")
-    lines.append("        self.transition_history.append((old, target_regime))")
-    if bindings is not None:
-        lines.append("        self.apply_bindings(ctx)")
-    lines.append(f"        ctx.record_log(f'Regime transition: {{old}} -> {{target_regime}}')")
-    lines.append("        return True")
-    lines.append("")
+    _emit_checked_execute(lines, transitions, bindings is not None)
 
     content = "\n".join(lines)
     if not content.endswith("\n"):
@@ -123,8 +93,8 @@ def generate_transitions_module(
     return content
 
 
-def _emit_checked_execute(lines: list, transitions: List[TransitionDef]) -> None:
-    """execute_transition of a file with regime bindings (A.7.1, "Runs"):
+def _emit_checked_execute(lines: list, transitions: List[TransitionDef], bound: bool) -> None:
+    """execute_transition (A.7.1, "Runs"):
     the safety invariant is checked explicitly (not with assert, which
     `python -O` removes); when it does not hold, or cannot be compiled, the
     transition is not taken, the regime stays, and the refusal is
@@ -133,9 +103,10 @@ def _emit_checked_execute(lines: list, transitions: List[TransitionDef]) -> None
     lines.append('        """Take a regime transition if its safety invariant holds (A.7.1).')
     lines.append("        Returns False, and keeps the current regime, when it does not hold")
     lines.append('        or cannot be checked."""')
-    lines.append("        if target_regime not in self.REGIMES:")
-    lines.append("            raise ValueError(f'{target_regime!r} is not a regime of the file "
-                 "({\", \".join(self.REGIMES)})')")
+    if bound:
+        lines.append("        if target_regime not in self.REGIMES:")
+        lines.append("            raise ValueError(f'{target_regime!r} is not a regime of the file "
+                     "({\", \".join(self.REGIMES)})')")
     lines.append("        old = self.current_regime")
     for t in transitions:
         if not t.safety_invariant:
@@ -160,7 +131,8 @@ def _emit_checked_execute(lines: list, transitions: List[TransitionDef]) -> None
         lines.append(f"{pad}return False")
     lines.append("        self.current_regime = target_regime")
     lines.append("        self.transition_history.append((old, target_regime))")
-    lines.append("        self.apply_bindings(ctx)")
+    if bound:
+        lines.append("        self.apply_bindings(ctx)")
     lines.append("        ctx.record_log(f'Regime transition: {old} -> {target_regime}')")
     lines.append("        return True")
     lines.append("")
