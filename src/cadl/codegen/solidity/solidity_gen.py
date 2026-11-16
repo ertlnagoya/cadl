@@ -327,7 +327,8 @@ def generate_regime_sol(sos: SoSDefinition, bindings: list | None = None) -> str
             from_id = sanitize_id(t.from_regime)
             to_id = sanitize_id(t.to_regime)
             if t.condition:
-                cond = _compile_condition(t.condition, ctx)
+                # as an invariant: only with values set, `false` when inexpressible
+                cond = _compile_invariant(t.condition, ctx)
                 lines.append(f"        if (currentRegime == Regime.{from_id} && ({cond})) {{")
             else:
                 lines.append(f"        if (currentRegime == Regime.{from_id}) {{")
@@ -457,21 +458,9 @@ def _compile_predicate(expr: Expression, ctx: SolidityContext) -> str:
     return predicate_to_solidity(expr, ctx)
 
 
-def _compile_condition(cond_str: str, ctx: SolidityContext) -> str:
-    """Compile a condition string to Solidity."""
-    from ...parser import parse_expr
-    try:
-        expr = parse_expr(cond_str)
-        return predicate_to_solidity(expr, ctx)
-    except Exception:
-        # Fallback: use as boolean state variable
-        sanitized = cond_str.replace(" ", "_").replace(".", "_")[:40]
-        sanitized = "".join(c for c in sanitized if c.isalnum() or c == "_")
-        return f"stateBool[\"{sanitized}\"]"
-
-
 def _compile_invariant(text: str, ctx: SolidityContext) -> str:
-    """A safety invariant in Solidity, true only when every value it reads
+    """A safety invariant, or a transition condition, in Solidity: true only
+    when every value it reads
     was set (`isSet`); `false` when it uses what the observed state of the
     controller cannot give (a function such as `len(queue)`, an actor
     field, a text, a fraction), so that the transition is refused rather

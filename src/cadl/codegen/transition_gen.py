@@ -73,7 +73,13 @@ def generate_transitions_module(
         if t.condition:
             py_cond = _compile_expr_str(t.condition)
             if py_cond:
-                lines.append(f"            if {py_cond}:")
+                # a condition that cannot be evaluated (a value missing from
+                # ctx.state) does not hold, and the run goes on (A.7.1)
+                lines.append("            try:")
+                lines.append(f"                holds = bool({py_cond})")
+                lines.append("            except Exception:")
+                lines.append("                holds = False")
+                lines.append("            if holds:")
                 lines.append(f"                return '{t.to_regime}'")
             else:
                 cond_comment = t.condition.replace("\n", " ").strip()

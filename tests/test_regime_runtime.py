@@ -1116,3 +1116,59 @@ def test_runs_without_regimes(tmp_path):
         proc = subprocess.run([S.solc_binary(), "--bin", "Order.sol"], cwd=out,
                               capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr[-2000:]
+
+
+def test_condition_with_a_missing_value_does_not_hold(tmp_path):
+    """A.7.1: a condition that cannot be evaluated does not hold: the
+    transition is not selected and the run goes on (Python: no KeyError out
+    of the event loop; Solidity: an unset value is not 0)."""
+    import asyncio
+    pkg = tmp_path / "town_c"
+    generate(parse(GOOD), pkg)
+    script = textwrap.dedent("""
+        import asyncio, sys
+        sys.path.insert(0, sys.argv[1])
+        from town_c.runtime import RobotTownRuntime
+        rt = RobotTownRuntime()
+        rt.ctx.state.update(robots_on_road=0, waiting_on_road=1)
+        asyncio.run(rt.create_event_loop().run(max_cycles=2))
+        print(rt.regime_controller.current_regime)
+        rt.ctx.state["orders_in_window"] = 10
+        asyncio.run(rt.create_event_loop().run(max_cycles=1))
+        print(rt.regime_controller.current_regime)
+    """)
+    proc = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True,
+                          text=True, env={"PYTHONPATH": str(ROOT / "src")})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["DISTRIBUTED", "CENTRALIZED"]
+    ctl = (_solidity(tmp_path, GOOD) / "RegimeController.sol").read_text()
+    assert ('if (currentRegime == Regime.Distributed && (isSetUint["orders_in_window"] && '
+            '((stateUint["orders_in_window"] < 22)))) {') in ctl
+
+
+@pytest.mark.skipif(S.solc_binary() is None or S.evm_python() is None,
+                    reason="no solc, or no EVM (CADL_EVM_PYTHON)")
+def test_condition_with_an_unset_value_on_an_evm(tmp_path):
+    out = _solidity(tmp_path, GOOD)
+    proc = subprocess.run([S.solc_binary(), "--combined-json", "abi,bin", "RobotTown.sol"],
+                          cwd=out, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    data = json.loads(proc.stdout)["contracts"]
+    contracts = {k.split(":")[-1]: {"abi": v["abi"] if isinstance(v["abi"], list)
+                                    else json.loads(v["abi"]), "bin": v["bin"]}
+                 for k, v in data.items()}
+    rc = ["regimeController"]
+    steps = [["send", [], "setUint", ["robots_on_road", 0]],     # orders_in_window never set
+             ["send", [], "runMonitorCycle", []], ["call", rc, "currentRegime", []],
+             ["send", [], "setBool", ["orders_in_window", True]],  # the other type
+             ["send", [], "runMonitorCycle", []], ["call", rc, "currentRegime", []],
+             ["send", [], "setUint", ["orders_in_window", 10]],
+             ["send", [], "runMonitorCycle", []], ["call", rc, "currentRegime", []]]
+    (tmp_path / "job.json").write_text(json.dumps(
+        {"contracts": contracts, "main": "RobotTown", "steps": steps}), encoding="utf-8")
+    proc = subprocess.run([S.evm_python(), "-I", str(HERE / "regime_evm_driver.py"),
+                           str(tmp_path / "job.json"), str(tmp_path / "out.json")],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    got = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+    assert got == ["ok", "ok", [1], "ok", "ok", [1], "ok", "ok", [0]]

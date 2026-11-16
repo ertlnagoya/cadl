@@ -112,6 +112,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the regime stays, and the refusal is recorded in `refused_transitions`
   and the log (A.7.1). `transitions.py` changes for every file with
   `transitions:`.
+- A transition `condition:` that cannot be evaluated does not hold, and
+  the run goes on: the Python controller raised `KeyError` out of the
+  event loop for a value missing from `ctx.state`, and the Solidity
+  controller read an unset value as 0. Solidity now reads a condition, as
+  an invariant, only with values set (`isSetUint`, `isSetBool`), and a
+  condition it cannot express is `false`.
 - `cadl codegen -t solidity`, a file with `transitions:`: the
   `RegimeController` did not check the safety invariant, had no setter of
   the observed state (so a condition read 0), and its
