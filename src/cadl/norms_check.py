@@ -87,6 +87,11 @@ IN_FORCE = (ACTIVE, SUSPENDED)
 MAX_HORIZON = 1000
 MAX_CHOICES = 8192
 MAX_VALUATIONS = 50000
+# The states (patterns) that the elimination of the quantities of a
+# component may keep at one step, and the points of the faces of its
+# linear arrangement (F.12): --max-states, at most MAX_STATES_BOUND.
+DEFAULT_MAX_STATES = 50000
+MAX_STATES_BOUND = 1000000
 MAX_ATOMS = 16
 MAX_INSTANCES = 4
 MAX_COMMANDS = 32768
@@ -1950,8 +1955,10 @@ class Environment:
     Translator per instance translates its norms; the environment then
     numbers the message events and predicates of all of them."""
 
-    def __init__(self, trs: list, step_ms: int | None, horizon: int | None) -> None:
+    def __init__(self, trs: list, step_ms: int | None, horizon: int | None,
+                 limit: int = DEFAULT_MAX_STATES) -> None:
         self.trs = trs
+        self.limit = limit
         self.notes: list[str] = []
         # predicates: one list, each predicate evaluated with the bindings of
         # its instance
@@ -2260,15 +2267,18 @@ class Environment:
         """The vectors of a component with too many valuations by types and
         patterns, found by elimination of its quantities (F.12)."""
         el = _Elimination(self, ids, keys, linear)
-        got = el.run(MAX_VALUATIONS)
+        limit = getattr(self, "limit", DEFAULT_MAX_STATES)
+        got = el.run(limit)
         if got is None:
             what = (f"the leaves that read numbers of the linear arrangement needed more than "
-                    f"{MAX_VALUATIONS} points of its faces" if el.exceeded == "points" else
-                    f"more than {MAX_VALUATIONS} patterns of the quantities that the remaining "
+                    f"{limit} points of its faces" if el.exceeded == "points" else
+                    f"more than {limit} patterns of the quantities that the remaining "
                     f"comparisons still read had to be kept at one step")
             raise NormsCheckError(
                 f"{why}; adding the quantities one at a time (F.12), {what}, and norms-check "
-                f"refuses more" + self._fewer(keys))
+                f"refuses more (the limit of --max-states, {limit}"
+                + (f", which may be raised up to {MAX_STATES_BOUND}" if limit < MAX_STATES_BOUND
+                   else ", the largest") + ")" + self._fewer(keys))
         return got
 
     def _linear_valuations(self, ids: list, keys: list) -> list:
@@ -2604,6 +2614,17 @@ class Environment:
 # as the frontier says and anywhere consistent against the rest), so every
 # vector comes with a valuation, and every vector is checked on it with
 # the evaluator of norms-eval.
+#
+# From cadl 0.3.32, when the elimination above exceeds 50 000 states at one
+# step, it runs again with three reductions that keep fewer states, each
+# leaving the set of vectors the same (a component within that limit keeps
+# the vectors and valuations of 0.3.31; see the sections below): states equal up to a
+# permutation of members that keeps the remaining expressions are merged
+# (symmetry of a state); a state whose remaining expressions can only give
+# vectors already found, by descents that add the quantities along one
+# extension at a time, is left out; and a leaf that reads a set through
+# min or max keeps only representatives of its members (fold nodes). The
+# limit on the states of one step is --max-states (default 50 000).
 
 _OUTCOME_FLIP = {"lt": "gt", "gt": "lt", "eq": "eq", "inc": "inc", "ne": "ne"}
 
@@ -2650,9 +2671,19 @@ class _NoAmalgam(Exception):
     pass
 
 
+class _NotSymmetric(Exception):
+    pass
+
+
 class _Elimination:
     """The vectors of predicate values of one component, by elimination of
     its quantities (see above)."""
+
+    # the reductions of cadl 0.3.32 (tests compare the vectors without them)
+    LOCAL = True        # symmetry of a state
+    PRUNE = True        # states that can only give vectors already found
+    FOLD = True         # leaves that read min or max of a set
+    reduced = True      # run() sets it: False for the elimination of 0.3.31
 
     def __init__(self, env: Any, ids: list, keys: list, linear: bool = False) -> None:
         self.env, self.ids, self.keys = env, ids, keys
@@ -2803,6 +2834,8 @@ class _Elimination:
             return node
         if node[0] == "leaf":
             return vals.get(node[1], node)
+        if node[0] == "fold":
+            return node
         if node[0] == "not":
             s = cls._simp(node[1], vals)
             return {"T": "F", "F": "T", "U": "U"}.get(s, ("not", s)) if isinstance(s, str) \
@@ -2829,7 +2862,7 @@ class _Elimination:
     def _pending(cls, node: Any, out: set) -> set:
         if isinstance(node, str):
             return out
-        if node[0] == "leaf":
+        if node[0] in ("leaf", "fold"):
             out.add(node[1])
         elif node[0] == "not":
             cls._pending(node[1], out)
@@ -3137,6 +3170,457 @@ class _Elimination:
             return False
         return True
 
+    def _reads(self, node: Any, out: set) -> set:
+        """The quantities that the pending leaves of a node still read."""
+        if isinstance(node, str):
+            return out
+        if node[0] == "leaf":
+            out.update(self.leaves[node[1]][3])
+        elif node[0] == "fold":
+            members = self.folds[node[1]][2]
+            out.update(k for k in self.leaves[node[1]][3] if k not in members)
+            out.update(node[2])
+        elif node[0] == "not":
+            self._reads(node[1], out)
+        else:
+            for c in node[2]:
+                self._reads(c, out)
+        return out
+
+    # --- leaves that read the minimum or maximum of a set (from cadl 0.3.32) -----
+    #
+    # A leaf that reads the members of a set only through min(e for r in S)
+    # and max(e for r in S) (or S[*].f), the element being the same field f
+    # of the member, reads all of their fields f. The evaluator of norms-eval
+    # computes such an aggregate (and decides a comparison of it from an
+    # interval, F.5) from what each element is (_elements: a number, of a
+    # wrong kind, or a marker such as no value) through the set of these
+    # sorts and the smallest or largest number; neither how many elements
+    # have each sort nor the other numbers count. So the leaf has the same
+    # value when every element is replaced by one of a few representatives
+    # that together give the same: the first element of each sort that is
+    # not a number (the sort computed by _elements on the value of its kind)
+    # and the elements with the smallest (min) and the largest (max) number.
+    # The elimination keeps only these representatives of the added members
+    # in the frontier (the fold node ("fold", leaf, representatives)); when
+    # the last quantity of the leaf is added, the leaf is evaluated with each
+    # member given the value of a representative, every representative used.
+    # In the key of a state, a representative that only its fold node reads
+    # is named by the fold and its role, not by its member, and one that is
+    # not a number by its sort (_loose); a set that only fold nodes read is
+    # not sorted (the symmetry above), since which members are
+    # representatives is not kept.
+
+    def _fold_of(self, lid: int) -> tuple | None:
+        """(min or max, set, member keys) of a leaf that reads the members
+        of a set only through min or max of one field, else None."""
+        from .ast_nodes import Comprehension
+        _tr, e, scope, ks = self.leaves[lid]
+        calls: list = []
+
+        def element_field(c: Any) -> str | None:
+            el, var = c.element, c.variable
+            if not isinstance(el, MemberAccess) or not isinstance(el.obj, ActorRef):
+                return None
+            o = el.obj
+            if o.name == var and o.index is None:
+                return el.member
+            if isinstance(o.index, ActorRef) and o.index.name == var and o.index.index is None \
+                    and isinstance(c.domain, ActorRef) and o.name == c.domain.name:
+                return el.member
+            return None
+
+        def walk(n: Any, out: set) -> None:
+            import dataclasses
+            if isinstance(n, FunctionCall) and n.name in ("min", "max") and len(n.args) == 1 \
+                    and isinstance(n.args[0], Comprehension):
+                c = n.args[0]
+                f = element_field(c)
+                if f is not None and isinstance(c.domain, ActorRef) \
+                        and c.domain.index in (None, "*"):
+                    calls.append((n.name, c.domain.name, f))
+                    return
+            if isinstance(n, ActorRef):
+                out.add(n.name)
+                if isinstance(n.index, str):
+                    out.add(n.index)
+                else:
+                    walk(n.index, out)
+            elif isinstance(n, (list, tuple)):
+                for x in n:
+                    walk(x, out)
+            elif dataclasses.is_dataclass(n):
+                for fl in dataclasses.fields(n):
+                    if fl.name != "loc":
+                        walk(getattr(n, fl.name), out)
+
+        rest: set = set()
+        walk(e, rest)
+        if not calls or len({(n, f) for _a, n, f in calls}) != 1:
+            return None
+        aggs = frozenset(a for a, _n, _f in calls)
+        _a, name, field = calls[0]
+        if name in rest or any(v in rest for v, (g, _i) in scope.items() if g == name):
+            return None
+        members = tuple(k for k in ks if re.fullmatch(re.escape(name) + r"\[\d+\]\."
+                                                      + re.escape(field), k))
+        if len(members) < 2 or any(k.startswith(name + "[") and k not in members for k in ks):
+            return None
+        return (aggs, name, frozenset(members))
+
+    def _fold_nodes(self, node: Any) -> Any:
+        if isinstance(node, str):
+            return node
+        if node[0] == "leaf":
+            return ("fold", node[1], ()) if node[1] in self.folds else node
+        if node[0] == "not":
+            return ("not", self._fold_nodes(node[1]))
+        return (node[0], node[1], tuple(self._fold_nodes(c) for c in node[2]))
+
+    def _fold_class(self, lid: int, k: str, kind: tuple) -> Any:
+        """'num' for a number, else what the evaluator of norms-eval makes
+        of the element (_elements: of a wrong kind, the markers): elements
+        with the same are the same for the aggregate."""
+        key = (lid, k, kind)
+        got = self._fold_classes.get(key)
+        if got is None:
+            from .ast_nodes import Comprehension
+            tr, e, _scope, _ks = self.leaves[lid]
+            aggs, name, _members = self.folds[lid]
+            v = self._realise({k: kind}, {}, [k])[k]
+            if _is_number(v):
+                got = "num"
+            else:
+                agg = min(aggs)
+                comp = next(n.args[0] for n in self._calls(e) if n.name == agg)
+                m = re.fullmatch(re.escape(name) + r"\[(\d+)\]\..+", k)
+                ev = tr._evaluator({k: v})
+                vals, markers, invalid = ev._elements(agg, comp, name, [int(m.group(1))], 0, 0)
+                if vals:
+                    raise NormsCheckError(f"internal: the element {v!r} of {agg}() is a number")
+                got = (invalid, tuple(repr(x) for x in markers))
+            self._fold_classes[key] = got
+        return got
+
+    @staticmethod
+    def _calls(e: Any) -> list:
+        import dataclasses
+        from .ast_nodes import Comprehension
+        out: list = []
+
+        def walk(n: Any) -> None:
+            if isinstance(n, FunctionCall) and n.name in ("min", "max") and len(n.args) == 1 \
+                    and isinstance(n.args[0], Comprehension):
+                out.append(n)
+            if isinstance(n, (list, tuple)):
+                for x in n:
+                    walk(x)
+            elif dataclasses.is_dataclass(n):
+                for fl in dataclasses.fields(n):
+                    if fl.name != "loc":
+                        walk(getattr(n, fl.name))
+
+        walk(e)
+        return out
+
+    def _fold_step(self, node: Any, x: str, P: dict, R: dict, added: set) -> Any:
+        if isinstance(node, str):
+            return node
+        if node[0] == "fold":
+            lid, reps = node[1], node[2]
+            agg, _name, members = self.folds[lid]
+            if x not in self.leaves[lid][3]:
+                return node
+            if x in members:
+                cls_ = self._fold_class(lid, x, P[x])
+                same = [r for r in reps if self._fold_class(lid, r, P[r]) == cls_]
+                if not same:
+                    reps = reps + (x,)
+                elif cls_ == "num":
+                    # the smallest (min) and the largest (max) number, the
+                    # earlier one on a tie
+                    vals = self._realise(P, R, same + [x])
+                    nums = sorted(same + [x], key=lambda r: (exact_value(vals[r]),
+                                                             r == x))
+                    hi = sorted(same + [x], key=lambda r: (-exact_value(vals[r]),
+                                                           r == x))
+                    keep = ({nums[0]} if "min" in agg else set()) | (
+                        {hi[0]} if "max" in agg else set())
+                    reps = tuple(r for r in reps if r not in same) + tuple(keep)
+                reps = tuple(sorted(reps, key=self.index.get))
+            if set(self.leaves[lid][3]) <= added:
+                return self._fold_value(lid, reps, P, R)
+            return ("fold", lid, reps)
+        if node[0] == "leaf":
+            return node
+        if node[0] == "not":
+            return ("not", self._fold_step(node[1], x, P, R, added))
+        return (node[0], node[1], tuple(self._fold_step(c, x, P, R, added) for c in node[2]))
+
+    def _loose(self, res: tuple, P: dict, R: dict, front: set) -> tuple | None:
+        """The key of a state whose representatives are read only by their
+        fold node: such a representative is named by its fold and its role
+        (the sort of element, or the smaller or larger number), since which
+        member it is does not change any leaf; one that is not a number
+        stands for its sort (its kind and outcomes do not change the
+        aggregate). None when no representative is renamed."""
+        other: set = set()
+        reps: dict = {}
+
+        def walk(node: Any) -> None:
+            if isinstance(node, str):
+                return
+            if node[0] == "leaf":
+                other.update(self.leaves[node[1]][3])
+            elif node[0] == "fold":
+                other.update(k for k in self.leaves[node[1]][3]
+                             if k not in self.folds[node[1]][2])
+                for r in node[2]:
+                    reps.setdefault(r, []).append(node[1])
+            elif node[0] == "not":
+                walk(node[1])
+            else:
+                for c in node[2]:
+                    walk(c)
+
+        for r in res:
+            walk(r)
+        ren: dict = {}
+        sorts: dict = {}
+        nums: dict = {}
+        for r, lids in reps.items():
+            if r in other or r in self.sorted_keys or len(lids) != 1:
+                continue
+            if P[r] == ("s", "list"):
+                continue        # its outcomes bound the lists still to add
+            c = self._fold_class(lids[0], r, P[r])
+            if c == "num":
+                nums.setdefault(lids[0], []).append(r)
+            else:
+                ren[r] = ("#", lids[0], repr(c))
+                sorts[r] = ("sort", repr(c))
+        for lid, rs in nums.items():
+            if len(rs) == 1:
+                ren[rs[0]] = ("#", lid, "num")
+            else:
+                vals = self._realise(P, R, rs)
+                lo, hi = sorted(rs, key=lambda r: exact_value(vals[r]))
+                ren[lo], ren[hi] = ("#", lid, "lo"), ("#", lid, "hi")
+        if not ren:
+            return None
+
+        def name(k: str) -> Any:
+            return ren.get(k, ("=", k))
+
+        def tree(node: Any) -> Any:
+            if isinstance(node, str) or node[0] == "leaf":
+                return node
+            if node[0] == "fold":
+                return ("fold", node[1], tuple(sorted(map(name, node[2]))))
+            if node[0] == "not":
+                return ("not", tree(node[1]))
+            return (node[0], node[1], tuple(tree(c) for c in node[2]))
+
+        kinds = tuple(sorted((name(k), sorts.get(k, P[k])) for k in front))
+        outs = []
+        for (a, b), o in R.items():
+            if a in front and b in front and a not in sorts and b not in sorts:
+                na, nb = name(a), name(b)
+                outs.append((na, nb, o) if na < nb else (nb, na, _OUTCOME_FLIP[o]))
+        return ("loose", tuple(tree(r) for r in res), kinds, tuple(sorted(outs)))
+
+    def _fold_value(self, lid: int, reps: tuple, P: dict, R: dict) -> str:
+        tr, e, scope, keys = self.leaves[lid]
+        members = self.folds[lid][2]
+        others = [k for k in keys if k not in members]
+        read = sorted(set(others) | set(reps), key=self.index.get)
+        memo = ("fold", lid, reps) + self._canon(P, R, read)
+        v = self.memo.get(memo)
+        if v is None:
+            vals = self._realise(P, R, read)
+            if vals is None:
+                raise NormsCheckError("internal: a pattern of a leaf has no values")
+            ms = sorted(members, key=self.index.get)
+            for i, m in enumerate(ms):
+                if m not in reps:
+                    vals[m] = copy.deepcopy(vals[reps[i % len(reps)]])
+            self.calls += 1
+            v = self.memo[memo] = tr._scoped_value(e, scope, vals)
+        return v
+
+    # --- symmetry of a state (from cadl 0.3.32) ----------------------------------
+    #
+    # A permutation of the members of a set maps a leaf to the leaf of the
+    # same expression with the members of its scope permuted when the leaf
+    # uses the members only through variables (_invariant with the variables
+    # of its scope bound to the set); its value on the permuted valuation is
+    # the same. A state (remaining expressions, frontier pattern) and the
+    # state with the permuted remaining expressions and frontier pattern
+    # give the same vectors for the same quantities still to add, when the
+    # permutation moves only members whose quantities are all added, maps
+    # frontier quantities to frontier quantities of the same kinds and maps
+    # every other leaf that still reads a moved member to itself. When the
+    # remaining expressions are the same after the permutation (up to the
+    # order of the operands of AND and OR, which Kleene logic does not
+    # see), the state and the state with the permuted frontier pattern give
+    # the same vectors: the elimination keeps one state per class of such
+    # patterns (the permutations that exchange two members and keep the
+    # expressions generate, per set, the permutations of classes of members;
+    # their patterns are relabelled in an order of the members computed from
+    # their kinds and outcomes). This holds for every predicate that is not
+    # the same for every permutation of the whole set, such as every pair of
+    # members compared in the order of their indices; the sets that the
+    # predicates treat alike keep the sorted valuations above instead.
+
+    def _local_setup(self) -> None:
+        self.local = not self.linear and self.LOCAL and self.reduced
+        self.member_keys: dict = {}     # set -> member -> {field: key}
+        global_sets = {re.match(r"([A-Za-z_]\w*)\[", ks[0]).group(1) for ks in self.symmetric}
+        for k in self.keys:
+            m = re.fullmatch(r"([A-Za-z_]\w*)\[(\d+)\]\.(.+)", k)
+            if m and m.group(1) not in global_sets:
+                self.member_keys.setdefault(m.group(1), {}).setdefault(
+                    int(m.group(2)), {})[m.group(3)] = k
+        self.member_keys = {n: ms for n, ms in self.member_keys.items() if len(ms) > 1}
+        self.local = self.local and bool(self.member_keys)
+        self._swap_cache: dict = {}
+        self._equiv: dict = {}
+        self._canon_cache: dict = {}
+
+    def _equivariant(self, lid: int, name: str) -> bool:
+        key = (lid, name)
+        got = self._equiv.get(key)
+        if got is None:
+            _tr, e, scope, _ks = self.leaves[lid]
+            bound = {v: g == name for v, (g, _i) in scope.items()}
+            got = self._equiv[key] = self._invariant(e, name, bound)
+        return got
+
+    def _image(self, lid: int, name: str, a: int, b: int) -> int | None:
+        """The leaf to which exchanging the members a and b of `name` maps
+        the leaf lid; None when it is not a leaf of the elimination."""
+        tr, e, scope, ks = self.leaves[lid]
+        reads = {int(m.group(1)) for k in ks
+                 for m in [re.fullmatch(re.escape(name) + r"\[(\d+)\]\..+", k)] if m}
+        reads |= {i for (g, i) in scope.values() if g == name}
+        if a not in reads and b not in reads:
+            return lid
+        if not self._equivariant(lid, name):
+            return None
+        swap = {a: b, b: a}
+        scope2 = {v: (g, swap.get(i, i) if g == name else i) for v, (g, i) in scope.items()}
+        return self._leaf_ids.get((id(tr), repr(e), tuple(sorted(scope2.items(), key=repr))))
+
+    def _canonical_tree(self, node: Any, img: Any, ren: dict) -> Any:
+        if isinstance(node, str):
+            return node
+        if node[0] in ("leaf", "fold"):
+            got = img(node[1])
+            if got is None:
+                raise _NotSymmetric()
+            if node[0] == "fold":
+                return ("fold", got, tuple(sorted((ren.get(k, k) for k in node[2]),
+                                                  key=self.index.get)))
+            return got
+        if node[0] == "not":
+            return ("not", self._canonical_tree(node[1], img, ren))
+        kids = sorted((self._canonical_tree(c, img, ren) for c in node[2]), key=repr)
+        return (node[0], node[1], tuple(kids))
+
+    def _swaps(self, res: tuple, names: tuple, added: set) -> tuple:
+        """The classes of members (set, members) of the state whose
+        exchanges keep the remaining expressions (see above)."""
+        ck = (res, names, len(added))
+        got = self._swap_cache.get(ck)
+        if got is not None:
+            return got
+        front = set(names)
+        base = self._canon_cache.get(res)
+        if base is None:
+            base = self._canon_cache[res] = tuple(
+                self._canonical_tree(r, lambda lid: lid, {}) for r in res)
+        out = []
+        for name, members in self.member_keys.items():
+            movable = [i for i, fs in members.items() if all(k in added for k in fs.values())]
+            parent = {i: i for i in movable}
+
+            def root(i: int) -> int:
+                while parent[i] != i:
+                    i = parent[i]
+                return i
+
+            for x, a in enumerate(movable):
+                for b in movable[x + 1:]:
+                    if root(a) == root(b):
+                        continue
+                    fa, fb = members[a], members[b]
+                    if set(fa) != set(fb) or any(
+                            (fa[f] in front) != (fb[f] in front) or (fa[f] in front and (
+                                self.kinds[fa[f]] != self.kinds[fb[f]]
+                                or self.group.get(fa[f]) != self.group.get(fb[f])
+                                or not self._same_values(self.unary[fa[f]], self.unary[fb[f]])))
+                            for f in fa):
+                        continue
+                    try:
+                        img = (lambda lid, a=a, b=b, name=name: self._image(lid, name, a, b))
+                        ren = {fa[f]: fb[f] for f in fa}
+                        ren.update({fb[f]: fa[f] for f in fa})
+                        same = tuple(self._canonical_tree(r, img, ren) for r in res) == base
+                    except _NotSymmetric:
+                        same = False
+                    if same:
+                        parent[root(b)] = root(a)
+            classes: dict = {}
+            for i in movable:
+                classes.setdefault(root(i), []).append(i)
+            out += [(name, sorted(c)) for c in classes.values() if len(c) > 1]
+        got = self._swap_cache[ck] = tuple(out)
+        return got
+
+    def _sym_canon(self, P: dict, R: dict, front: set, swaps: tuple) -> tuple:
+        """The frontier pattern with the members of each class relabelled
+        in an order computed from their kinds and outcomes."""
+        ren: dict = {}
+        for name, members in swaps:
+            ms = self.member_keys[name]
+            # relabelling members none of whose quantities is in the
+            # frontier does not change the pattern
+            members = [i for i in members if any(k in front for k in ms[i].values())]
+            if len(members) < 2:
+                continue
+            fields = sorted(ms[members[0]])
+            mine = {ms[i][f]: (i, f) for i in members for f in fields}
+
+            def col0(i: int) -> tuple:
+                return tuple(P.get(ms[i][f], "-") for f in fields)
+
+            def colour(i: int, inner: Any) -> tuple:
+                out = []
+                for f in fields:
+                    a = ms[i][f]
+                    if a not in P:
+                        continue
+                    for k in front:
+                        if k == a or k not in P or self._pair(a, k) not in R:
+                            continue
+                        o = self._out(R, a, k)
+                        other = mine.get(k)
+                        out.append((f, o, ("m", other[1], inner(other[0])) if other else k))
+                return (inner(i), tuple(sorted(out, key=repr)))
+
+            c1 = {i: colour(i, col0) for i in members}
+            c2 = {i: colour(i, lambda j: c1[j]) for i in members}
+            order = sorted(members, key=lambda i: (repr(c2[i]), i))
+            for src, dst in zip(order, members):
+                for f in fields:
+                    ren[ms[src][f]] = ms[dst][f]
+        P2 = {ren.get(k, k): v for k, v in P.items()}
+        R2 = {}
+        for (a, b), o in R.items():
+            a2, b2 = ren.get(a, a), ren.get(b, b)
+            R2[self._pair(a2, b2)] = o if self.index[a2] < self.index[b2] else _OUTCOME_FLIP[o]
+        return self._canon(P2, R2, front)
+
     # --- the elimination -----------------------------------------------------------
 
     def _order(self, leaf_keys: list) -> list:
@@ -3162,6 +3646,19 @@ class _Elimination:
         when a kept pattern cannot be extended, the elimination is run
         again keeping every added list of a group in the states as long as
         the group has quantities to add."""
+        # the elimination of 0.3.31 first, so that a component within its
+        # limit gets the same vectors and valuations; the reductions only
+        # when it exceeds that limit
+        self.reduced = False
+        got = self._run_lists(min(limit, DEFAULT_MAX_STATES))
+        if got is not None or self.linear or not (self.LOCAL or self.PRUNE or self.FOLD):
+            if got is None and limit > DEFAULT_MAX_STATES:
+                return self._run_lists(limit)
+            return got
+        self.reduced = True
+        return self._run_lists(limit)
+
+    def _run_lists(self, limit: int) -> list | None:
         self.kept_lists = False
         self.exceeded = None
         try:
@@ -3186,70 +3683,130 @@ class _Elimination:
         const = {lid: self.leaves[lid][0]._scoped_value(self.leaves[lid][1], self.leaves[lid][2], {})
                  for lid in range(len(self.leaves)) if not self.leaves[lid][3]}
         res = tuple(self._simp(r, const) for r in res)
+        self.folds = {} if self.linear or not (self.FOLD and self.reduced) else {
+            lid: f for lid in range(len(self.leaves)) for f in [self._fold_of(lid)] if f}
+        self._fold_classes: dict = {}
+        if self.folds:
+            res = tuple(self._fold_nodes(r) for r in res)
         order = self._order([lv[3] for lv in self.leaves])
         # members that every predicate treats alike: in the order of the
         # elimination, each one after the previous one of its set
         prev: dict = {}
         earlier: dict = {}
         self.symmetric = self._symmetric_sets()
+        # a set read only by fold nodes needs no sorted valuations: which
+        # member is a representative is not kept (_loose)
+        self.symmetric = [keys for keys in self.symmetric if not self.folds or not all(
+            lid in self.folds for lid in range(len(self.leaves))
+            if set(self.leaves[lid][3]) & set(keys))]
+        self.sorted_keys = {k for keys in self.symmetric for k in keys}
+        self._local_setup()
         for keys in self.symmetric:
             seq = [k for k in order if k in keys]
             for a, b in zip(seq, seq[1:]):
                 prev[b] = a
             for i, b in enumerate(seq):
                 earlier[b] = seq[:i]
+        self._ctx = (order, prev, earlier, keep_lists)
+        self._ext_cache: dict = {}
+        self._poss_cache: dict = {}
+        self._poss_exact: dict = {}
         # a state: (remainders, frontier keys, frontier pattern) -> (remainders,
         # kinds, outcomes, kept pattern of all added quantities)
-        states: dict = {(res, (), ((), ())): (res, {}, {}, ({}, {}))}
-        cache: dict = {}
+        start = (res, {}, {}, ({}, {}))
+        states: dict = {(res, (), ((), ())): start}
+        out: dict = {}
+        self.points = 0
+        self.pruned = 0
+        self.prune = not self.linear and self.PRUNE and self.reduced
+        if self.prune:
+            self._descents(start, out, limit)
         self.peak = 1
         for step, x in enumerate(order):
-            added = set(order[:step + 1])
             new: dict = {}
-            cache.clear()
-            for (_r, names, front_key), (res, P, R, H) in states.items():
+            self._ext_cache.clear()
+            self._poss_cache.clear()
+            self._poss_exact.clear()
+            for state in states.values():
                 _generation_time()
-                pending = set().union(*(self._pending(r, set()) for r in res))
-                ready = [lid for lid in pending if x in self.leaves[lid][3]
-                         and set(self.leaves[lid][3]) <= added]
-                nums = {k for k in P if P[k] == ("n",)}
-                ck = (names, front_key)
-                exts = cache.get(ck)
-                if exts is None:
-                    exts = cache[ck] = [
-                        e for e in self._extensions(P, R, x)
-                        if self._canonical(P, x, e, prev.get(x), earlier.get(x, ()))]
-                for kind, outs in exts:
-                    P2, R2 = self._extend(P, R, x, kind, outs)
-                    num = nums | ({x} if kind == ("n",) else set())
-                    vals = {lid: self._leaf_value(lid, P2, R2) for lid in ready
-                            if not num.intersection(self.leaves[lid][3])}
-                    res2 = tuple(self._simp(r, vals) for r in res)
-                    pend2 = set().union(*(self._pending(r, set()) for r in res2))
-                    front = {k for lid in pend2 for k in self.leaves[lid][3] if k in added}
-                    if keep_lists:
-                        front |= {k for k in P2 if P2[k] == ("s", "list")
-                                  and not set(self.groups[self.group[k]]["keys"]) <= added}
-                    canon = (res2, tuple(sorted(front, key=self.index.get)),
-                             self._canon(P2, R2, front))
+                for canon, (res2, make, _kind) in self._successors(state, step):
                     if canon in new:
                         continue
-                    H2 = self._amalgamate(H, x, kind, outs)
-                    if H2 is None:
-                        if keep_lists:
-                            raise NormsCheckError(
-                                f"internal: no lists realise a pattern of "
-                                f"{', '.join(sorted(added))}")
-                        raise _NoAmalgam()
-                    new[canon] = (res2,) + self._restrict(P2, R2, front) + (H2,)
+                    if self.prune and self._covered(res2, out):
+                        self.pruned += 1
+                        continue
+                    new[canon] = make()
                     if len(new) > limit:
                         self.exceeded = "states"
                         return None
             states = new
             self.peak = max(self.peak, len(states))
-        out: dict = {}
-        self.points = 0
-        for res, P, R, H in states.values():
+        self._finish(states.values(), out, limit)
+        self.states = len(states)
+        return list(out.items())
+
+    def _successors(self, state: tuple, step: int) -> list:
+        """The states after adding the quantity of this step to a state:
+        (key, state) for each extension of its frontier pattern."""
+        order, prev, earlier, keep_lists = self._ctx
+        x = order[step]
+        added = set(order[:step + 1])
+        res, P, R, H = state
+        pending = set().union(*(self._pending(r, set()) for r in res))
+        ready = [lid for lid in pending if x in self.leaves[lid][3] and lid not in self.folds
+                 and set(self.leaves[lid][3]) <= added]
+        folding = self.folds and any(x in self.leaves[lid][3] for lid in pending
+                                     if lid in self.folds)
+        nums = {k for k in P if P[k] == ("n",)}
+        names = tuple(sorted(P, key=self.index.get))
+        ck = (names, self._canon(P, R, names))
+        exts = self._ext_cache.get(ck)
+        if exts is None:
+            exts = self._ext_cache[ck] = [
+                e for e in self._extensions(P, R, x)
+                if self._canonical(P, x, e, prev.get(x), earlier.get(x, ()))]
+        got: dict = {}
+        for kind, outs in exts:
+            P2, R2 = self._extend(P, R, x, kind, outs)
+            num = nums | ({x} if kind == ("n",) else set())
+            vals = {lid: self._leaf_value(lid, P2, R2) for lid in ready
+                    if not num.intersection(self.leaves[lid][3])}
+            res1 = (tuple(self._fold_step(r, x, P2, R2, added) for r in res) if folding
+                    else res)
+            res2 = tuple(self._simp(r, vals) for r in res1)
+            read: set = set()
+            for r in res2:
+                self._reads(r, read)
+            front = read & added
+            if keep_lists:
+                front |= {k for k in P2 if P2[k] == ("s", "list")
+                          and not set(self.groups[self.group[k]]["keys"]) <= added}
+            names2 = tuple(sorted(front, key=self.index.get))
+            canon = self._loose(res2, P2, R2, front) if self.folds else None
+            if canon is None:
+                swaps = self._swaps(res2, names2, added) if self.local else ()
+                canon = (res2, names2, self._sym_canon(P2, R2, front, swaps) if swaps
+                         else self._canon(P2, R2, front))
+            if canon in got:
+                continue
+
+            def make(kind=kind, outs=outs, res2=res2, P2=P2, R2=R2, front=front) -> tuple:
+                H2 = self._amalgamate(H, x, kind, outs)
+                if H2 is None:
+                    if keep_lists:
+                        raise NormsCheckError(
+                            f"internal: no lists realise a pattern of "
+                            f"{', '.join(sorted(added))}")
+                    raise _NoAmalgam()
+                return (res2,) + self._restrict(P2, R2, front) + (H2,)
+
+            got[canon] = (res2, make, kind)
+        return list(got.items())
+
+    def _finish(self, states: Any, out: dict, limit: int) -> None:
+        """The vectors of final states, each kept with a valuation checked
+        by the evaluator of norms-eval."""
+        for res, P, R, H in states:
             for vec, point in self._numbers(res, P, R, limit):
                 if vec in out:
                     continue
@@ -3260,8 +3817,130 @@ class _Elimination:
                     if k not in vals:
                         vals[k] = point.get(k, 0)    # a number that no leaf reads
                 self._verify(vec, vals, out)
-        self.states = len(states)
-        return list(out.items())
+
+    # --- vectors found early (from cadl 0.3.32) ----------------------------------
+    #
+    # Only the set of vectors of the component is needed. Before the first
+    # step, a few descents add the quantities along one
+    # extension at a time (chosen to reach a vector not yet found) and keep
+    # the vector of each completed descent with its valuation, checked by
+    # the evaluator. A state whose remaining expressions can only give
+    # vectors already found is then not kept: the values each remaining
+    # expression can still take are bounded from its Kleene structure (a
+    # leaf any of T, F, U; NOT, AND and OR of the bounds of their operands),
+    # and when every combination of these is a vector already found, no
+    # completion of the state gives a new one. The vectors found are the
+    # same; only the states that cannot add one are left out.
+
+    _POSS_ALL = frozenset("TFU")
+
+    def _poss(self, node: Any) -> frozenset:
+        if isinstance(node, str):
+            return frozenset(node)
+        if node[0] == "fold":
+            return self._POSS_ALL
+        got = self._poss_exact.get(node)
+        if got is not None:
+            return got
+        ks: set = set()
+        self._reads(node, ks)
+        if len(ks) <= 2 and not self._has_fold(node):
+            got = self._poss_exact[node] = self._poss_of(node, sorted(ks, key=self.index.get))
+            return got
+        if node[0] == "leaf":
+            return self._POSS_ALL
+        if node[0] == "not":
+            return frozenset({"T": "F", "F": "T", "U": "U"}[v] for v in self._poss(node[1]))
+        kids = [self._poss(c) for c in node[2]]
+        stop, unit = ("F", "T") if node[0] == "and" else ("T", "F")
+        u = node[1]
+        got = set()
+        if any(stop in k for k in kids):
+            got.add(stop)
+        if not u and all(unit in k for k in kids):
+            got.add(unit)
+        if all(k - {stop} for k in kids) and (u or any("U" in k for k in kids)):
+            got.add("U")
+        return frozenset(got)
+
+    @classmethod
+    def _has_fold(cls, node: Any) -> bool:
+        if isinstance(node, str) or node[0] == "leaf":
+            return False
+        if node[0] == "fold":
+            return True
+        if node[0] == "not":
+            return cls._has_fold(node[1])
+        return any(cls._has_fold(c) for c in node[2])
+
+    def _poss_of(self, node: Any, ks: list) -> frozenset:
+        """The values of a part of a predicate that reads at most two
+        quantities, over every pattern of them (exact, so a bound)."""
+        pats = [({}, {})]
+        for k in ks:
+            pats = [self._extend(P, R, k, kind, outs) for P, R in pats
+                    for kind, outs in self._extensions(P, R, k)]
+        lids = self._pending(node, set())
+        got = set()
+        for P, R in pats:
+            _generation_time()
+            if self._realise(P, R, ks) is None:
+                return self._POSS_ALL           # (no bound from this part)
+            v = self._simp(node, {lid: self._leaf_value(lid, P, R) for lid in lids})
+            if not isinstance(v, str):
+                return self._POSS_ALL
+            got.add(v)
+        return frozenset(got)
+
+    def _possible(self, res: tuple) -> list:
+        got = self._poss_cache.get(res)
+        if got is None:
+            got = self._poss_cache[res] = [self._poss(r) for r in res]
+        return got
+
+    def _covered(self, res: tuple, out: dict) -> bool:
+        """Whether every vector that the remaining expressions can give
+        has been found."""
+        poss = self._possible(res)
+        size = 1
+        for p in poss:
+            size *= len(p)
+        if size > len(out):
+            return False
+        return all(v in out for v in itertools.product(*poss))
+
+    def _descents(self, start: tuple, out: dict, limit: int) -> None:
+        """Descents from the initial state toward vectors not yet found."""
+        order = self._ctx[0]
+        self._poss_cache: dict = {}
+        self._poss_exact: dict = {}
+        rng = random.Random(0)
+        budget = max(8, min(400, 20000 // max(1, len(order))))
+        misses = 0
+        for d in range(budget):
+            state = start
+            # every other descent gives each quantity the kind of the
+            # previous one when it can (groups of equal or ordered values)
+            mimic = d % 2 == 1
+            try:
+                for step in range(len(order)):
+                    _generation_time()
+                    self._ext_cache.clear()
+                    succ = [m for _c, m in self._successors(state, step)]
+                    fresh = [m for m in succ if not self._covered(m[0], out)] or succ
+                    if mimic and step:
+                        last = state[3][0].get(order[step - 1])
+                        same = [m for m in fresh if m[2] == last]
+                        if same and rng.random() < 0.9:
+                            fresh = same
+                    state = rng.choice(fresh)[1]()
+            except _NoAmalgam:
+                continue            # (the states run again keeping the lists)
+            before = len(out)
+            self._finish([state], out, limit)
+            misses = 0 if len(out) > before else misses + 1
+            if misses >= 100 or self._covered(start[0], out):
+                break
 
     def _numbers(self, res: tuple, P: dict, R: dict, limit: int) -> list:
         """The vectors of a final state, with the numbers of the arrangement:
@@ -5054,10 +5733,21 @@ def _parse_domains(items) -> dict:
 def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=None,
                 members=None, step: str | int | None = None,
                 horizon: int | None = None, domains=None, instances=None,
-                versions=None, starts: str = "any") -> NormsModel:
+                versions=None, starts: str = "any", max_states: int | None = None) -> NormsModel:
     """Translate one contract instance (F.12). `bindings` and `members`
     map names to integers (or are lists of "name=n" texts), `step` is a
-    duration text or milliseconds."""
+    duration text or milliseconds; `max_states` is the limit of the
+    elimination (--max-states, default DEFAULT_MAX_STATES)."""
+    if max_states is not None and not (
+            isinstance(max_states, int) and 1 <= max_states <= MAX_STATES_BOUND):
+        raise NormsCheckError(f"--max-states must be an integer from 1 to {MAX_STATES_BOUND}")
+    return _build_model(sos, contract_id, bindings, members, step, horizon, domains,
+                        instances, versions, starts,
+                        DEFAULT_MAX_STATES if max_states is None else max_states)
+
+
+def _build_model(sos: SoSDefinition, contract_id, bindings, members, step, horizon, domains,
+                 instances, versions, starts: str, limit: int) -> NormsModel:
     if not norms_declared(sos):
         raise NormsCheckError("the file does not declare 'norms: 0.1' under extensions:")
     contract = select_contract(sos, contract_id)
@@ -5083,17 +5773,17 @@ def build_model(sos: SoSDefinition, contract_id: str | None = None, bindings=Non
             # observation: each instance has the same sequence of versions
             vts = [_version_translators(t, sos, contract, versions, {**bindings, **b}, members,
                                         step_ms, horizon, domains) for t, b in zip(trs, sets)]
-            Environment(trs + [v for vt in vts for v in vt], step_ms, horizon)
+            Environment(trs + [v for vt in vts for v in vt], step_ms, horizon, limit)
             return NormsModel(trs, versions=vts, starts=starts)
-        Environment(trs, step_ms, horizon)
+        Environment(trs, step_ms, horizon, limit)
         return NormsModel(trs, starts=starts)
     tr = Translator(sos, contract, bindings, members, step_ms, horizon, domains)
     if versions:
         vtrs = _version_translators(tr, sos, contract, versions, bindings, members, step_ms,
                                     horizon, domains)
-        Environment([tr] + vtrs, step_ms, horizon)
+        Environment([tr] + vtrs, step_ms, horizon, limit)
         return NormsModel(tr, versions=vtrs)
-    Environment([tr], step_ms, horizon)
+    Environment([tr], step_ms, horizon, limit)
     return NormsModel(tr)
 
 
@@ -6013,7 +6703,8 @@ def format_text(report: dict) -> str:
 
 def check_file(path, contract_id=None, bindings=None, members=None, step=None,
                horizon=None, export_dir=None, prism=None, timeout: float = 600,
-               domains=None, instances=None, versions=None, starts: str = "any") -> dict:
+               domains=None, instances=None, versions=None, starts: str = "any",
+               max_states: int | None = None) -> dict:
     """`cadl norms-check`: build the model of a file, check it, export."""
     import time
     from .norms_eval import load_version
@@ -6022,7 +6713,7 @@ def check_file(path, contract_id=None, bindings=None, members=None, step=None,
     _DEADLINE[0] = start + timeout
     try:
         model = build_model(sos, contract_id, bindings, members, step, horizon, domains,
-                            instances, versions, starts)
+                            instances, versions, starts, max_states)
     finally:
         _DEADLINE[0] = None
     built = time.monotonic() - start

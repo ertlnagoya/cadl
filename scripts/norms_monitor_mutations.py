@@ -2,7 +2,8 @@
 (tests/test_norms_monitor_targets.py, Appendix D, D.5).
 
 Each mutant of norms_monitor_base.sol runs the traces of one set of
-contents (RELEASE, COMPARE, TWO, THREE, FOUR, NESTED, ZERO, MIX, DEEP, FIVE: the boundary traces, N random traces and
+contents (RELEASE, COMPARE, TWO, THREE, FOUR, NESTED, ZERO, MIX, DEEP, FIVE, UNTILN, MIXED, SIX:
+the boundary traces, N random traces and
 three long ones) on the EVM; it is killed when a trace differs from
 `cadl norms-eval`. Needs the EVM of the tests (CADL_EVM_PYTHON, CADL_SOLC).
 
@@ -86,11 +87,35 @@ MUT = [
  ("five-words", "five", "uint256 words = ops.length > 4 ? 1 << (2 * (ops.length - 4)) : 1;",
   "uint256 words = ops.length > 4 ? 2 : 1;"),
  ("five-entries", "five", "out[v * words + w] |= both;", "out[v * words] |= both;"),
+ # contents decided per observation (General): until in a nesting, mixed operands, six operators
+ ("gen-decisive-range", "mixed", "for (uint256 y = first(data, vv, a, x, 1); y != NONE; y = first(data, vv, y + 1, x, 1)) {",
+  "for (uint256 y = first(data, vv, x, x, 1); y != NONE; y = first(data, vv, y + 1, x, 1)) {"),
+ ("gen-no-wake", "mixed", "                wake(g, op, data, x, n, out);", ""),
+ ("gen-no-wait", "mixed", "if (op.mode != W_UNTIL && y < op.ov) wait(g, op, data, y, e);", ""),
+ ("gen-no-kids", "mixed", "for (uint256 k = 0; k < c.c; k++) operand(g, op, data, c.a[k], n, nx);", ""),
+ ("gen-low", "mixed", "g.low = clo < low ? clo : low;", "g.low = n;"),
+ ("gen-window-edge", "mixed", "uint256 a = firstTime(data, g.start, x, data.obsT[x] - op.td);",
+  "uint256 a = firstTime(data, g.start, x, data.obsT[x] - op.td + 1);"),
+ ("gen-no-over", "six", "        recheck(g, op, data, vv, ov0, ov1, n, out);\n", "\n"),
+ ("gen-undefined", "six", "if (first(data, pp, y, e, 8) != NONE) return X_U;", ""),
+ ("gen-cand-hit", "six", "                if (v == X_T) g.hit = true;\n                else if (v != X_D) { gset(data, cc, y, 0); g.und--; }",
+  "                if (v != X_D && v != X_T) { gset(data, cc, y, 0); g.und--; }"),
+ ("gen-until-late", "until-nested", "if (late[0] != NONE) recheck(g, op, data, vv, late[0], late[1] + 1, n, out);", ""),
+ ("gen-until-late-range", "until-nested", "if (a < late[0]) late[0] = a;", "if (x < late[0]) late[0] = x;"),
+ ("gen-wake-link", "mixed", "for (; h != 0; h = data.gw[nk | (h - 1)]) push(ys, h - 1);\n        for (uint256 k = 0; k < ys.c; k++) recheck(g, op, data, vv, ys.a[k], ys.a[k] + 1, n, out);",
+  "for (; h != 0; h = data.gw[nk | (h - 1)]) recheck(g, op, data, vv, h - 1, h, n, out);"),
+ ("gen-until-q-now", "until-nested", "else if (gget(data, gpre(g.gen, op.node, 2), n) == X_T) {", "else if (false) {"),
+ ("gen-until-prefix", "until-nested", "if (first(data, qq, y, gi == NONE ? r : gi, 2) != NONE) return X_T;",
+  "if (first(data, qq, y, r, 2) != NONE) return X_T;"),
+ ("gen-until-undecided", "until-nested", "if (gd != NONE && first(data, qq, gd + 1, r, 10) != NONE) return X_D;", ""),
+ ("gen-until-unknown", "until-nested", "if (gu != NONE && first(data, qq, gu + 1, r, 2) != NONE) return X_U;", ""),
+ ("gen-until-broken", "until-nested", "uint256 r = b == NONE ? e : b;", "uint256 r = e;"),
 ]
 SETS = {"release": (T.RELEASE, 20261301), "compare": (T.COMPARE, 20261302), "two": (T.TWO, 20261303),
         "three": (T.THREE, 20261304), "four": (T.FOUR, 20261305), "nested": (T.NESTED, 20261306),
         "zero": (T.ZERO, 20261307), "mix": (T.MIX, 20261308), "deep": (T.DEEP, 20261309),
-        "five": (T.FIVE, 20261310)}
+        "five": (T.FIVE, 20261310), "until-nested": (T.UNTILN, 20261311), "mixed": (T.MIXED, 20261312),
+        "six": (T.SIX, 20261313)}
 base = M.BASE.read_text()
 names = sys.argv[4:]
 for name, st, old, new in MUT:

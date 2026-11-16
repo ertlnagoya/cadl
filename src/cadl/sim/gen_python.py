@@ -105,6 +105,15 @@ def _build_config(ir: SimIR) -> dict:
             _transition_dict(t) for t in ir.transitions
         ]
 
+    # Regime bindings (A.7.1): parameter values and active contracts per regime
+    if ir.regimes_declared and ir.regimes is not None:
+        cfg["regimes"] = [
+            {"name": r["name"], "parameters": dict(r["parameters"]),
+             "active_contracts": list(r["active_contracts"]),
+             "suspended_contracts": list(r["suspended_contracts"])}
+            for r in ir.regimes
+        ]
+
     # Metrics
     if ir.metrics:
         cfg["metrics"] = [
@@ -205,4 +214,6 @@ def _transition_dict(t) -> dict:
         d["condition"] = t.condition
     if t.protocol:
         d["protocol"] = t.protocol
+    if t.safety_invariant:
+        d["safety_invariant"] = t.safety_invariant
     return d

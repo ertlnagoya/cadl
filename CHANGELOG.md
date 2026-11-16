@@ -4,7 +4,204 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.32] — 2026-11-16
+
+### Added
+
+- `regimes:` under `sos:` (Appendix A, A.7.1): per regime of
+  `transitions:`, values of declared parameters (`C.alpha`, `C.beta`,
+  `C.lambda` of a contract that writes the value, `environment.X` of
+  `context.environment`) and the contracts in force (`contracts:` with
+  `active:` or `suspended:`). `cadl check` reports an unknown regime,
+  entry key, parameter or contract, a value of the wrong type or outside
+  `[0, 1]`, both `active:` and `suspended:`, a contract listed twice, a
+  parameter bound twice, and a parameter of a suspended contract (R-1 to
+  R-6). `cadl sim-ir` writes the resolved bindings of every regime under
+  the key `regimes` (only for a file with the block; `null` when it breaks
+  a rule), and `cadl sim-gen` passes them to the python, go (`regimes`)
+  and unity (`regimeBindings`) targets. `cadl verify` still checks every
+  pair of contracts that share a party; a conflict between two contracts
+  that no regime has in force together is a warning, not a failure, a
+  consistent such pair gets an `info` line, and an undecided one stays
+  `unknown`. A file with `regimes:` but
+  no regimes (no `transitions:`) has every contract in force. The Python
+  code of `cadl codegen` gets `RegimeController.parameters()`,
+  `contract_active()` and `apply_bindings()`; the current values are in
+  `ctx.parameters` (a new attribute of `RuntimeContext`), which the
+  generated monitors do not read, and a suspended contract is not
+  monitored. With `stochastic: 0.1`, a bound value is the value of the
+  model parameter bound to the same source under the design of the
+  regime, and a different value in `model.regimes:` is an error (R-7).
+  A file without `regimes:` gives the same results as in 0.3.31, apart
+  from `safety_invariant` in the IR (next entry).
+- `cadl sim-ir` writes the `safety_invariant` of a transition, as
+  written (the key is absent for a transition without one), and
+  `cadl sim-gen` passes it on (`safety_invariant`, unity
+  `safetyInvariant`). Up to 0.3.31 it was checked but not in the IR.
+- Amendment extension (`amendment: 0.1`, Appendix K of the
+  specification). `amendment.parameters` declares which values of the
+  model may be amended: the layer (`rule`, `contract`, `regulation`), who
+  decides (`decided_by:` an actor or a role of the model, alone or with
+  `procedure: vote`, `quorum:` and `voters:`, which are actors; defaults per layer under
+  `amendment.layers`), `min`, `max`, `step`, `max_steps` (the largest
+  change of one amendment, in steps), `unit`, `safety`, and `at:`, the
+  places of the model that hold the value (paths such as
+  `contracts.ROAD_USE.lifecycle.transitions.release.deadline`; a quoted
+  segment may contain dots, as in
+  `regimes.CENTRALIZED.parameters."ROUTING.beta"`). The
+  identity of a version is `sos.version`; `amendment.previous` names the
+  version it replaces, `amendment.effective` when it takes effect
+  (`period:` or an ISO 8601 `at:`), and `amendment.transitional` what
+  contract instances running at that time do: `keep` (finish under the
+  version they started in), `switch` (follow the new version, from the
+  effective time or when the instance is in one of `in_states:`), with a
+  default and an entry per contract. `switch` is the case to which the
+  `on_amendment:` of the norms (F.6) applies; under `keep` it does not.
+  `amendment.decisions` lists records of human decisions (`id`, a URI
+  reference `ref` such as `gsn.yaml#S2`, `kind: gsn | record`), which a
+  parameter, a schedule entry and a measurement method name with
+  `decision:`. A metric gets `schedule:` (targets from a period, a time
+  or a version on) and `measure:` (`window`, `every`, `aggregate`,
+  `runs`, `across_runs`, `description`). `cadl check` applies the rules
+  K-1 to K-13 (unknown actors and roles, values outside the range or off
+  the steps, locations that do not exist or do not hold the value,
+  undeclared decisions, schedules out of order, transitional rules for
+  unknown contracts or terminal states, malformed values; keys used
+  without the declaration get one warning), and `cadl sim-ir` adds the
+  top-level key `amendment` for a file that declares the extension.
+- `cadl amend-diff OLD NEW`: compares two versions of a model under the
+  declaration of the old one (an old version without the declaration
+  declares no parameter). It lists the parameters that changed and the
+  contracts they changed, and checks each change against the range, the
+  steps and `max_steps`. The new values of all changed parameters are put
+  into the old version in one pass; a location that holds the old value
+  more than once, or two parameters that change the same value at one
+  place differently, is an error, and the index of an actor reference is
+  never a parameter. A change of the rules that no parameter explains is
+  an error, including `verification:`, `regimes:`, and the order of the
+  actors and of the norms of a contract; a change of metrics, codegen and
+  texts, and of the order of other lists, is a warning, as is a change of
+  the declaration itself. A `previous:` that is not the old version, the
+  same version on both sides, and an effective time that is not later are
+  errors; a period and a time cannot be compared (warning). For every
+  contract with norms whose running instances switch, it includes the
+  findings of `cadl norms-diff`, and it warns when a switching instance
+  could be in a state that the new version removed. Equal values written
+  differently (`60s` and `1min`, `0.5` and `0.50`) are equal. Exit status
+  0 when the changes respect the declaration, 1 when they do not or the
+  new version is invalid, 2 on a usage error.
+- `examples/amendment_robot_town_v1.cadl` and `_v2.cadl`: the robot town
+  of the Course D hands-on with the amendment extension, two versions of
+  its rules (`block_k` 3 → 2).
+
+- `cadl norms-check --max-states N`: the limit on the states that the
+  elimination of a group of compared quantities keeps at one step, and on
+  the points of the faces of its linear arrangement (F.12; default 50 000,
+  at most 1 000 000). The refusal names the limit, its value, and how far
+  it may be raised.
+
+- The Solidity norms monitor decides the contents of norms it refused
+  (Appendix D, D.5): six or more temporal operators in one content,
+  `until` in a nesting (`within(5s, until(p, q, 3s))`, `until(p,
+  within(2s, q), 3s)`), and an operand that combines a nested operator
+  with other parts (`within(5s, throughout(2s, p) AND r)`). Such a
+  content is decided per observation (`General`, in `CadlNormsMulti`):
+  from the first candidate of an activation on, each temporal operator
+  of the content keeps the truth values of its operands and its own
+  value at every observation, two bits each and 128 to a storage word,
+  each operator after those inside it; its value at an observation is
+  that of F.4 over the operand values of its window, found with a few
+  masks per word. An observation reads again only the operands at the
+  observations whose value inside them it decided, the windows that hold
+  an operand decided now (all of them for a decisive value of `within`
+  or `throughout` and for `until`), and the windows that it ends; a
+  window of `within` or `throughout` that is over and still waits for an
+  undecided operand is read again when its last undecided operand is
+  decided. The content is read again at the candidates whose operators
+  the observation decided. The contents that 0.3.31 decided are
+  generated and decided as before. The gas of an observation does not
+  grow with the number of earlier observations; it grows linearly with
+  the operators and, for these contents, can grow with the number of
+  observations inside a window (after a gap in time one observation can
+  decide the values of a whole window). Measured at one observation per
+  second into 1000 s windows, at the 320th and the 1000th observation:
+  `within(1000s, throughout(500s, …) AND …)` 5.4 × 10^5 and 6.4 × 10^5
+  gas, `within(1000s, until(…, …, 500s))` 5.3 × 10^5 and 6.8 × 10^5
+  (each rises once, when the inner windows end from the 500th second
+  on), six operators 9.8 × 10^5 and 9.9 × 10^5 (at most 1.3 × 10^6; five
+  operators in the tree cost 6.7 × 10^6), twelve operators 1.6 × 10^6
+  (120th observation); `within(100s, NOT throughout(50s, …) OR …)`,
+  whose windows wait for their operands, 5.4 × 10^5 before the 100th
+  second and 7.4 × 10^5 from the 150th on. An observation costs at most
+  in proportion to the observations of the windows it decides or reads
+  again (`until` reads the windows of its late operand values once per
+  observation, as one range): `until(throughout(60s, …), within(60s, …),
+  60s)` with p decided false at all 61 observations at once costs
+  4.0 × 10^6 gas (7.6 × 10^6 with 120 s windows); six `within(10s, …)`
+  with an observation every 0.01 s and then a gap to t = 100 cost
+  6.7 × 10^6 at that observation after 50 observations and 2.2 × 10^7
+  after 150, and about 200 reach the 3 × 10^7 gas of a block in the
+  tests. `cadl codegen` does not refuse such contents (the bound depends
+  on the trace); a deployment should bound the observations inside a
+  window. The first observation of a content with 6, 12, 24 and 48
+  operators (`within(1s, …) OR …`) costs 1.3 × 10^6, 2.2 × 10^6,
+  4.1 × 10^6 and 7.7 × 10^6 gas. What limits the size of such a content
+  is the deployment: the constructor stores the model, about 5.5 × 10^5
+  gas per operator of this form (7.4 × 10^6 gas for 6 operators,
+  1.7 × 10^7 for 24, 3.1 × 10^7 for 48, the creation code 21 646,
+  30 688 and 42 760 bytes); the estimate of the creation code refuses a
+  monitor above the limit of EIP-3860 as before. The generated
+  constructor calls `_general(root)`, then per operator, inner ones
+  first, `_gop(mode, node, p, q, d)` and `_gkid(j)` for each operator
+  directly inside its operands, and `_gtop(j)` for the operators of the
+  content not inside another; these operators get the node code 13
+  (`OP_GVAL`), whose value `CadlNormsEval.ev` reads from the stored
+  values. The constructor of a monitor without such a content is
+  unchanged; its observations cost 0.03 % to 0.2 % more gas in the tests
+  (the larger dispatch of `CadlNormsMulti` and one flag).
+- tests/test_norms_monitor_targets.py: the sets UNTILN, MIXED and SIX on
+  the EVM and on OPA, six boundary traces of `until` (q true deciding
+  earlier windows at once, q true after p undefined, also under `NOT`,
+  after p undecided, and after p false, also when p is decided late) and
+  two of windows that wait for their operands, random contents with temporal operators inside
+  others (until anywhere, mixed operands, comparisons) on both, the gas
+  of the new contents, and of windows that wait for their operands.
+  scripts/norms_monitor_mutations.py: 17 mutants of `General`, all
+  killed.
+
+### Changed
+
+- `cadl norms-check`: when the elimination (F.12) of 0.3.31 needs more
+  than 50 000 states at one step, it runs again with reductions that
+  keep fewer states (a component within that limit gets the same
+  combinations and valuations as with 0.3.31). Each reduction leaves the
+  combinations of predicate values the same, and
+  every combination still comes with a valuation that the evaluator of
+  `cadl norms-eval` confirms. States that a permutation of the members of
+  a set maps to each other are merged, when the leaves that read the
+  moved members use them only through variables and the remainders are
+  the same up to the order of the operands of `AND` and `OR`; this covers
+  predicates that order every pair of members by their indices. A state
+  whose remainders can only give combinations already found (by a few
+  runs that add the quantities along one extension at a time; the values
+  of a remainder are bounded by Kleene's tables, exactly for parts that
+  read at most two quantities) is left out. A leaf that reads a set only
+  through `min` and `max` of one field keeps one member of each sort of
+  element (a number, a value of a wrong kind, no value, as `_elements` of
+  the evaluator tells them apart) and the members with the smallest and
+  largest number, named in the state by their role. Every pair of 6, 7 or
+  8 members ordered by their indices, refused by 0.3.31, takes less than
+  a second, and so does `max(r.load for r in R) > D.load` over 8 members
+  (0.3.31: refused from 6 members, 40 to 50 s for 5). Still refused within the default
+  limit: a leaf that reads many quantities through `count` when one of
+  its values never occurs, linear arithmetic over many ordered quantities,
+  and predicates that read the same members through `max` and by their
+  indices.
+
+- The runtime estimates of `CadlNormsMulti`, `CadlNormsEval`,
+  `CadlNormsActs` and the main contract are 16 270, 11 550, 12 200 and
+  17 250 bytes (10 120, 11 440, 12 080 and 16 670).
+
 
 ## [0.3.31] — 2026-11-14
 

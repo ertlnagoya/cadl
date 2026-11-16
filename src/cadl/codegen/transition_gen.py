@@ -8,8 +8,17 @@ from ..ast_nodes import TransitionDef
 from .emitter import sanitize_id
 
 
-def generate_transitions_module(transitions: List[TransitionDef]) -> str:
-    """Generate the transitions.py module with a RegimeController class."""
+def generate_transitions_module(
+    transitions: List[TransitionDef],
+    bindings: list | None = None,
+    declared_params: dict | None = None,
+) -> str:
+    """Generate the transitions.py module with a RegimeController class.
+
+    ``bindings`` are the resolved regime bindings of `regimes:` (Appendix A,
+    A.7.1, `cadl.regimes.checked`), or None for a file without the block; the
+    module is then the same as without them. ``declared_params`` maps each
+    bound parameter to its declared value."""
     if not transitions:
         return _empty_module()
 
@@ -33,6 +42,8 @@ def generate_transitions_module(transitions: List[TransitionDef]) -> str:
 
     lines.append(f"    REGIMES = {sorted(regimes)!r}")
     lines.append("")
+    if bindings is not None:
+        _emit_bindings(lines, bindings, declared_params or {})
 
     # Constructor
     first_regime = transitions[0].from_regime if transitions else "UNKNOWN"
@@ -82,6 +93,8 @@ def generate_transitions_module(transitions: List[TransitionDef]) -> str:
 
     lines.append("        self.current_regime = target_regime")
     lines.append("        self.transition_history.append((old, target_regime))")
+    if bindings is not None:
+        lines.append("        self.apply_bindings(ctx)")
     lines.append(f"        ctx.record_log(f'Regime transition: {{old}} -> {{target_regime}}')")
     lines.append("        return True")
     lines.append("")
@@ -90,6 +103,31 @@ def generate_transitions_module(transitions: List[TransitionDef]) -> str:
     if not content.endswith("\n"):
         content += "\n"
     return content
+
+
+def _emit_bindings(lines: list, bindings: list, declared_params: dict) -> None:
+    """The regime bindings of `regimes:` as class data and three methods."""
+    lines.append("    # Regime bindings (regimes:, Appendix A, A.7.1)")
+    lines.append(f"    DECLARED_PARAMETERS = {dict(declared_params)!r}")
+    regime_params = {b.name: dict(b.parameters) for b in bindings}
+    suspended = {b.name: list(b.suspended) for b in bindings}
+    lines.append(f"    REGIME_PARAMETERS = {regime_params!r}")
+    lines.append(f"    SUSPENDED_CONTRACTS = {suspended!r}")
+    lines.append("")
+    lines.append("    def parameters(self) -> dict:")
+    lines.append('        """The value of every bound parameter in the current regime."""')
+    lines.append("        values = dict(self.DECLARED_PARAMETERS)")
+    lines.append("        values.update(self.REGIME_PARAMETERS.get(self.current_regime, {}))")
+    lines.append("        return values")
+    lines.append("")
+    lines.append("    def contract_active(self, contract_id: str) -> bool:")
+    lines.append('        """Whether a contract is in force in the current regime."""')
+    lines.append("        return contract_id not in self.SUSPENDED_CONTRACTS.get(self.current_regime, [])")
+    lines.append("")
+    lines.append("    def apply_bindings(self, ctx: RuntimeContext) -> None:")
+    lines.append('        """Publish the parameter values of the current regime in ctx.parameters."""')
+    lines.append("        ctx.parameters = self.parameters()")
+    lines.append("")
 
 
 def _compile_expr_str(condition: str) -> str | None:

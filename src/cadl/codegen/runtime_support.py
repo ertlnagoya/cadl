@@ -90,6 +90,9 @@ class RuntimeContext:
         self.messages: List[Message] = []
         self.violations: List[Violation] = []
         self.log: List[str] = []
+        # Values of the parameters bound by `regimes:` (Appendix A, A.7.1)
+        # in the current regime; set by the generated RegimeController.
+        self.parameters: Dict[str, Any] = {}
 
     def register_actor(self, actor: ActorBase) -> None:
         self.actors[actor.actor_id] = actor
