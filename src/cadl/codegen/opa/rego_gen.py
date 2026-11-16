@@ -28,17 +28,77 @@ def generate_rego(sos: SoSDefinition, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for contract in sos.contracts:
-        code = generate_contract_rego(contract, sos)
+        code = generate_contract_rego(contract, sos, _bindings(sos))
         filename = f"{snake_case(contract.id)}.rego"
         (output_dir / filename).write_text(code, encoding="utf-8")
 
     # Generate main policy
-    code = generate_main_rego(sos)
+    code = generate_main_rego(sos, _bindings(sos))
     (output_dir / "main.rego").write_text(code, encoding="utf-8")
 
 
-def generate_contract_rego(contract: ContractDef, sos: SoSDefinition) -> str:
-    """Generate a Rego policy for a CADL ContractDef."""
+def _bindings(sos: SoSDefinition) -> list | None:
+    """The regime bindings of `regimes:` (Appendix A, A.7.1), or None for a
+    file without the block or without transitions: the policies are then
+    the same as before the block existed."""
+    if not sos.transitions:
+        return None
+    from ...regimes import checked
+    return checked(sos)
+
+
+def _rego_value(value) -> str:
+    """A scalar of a regime binding as a Rego term (JSON)."""
+    import json
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _per_regime(lines: list, name: str, per_regime: dict, default: str) -> None:
+    """`name` with the value of the current regime, else `default`."""
+    first = True
+    for regime, value in per_regime.items():
+        head = f"{name} := " if first else "} else := "
+        lines.append(f"{head}{value} if {{")
+        lines.append(f"    input.regime == {_rego_value(regime)}")
+        first = False
+    lines.append(f"}} else := {default}")
+
+
+def _regime_rules(lines: list, contract: ContractDef, bindings: list) -> None:
+    """Which regime is current, and whether the contract is in force in it."""
+    regimes = [b.name for b in bindings]
+    suspended = [b.name for b in bindings if contract.id not in b.active]
+    lines.append("# Regime bindings (regimes:, Appendix A, A.7.1): input.regime names the")
+    lines.append("# current regime, whose bindings apply. Without it, or with a name that is")
+    lines.append("# not a regime of the file, nothing is allowed and regime_error says why.")
+    lines.append(f"regimes := {_rego_list(regimes)}")
+    lines.append("")
+    lines.append("regime_error := msg if {")
+    lines.append("    not input.regime")
+    lines.append('    msg := "input.regime is missing: it names the current regime"')
+    lines.append("} else := msg if {")
+    lines.append("    not input.regime in regimes")
+    lines.append('    msg := sprintf("input.regime %v is not a regime of the file", [input.regime])')
+    lines.append("}")
+    lines.append("")
+    if suspended:
+        lines.append(f"# The regimes that do not have {contract.id} in force")
+        lines.append(f"suspended_in := {_rego_list(suspended)}")
+        lines.append("")
+    lines.append("in_force if {")
+    lines.append("    not regime_error")
+    if suspended:
+        lines.append("    not input.regime in suspended_in")
+    lines.append("}")
+    lines.append("")
+
+
+def generate_contract_rego(contract: ContractDef, sos: SoSDefinition,
+                           bindings: list | None = None) -> str:
+    """Generate a Rego policy for a CADL ContractDef. With the regime
+    bindings of `regimes:` (A.7.1), the policy reads `input.regime`: a
+    contract that is not in force in it is satisfied and has no violation,
+    and a value that the regime binds has the bound value."""
     pkg_name = snake_case(contract.id)
     ctx = RegoContext()
 
@@ -56,13 +116,27 @@ def generate_contract_rego(contract: ContractDef, sos: SoSDefinition) -> str:
     lines.append(f"parties := {_rego_list(party_names)}")
     lines.append("")
 
+    if bindings is not None:
+        _regime_rules(lines, contract, bindings)
+    bound: dict = {}
+    for b in bindings or []:
+        for key, value in b.parameters.items():
+            owner, attr = key.split(".", 1)
+            if owner == contract.id:
+                bound.setdefault(attr, {})[b.name] = value
+
     # Institutional parameters
-    if contract.authority and contract.authority.beta is not None:
-        lines.append(f"beta := {contract.authority.beta}")
-    if contract.information and contract.information.alpha is not None:
-        lines.append(f"alpha := {contract.information.alpha}")
-    if contract.incentives and contract.incentives.lambda_ is not None:
-        lines.append(f"lambda_ := {contract.incentives.lambda_}")
+    for attr, name, declared in (
+            ("beta", "beta", contract.authority.beta if contract.authority else None),
+            ("alpha", "alpha", contract.information.alpha if contract.information else None),
+            ("lambda", "lambda_", contract.incentives.lambda_ if contract.incentives else None)):
+        if declared is None:
+            continue
+        if attr in bound:
+            lines.append(f"# {name} in the current regime (A.7.1); declared {declared}")
+            _per_regime(lines, name, bound[attr], str(declared))
+        else:
+            lines.append(f"{name} := {declared}")
     if contract.authority or contract.information or contract.incentives:
         lines.append("")
 
@@ -109,19 +183,33 @@ def generate_contract_rego(contract: ContractDef, sos: SoSDefinition) -> str:
     # allow rule
     lines.append("# Contract satisfied when assumptions imply guarantees hold")
     lines.append("allow if {")
+    if bindings is not None:
+        lines.append("    in_force")
     lines.append("    assumptions_hold")
     lines.append("    guarantees_hold")
     lines.append("}")
     lines.append("")
+    if bindings is not None:
+        lines.append("# A contract that the current regime does not have in force is satisfied")
+        lines.append("allow if {")
+        lines.append("    not regime_error")
+        lines.append("    not in_force")
+        lines.append("}")
+        lines.append("")
 
     # violation rule
     lines.append("# Violation: assumptions hold but guarantees do not")
     lines.append("violation contains msg if {")
+    if bindings is not None:
+        lines.append("    in_force")
     lines.append("    assumptions_hold")
     lines.append("    not guarantees_hold")
     lines.append(f'    msg := "Guarantee violated in {contract.id}"')
     lines.append("}")
     lines.append("")
+    if bindings is not None:
+        lines.append("violation contains regime_error")
+        lines.append("")
 
     # Authority policy
     if contract.authority:
@@ -150,8 +238,10 @@ def generate_contract_rego(contract: ContractDef, sos: SoSDefinition) -> str:
     return "\n".join(lines)
 
 
-def generate_main_rego(sos: SoSDefinition) -> str:
-    """Generate the main Rego policy that aggregates all contracts."""
+def generate_main_rego(sos: SoSDefinition, bindings: list | None = None) -> str:
+    """Generate the main Rego policy that aggregates all contracts. With the
+    regime bindings of `regimes:` (A.7.1) it gives the values of the bound
+    parameters in the regime that `input.regime` names."""
     pkg_name = snake_case(sos.name)
 
     lines: list[str] = []
@@ -179,6 +269,32 @@ def generate_main_rego(sos: SoSDefinition) -> str:
     if sos.actors:
         actor_names = [a.id.name for a in sos.actors]
         lines.append(f"actors := {_rego_list(actor_names)}")
+        lines.append("")
+
+    if bindings is not None:
+        from ...regimes import declared_value, initial_regime
+        keys = list(dict.fromkeys(k for b in bindings for k in b.parameters))
+        declared = {k: declared_value(sos, k) for k in keys}
+        lines.append("# Regime bindings (regimes:, Appendix A, A.7.1): the regimes, the one in")
+        lines.append("# which a run starts, and the value of every bound parameter in the")
+        lines.append("# regime that input.regime names (C.alpha, C.beta, C.lambda,")
+        lines.append("# environment.X)")
+        lines.append(f"regimes := {_rego_list([b.name for b in bindings])}")
+        lines.append(f'initial_regime := "{initial_regime(sos)}"')
+        lines.append("")
+        default = "{" + ", ".join(f"{_rego_value(k)}: {_rego_value(v)}"
+                                  for k, v in declared.items()) + "}"
+        per_regime = {}
+        for b in bindings:
+            values = dict(declared)
+            values.update(b.parameters)
+            if values != declared:
+                per_regime[b.name] = "{" + ", ".join(
+                    f"{_rego_value(k)}: {_rego_value(v)}" for k, v in values.items()) + "}"
+        if per_regime:
+            _per_regime(lines, "parameters", per_regime, default)
+        else:
+            lines.append(f"parameters := {default}")
         lines.append("")
 
     # Aggregate compliance check

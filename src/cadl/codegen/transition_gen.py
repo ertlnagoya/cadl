@@ -12,13 +12,16 @@ def generate_transitions_module(
     transitions: List[TransitionDef],
     bindings: list | None = None,
     declared_params: dict | None = None,
+    initial: str | None = None,
 ) -> str:
     """Generate the transitions.py module with a RegimeController class.
 
     ``bindings`` are the resolved regime bindings of `regimes:` (Appendix A,
     A.7.1, `cadl.regimes.checked`), or None for a file without the block; the
     module is then the same as without them. ``declared_params`` maps each
-    bound parameter to its declared value."""
+    bound parameter to its declared value. ``initial`` is the regime in
+    which a run starts (A.7.1, `cadl.regimes.initial_regime`); it is used
+    with bindings only, so that a file without them keeps its module."""
     if not transitions:
         return _empty_module()
 
@@ -47,6 +50,8 @@ def generate_transitions_module(
 
     # Constructor
     first_regime = transitions[0].from_regime if transitions else "UNKNOWN"
+    if bindings is not None and initial is not None:
+        first_regime = initial          # the initial regime of A.7.1
     lines.append(f"    def __init__(self, initial_regime: str = '{first_regime}') -> None:")
     lines.append("        self.current_regime = initial_regime")
     lines.append("        self.transition_history: list[tuple[str, str]] = []")

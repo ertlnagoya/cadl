@@ -75,7 +75,8 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
     file that declares norms 0.1 (Appendix F, F.5; Appendix D), one entry
     per contract: ``{"contract", "file", "text", "reasons", "left_out"}``.
     ``text`` is None when the contract cannot be monitored (``reasons``
-    says why); ``left_out`` lists the (key, position, text, reason) of the
+    says why), also when a regime of `regimes:` does not have the contract
+    in force (A.7.1); ``left_out`` lists the (key, position, text, reason) of the
     items the monitor leaves out. An empty list for other files and
     targets."""
     from ..norms import norms_declared
@@ -92,10 +93,23 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
 
         def monitor_filename(contract_id: str) -> str:
             return f"{monitor_name(contract_id)}.sol"
+    from ..regimes import checked, suspended_somewhere
+    bindings = checked(sos) if sos.transitions else None
     out = []
     for contract in sos.contracts:
         entry = {"contract": contract.id, "file": monitor_filename(contract.id),
                  "text": None, "reasons": [], "left_out": []}
+        apart = suspended_somewhere(bindings, contract.id)
+        if apart:
+            # Regime bindings (A.7.1): the monitor of this target does not
+            # read the regime, so it could not leave out the observations
+            # at which the contract is not in force (F.5).
+            entry["reasons"] = [
+                f"the regime(s) {', '.join(apart)} do not have the contract in force "
+                f"(regimes:, Appendix A, A.7.1), and the norms monitor of the {target} "
+                f"target does not read the current regime"]
+            out.append(entry)
+            continue
         try:
             ir = ir_of(sos, contract)
             entry["left_out"] = unsupported_items(ir)
@@ -178,14 +192,15 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
         if sos.protocols:
             _write(output_dir / "protocols.py", generate_protocols_module(sos.protocols))
 
-        from ..regimes import checked as checked_regimes, declared_value
+        from ..regimes import checked as checked_regimes, declared_value, initial_regime
         bindings = checked_regimes(sos)
         declared_params = {
             key: declared_value(sos, key)
             for b in (bindings or []) for key in b.parameters
         }
         _write(output_dir / "transitions.py",
-               generate_transitions_module(sos.transitions, bindings, declared_params))
+               generate_transitions_module(sos.transitions, bindings, declared_params,
+                                           initial_regime(sos)))
         _write(output_dir / "metrics.py", generate_metrics_module(sos.metrics))
         _write(output_dir / "runtime.py", generate_runtime_module(sos))
 
