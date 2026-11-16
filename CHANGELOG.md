@@ -73,7 +73,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - An `amend` to a version whose transitional rule for the contract is
   `keep` or `switch` with `in_states:` is applied as a switch with a
   warning (`cadl norms-eval` standard error, the monitor's
-  `amend_warnings`, the warnings of `cadl agents-run` and the gateways).
+  `amend_warnings`, the warnings of `cadl agents-run`).
   `cadl norms-eval --version` without a time base and without a named
   version warns that the first version is in force throughout.
 - In `metrics.py` of the Python target, the target check of a metric
