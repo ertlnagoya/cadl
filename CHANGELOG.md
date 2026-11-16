@@ -112,6 +112,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   member. It is now a truth value that the host gives,
   `input.items["TEXT"] == true`. The `opa check` test covers every file
   of `examples/` and `tests/data/` that `cadl codegen -t opa` accepts.
+- `cadl codegen -t opa`: `A OR B` in an `assume:` or `guarantee:` item was
+  written as `(A) # OR (B)`, which drops `B`, so a guarantee that held by
+  `B` alone was reported violated; `NOT (A AND B)` was written as
+  `not A; B`. Such an item is now a rule with one body per disjunct of its
+  disjunctive normal form (NOT pushed to the comparisons; more than 64
+  disjuncts: a value the host gives). A text item (an opaque predicate)
+  was a string, which Rego reads as true; it is now
+  `input.items["TEXT"] == true`, as is an item with `IN` or a list.
 
 ## [0.3.32] — 2026-11-16
 
