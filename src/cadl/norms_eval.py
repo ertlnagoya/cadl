@@ -2649,6 +2649,406 @@ def run_trace(contract: ContractDef, trace: Trace, loader=None,
 
 # <<< monitor-runtime
 
+
+# >>> monitor-regimes
+# === Contracts not in force (Appendix A, A.7.1; Appendix F, F.5) ===========
+#
+# A file with `regimes:` binds, per regime, the contracts in force. A trace
+# names the current regime with the key ``regime``; from that observation
+# on the named regime is current, and before the first one the regime is
+# not known and the contract is in force. A contract instance whose
+# contract is not in force sees nothing of an observation: it is judged on
+# the projection of the trace (F.5, "Contracts not in force"), the
+# observations at which the contract is in force. Their deadlines and the
+# intervals of the temporal operators are measured on the clock of the
+# contract, the time without the time it spent not in force; every time
+# that is reported is the time of the trace. An instance that ends at an
+# observation at which the contract is not in force is settled there
+# (F.5, item 6) on the clock as it stood when the contract left force.
+#
+# A trace that names no regime is judged by `run_trace` above, as before
+# regimes existed. The norms monitor of the Python target contains this
+# part only when the file has `regimes:`.
+
+REGIME_KEY = "regime"
+_REGIMES_NO_AMEND = (
+    "a trace that names a regime cannot also amend the contract ('amend'); "
+    "cadl does not apply regime bindings and amendments together")
+
+
+class RegimeBindings:
+    """The regimes of a file and, per regime, the contracts not in force."""
+
+    def __init__(self, regimes: Any, suspended: Any) -> None:
+        self.regimes = list(regimes)
+        self.suspended = {str(r): list(c) for r, c in dict(suspended).items()}
+
+    def in_force(self, contract_id: str, regime: str | None) -> bool:
+        return regime is None or contract_id not in self.suspended.get(regime, ())
+
+    def check(self, regime: Any, where: str) -> str:
+        if not isinstance(regime, str) or regime not in self.regimes:
+            got = f"'{regime}'" if isinstance(regime, str) else "a value that is not a string"
+            raise TraceError(f"{where}: 'regime' must name a regime of the file "
+                             f"({', '.join(self.regimes)}), got {got}")
+        return regime
+
+
+def split_regime(rec: Any, where: str, bindings: RegimeBindings | None) -> tuple:
+    """(the observation without its key ``regime``, the regime it names or None)."""
+    if not isinstance(rec, dict) or REGIME_KEY not in rec:
+        return rec, None
+    if bindings is None:
+        raise TraceError(f"{where}: 'regime' names the current regime, but the file has "
+                         f"no regimes: block (Appendix A, A.7.1)")
+    regime = bindings.check(rec[REGIME_KEY], where)
+    return {k: v for k, v in rec.items() if k != REGIME_KEY}, regime
+
+
+class _ContractClock:
+    """Whether a contract is in force, and its clock: the time of the trace
+    without the time the contract spent not in force before it."""
+
+    def __init__(self, bindings: RegimeBindings, contract_id: str) -> None:
+        self.bindings = bindings
+        self.contract_id = contract_id
+        self.regime: str | None = None
+        self.out_since: Any = None        # when the contract left force
+        self.offset: Any = 0              # time not in force, before out_since
+
+    def save(self) -> tuple:
+        return self.regime, self.out_since, self.offset
+
+    def restore(self, saved: tuple) -> None:
+        self.regime, self.out_since, self.offset = saved
+
+    @property
+    def in_force_now(self) -> bool:
+        return self.out_since is None
+
+    def step(self, t: Any, regime: str | None) -> tuple:
+        """(in force, clock) at an observation at time t that names `regime`
+        (None: the current regime goes on)."""
+        if regime is not None:
+            self.regime = regime
+        if self.bindings.in_force(self.contract_id, self.regime):
+            if self.out_since is not None:
+                self.offset += t - self.out_since
+                self.out_since = None
+            return True, (t - self.offset if self.offset else t)
+        if self.out_since is None:
+            self.out_since = t
+        return False, self.out_since - self.offset
+
+
+def _regime_ends_at(o: Observation, lifecycle: Any, is_last: bool) -> bool:
+    """Whether the contract instance ends at an observation (F.5, item 6)."""
+    after = o.state_after
+    if after is None and lifecycle is not None:
+        after = lifecycle.initial
+    return (o.end is True or (lifecycle is not None and after in lifecycle.terminal)
+            or (is_last and o.end is not False))
+
+
+def _regime_check_state(o: Observation, contract: ContractDef) -> None:
+    lc = contract.lifecycle
+    if lc is not None and o.state_after is not None and o.state_after not in lc.states:
+        raise TraceError(
+            f"state '{o.state_after}' at t={_fmt_t(o.t)} is not a state of the "
+            f"lifecycle of {contract.id}")
+
+
+def parse_trace_regimes(lines, path: str | None = None,
+                        bindings: RegimeBindings | None = None) -> Trace:
+    """`parse_trace` for a trace that may name regimes: each observation
+    gets the attribute ``regime``, the regime it names or None."""
+    trace = Trace(observations=[], path=path)
+    reader = _TraceReader(trace)
+    for lineno, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        where = f"line {lineno}"
+        try:
+            rec = loads_strict(line)
+        except NumberRangeError as e:
+            raise TraceError(f"{where}: {e}") from None
+        except json.JSONDecodeError as e:
+            raise TraceError(f"{where}: not JSON ({e.msg})") from None
+        except ValueError as e:
+            raise TraceError(f"{where}: not JSON ({e})") from None
+        rec, regime = split_regime(rec, where, bindings)
+        reader.add(rec, where).regime = regime
+    if not trace.observations:
+        raise TraceError("the trace has no observation")
+    return trace
+
+
+def names_regime(trace: Trace) -> bool:
+    return any(getattr(o, "regime", None) is not None for o in trace.observations)
+
+
+class _RegimeNormInst(_NormInst):
+    """A norm instance whose deadline is measured on the contract's clock:
+    `clocks` holds the clock of each entry of `history`."""
+
+    def closed_at(self, t: Any) -> Any:
+        """The clock at which the active time reached the deadline (t is the
+        clock now); None if it has not."""
+        acc, start = self.elapsed_start, None
+        stretches = list(zip(self.history, self.clocks))
+        if acc >= self.deadline:
+            return next((c for h, c in stretches if h["state"] == "active"), None)
+        for h, c in stretches + [({"from": self.state, "state": None}, t)]:
+            if start is not None and h["from"] == "active" and h["state"] != "active":
+                if acc + (c - start) >= self.deadline:
+                    return start + (self.deadline - acc)
+                acc += c - start
+                start = None
+            if h["state"] == "active" and start is None:
+                start = c
+        return None
+
+
+class _RegimeEvaluator(_Evaluator):
+    def _window(self, k: int, n: int, d: float) -> tuple[range, bool]:
+        """The observations of [c_k, c_k + d] on the clock of the contract."""
+        limit = self.obs[k].c + d
+        j = k
+        while j <= n and self.obs[j].c <= limit:
+            j += 1
+        return range(k, j), j <= n
+
+
+class _RegimeEngine(_Engine):
+    """The engine on the projection of a trace (F.5, "Contracts not in
+    force"). Every observation has the attributes ``c`` (the clock of the
+    contract) and ``out`` (True only for an observation at which the
+    contract is not in force and the instance ends)."""
+
+    def __init__(self, contract: ContractDef, trace: Trace, loader=None,
+                 actors: dict | None = None) -> None:
+        super().__init__(contract, trace, loader, actors)
+        self.ev.__class__ = _RegimeEvaluator
+        for norm in self.norms:
+            norm.__class__ = _RegimeNormInst
+            norm.clocks = []
+        # False when the trace goes on after the last observation of the
+        # projection (it was left out), so that it does not end there.
+        self.ends_at_last = True
+
+    def _real(self, x: Any, n: int) -> Any:
+        """The time of the trace at clock x (x at most the clock of
+        observation n): on the stretch in force that contains it."""
+        k = n
+        while k > 0 and (self.obs[k].out or self.obs[k].c >= x):
+            k -= 1
+        return self.obs[k].t + (x - self.obs[k].c)
+
+    def run(self) -> None:
+        last = len(self.obs) - 1
+        for n in range(len(self.obs)):
+            if self._step(n, n == last and self.ends_at_last):
+                break
+        self._finish_items()
+
+    def _step(self, n: int, is_last: bool) -> bool:
+        o = self.obs[n]
+        if not o.out:
+            return super()._step(n, is_last)
+        # The instance ends at an observation at which the contract is not
+        # in force: only the settlement (F.5, item 6) applies.
+        self._amend_violated = []
+        self._check_state(n)
+        if self.lifecycle and o.state_after in self.lifecycle.terminal:
+            reason = f"terminal state {o.state_after}"
+        elif o.end is True:
+            reason = "end of the instance in the trace"
+        else:
+            reason = _END_LAST
+        self._settle(n, f"{reason}, while the contract is not in force")
+        return True
+
+    def _amend(self, n: int, name: str) -> None:
+        raise NormsEvalError(_REGIMES_NO_AMEND)
+
+    def _set(self, norm: _NormInst, n: int, state: str, reason: str, log: bool = True) -> None:
+        o = self.obs[n]
+        t, c = o.t, o.c
+        old = norm.state
+        if old == "active" and norm.active_since is not None:
+            norm.elapsed_before += c - norm.active_since
+        norm.state = state
+        norm.time = t
+        norm.reason = reason
+        if state == "active":
+            norm.active_since = c
+            if norm.activated_at is None:
+                norm.activated_at = t
+                norm.activated_index = n
+        if state == "violated":
+            norm.verdict = "excused" if self.assumption_failed_at is not None else "violated"
+        elif state in ("fulfilled", "discharged"):
+            norm.verdict = "fulfilled"
+        if state in FINAL_STATES:
+            norm.candidates = []
+        norm.history.append({"t": t, "from": old, "state": state, "reason": reason})
+        norm.clocks.append(c)
+        if log:
+            self._log(n, "norm", f"{norm.d.id}: {old} -> {state} ({reason})",
+                      norm=norm.d.id, state=state)
+
+    def _judge(self, n: int, created: list[dict]) -> list[_NormInst]:
+        c = self.obs[n].c
+        violated: list[_NormInst] = []
+        for norm in self.norms:
+            if norm.frozen or n < norm.judge_from:
+                continue
+            kind = norm.d.kind
+            if norm.state == "active" and kind in ("obligation", "prohibition"):
+                elapsed = norm.elapsed(c)
+                open_ = norm.deadline is None or elapsed <= norm.deadline
+                if open_:
+                    norm.candidates.append(n)
+                hit = None
+                for k in list(norm.candidates):
+                    v = norm.content.content(k, n, created)
+                    if v is True and norm.d.id in self._exempt.get(k, ()):
+                        v = False
+                    if v is True:
+                        hit = k
+                        break
+                    if v is not UNDECIDED:
+                        norm.candidates.remove(k)
+                if hit is not None:
+                    at = "" if hit == n else f" at t={_fmt_t(self.obs[hit].t)}"
+                    verb = "holds" if norm.content.kind == "predicate" else "occurred"
+                    if hit != n and norm.content.kind == "predicate":
+                        verb = "held"
+                    if kind == "obligation":
+                        self._set(norm, n, "fulfilled", f"content {verb}{at}: {norm.content.text}")
+                    else:
+                        self._set(norm, n, "violated", f"content {verb}{at}: {norm.content.text}")
+                        violated.append(norm)
+                elif not open_ and not norm.candidates:
+                    due = norm.closed_at(c)
+                    if due is None:
+                        due = c - (elapsed - norm.deadline)
+                    due = self._real(due, n)
+                    if kind == "obligation":
+                        self._set(norm, n, "violated",
+                                  f"deadline of {_fmt_t(norm.deadline)}s passed at "
+                                  f"t={_fmt_t(due)} without the content")
+                        violated.append(norm)
+                    else:
+                        self._set(norm, n, "fulfilled",
+                                  f"window of {_fmt_t(norm.deadline)}s closed at "
+                                  f"t={_fmt_t(due)} without the content")
+            if (norm.state in ("active", "suspended") and norm.until is not None
+                    and norm.until.occurs(n, created)):
+                self._set(norm, n, "discharged", f"until occurred: {norm.until.text}")
+        return violated
+
+    def _settle(self, n: int, reason: str) -> None:
+        """End of the contract instance (F.5, item 6), on the clock."""
+        self.ended_at = n
+        self.end_reason = reason
+        self._log(n, "end", f"contract instance ended ({reason})")
+        c = self.obs[n].c
+        why = "contract instance ended"
+        late: list[_NormInst] = []
+        for norm in self.norms:
+            if norm.frozen or norm.state in FINAL_STATES:
+                continue
+            kind = norm.d.kind
+            in_force = norm.state in ("active", "suspended")
+            if in_force and norm.activated_index == n:
+                self._set(norm, n, "discharged",
+                          f"{why} at the observation at which the norm was activated")
+                continue
+            if in_force and kind in ("obligation", "prohibition") and norm.candidates:
+                norm.reason = ("not decided: the contract instance ended before the temporal "
+                               "content was decided")
+                continue
+            if in_force and kind == "obligation":
+                if norm.deadline is None:
+                    self._set(norm, n, "violated", f"{why} without the content")
+                    late.append(norm)
+                elif norm.elapsed(c) <= norm.deadline:
+                    self._set(norm, n, "discharged", f"{why} before the deadline")
+                else:
+                    self._set(norm, n, "violated", f"{why} after the deadline without the content")
+                    late.append(norm)
+            elif in_force and kind == "prohibition":
+                self._set(norm, n, "fulfilled", f"{why} without the content")
+            else:
+                self._set(norm, n, "discharged", why)
+        for norm in late:
+            self._on_violation(norm, n, activate=False)
+
+
+def project_trace(trace: Trace, contract: ContractDef, bindings: RegimeBindings) -> tuple:
+    """(the projection of a trace for a contract, the index in the trace of
+    each of its observations, whether the trace goes on after it).
+    Sets ``c`` and ``out`` on the observations of the trace."""
+    clock = _ContractClock(bindings, contract.id)
+    obs = trace.observations
+    last = len(obs) - 1
+    kept: list[Observation] = []
+    index: list[int] = []
+    for i, o in enumerate(obs):
+        if o.amend:
+            raise NormsEvalError(_REGIMES_NO_AMEND)
+        inside, o.c = clock.step(o.t, getattr(o, "regime", None))
+        o.out = not inside
+        if not inside:
+            _regime_check_state(o, contract)
+            if not _regime_ends_at(o, contract.lifecycle, i == last):
+                continue
+        kept.append(o)
+        index.append(i)
+        if o.out:
+            break
+    goes_on = not index or index[-1] != last
+    projection = Trace(observations=kept, bindings=trace.bindings, request=trace.request,
+                       path=trace.path)
+    return projection, index, goes_on
+
+
+def run_regime_trace(contract: ContractDef, trace: Trace, bindings: RegimeBindings,
+                     actors: dict | None = None) -> dict:
+    """`run_trace` for a trace that names regimes (F.5, "Contracts not in
+    force")."""
+    projection, index, goes_on = project_trace(trace, contract, bindings)
+    if not projection.observations:
+        raise NormsEvalError(
+            f"the contract {contract.id} is not in force at any observation of the trace, "
+            f"which does not end the contract instance: there is nothing to judge")
+
+    def engine_for(observations: list, through: int, ends_at_last: bool) -> _RegimeEngine:
+        part = Trace(observations=observations, bindings=trace.bindings,
+                     request=trace.request, path=trace.path)
+        eng = _RegimeEngine(contract, part, None, actors)
+        eng.ends_at_last = ends_at_last
+        # the names of the quantities: those of every observation of the
+        # instance, also of one at which the contract is not in force
+        for o in trace.observations[:through + 1]:
+            eng.ev.known.update(o.values)
+        return eng
+
+    last = len(trace.observations) - 1
+    engine = engine_for(projection.observations, last, not goes_on)
+    engine.run()
+    if engine.ended_at is not None:
+        end = index[engine.ended_at]
+        if end < last:
+            engine = engine_for(projection.observations[:engine.ended_at + 1], end, True)
+            engine.run()
+            engine.warnings.append(engine._ignored_warning(last - end))
+    return engine.result()
+
+# <<< monitor-regimes
+
+
 def load_version(path) -> SoSDefinition:
     """Parse and type-check a CADL file that declares norms 0.1."""
     from .parser import parse_file
@@ -2690,7 +3090,24 @@ def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
         base = Path(trace.path).parent if trace.path else Path(".")
         return load_version(base / name)
 
+    if names_regime(trace):
+        bindings = regime_bindings(sos)
+        if bindings is None:
+            raise NormsEvalError("the trace names a regime ('regime'), but the file has no "
+                                 "regimes: block (Appendix A, A.7.1)")
+        return run_regime_trace(contract, trace, bindings, declared_actors(sos))
     return run_trace(contract, trace, loader, declared_actors(sos))
+
+
+def regime_bindings(sos: SoSDefinition) -> RegimeBindings | None:
+    """The regimes of a file with `regimes:` and the contracts each does
+    not have in force, or None for a file without the block (or with a
+    block that breaks R-1 to R-6)."""
+    from .regimes import checked
+    bindings = checked(sos)
+    if bindings is None:
+        return None
+    return RegimeBindings([b.name for b in bindings], {b.name: b.suspended for b in bindings})
 
 
 # >>> monitor-runtime
@@ -2799,7 +3216,12 @@ def evaluate_files(cadl_path, trace_path, contract_id: str | None = None) -> dic
     if not Path(trace_path).exists():
         raise NormsEvalError(f"File not found: {trace_path}")
     sos = load_version(cadl_path)
-    trace = load_trace(trace_path)
+    bindings = regime_bindings(sos)
+    if bindings is None:
+        trace = load_trace(trace_path)
+    else:
+        with open(trace_path, encoding="utf-8") as f:
+            trace = parse_trace_regimes(f, path=str(trace_path), bindings=bindings)
     result = evaluate(sos, trace, contract_id)
     result["file"] = str(cadl_path)
     return result
