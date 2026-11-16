@@ -25,10 +25,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   instance that ends while its contract is not in force is only settled
   there, on the stopped clock. The monitor gets `in_force`, and
   `next_deadline()` / `next_check()` are `None` while the contract is not
-  in force. A trace that names a regime cannot also amend the contract.
+  in force. Before the first `regime` key a trace is in the initial
+  regime. A trace that names a regime, or one for a contract that the
+  initial regime does not have in force, cannot also amend the contract.
 - `cadl regime-map` shows the bindings of each regime: a section of the
   text output, node labels in DOT, and the key `regimes` in JSON (`null`
   for a block that breaks R-1 to R-6).
+- A transition whose safety invariant does not hold, or cannot be
+  evaluated, is not taken and is reported: the Python controller of a
+  file with `regimes:` checks it explicitly (no `assert`) and records it
+  in `refused_transitions`, and the Solidity `RegimeController` emits
+  `RegimeTransitionRefused`. The Python controller raises `ValueError`
+  for a name that is not a regime.
+- Solidity, for a file with `regimes:`: one step is one
+  `runMonitorCycle()` of the orchestrator, which only its deployer may
+  call and which sets the observed state of every contract and the
+  controller (`setUint`, `setBool`); only the orchestrator runs their
+  steps.
 - Solidity: `RegimeController.contractActive(id)`; a contract that some
   regime suspends takes the controller in its constructor and skips
   `runMonitorCycle()` while it is not in force, and `ALPHA`, `BETA`,
@@ -38,7 +51,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `regime_error`, `in_force`); a contract that is not in force is allowed
   and has no violation, `alpha`, `beta`, `lambda_` have the value of the
   regime, and a missing or unknown regime allows nothing. `main.rego`
-  gives `regimes`, `initial_regime` and `parameters`.
+  gives `regimes`, `initial_regime` and `parameters` (undefined without
+  a regime of the file).
 
 ### Changed
 
@@ -59,9 +73,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `agents-run`, the gateways) for a file in which a regime suspends an
   enforced contract. For a contract in force in every regime these
   outputs are those of the file without `regimes:`.
+- A file with transitions and an empty `regimes: {}` counts as a file
+  with the block: its controllers start in the initial regime of A.7.1
+  and its Rego contract policies require `input.regime`.
 - A file without `regimes:` gives the same output as 0.3.32 for every
-  command and target, and a trace without `regime` the same result
-  (checked on all files of `examples/` and `tests/data/`).
+  command and target, apart from the `opa` corrections below, and a trace
+  without `regime` the same result (checked on all files of `examples/`
+  and `tests/data/`).
+
+### Fixed
+
+- `cadl codegen -t opa`: `all_violations` of `main.rego` assigned `msg`
+  once per contract, so `opa check` rejected the policy of a file with two
+  or more contracts; it is now one rule per contract.
+- `cadl codegen -t opa`: a function call that Rego does not have was
+  written as is, so `opa check` rejected it (`all_routes_conflict_free()`
+  of `examples/robot_delivery.cadl` as an unsafe variable,
+  `length(goal_sequence)` as an undefined function). It is now a value of
+  the input that the host gives: `input.NAME` without arguments,
+  `input.calls["TEXT"]` with them; `count`, `sum`, `max`, `min` and `abs`
+  stay Rego functions. A test runs `opa check` on the output of every
+  example.
+- The generator functions of the Rego and Solidity norms monitors refuse a
+  contract that a regime suspends, as `cadl codegen` already did.
 
 ## [0.3.32] — 2026-11-16
 
