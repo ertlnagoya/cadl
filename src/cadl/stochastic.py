@@ -733,6 +733,8 @@ class _Analyser:
         # Commands whose guard and updates are well typed (for S-7, S-9).
         self.enumerable: list[Command] = []
         self.vars_ok = True
+        # Parameters that a regime of `sos.regimes:` assigns (R-7).
+        self.core_assigned: set[str] = set()
 
     # -- diagnostics --
     def error(self, message: str, rule: str) -> None:
@@ -1438,7 +1440,48 @@ class _Analyser:
                     if name not in regs:
                         self.warn(f"The regime '{name}' has no entry in model.regimes",
                                   "S-10")
+        self.core_regime_bindings(assign)
         self.model.designs = [Design(name=n, assign=assign[n]) for n in self.design_names]
+
+    def core_regime_bindings(self, assign: dict) -> None:
+        """R-7 (Appendix A, A.7.1): a value that `sos.regimes:` binds to the
+        source of a bound parameter is the parameter's value under the design
+        of that regime; model.regimes may repeat it but not contradict it."""
+        from . import regimes as core
+        if not core.declared(self.sos):
+            return
+        bindings = core.checked(self.sos)
+        if bindings is None:
+            self.error("The designs cannot be formed because the regimes: block of the "
+                       "file breaks a rule of A.7.1", "R-7")
+            return
+        for b in bindings:
+            if b.name not in assign:
+                continue
+            for p in self.model.params:
+                if p.source is None or p.source not in b.parameters:
+                    continue
+                num = yaml_number(b.parameters[p.source])
+                if num is None:
+                    continue    # not a number: S-3 already reports the source
+                old = assign[b.name].get(p.id)
+                if old is not None and old != num:
+                    self.error(f"model.regimes.{b.name} gives '{p.id}' the value "
+                               f"{decimal_text(old)}, but regimes.{b.name} binds its "
+                               f"source '{p.source}' to {decimal_text(num)}", "R-7")
+                    continue
+                if p.lo is not None and not p.lo <= num <= p.hi:
+                    self.error(f"regimes.{b.name} binds '{p.source}' to "
+                               f"{decimal_text(num)}, outside the declared range "
+                               f"[{decimal_text(p.lo)}, {decimal_text(p.hi)}] of the "
+                               f"parameter '{p.id}'", "S-4")
+                    continue
+                assign[b.name][p.id] = num
+                self.core_assigned.add(p.id)
+
+    def assigned_by(self, name: str) -> str:
+        """Where a regime assigns the parameter: model.regimes or regimes:."""
+        return "regimes:" if name in self.core_assigned else "model.regimes"
 
     # -- S-12: rewards --
     def check_rewards(self) -> None:
@@ -1616,7 +1659,7 @@ class _Analyser:
                         continue
                     if key in assigned:
                         self.error(f"'over' of {where} lists '{key}', which a regime of "
-                                   f"model.regimes assigns", "S-14")
+                                   f"{self.assigned_by(key)} assigns", "S-14")
                         continue
                     q.over[key] = (lo, hi)
                     p.open = True

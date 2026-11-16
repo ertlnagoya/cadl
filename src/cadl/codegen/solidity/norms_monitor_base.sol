@@ -58,6 +58,9 @@ uint8 constant OP_IN = 9;
 uint8 constant OP_WITHIN = 10;
 uint8 constant OP_THROUGHOUT = 11;
 uint8 constant OP_UNTIL = 12;
+// an operator of a content decided per observation (General): its value
+// is read from EvalData.gw
+uint8 constant OP_GVAL = 13;
 // the index of an actor reference
 uint8 constant I_NONE = 0;
 uint8 constant I_LIT = 1;
@@ -90,6 +93,10 @@ struct EvalData {
     mapping(bytes32 => Scan) scans;       // incremental temporal operators, by (node, start)
     int256[] obsT;
     string[] obsSt;          // lifecycle state before each observation
+    // the values of the operators of a General content (see General), by
+    // the key of gpre; gtag: the key of the values of such an operator
+    mapping(uint256 => uint256) gw;
+    mapping(uint256 => uint256) gtag;
 }
 
 // Functions of the monitor without state, in a library of their own (the
@@ -484,6 +491,7 @@ library CadlNormsEval {
         if (op == OP_AND || op == OP_OR) return andOr(op == OP_OR, truth(ev(data, nd.a, p, n)), truth(ev(data, nd.b, p, n)));
         if (op == OP_BIN) return CadlNormsValues.binop(nd.bop, ev(data, nd.a, p, n), ev(data, nd.b, p, n));
         if (op == OP_IN) return inList(data, nd, p, n);
+        if (op == OP_GVAL) return codeVal(gget(data, data.gtag[id], p));
         if (op == OP_WITHIN || op == OP_THROUGHOUT) return temporal(data, id, nd, p, n);
         return untilOp(data, id, nd, p, n);
     }
@@ -947,6 +955,54 @@ struct Multi {
     mapping(uint256 => uint256) nodes;
 }
 
+// A content that the tree above does not decide: more than five temporal
+// operators, `until` inside another operator or with one inside its
+// operands, or an operand that combines an operator with other parts
+// (from cadl 0.3.32). Each temporal operator of the content keeps, from
+// the first candidate of the activation on, the truth values of its
+// operands and its own value at every observation, two bits each (X_D, the
+// zero, while undecided), packed 128 to a storage word of EvalData.gw. An
+// operator after those inside it reads their values (`gtag`, see
+// CadlNormsEval.ev); its value at an observation y is that of F.4 over the
+// operand values of the window of y, found with a few masks per word. An
+// observation re-reads only what it can change: the operands at the
+// observations whose value inside them it decided, and the values of the
+// windows that hold such an operand or that it ends.
+struct GOp {
+    uint8 mode; uint256 node; uint256 tp; uint256 tq; int256 td;
+    uint256[] kids;     // the operators directly inside its operands (indices into General.ops)
+    uint256 ov;         // the windows of the observations before ov are over
+    uint256 lo;         // the operands of the observations before lo are decided
+}
+
+struct General {
+    uint256 root;
+    GOp[] ops;          // each operator after those inside it
+    uint256[] tops;     // the operators of the content that are not inside another
+    uint256 gen;        // the values of the current activation (from 1)
+    bool on;            // the activation has candidates, from observation start
+    uint256 start;
+    uint256 noted;      // n + 1 once observation n has been applied
+    uint256 und;        // the undecided candidates
+    bool hit;           // a candidate is true
+    bool pend;          // a candidate was undecided at the last judgement
+    uint256 clo;        // the candidates before clo are decided
+    uint256 low;        // no operand or candidate before it is read again
+}
+
+// A growing list in memory.
+struct Vec { uint256[] a; uint256 c; }
+
+// The key of word w of the values of node (slot 0: its value, 1 and 2: its
+// operands p and q, 3: the undecided candidates of a content) in activation gen.
+function gpre(uint256 gen, uint256 node, uint256 slot) pure returns (uint256) {
+    return gen << 192 | node << 72 | slot << 64;
+}
+
+function gget(EvalData storage data, uint256 pre, uint256 y) view returns (uint8) {
+    return uint8(data.gw[pre | y >> 7] >> (2 * (y & 127)) & 3);
+}
+
 library CadlNormsMulti {
     uint256 internal constant BITS = (1 << 250) - 1;
     // the states with every operator decided or undecided (X_D) in the future
@@ -1372,6 +1428,325 @@ library CadlNormsMulti {
         if (v.k == K_B || v.k == K_N) return v.n != 0 ? X_T : X_F;
         return X_U;
     }
+
+    // --- contents decided per observation (General, from cadl 0.3.32) -----------------
+
+    uint256 internal constant NONE = type(uint256).max;
+    uint256 internal constant LO2 = 0x5555555555555555555555555555555555555555555555555555555555555555;
+
+    /// An observation, for the candidates there are (also while the norm
+    /// is suspended).
+    function gnote(General storage g, EvalData storage data, uint256 n) public {
+        if (g.on) gobserve(g, data, n);
+    }
+
+    /// As judge above, for a General content.
+    function gjudge(General storage g, EvalData storage data, uint256 n, bool open)
+            public returns (bool hit, bool empty) {
+        if (!g.on) {
+            if (!open) return (false, true);
+            g.on = true;
+            g.start = n;
+            g.clo = n;
+            for (uint256 i = 0; i < g.ops.length; i++) {
+                GOp storage op = g.ops[i];
+                op.ov = n;
+                op.lo = n;
+                data.gtag[op.node] = gpre(g.gen, op.node, 0);
+            }
+        }
+        if (g.noted != n + 1) gobserve(g, data, n);
+        if (open) {
+            uint8 v = gcode(CadlNormsEval.evaluate(data, g.root, n, n));
+            if (v == X_T) g.hit = true;
+            else if (v == X_D) { gset(data, gpre(g.gen, g.root, 3), n, 1); g.und++; }
+        }
+        hit = g.hit;
+        g.pend = !hit && g.und > 0;
+        empty = !g.pend;
+    }
+
+    /// A new activation starts without candidates and without values.
+    function gclear(General storage g) internal {
+        g.pend = false;
+        g.hit = false;
+        if (g.on) { g.gen++; g.on = false; g.und = 0; }
+    }
+
+    function gobserve(General storage g, EvalData storage data, uint256 n) internal {
+        g.noted = n + 1;
+        Vec[] memory nw = new Vec[](g.ops.length);
+        uint256 low = n;
+        for (uint256 i = 0; i < g.ops.length; i++) {
+            nw[i] = gop(g, g.ops[i], data, n, nw);
+            if (g.ops[i].lo < low) low = g.ops[i].lo;
+        }
+        // the candidates whose operators it decided
+        uint256 cc = gpre(g.gen, g.root, 3);
+        for (uint256 j = 0; j < g.tops.length; j++) {
+            Vec memory c = nw[g.tops[j]];
+            for (uint256 k = 0; k < c.c; k++) {
+                uint256 y = c.a[k];
+                if (gget(data, cc, y) != 1) continue;
+                uint8 v = gcode(CadlNormsEval.evaluate(data, g.root, y, n));
+                if (v == X_T) g.hit = true;
+                else if (v != X_D) { gset(data, cc, y, 0); g.und--; }
+            }
+        }
+        uint256 clo = g.clo < n ? first(data, cc, g.clo, n - 1, 2) : n;
+        if (clo == NONE) clo = n;
+        g.clo = clo;
+        g.low = clo < low ? clo : low;
+    }
+
+    /// Observation n for operator op: its operands at n and at the
+    /// observations whose value inside them n decided, then its values that
+    /// these operands or the end of a window decide. Returns the
+    /// observations whose value of op n decided.
+    function gop(General storage g, GOp storage op, EvalData storage data, uint256 n, Vec[] memory nw)
+            internal returns (Vec memory out) {
+        Vec memory nx;
+        operand(g, op, data, n, n, nx);
+        for (uint256 j = 0; j < op.kids.length; j++) {
+            Vec memory c = nw[op.kids[j]];
+            for (uint256 k = 0; k < c.c; k++) operand(g, op, data, c.a[k], n, nx);
+        }
+        uint256 vv = gpre(g.gen, op.node, 0);
+        // the windows that n ends
+        uint256 ov0 = op.ov;
+        uint256 ov1 = firstTime(data, ov0, n + 1, data.obsT[n] - op.td);
+        op.ov = ov1;
+        recheck(g, op, data, vv, ov0, ov1, n, out);
+        // until: the windows that hold an operand decided after its
+        // observation, read once as one range [late[0], late[1]]
+        uint256[] memory late = new uint256[](2);
+        late[0] = NONE;
+        for (uint256 j = 0; j < nx.c; j++) decideAt(g, op, data, nx.a[j], n, out, late);
+        if (late[0] != NONE) recheck(g, op, data, vv, late[0], late[1] + 1, n, out);
+        if (gget(data, vv, n) == X_D) recheck(g, op, data, vv, n, n + 1, n, out);
+        // the operands decided so far
+        uint256 pp = gpre(g.gen, op.node, 1);
+        uint256 lo = op.lo;
+        uint256 qq = gpre(g.gen, op.node, 2);
+        while (lo <= n && gget(data, pp, lo) != X_D && (op.mode != W_UNTIL || gget(data, qq, lo) != X_D)) lo++;
+        op.lo = lo;
+    }
+
+    /// The values of op that the operands at observation x, decided at n,
+    /// decide; for until, a value decided after its observation widens
+    /// late, the range read again once (see gop).
+    function decideAt(General storage g, GOp storage op, EvalData storage data, uint256 x, uint256 n,
+                      Vec memory out, uint256[] memory late) internal {
+        uint256 vv = gpre(g.gen, op.node, 0);
+        uint256 pp = gpre(g.gen, op.node, 1);
+        uint256 a = firstTime(data, g.start, x, data.obsT[x] - op.td);
+        if (op.mode != W_UNTIL) {
+            uint8 dec = op.mode == W_WITHIN ? X_T : X_F;
+            if (gget(data, pp, x) == dec) {
+                // a decisive operand decides every window that holds it
+                for (uint256 y = first(data, vv, a, x, 1); y != NONE; y = first(data, vv, y + 1, x, 1)) {
+                    gset(data, vv, y, dec);
+                    push(out, y);
+                }
+            } else {
+                // another one can only end the wait of a window that is
+                // over: those waiting for x (see recheck)
+                wake(g, op, data, x, n, out);
+            }
+        } else if (x == n) {
+            // p false at n breaks every window that holds n; q true at n
+            // decides those with p true since them; none of them is over
+            if (gget(data, pp, n) == X_F) recheck(g, op, data, vv, a, n + 1, n, out);
+            else if (gget(data, gpre(g.gen, op.node, 2), n) == X_T) {
+                uint256 b = n > a ? last(data, pp, a, n - 1, 13) : NONE;
+                recheck(g, op, data, vv, b == NONE ? a : b + 1, n + 1, n, out);
+            }
+        } else {
+            if (a < late[0]) late[0] = a;
+            if (x > late[1]) late[1] = x;
+        }
+    }
+
+    /// The operands of op at observation y, when undecided; y joins nx
+    /// when one is decided now.
+    function operand(General storage g, GOp storage op, EvalData storage data, uint256 y, uint256 n,
+                     Vec memory nx) internal {
+        bool now_ = false;
+        uint256 pp = gpre(g.gen, op.node, 1);
+        if (gget(data, pp, y) == X_D) {
+            uint8 c = gcode(CadlNormsEval.evaluate(data, op.tp, y, n));
+            if (c != X_D) { gset(data, pp, y, c); now_ = true; }
+        }
+        if (op.mode == W_UNTIL) {
+            uint256 qq = gpre(g.gen, op.node, 2);
+            if (gget(data, qq, y) == X_D) {
+                uint8 c = gcode(CadlNormsEval.evaluate(data, op.tq, y, n));
+                if (c != X_D) { gset(data, qq, y, c); now_ = true; }
+            }
+        }
+        if (now_) push(nx, y);
+    }
+
+    /// The undecided values of op at the observations [lo, hi), read again.
+    /// A window of within or throughout that is over and stays undecided
+    /// waits for the last undecided operand in it: it is read again when
+    /// that operand is decided (a list per operand: slot 4 its first
+    /// window, slot 5 the next one), unless a decisive operand decides it before.
+    function recheck(General storage g, GOp storage op, EvalData storage data, uint256 vv, uint256 lo,
+                     uint256 hi, uint256 n, Vec memory out) internal {
+        if (lo >= hi) return;
+        for (uint256 y = first(data, vv, lo, hi - 1, 1); y != NONE; y = first(data, vv, y + 1, hi - 1, 1)) {
+            (uint8 v, uint256 e) = gval(g, op, data, y, n);
+            if (v == X_D) {
+                if (op.mode != W_UNTIL && y < op.ov) wait(g, op, data, y, e);
+                continue;
+            }
+            gset(data, vv, y, v);
+            push(out, y);
+        }
+    }
+
+    /// The windows waiting for the operand at x, read again.
+    function wake(General storage g, GOp storage op, EvalData storage data, uint256 x, uint256 n,
+                  Vec memory out) internal {
+        uint256 hk = gpre(g.gen, op.node, 4) | x;
+        uint256 h = data.gw[hk];
+        if (h == 0) return;
+        data.gw[hk] = 0;
+        uint256 vv = gpre(g.gen, op.node, 0);
+        uint256 nk = gpre(g.gen, op.node, 5);
+        // the list first: a window that waits again is put on another
+        // list, which overwrites its link
+        Vec memory ys;
+        for (; h != 0; h = data.gw[nk | (h - 1)]) push(ys, h - 1);
+        for (uint256 k = 0; k < ys.c; k++) recheck(g, op, data, vv, ys.a[k], ys.a[k] + 1, n, out);
+    }
+
+    /// The window [y, e] of y waits for its last undecided operand.
+    function wait(General storage g, GOp storage op, EvalData storage data, uint256 y, uint256 e) internal {
+        uint256 hk = gpre(g.gen, op.node, 4) | last(data, gpre(g.gen, op.node, 1), y, e, 1);
+        data.gw[gpre(g.gen, op.node, 5) | y] = data.gw[hk];
+        data.gw[hk] = y + 1;
+    }
+
+    /// The value of op at observation y given the observations up to n
+    /// (F.4, as cadl/norms_eval.py computes it), from the operand values of
+    /// the window [y, e] of y.
+    function gval(General storage g, GOp storage op, EvalData storage data, uint256 y, uint256 n)
+            internal view returns (uint8, uint256 e) {
+        uint256 e1 = firstTime(data, y, n + 1, data.obsT[y] + op.td + 1);
+        bool over = e1 <= n;
+        e = e1 - 1;
+        return (op.mode == W_UNTIL ? gvalUntil(g, op, data, y, e, over) : gvalWindow(g, op, data, y, e, over), e);
+    }
+
+    function gvalWindow(General storage g, GOp storage op, EvalData storage data, uint256 y, uint256 e,
+                        bool over) internal view returns (uint8) {
+        uint256 pp = gpre(g.gen, op.node, 1);
+        uint8 dec = op.mode == W_WITHIN ? X_T : X_F;
+        if (first(data, pp, y, e, 1 << dec) != NONE) return dec;
+        if (!over || first(data, pp, y, e, 1) != NONE) return X_D;
+        if (first(data, pp, y, e, 8) != NONE) return X_U;
+        return dec == X_T ? X_F : X_T;
+    }
+
+    function gvalUntil(General storage g, GOp storage op, EvalData storage data, uint256 y, uint256 e,
+                       bool over) internal view returns (uint8) {
+        uint256 pp = gpre(g.gen, op.node, 1);
+        // until(p, q): the window up to the first p false (b), and the
+        // first p not true (gi) bound the terms q_j with p true before j
+        uint256 qq = gpre(g.gen, op.node, 2);
+        uint256 b = first(data, pp, y, e, 4);
+        uint256 r = b == NONE ? e : b;
+        uint256 gi = first(data, pp, y, r, 9);
+        if (first(data, qq, y, gi == NONE ? r : gi, 2) != NONE) return X_T;
+        if (b == NONE && !over) return X_D;
+        // q undecided, or q true or undefined after p undecided
+        if (first(data, qq, y, r, 1) != NONE) return X_D;
+        uint256 gd = first(data, pp, y, r, 1);
+        if (gd != NONE && first(data, qq, gd + 1, r, 10) != NONE) return X_D;
+        // q undefined, or q true after p undefined
+        if (first(data, qq, y, r, 8) != NONE) return X_U;
+        uint256 gu = first(data, pp, y, r, 8);
+        if (gu != NONE && first(data, qq, gu + 1, r, 2) != NONE) return X_U;
+        return X_F;
+    }
+
+    function gset(EvalData storage data, uint256 pre, uint256 y, uint8 c) internal {
+        uint256 slot = pre | y >> 7;
+        uint256 sh = 2 * (y & 127);
+        data.gw[slot] = (data.gw[slot] & ~(uint256(3) << sh)) | (uint256(c) << sh);
+    }
+
+    /// The fields of word w whose code is in set (bit c for code c), as
+    /// their low bits.
+    function fields(uint256 w, uint256 set) internal pure returns (uint256 m) {
+        for (uint256 c = 0; c < 4; c++) {
+            if (set >> c & 1 == 0) continue;
+            uint256 x = w ^ (LO2 * c);
+            m |= ~(x | (x >> 1)) & LO2;
+        }
+    }
+
+    /// The bits of the fields [f0, f1] of a word.
+    function span(uint256 f0, uint256 f1) internal pure returns (uint256) {
+        uint256 hi = f1 == 127 ? type(uint256).max : (uint256(1) << (2 * f1 + 2)) - 1;
+        return hi & ~((uint256(1) << (2 * f0)) - 1);
+    }
+
+    /// The first observation in [lo, hi] whose code is in set, or NONE.
+    function first(EvalData storage data, uint256 pre, uint256 lo, uint256 hi, uint256 set)
+            internal view returns (uint256) {
+        if (lo > hi) return NONE;
+        for (uint256 w = lo >> 7; w <= hi >> 7; w++) {
+            uint256 f0 = w == lo >> 7 ? lo & 127 : 0;
+            uint256 f1 = w == hi >> 7 ? hi & 127 : 127;
+            uint256 m = fields(data.gw[pre | w], set) & span(f0, f1);
+            if (m != 0) return (w << 7) + lsb(m) / 2;
+        }
+        return NONE;
+    }
+
+    /// The last observation in [lo, hi] whose code is in set, or NONE.
+    function last(EvalData storage data, uint256 pre, uint256 lo, uint256 hi, uint256 set)
+            internal view returns (uint256) {
+        if (lo > hi) return NONE;
+        for (uint256 w = (hi >> 7) + 1; w > lo >> 7; w--) {
+            uint256 f0 = w - 1 == lo >> 7 ? lo & 127 : 0;
+            uint256 f1 = w - 1 == hi >> 7 ? hi & 127 : 127;
+            uint256 m = fields(data.gw[pre | (w - 1)], set) & span(f0, f1);
+            if (m != 0) return ((w - 1) << 7) + msb(m) / 2;
+        }
+        return NONE;
+    }
+
+    function lsb(uint256 x) internal pure returns (uint256 r) {
+        for (uint256 s = 128; s > 0; s >>= 1) {
+            if (x & ((uint256(1) << s) - 1) == 0) { r += s; x >>= s; }
+        }
+    }
+
+    function msb(uint256 x) internal pure returns (uint256 r) {
+        for (uint256 s = 128; s > 0; s >>= 1) {
+            if (x >> s != 0) { r += s; x >>= s; }
+        }
+    }
+
+    function push(Vec memory v, uint256 x) internal pure {
+        if (v.c == v.a.length) {
+            uint256[] memory b = new uint256[](2 * v.a.length + 4);
+            for (uint256 i = 0; i < v.c; i++) b[i] = v.a[i];
+            v.a = b;
+        }
+        v.a[v.c++] = x;
+    }
+
+    /// A value as a truth value: undecided, true, false or undefined.
+    function gcode(Val memory v) internal pure returns (uint8) {
+        if (v.k == K_D) return X_D;
+        if (v.k == K_B || v.k == K_N) return v.n != 0 ? X_T : X_F;
+        return X_U;
+    }
 }
 
 // The assume: and guarantee: items (value: 0 not decided, 1 true, 2 false,
@@ -1467,7 +1842,8 @@ struct NormDef {
     bool hasReparationId; string reparationId; bool hasTransition; string transition;
     uint256[] activate; uint256[] suspend; uint256[] resume; uint256[] discharge;
     // a content with one temporal operator (1, see `temporals`), two or
-    // more or a nested one (2, see `multis`), or none (0)
+    // more or a nested one (2, see `multis`), one decided per observation
+    // (3, see `generals`), or none (0)
     uint8 tmode;
 }
 struct Rule { string creates; bool broken; int256 when; int256 cond; }
@@ -1503,11 +1879,14 @@ struct Monitor {
     // by norm, for a content with two or more temporal operators or a
     // nested one
     mapping(uint256 => Multi) multis;
+    // by norm, for a content that the tree does not decide (see General)
+    mapping(uint256 => General) generals;
     // --- the state of the contract instance
     uint256 observations;      // observations of the instance so far
     int256 lastT;
     bool hasLastT;
     bool ended;
+    bool hasGeneral;           // a norm has a content decided per observation (same slot as ended)
     uint256 ignored;           // observations after the end
     bool begun;
     string lc;                 // lifecycle state after the last observation
@@ -1534,6 +1913,7 @@ function setSt(Monitor storage m, uint256 i, uint8 st, uint256 n, int256 t) {
     if (st >= FULFILLED) {
         CadlNormsWindows.clear(m.windows[i]);
         CadlNormsMulti.clear(m.multis[i]);
+        if (m.hasGeneral) CadlNormsMulti.gclear(m.generals[i]);
     }
 }
 
@@ -1878,8 +2258,15 @@ abstract contract CadlNormsMonitorBase {
         // the first observation that a later step can read: this one, and
         // the first while a temporal item is not decided (the candidates of
         // a temporal content keep what they need in their window)
-        m.data.keepFrom = n > 0 && CadlNormsItems.pending(m.assumeItems, m.assumeRecs, m.guaranteeItems,
-                                                          m.guaranteeRecs) ? 0 : n;
+        uint256 keep = n > 0 && CadlNormsItems.pending(m.assumeItems, m.assumeRecs, m.guaranteeItems,
+                                                       m.guaranteeRecs) ? 0 : n;
+        // and the first observation that a General content reads again
+        for (uint256 i = 0; m.hasGeneral && i < m.normDefs.length; i++) {
+            if (m.normDefs[i].tmode != 3) continue;
+            General storage g = m.generals[i];
+            if (g.on && g.low < keep) keep = g.low;
+        }
+        m.data.keepFrom = keep;
     }
 
     function record(int256 t, ValIn[] calldata values, bool hasState, string calldata state, bool end)
@@ -1986,7 +2373,8 @@ abstract contract CadlNormsMonitorBase {
             NormDef storage d = m.normDefs[i];
             if (d.tmode == 0) continue;
             if (d.tmode == 1) CadlNormsWindows.note(m.windows[i], m.data, m.temporals[i], n, t);
-            else CadlNormsMulti.note(m.multis[i], m.data, n, t);
+            else if (d.tmode == 2) CadlNormsMulti.note(m.multis[i], m.data, n, t);
+            else CadlNormsMulti.gnote(m.generals[i], m.data, n);
         }
         uint256[] memory violated = judge(n, t, msgs, created);
         for (uint256 v = 0; v < violated.length; v++) onViolation(violated[v], n, t, true);
@@ -2045,7 +2433,8 @@ abstract contract CadlNormsMonitorBase {
     function judgeWindow(uint256 i, uint256 n, int256 t, bool open) internal returns (bool hit, bool closed) {
         bool empty;
         if (m.normDefs[i].tmode == 1) (hit, empty) = CadlNormsWindows.judge(m.windows[i], m.data, m.temporals[i], n, t, open);
-        else (hit, empty) = CadlNormsMulti.judge(m.multis[i], m.data, n, t, open);
+        else if (m.normDefs[i].tmode == 2) (hit, empty) = CadlNormsMulti.judge(m.multis[i], m.data, n, t, open);
+        else (hit, empty) = CadlNormsMulti.gjudge(m.generals[i], m.data, n, open);
         closed = !hit && !open && empty;
     }
 
@@ -2089,7 +2478,7 @@ abstract contract CadlNormsMonitorBase {
             bool inForce = r.state == ACTIVE || r.state == SUSPENDED;
             if (inForce && r.act == int256(n)) { setSt(m, i, DISCHARGED, n, t); continue; }
             if (inForce && (d.kind == OBLIGATION || d.kind == PROHIBITION)
-                && (CadlNormsWindows.pending(m.windows[i]) || m.multis[i].pend)) continue;
+                && (CadlNormsWindows.pending(m.windows[i]) || m.multis[i].pend || (m.hasGeneral && m.generals[i].pend))) continue;
             if (inForce && d.kind == OBLIGATION) {
                 if (!d.hasDeadline) { setSt(m, i, VIOLATED, n, t); late[c++] = i; }
                 else if (elapsed(m, i, t) <= d.deadline) setSt(m, i, DISCHARGED, n, t);
@@ -2189,6 +2578,32 @@ abstract contract CadlNormsMonitorBase {
     function _op(uint8 mode, uint256 tp, uint256 tq, int256 td, uint256 node) internal {
         MOp storage op = m.multis[m.normDefs.length - 1].ops.push();
         op.mode = mode; op.tp = tp; op.tq = tq; op.td = td; op.node = node;
+    }
+
+    /// The content of the last norm is decided per observation (General):
+    /// the calls of _gop add its temporal operators, each after those
+    /// inside it, _gkid the operators directly inside the operands of the
+    /// last one, and _gtop those of the content not inside another.
+    function _general(uint256 root) internal {
+        uint256 i = m.normDefs.length - 1;
+        m.normDefs[i].tmode = 3;
+        m.hasGeneral = true;
+        m.generals[i].root = root;
+        m.generals[i].gen = 1;
+    }
+
+    function _gop(uint8 mode, uint256 node, uint256 tp, uint256 tq, int256 td) internal {
+        GOp storage op = m.generals[m.normDefs.length - 1].ops.push();
+        op.mode = mode; op.node = node; op.tp = tp; op.tq = tq; op.td = td;
+    }
+
+    function _gkid(uint256 j) internal {
+        GOp[] storage ops = m.generals[m.normDefs.length - 1].ops;
+        ops[ops.length - 1].kids.push(j);
+    }
+
+    function _gtop(uint256 j) internal {
+        m.generals[m.normDefs.length - 1].tops.push(j);
     }
 
     /// outer (within or throughout) with duration td on the levels that

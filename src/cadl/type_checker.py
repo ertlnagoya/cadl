@@ -16,6 +16,8 @@ Checks performed (per spec §6.2.2):
    when the file declares `stochastic: 0.1`
 10. Grounding static semantics, rules J-1 to J-9 (Appendix J §J.8), when the
    file declares `grounding: 0.1` (which requires `norms: 0.1`)
+11. Amendment static semantics, rules K-1 to K-13 (Appendix K §K.6), when
+   the file declares `amendment: 0.1`
 """
 
 from __future__ import annotations
@@ -67,7 +69,7 @@ SIM_TARGETS = ("unity", "go")
 # Extensions this processor implements, with the versions it knows
 KNOWN_EXTENSIONS = {"sos-dsl": ("0.1",), "norms": ("0.1",), "agents": ("0.1",),
                     "stochastic": ("0.1",), "games": ("0.1",),
-                    "grounding": ("0.1",)}
+                    "grounding": ("0.1",), "amendment": ("0.1",)}
 
 
 @dataclass
@@ -310,6 +312,7 @@ class TypeChecker:
         self._check_contracts(sos)
         self._check_protocols(sos)
         self._check_transitions(sos)
+        self._check_regime_bindings(sos)
         self._check_algorithms(sos)
         self._check_metrics(sos)
         self._check_codegen(sos)
@@ -320,7 +323,19 @@ class TypeChecker:
             self._check_ungoverned_tool_servers(sos)
         self._check_stochastic_model(sos)
         self._check_grounding(sos)
+        self._check_amendment(sos)
         return self.result
+
+    # --- Amendment extension (Appendix K, K.6) ---
+
+    def _check_amendment(self, sos: SoSDefinition) -> None:
+        """Rules K-1 to K-12, when the file declares `amendment: 0.1`; one
+        warning for an undeclared use of the keys (K-13)."""
+        from .amendment import check
+        add = {"error": self.result.add_error, "warning": self.result.add_warning,
+               "info": self.result.add_info}
+        for level, message in check(sos):
+            add[level](message, sos.loc)
 
     # --- Grounding extension (Appendix J, J.8) ---
 
@@ -2293,6 +2308,12 @@ class TypeChecker:
                 self.result.add_warning(
                     f"Regime '{name}' is a dead-end (no outgoing transitions)",
                 )
+
+    def _check_regime_bindings(self, sos: SoSDefinition) -> None:
+        """Rules R-1 to R-6 for `regimes:` (Appendix A, A.7.1)."""
+        from .regimes import check
+        for message in check(sos):
+            self.result.add_error(message, sos.loc)
 
     def _check_algorithms(self, sos: SoSDefinition) -> None:
         """Check algorithm definitions for duplicates."""

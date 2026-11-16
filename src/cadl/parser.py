@@ -1331,6 +1331,10 @@ def _build_sos(data: dict) -> SoSDefinition:
                     safety_invariant=_get(t, 'safety_invariant'),
                 ))
 
+    # Regime bindings (Appendix A, A.7.1), kept as written; checked and
+    # resolved by cadl.regimes.
+    sos.regimes_raw = _get(sos_data, 'regimes')
+
     # Metrics
     metrics_data = _get(sos_data, 'metrics', [])
     if isinstance(metrics_data, list):
@@ -1382,6 +1386,11 @@ def _build_sos(data: dict) -> SoSDefinition:
     # not interpreted (H.15).
     if 'model' in sos_data:
         sos.model = _build_model(sos_data['model'])
+
+    # Amendment extension (Appendix K): its keys are kept as written and
+    # interpreted only when it is declared (K-13).
+    from .amendment import read_raw as _read_amendment
+    sos.amendment = _read_amendment(sos_data)
 
     return sos
 

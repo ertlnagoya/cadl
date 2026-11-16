@@ -178,7 +178,14 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
         if sos.protocols:
             _write(output_dir / "protocols.py", generate_protocols_module(sos.protocols))
 
-        _write(output_dir / "transitions.py", generate_transitions_module(sos.transitions))
+        from ..regimes import checked as checked_regimes, declared_value
+        bindings = checked_regimes(sos)
+        declared_params = {
+            key: declared_value(sos, key)
+            for b in (bindings or []) for key in b.parameters
+        }
+        _write(output_dir / "transitions.py",
+               generate_transitions_module(sos.transitions, bindings, declared_params))
         _write(output_dir / "metrics.py", generate_metrics_module(sos.metrics))
         _write(output_dir / "runtime.py", generate_runtime_module(sos))
 
