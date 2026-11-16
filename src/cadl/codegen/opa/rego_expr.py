@@ -26,6 +26,10 @@ from ...ast_nodes import (
 )
 
 
+# Functions of A.10 predicates that Rego has with the same meaning.
+_REGO_FUNCTIONS = frozenset({"count", "sum", "max", "min", "abs"})
+
+
 @dataclass
 class RegoContext:
     """Compilation context for Rego expression translation."""
@@ -83,9 +87,21 @@ def expr_to_rego(expr: Expression, ctx: RegoContext | None = None) -> str:
 
     if isinstance(expr, FunctionCall):
         args = ", ".join(expr_to_rego(a, ctx) for a in expr.args)
-        if args:
+        if args and expr.name in _REGO_FUNCTIONS:
             return f"{expr.name}({args})"
-        return f"{expr.name}"
+        if args:
+            # A function that Rego does not have (`length(goal_sequence)`,
+            # `collision_resolved_within(30s)`): the host gives the value of
+            # the call, keyed by its text. Up to 0.3.32 the call was written
+            # as is, which OPA rejects as an undefined function.
+            import json
+            from ...unparse import expr_to_source
+            return f"{ctx.input_prefix}.calls[{json.dumps(expr_to_source(expr))}]"
+        # A function without arguments that A.10 does not define, such as
+        # all_routes_conflict_free(): a value the host gives in the input, as
+        # for a name. Up to 0.3.32 it was written as a bare variable, which
+        # OPA rejects as unsafe.
+        return f"{ctx.input_prefix}.{expr.name}"
 
     if isinstance(expr, BinaryOp):
         left = expr_to_rego(expr.left, ctx)

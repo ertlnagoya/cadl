@@ -457,6 +457,8 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
     """The Solidity text of the monitor of one contract. Raises
     `NormsTargetUnsupported` for a contract that cannot be monitored."""
     check_contract_id(contract.id)
+    from ..norms_ir import check_regimes
+    check_regimes(sos, contract, 'solidity')
     ir = solidity_ir(sos, contract)
     skip = {k for it in ir["items"]["guarantee"] if it.get("unsupported") and it["expr"] is not None
             for k in _subtree(ir["exprs"], it["expr"])}

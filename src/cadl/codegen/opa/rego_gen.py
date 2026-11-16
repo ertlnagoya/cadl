@@ -53,15 +53,22 @@ def _rego_value(value) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _per_regime(lines: list, name: str, per_regime: dict, default: str) -> None:
-    """`name` with the value of the current regime, else `default`."""
+def _per_regime(lines: list, name: str, per_regime: dict, default: str,
+                guard: str | None = None) -> None:
+    """`name` with the value of the current regime, else `default` (only
+    when `guard` holds, if given)."""
     first = True
     for regime, value in per_regime.items():
         head = f"{name} := " if first else "} else := "
         lines.append(f"{head}{value} if {{")
         lines.append(f"    input.regime == {_rego_value(regime)}")
         first = False
-    lines.append(f"}} else := {default}")
+    if guard is None:
+        lines.append(f"}} else := {default}")
+    else:
+        lines.append(f"}} else := {default} if {{")
+        lines.append(f"    {guard}")
+        lines.append("}")
 
 
 def _regime_rules(lines: list, contract: ContractDef, bindings: list) -> None:
@@ -291,10 +298,13 @@ def generate_main_rego(sos: SoSDefinition, bindings: list | None = None) -> str:
             if values != declared:
                 per_regime[b.name] = "{" + ", ".join(
                     f"{_rego_value(k)}: {_rego_value(v)}" for k, v in values.items()) + "}"
+        # undefined without input.regime or with a name that is not a regime
         if per_regime:
-            _per_regime(lines, "parameters", per_regime, default)
+            _per_regime(lines, "parameters", per_regime, default, "input.regime in regimes")
         else:
-            lines.append(f"parameters := {default}")
+            lines.append(f"parameters := {default} if {{")
+            lines.append("    input.regime in regimes")
+            lines.append("}")
         lines.append("")
 
     # Aggregate compliance check
@@ -310,16 +320,21 @@ def generate_main_rego(sos: SoSDefinition, bindings: list | None = None) -> str:
     lines.append("")
 
     # Aggregate violations
-    lines.append("all_violations contains msg if {")
+    # one rule per contract: the violations of any contract (up to 0.3.32 one
+    # rule assigned msg once per contract, which OPA rejects for two or more)
     if sos.contracts:
         for contract in sos.contracts:
             cpkg = snake_case(contract.id)
-            lines.append(f"    msg := data.cadl.{cpkg}.violation[_]")
+            lines.append("all_violations contains msg if {")
+            lines.append(f"    some msg in data.cadl.{cpkg}.violation")
+            lines.append("}")
+            lines.append("")
     else:
+        lines.append("all_violations contains msg if {")
         lines.append('    msg := "no contracts"')
         lines.append("    false")
-    lines.append("}")
-    lines.append("")
+        lines.append("}")
+        lines.append("")
 
     return "\n".join(lines)
 

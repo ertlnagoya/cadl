@@ -748,6 +748,8 @@ def test_rego_main_parameters(tmp_path):
     text = (out / "main.rego").read_text()
     assert 'initial_regime := "DISTRIBUTED"' in text
     assert '"ROUTING.beta": 0.9, "environment.bays": 3' in text
+    # no values without a regime of the file (nothing is allowed then)
+    assert text.rstrip().count("input.regime in regimes") == 1
     plain = tmp_path / "plain"
     generate(parse(BASE), plain, target="opa")
     assert "regime" not in (plain / "routing.rego").read_text()
@@ -760,6 +762,13 @@ def test_norms_monitors_of_opa_and_solidity(target):
     sos = parse(_with_regimes(EXAMPLE, "DELIVERY_SLA"))
     [m] = norms_monitors(sos, target)
     assert m["text"] is None and "STORM do not have the contract in force" in m["reasons"][0]
+    # the public generators refuse it too
+    from cadl.codegen.norms_ir import NormsTargetUnsupported
+    from cadl.codegen.opa.norms_monitor_rego import generate_norms_monitor_rego
+    from cadl.codegen.solidity.norms_monitor_sol import generate_norms_monitor_sol
+    gen = generate_norms_monitor_rego if target == "opa" else generate_norms_monitor_sol
+    with pytest.raises(NormsTargetUnsupported, match="STORM do not have the contract"):
+        gen(sos, sos.contracts[0])
     # a contract that every regime has in force: the monitor of the file
     # without the block (no norm reads a parameter)
     other = _with_regimes(EXAMPLE, "DELIVERY_SLA").replace(
@@ -856,3 +865,40 @@ def test_python_controller_checks_the_safety_invariant_and_the_names(tmp_path):
                         "'safety invariant does not hold: robots_on_road == 0')]")
     assert lines[1] == "True CENTRALIZED"
     assert lines[2:] == ["ValueError 'BOGUS' is not a regime of the file (CENTRALIZED, DISTRIBUTED)"] * 2
+
+
+@pytest.mark.skipif(S.opa_binary() is None, reason="the opa binary is not on PATH")
+@pytest.mark.parametrize("path", sorted((ROOT / "examples").glob("*.cadl")), ids=lambda p: p.stem)
+def test_opa_check_of_every_example(path, tmp_path):
+    """`opa check` accepts what `cadl codegen -t opa` writes for every example
+    (0.3.33 fixes all_violations of main.rego for two or more contracts and
+    function calls that Rego does not have)."""
+    sos = parse_file(path)
+    if not type_check(sos).ok:
+        pytest.skip("the example does not pass cadl check")
+    generate(sos, tmp_path / "opa", target="opa")
+    proc = subprocess.run([S.opa_binary(), "check", str(tmp_path / "opa")],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.skipif(S.opa_binary() is None, reason="the opa binary is not on PATH")
+def test_rego_main_parameters_need_a_regime(tmp_path):
+    out = tmp_path / "opa"
+    generate(parse(GOOD), out, target="opa")
+    files = sorted(str(f) for f in out.glob("*.rego"))
+
+    def params(inp: dict):
+        (tmp_path / "in.json").write_text(json.dumps(inp), encoding="utf-8")
+        args = [S.opa_binary(), "eval", "-i", str(tmp_path / "in.json"), "--format", "json"]
+        for f in files:
+            args += ["-d", f]
+        proc = subprocess.run(args + ["data.cadl.robot_town.parameters"],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        res = json.loads(proc.stdout).get("result")
+        return res[0]["expressions"][0]["value"] if res else None
+
+    assert params({"regime": "CENTRALIZED"})["ROUTING.beta"] == 0.9
+    assert params({"regime": "DISTRIBUTED"})["ROUTING.beta"] == 0.2
+    assert params({}) is None and params({"regime": "CALM"}) is None

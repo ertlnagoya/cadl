@@ -80,7 +80,7 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
     items the monitor leaves out. An empty list for other files and
     targets."""
     from ..norms import norms_declared
-    from .norms_ir import NormsTargetUnsupported, build_ir, unsupported_items
+    from .norms_ir import NormsTargetUnsupported, build_ir, check_regimes, unsupported_items
     if target not in ("opa", "solidity") or not norms_declared(sos):
         return []
     ir_of = build_ir
@@ -93,24 +93,13 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
 
         def monitor_filename(contract_id: str) -> str:
             return f"{monitor_name(contract_id)}.sol"
-    from ..regimes import checked, suspended_somewhere
-    bindings = checked(sos) if sos.transitions else None
     out = []
     for contract in sos.contracts:
         entry = {"contract": contract.id, "file": monitor_filename(contract.id),
                  "text": None, "reasons": [], "left_out": []}
-        apart = suspended_somewhere(bindings, contract.id)
-        if apart:
-            # Regime bindings (A.7.1): the monitor of this target does not
-            # read the regime, so it could not leave out the observations
-            # at which the contract is not in force (F.5).
-            entry["reasons"] = [
-                f"the regime(s) {', '.join(apart)} do not have the contract in force "
-                f"(regimes:, Appendix A, A.7.1), and the norms monitor of the {target} "
-                f"target does not read the current regime"]
-            out.append(entry)
-            continue
         try:
+            # first: a contract that a regime does not have in force (A.7.1)
+            check_regimes(sos, contract, target)
             ir = ir_of(sos, contract)
             entry["left_out"] = unsupported_items(ir)
             entry["text"] = gen(sos, contract)
