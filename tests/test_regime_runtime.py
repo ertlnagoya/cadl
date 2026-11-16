@@ -637,6 +637,10 @@ def test_solidity_text(tmp_path):
     assert 'if (!regimeController.contractActive("BAY_ASSIGNMENT")) return;' in bay
     ctl = (out / "RegimeController.sol").read_text()
     assert "Regime public currentRegime = Regime.Distributed;" in ctl
+    assert "function evaluateTransitions() public onlyOrchestrator {" in ctl
+    assert "emit RegimeTransitionRefused(currentRegime, Regime.Centralized" in ctl
+    assert "function setUint(string calldata key, uint256 value) external onlyOrchestrator" in ctl
+    assert "function runMonitorCycle() public onlyOrchestrator {" in bay
     main_ = (out / "RobotTown.sol").read_text()
     assert main_.index("regimeController = new RegimeController();") < main_.index(
         "routing = new Routing(regimeController);")
@@ -659,23 +663,39 @@ def test_solidity_on_an_evm(tmp_path):
         abi = value["abi"] if isinstance(value["abi"], list) else json.loads(value["abi"])
         contracts[key.split(":")[-1]] = {"abi": abi, "bin": value["bin"]}
     rc = ["regimeController"]
+    fp, bay = ["free_passage"], ["bay_assignment"]
+
+    def cycle():
+        return [["send", [], "runMonitorCycle", []], ["call", rc, "currentRegime", []],
+                ["call", fp, "violationCount", []], ["call", bay, "violationCount", []]]
+
+    def put(key, value):
+        return ["send", [], "setUint", [key, value]]
+
+    # Regime enum: Centralized = 0, Distributed = 1 (sorted)
     steps = [
-        ["call", ["routing"], "BETA", []],
-        ["call", rc, "currentRegime", []],
-        ["call", rc, "contractActive", ["BAY_ASSIGNMENT"]],
-        ["call", rc, "contractActive", ["FREE_PASSAGE"]],
-        ["send", ["bay_assignment"], "runMonitorCycle", []],
-        ["call", ["bay_assignment"], "violationCount", []],
-        ["send", ["free_passage"], "runMonitorCycle", []],   # waiting_on_road (0) >= 1 fails
-        ["call", ["free_passage"], "violationCount", []],
-        ["send", [], "runMonitorCycle", []],                 # orders_in_window (0) < 22
-        ["call", rc, "currentRegime", []],
-        ["call", ["routing"], "BETA", []],
-        ["call", rc, "contractActive", ["BAY_ASSIGNMENT"]],
-        ["call", rc, "contractActive", ["FREE_PASSAGE"]],
-        ["send", ["free_passage"], "runMonitorCycle", []],
-        ["call", ["free_passage"], "violationCount", []],
+        ["call", ["routing"], "BETA", []],                   # [200]
+        ["call", rc, "currentRegime", []],                   # [1]: the initial regime
+        ["send", bay, "runMonitorCycle", []],                # only the orchestrator
+        ["send", rc, "evaluateTransitions", []],             # only the orchestrator
+        put("orders_in_window", 25), put("waiting_on_road", 0), put("robots_on_road", 3),
+        *cycle(),                                            # stays: 25 >= 22
+        put("orders_in_window", 10),
+        *cycle(),                                            # refused: robots_on_road == 3
+        put("robots_on_road", 0),
+        *cycle(),                                            # taken
+        ["call", ["routing"], "BETA", []],                   # [900]
+        *cycle(),                                            # FREE_PASSAGE not in force
+        put("orders_in_window", 30),
+        *cycle(),                                            # back to DISTRIBUTED
     ]
+    expect = [[200], [1], "error", "error", "ok", "ok", "ok",
+              "ok", [1], [1], [0],
+              "ok", "ok", [1], [2], [0],
+              "ok", "ok", [0], [3], [0],
+              [900],
+              "ok", [0], [3], [0],
+              "ok", "ok", [1], [3], [0]]
     job = {"contracts": contracts, "main": "RobotTown", "steps": steps}
     (tmp_path / "job.json").write_text(json.dumps(job), encoding="utf-8")
     proc = subprocess.run([S.evm_python(), "-I", str(HERE / "regime_evm_driver.py"),
@@ -684,8 +704,8 @@ def test_solidity_on_an_evm(tmp_path):
     assert proc.returncode == 0, proc.stderr[-3000:]
     got = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
     # Regime enum: Centralized = 0, Distributed = 1 (sorted)
-    assert got == [[200], [1], [False], [True], "ok", [0], "ok", [1],
-                   "ok", [0], [900], [True], [False], "ok", [2]], got
+    got = ["error" if isinstance(g, dict) and "error" in g else g for g in got]
+    assert got == expect, got
 
 
 # === Rego ============================================================================
@@ -799,3 +819,40 @@ def test_regime_map_shows_the_bindings():
     broken = RegimeMap.from_sos(parse(GOOD.replace("ROUTING.beta: 0.9", "ROUTING.beta: 9")))
     assert broken.to_json()["regimes"] is None
     assert "not shown, the regimes: block has errors" in broken.to_text()
+
+
+def test_python_controller_checks_the_safety_invariant_and_the_names(tmp_path):
+    """A.7.1: a transition whose safety invariant does not hold is not
+    taken, the regime stays and the refusal is recorded (no assert, which
+    `python -O` removes); a name that is not a regime is a ValueError."""
+    pkg = tmp_path / "town_m1"
+    generate(parse(GOOD), pkg)
+    text = (pkg / "transitions.py").read_text()
+    assert "assert " not in text
+    script = textwrap.dedent("""
+        import sys
+        sys.path.insert(0, sys.argv[1])
+        from town_m1.runtime import RobotTownRuntime
+        rt = RobotTownRuntime()
+        rc = rt.regime_controller
+        rt.ctx.state.update(orders_in_window=10, robots_on_road=3, waiting_on_road=1)
+        target = rc.evaluate_transitions(rt.ctx)
+        print(target, rc.execute_transition(target, rt.ctx), rc.current_regime,
+              rc.refused_transitions)
+        rt.ctx.state["robots_on_road"] = 0
+        print(rc.execute_transition(target, rt.ctx), rc.current_regime)
+        for bad in ("lambda: type(rc)('BOGUS')", "lambda: rc.execute_transition('BOGUS', rt.ctx)"):
+            try:
+                eval(bad)()
+            except ValueError as e:
+                print("ValueError", e)
+    """)
+    proc = subprocess.run([sys.executable, "-O", "-c", script, str(tmp_path)],
+                          capture_output=True, text=True,
+                          env={"PYTHONPATH": str(ROOT / "src")})
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.splitlines()
+    assert lines[0] == ("CENTRALIZED False DISTRIBUTED [('DISTRIBUTED', 'CENTRALIZED', "
+                        "'safety invariant does not hold: robots_on_road == 0')]")
+    assert lines[1] == "True CENTRALIZED"
+    assert lines[2:] == ["ValueError 'BOGUS' is not a regime of the file (CENTRALIZED, DISTRIBUTED)"] * 2

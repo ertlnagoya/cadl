@@ -88,6 +88,7 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition,
     ctx = SolidityContext()
     regimed = _needs_controller(contract, bindings)
     bound = _bound_institutional(contract, bindings) if regimed else {}
+    stepped = bindings is not None      # a step is one call of the orchestrator (A.7.1)
 
     lines: list[str] = []
     lines.append("// SPDX-License-Identifier: Apache-2.0")
@@ -104,10 +105,9 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition,
         lines.append("    // (regimes:, Appendix A, A.7.1)")
         lines.append("    RegimeController public regimeController;")
         lines.append("")
-        lines.append("    constructor(RegimeController controller) {")
-        lines.append("        regimeController = controller;")
-        lines.append("    }")
-        lines.append("")
+    if stepped:
+        _orchestrated(lines, "RegimeController controller" if regimed else "",
+                      "regimeController = controller;" if regimed else None)
 
     # Party addresses
     for party in contract.parties:
@@ -184,7 +184,8 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition,
     lines.append("")
 
     # runMonitorCycle
-    lines.append("    function runMonitorCycle() public {")
+    lines.append("    function runMonitorCycle() public {" if not stepped
+                 else "    function runMonitorCycle() public onlyOrchestrator {")
     if regimed and any(contract.id not in b.active for b in bindings):
         lines.append("        // not checked in a regime that does not have the contract in force")
         lines.append(f'        if (!regimeController.contractActive("{contract.id}")) return;')
@@ -221,6 +222,40 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition,
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _orchestrated(lines: list, params: str, init: str | None) -> None:
+    """With regime bindings (A.7.1) one step of a run is one call of the
+    orchestrator: the contract it deploys is driven only by it, and it
+    sets the observed state that the predicates read."""
+    lines.append("    // Only the orchestrator that deploys this contract runs its step and")
+    lines.append("    // sets the observed state (Appendix A, A.7.1)")
+    lines.append("    address public orchestrator;")
+    lines.append("")
+    lines.append("    modifier onlyOrchestrator() {")
+    lines.append('        require(msg.sender == orchestrator, "only the orchestrator");')
+    lines.append("        _;")
+    lines.append("    }")
+    lines.append("")
+    lines.append(f"    constructor({params}) {{")
+    lines.append("        orchestrator = msg.sender;")
+    if init:
+        lines.append(f"        {init}")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    function setUint(string calldata key, uint256 value) external onlyOrchestrator {")
+    lines.append("        stateUint[key] = value;")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    function setBool(string calldata key, bool value) external onlyOrchestrator {")
+    lines.append("        stateBool[key] = value;")
+    lines.append("    }")
+    lines.append("")
+
+
+def _hex_string(text: str) -> str:
+    """A text of the file as a Solidity hex literal (no text is code)."""
+    return f'string(hex"{text.encode("utf-8").hex()}")'
 
 
 def _regime_value(lines: list, name: str, declared: float, per_regime: dict) -> None:
@@ -269,6 +304,9 @@ def generate_regime_sol(sos: SoSDefinition, bindings: list | None = None) -> str
 
     # Events
     lines.append("    event RegimeTransition(Regime from_, Regime to_);")
+    if bindings is not None:
+        lines.append("    // a transition whose safety invariant does not hold is not taken (A.7.1)")
+        lines.append("    event RegimeTransitionRefused(Regime from_, Regime to_, string invariant);")
     lines.append("")
 
     # State for conditions
@@ -276,9 +314,36 @@ def generate_regime_sol(sos: SoSDefinition, bindings: list | None = None) -> str
     lines.append("    mapping(string => bool) public stateBool;")
     lines.append("")
 
+    if bindings is not None:
+        _orchestrated(lines, "", None)
+        lines.append("    function evaluateTransitions() public onlyOrchestrator {")
+        for t in sos.transitions:
+            from_id = sanitize_id(t.from_regime)
+            to_id = sanitize_id(t.to_regime)
+            if t.condition:
+                cond = _compile_condition(t.condition, ctx)
+                lines.append(f"        if (currentRegime == Regime.{from_id} && ({cond})) {{")
+            else:
+                lines.append(f"        if (currentRegime == Regime.{from_id}) {{")
+            if t.safety_invariant:
+                inv = _compile_invariant(t.safety_invariant, ctx)
+                lines.append(f"            // safety_invariant: {_comment(t.safety_invariant)}")
+                lines.append(f"            if (!({inv})) {{")
+                lines.append(f"                emit RegimeTransitionRefused(currentRegime, Regime.{to_id}, "
+                             f"{_hex_string(t.safety_invariant)});")
+                lines.append("                return;")
+                lines.append("            }")
+            lines.append(f"            emit RegimeTransition(currentRegime, Regime.{to_id});")
+            lines.append(f"            currentRegime = Regime.{to_id};")
+            lines.append("            return;")
+            lines.append("        }")
+        lines.append("    }")
+        lines.append("")
+
     # evaluateTransitions
-    lines.append("    function evaluateTransitions() public {")
-    for t in sos.transitions:
+    if bindings is None:
+        lines.append("    function evaluateTransitions() public {")
+    for t in sos.transitions if bindings is None else []:
         from_id = sanitize_id(t.from_regime)
         to_id = sanitize_id(t.to_regime)
         if t.condition:
@@ -290,8 +355,9 @@ def generate_regime_sol(sos: SoSDefinition, bindings: list | None = None) -> str
         lines.append(f"            currentRegime = Regime.{to_id};")
         lines.append("            return;")
         lines.append("        }")
-    lines.append("    }")
-    lines.append("")
+    if bindings is None:
+        lines.append("    }")
+        lines.append("")
 
     # getCurrentRegime
     lines.append("    function getCurrentRegime() public view returns (Regime) {")
@@ -348,9 +414,21 @@ def generate_main_sol(sos: SoSDefinition, bindings: list | None = None) -> str:
         lines.append("    RegimeController public regimeController;")
     lines.append("")
 
+    if bindings is not None:
+        lines.append("    // One step of a run (Appendix A, A.7.1) is one call of runMonitorCycle()")
+        lines.append("    // by the reporter, the deployer; it also sets the observed state.")
+        lines.append("    address public reporter;")
+        lines.append("")
+        lines.append("    modifier onlyReporter() {")
+        lines.append('        require(msg.sender == reporter, "only the reporter");')
+        lines.append("        _;")
+        lines.append("    }")
+        lines.append("")
+
     # Constructor
     lines.append("    constructor() {")
     if bindings is not None:
+        lines.append("        reporter = msg.sender;")
         # the controller first: the contracts that read it get it
         lines.append("        regimeController = new RegimeController();")
     for contract in sos.contracts:
@@ -363,8 +441,19 @@ def generate_main_sol(sos: SoSDefinition, bindings: list | None = None) -> str:
     lines.append("    }")
     lines.append("")
 
+    if bindings is not None:
+        for fn, typ in (("setUint", "uint256"), ("setBool", "bool")):
+            lines.append(f"    /// The observed value of a quantity, for every contract and the controller")
+            lines.append(f"    function {fn}(string calldata key, {typ} value) external onlyReporter {{")
+            for contract in sos.contracts:
+                lines.append(f"        {snake_case(contract.id)}.{fn}(key, value);")
+            lines.append(f"        regimeController.{fn}(key, value);")
+            lines.append("    }")
+            lines.append("")
+
     # runMonitorCycle
-    lines.append("    function runMonitorCycle() public {")
+    lines.append("    function runMonitorCycle() public {" if bindings is None
+                 else "    function runMonitorCycle() public onlyReporter {")
     for contract in sos.contracts:
         var_name = snake_case(contract.id)
         lines.append(f"        {var_name}.runMonitorCycle();")
@@ -394,6 +483,20 @@ def _compile_condition(cond_str: str, ctx: SolidityContext) -> str:
         sanitized = cond_str.replace(" ", "_").replace(".", "_")[:40]
         sanitized = "".join(c for c in sanitized if c.isalnum() or c == "_")
         return f"stateBool[\"{sanitized}\"]"
+
+
+def _compile_invariant(text: str, ctx: SolidityContext) -> str:
+    """A safety invariant in Solidity; `false` when it cannot be compiled,
+    so that the transition is refused rather than taken unchecked."""
+    from ...parser import parse_expr
+    try:
+        return predicate_to_solidity(parse_expr(text), ctx)
+    except Exception:
+        return "false"
+
+
+def _comment(text: str) -> str:
+    return " ".join(text.split()).replace("*/", "* /")
 
 
 def _predicate_label(expr: Expression) -> str:
