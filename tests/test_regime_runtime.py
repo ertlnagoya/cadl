@@ -1037,3 +1037,41 @@ def test_rego_missing_values_never_satisfy_a_negation(tmp_path):
     assert full == {"N1": [True, 0], "N2": [True, 0], "N3": [True, 0], "N4": [True, 0],
                     "N5": [False, 1], "N6": [True, 0]}
     assert run({"x": 9, "items": {"the operator approves": True}})["N5"] == [True, 0]
+
+
+def test_solidity_invariant_reads_only_set_values(tmp_path):
+    """A.7.1: an invariant that reads a value never set, or that Solidity
+    cannot express (`len(queue)`), refuses the transition, as in Python."""
+    out = _solidity(tmp_path, GOOD)
+    ctl = (out / "RegimeController.sol").read_text()
+    assert 'if (!(isSet["robots_on_road"] && ((stateUint["robots_on_road"] == 0)))) {' in ctl
+    assert "isSet[key] = true;" in ctl
+    other = _solidity(tmp_path / "len", GOOD.replace('safety_invariant: "robots_on_road == 0"',
+                                                     'safety_invariant: "len(queue) == 0"'))
+    assert "if (!(false)) {" in (other / "RegimeController.sol").read_text()
+
+
+@pytest.mark.skipif(S.solc_binary() is None or S.evm_python() is None,
+                    reason="no solc, or no EVM (CADL_EVM_PYTHON)")
+def test_solidity_unset_value_refuses_on_an_evm(tmp_path):
+    out = _solidity(tmp_path, GOOD)
+    proc = subprocess.run([S.solc_binary(), "--combined-json", "abi,bin", "RobotTown.sol"],
+                          cwd=out, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    data = json.loads(proc.stdout)["contracts"]
+    contracts = {k.split(":")[-1]: {"abi": v["abi"] if isinstance(v["abi"], list)
+                                    else json.loads(v["abi"]), "bin": v["bin"]}
+                 for k, v in data.items()}
+    rc = ["regimeController"]
+    steps = [["send", [], "setUint", ["orders_in_window", 10]],   # robots_on_road never set
+             ["send", [], "runMonitorCycle", []], ["call", rc, "currentRegime", []],
+             ["send", [], "setUint", ["robots_on_road", 0]],
+             ["send", [], "runMonitorCycle", []], ["call", rc, "currentRegime", []]]
+    (tmp_path / "job.json").write_text(json.dumps(
+        {"contracts": contracts, "main": "RobotTown", "steps": steps}), encoding="utf-8")
+    proc = subprocess.run([S.evm_python(), "-I", str(HERE / "regime_evm_driver.py"),
+                           str(tmp_path / "job.json"), str(tmp_path / "out.json")],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    got = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+    assert got == ["ok", "ok", [1], "ok", "ok", [0]]     # Distributed = 1, Centralized = 0

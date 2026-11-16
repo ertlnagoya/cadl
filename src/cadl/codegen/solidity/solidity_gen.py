@@ -224,7 +224,7 @@ def generate_contract_sol(contract: ContractDef, sos: SoSDefinition,
     return "\n".join(lines)
 
 
-def _orchestrated(lines: list, params: str, init: str | None) -> None:
+def _orchestrated(lines: list, params: str, init: str | None, track: bool = False) -> None:
     """With regime bindings (A.7.1) one step of a run is one call of the
     orchestrator: the contract it deploys is driven only by it, and it
     sets the observed state that the predicates read."""
@@ -243,12 +243,22 @@ def _orchestrated(lines: list, params: str, init: str | None) -> None:
         lines.append(f"        {init}")
     lines.append("    }")
     lines.append("")
+    if track:
+        lines.append("    // Whether a value was set: a safety invariant that reads a value never")
+        lines.append("    // set cannot be evaluated, and its transition is refused (A.7.1)")
+        lines.append("    mapping(string => bool) public isSet;")
+        lines.append("")
+    mark = "        isSet[key] = true;" if track else None
     lines.append("    function setUint(string calldata key, uint256 value) external onlyOrchestrator {")
     lines.append("        stateUint[key] = value;")
+    if mark:
+        lines.append(mark)
     lines.append("    }")
     lines.append("")
     lines.append("    function setBool(string calldata key, bool value) external onlyOrchestrator {")
     lines.append("        stateBool[key] = value;")
+    if mark:
+        lines.append(mark)
     lines.append("    }")
     lines.append("")
 
@@ -315,7 +325,7 @@ def generate_regime_sol(sos: SoSDefinition, bindings: list | None = None) -> str
     lines.append("")
 
     if bindings is not None:
-        _orchestrated(lines, "", None)
+        _orchestrated(lines, "", None, track=True)
         lines.append("    function evaluateTransitions() public onlyOrchestrator {")
         for t in sos.transitions:
             from_id = sanitize_id(t.from_regime)
@@ -486,13 +496,44 @@ def _compile_condition(cond_str: str, ctx: SolidityContext) -> str:
 
 
 def _compile_invariant(text: str, ctx: SolidityContext) -> str:
-    """A safety invariant in Solidity; `false` when it cannot be compiled,
-    so that the transition is refused rather than taken unchecked."""
+    """A safety invariant in Solidity, true only when every value it reads
+    was set (`isSet`); `false` when it uses what the observed state of the
+    controller cannot give (a function such as `len(queue)`, an actor
+    field, a text, a fraction), so that the transition is refused rather
+    than taken unchecked, as in the Python target (A.7.1). A bare name
+    (`Idle` in `mode == Idle`) is a quantity of the observed state in both
+    targets."""
     from ...parser import parse_expr
     try:
-        return predicate_to_solidity(parse_expr(text), ctx)
+        expr = parse_expr(text)
+        names: list = []
+        if not _state_only(expr, ctx, names):
+            return "false"
+        compiled = predicate_to_solidity(expr, ctx)
     except Exception:
         return "false"
+    guards = [f'isSet["{n}"]' for n in dict.fromkeys(names)]
+    return " && ".join(guards + [f"({compiled})"])
+
+
+_INVARIANT_OPS = {"==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "AND", "OR"}
+
+
+def _state_only(expr, ctx: SolidityContext, names: list) -> bool:
+    """Whether an invariant reads only the observed state of the controller
+    (names it collects) with integers, booleans and the operators of A.10."""
+    from ...ast_nodes import ActorRef, BinaryOp, BoolLiteral, IntLiteral, UnaryOp
+    from .solidity_expr import _is_state_name
+    if isinstance(expr, (BoolLiteral, IntLiteral)):
+        return True
+    if isinstance(expr, ActorRef) and _is_state_name(expr, ctx):
+        names.append(expr.name)
+        return True
+    if isinstance(expr, UnaryOp) and expr.op == "NOT":
+        return _state_only(expr.operand, ctx, names)
+    if isinstance(expr, BinaryOp) and expr.op in _INVARIANT_OPS:
+        return _state_only(expr.left, ctx, names) and _state_only(expr.right, ctx, names)
+    return False
 
 
 def _comment(text: str) -> str:
