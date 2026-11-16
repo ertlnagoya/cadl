@@ -199,6 +199,21 @@ class TestNormsEval:
         assert ev == [(3600, "wait"), (3620, "switch")]
         assert [a["t"] for a in r["amendments"]] == [3620]
 
+    def test_waiting_switch_is_made_before_a_new_version(self, tmp_path):
+        # K.11: a waiting switch whose state holds before the observation is
+        # made first, then the version that takes effect there applies
+        v2 = _variant(tmp_path, "w2.cadl", "2", "1", 2,
+                      "    transitional:\n      contracts:\n        - { contract: DELIVERY_SLA,"
+                      " rule: switch, in_states: [PickedUp] }\n")
+        v3 = _variant(tmp_path, "k3.cadl", "3", "2", 3, "    transitional: { default: keep }\n")
+        lines = [{"t": 3550, "bindings": {"i": 2}}, {"t": 3600},
+                 {"t": 7000, "values": {"ROBOT[2].status": "PickedUp"}, "state": "PickedUp"},
+                 {"t": 7200}, {"t": 7210}]
+        r = evaluate_files(V1, _trace(tmp_path, lines), None, [v2, v3], HOUR)
+        ev = [(e["t"], e["event"], e["version"]) for e in r["versions"]["events"]]
+        assert ev == [(3600, "wait", "2"), (7200, "switch", "2"), (7200, "keep", "3")]
+        assert r["versions"]["follows"] == "2"
+
     def test_two_versions_at_one_observation(self, tmp_path):
         v2 = _variant(tmp_path, "a2.cadl", "2", "1", 2, "")
         v3 = _variant(tmp_path, "a3.cadl", "3", "2", 3, "", pickup="60s")
@@ -251,19 +266,17 @@ def _reference(times, rules, obs):
     waiting = None
     for n, (t, state) in enumerate(obs[1:], start=1):
         k = in_force(t)
-        fresh = False
+        if waiting and state in waiting[1]:       # first the waiting switch
+            out.append((n, waiting[0]))
+            waiting = None
         for v in range(cur + 1, k + 1):
             waiting = None
             rule, states = rules[v]
             if rule == "switch":
                 waiting = (v, states)
-                fresh = True
                 if states is None or state in states:
                     out.append((n, v))
                     waiting = None
-        if waiting and not fresh and state in waiting[1]:
-            out.append((n, waiting[0]))
-            waiting = None
         cur = k
     return out
 
@@ -370,8 +383,9 @@ def test_monitor_equals_norms_eval(tmp_path, monitors, seed):
     trace = _trace(tmp_path, lines)
     ref = evaluate_files(V1, trace, None, paths, None if named else HOUR)
     models = {str(i + 2): _monitor_model(tmp_path, p) for i, p in enumerate(paths)}
-    got = monitors["m1"].replay(trace.read_text().splitlines(keepends=True), versions=models,
-                                path=str(trace), period=None if named else 3600)
+    got = monitors["m1"].replay(trace.read_text().splitlines(keepends=True),
+                                run_versions=models, path=str(trace),
+                                period=None if named else 3600)
     ref.pop("file")
     assert got == json.loads(json.dumps(ref))
 
@@ -379,7 +393,7 @@ def test_monitor_equals_norms_eval(tmp_path, monitors, seed):
 class TestMonitor:
     def test_online(self, monitors, tmp_path):
         m = monitors["m1"].NormsMonitor("DELIVERY_SLA", bindings={"i": 2},
-                                        versions={"2": _monitor_model(tmp_path, V2)},
+                                        run_versions=[_monitor_model(tmp_path, V2)],
                                         period=3600)
         m.observe({"t": 3550})
         assert m.version == "1"
@@ -394,7 +408,7 @@ class TestMonitor:
 
     def test_refused_named_version_leaves_the_monitor(self, monitors, tmp_path):
         m = monitors["m1"].NormsMonitor("DELIVERY_SLA", bindings={"i": 2},
-                                        versions={"2": _monitor_model(tmp_path, V2)},
+                                        run_versions=[_monitor_model(tmp_path, V2)],
                                         period=3600)
         m.observe({"t": 3550})
         with pytest.raises(monitors["m1"].TraceError, match="by the effective times"):
@@ -408,6 +422,40 @@ class TestMonitor:
         m.observe({"t": 3550})
         m.observe({"t": 3660})
         assert "versions" not in m.result()
+
+    def test_versions_keeps_its_0333_meaning(self, monitors, tmp_path):
+        # a model given for `amend` is not a version of the run, also when
+        # its file declares amendment 0.1: the result is that of
+        # norms-eval without --version
+        trace = _trace(tmp_path, [{"t": 3550, "bindings": {"i": 2}},
+                                  {"t": 3560, "amend": V2.name}, {"t": 3700}])
+        (tmp_path / V2.name).write_text(V2.read_text())
+        ref = evaluate_files(V1, trace)
+        got = monitors["m1"].replay(trace.read_text().splitlines(keepends=True),
+                                    versions={V2.name: _monitor_model(tmp_path, V2)},
+                                    path=str(trace))
+        ref.pop("file")
+        assert got == json.loads(json.dumps(ref)) and "versions" not in got
+        assert [a["t"] for a in got["amendments"]] == [3560]
+
+    def test_named_version_after_amend_is_refused(self, monitors, tmp_path):
+        (tmp_path / V2.name).write_text(V2.read_text())
+        m = monitors["m1"].NormsMonitor("DELIVERY_SLA", bindings={"i": 2},
+                                        versions={V2.name: _monitor_model(tmp_path, V2)})
+        m.observe({"t": 0})
+        m.observe({"t": 10, "amend": V2.name})
+        with pytest.raises(monitors["m1"].ObservationError, match="cannot name a version"):
+            m.observe({"t": 15, "version": "1"})
+        assert [a["t"] for a in m.result()["amendments"]] == [10]
+        trace = _trace(tmp_path, [{"t": 0, "bindings": {"i": 2}}, {"t": 10, "amend": V2.name},
+                                  {"t": 15, "version": "1"}])
+        with pytest.raises(NormsEvalError, match="cannot also amend"):
+            evaluate_files(V1, trace)
+
+    def test_run_versions_must_carry_a_version(self, monitors, tmp_path):
+        model = _monitor_model(tmp_path, EXAMPLES / "norms_amendment_v2.cadl")
+        with pytest.raises(monitors["m1"].MonitorError, match="run_versions"):
+            monitors["m1"].NormsMonitor("DELIVERY_SLA", run_versions=[model])
 
     def test_named_later_activates(self, monitors, tmp_path):
         trace = _trace(tmp_path, [{"t": 3550, "bindings": {"i": 2}}, {"t": 3560},
@@ -543,3 +591,94 @@ class TestMetricsEval:
 def test_files_without_the_extension_have_no_chain():
     sos = load_version(EXAMPLES / "norms_amendment_v1.cadl")
     assert version_chain(sos) is None
+
+
+def test_generated_metric_checks(tmp_path):
+    """metrics.py applies schedule: at a given time, and an uncompilable
+    target is not judged (None), not met (K.11)."""
+    text = TOWN1.read_text()
+    start, end = text.index("  metrics:\n"), text.index("  amendment:\n")
+    metrics = ("  metrics:\n    - id: m\n      formula: \"x\"\n      target: \"<= 600s\"\n"
+               "      schedule:\n        - { from: { period: 2 }, target: \"<= 300s\" }\n"
+               "        - { from: { period: 3 }, target: \">= 0.5 * count(x)\" }\n"
+               "    - id: n\n      formula: \"x\"\n      target: \">= 0.9 * count(orders)\"\n")
+    f = tmp_path / "m.cadl"
+    f.write_text(text[:start] + metrics + text[end:])
+    generate(parse_file(f), tmp_path / "pkg", "python")
+    spec = importlib.util.spec_from_file_location("am_metrics", tmp_path / "pkg" / "metrics.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    m = mod.MetricsCollector.__new__(mod.MetricsCollector)
+    assert m.check_m_target(500) is None                      # no time
+    assert m.check_m_target(500, t=100) is None               # no time base
+    assert m.check_m_target(500, t=100, period=3600) is True
+    assert m.check_m_target(500, t=3600, period=3600) is False
+    assert m.check_m_target(1, t=7200, period=3600) is None   # not compiled
+    assert m.check_n_target(1) is None
+    ns: dict = {}
+    exec((tmp_path / "pkg" / "version.py").read_text(), ns)
+    assert ns["SCHEDULES"]["m"][0] == ({"period": 2}, "<= 300s")
+
+
+class TestReviewFixes:
+    def test_version_change_inside_window_not_judged(self, tmp_path):
+        # M3: a new version with another target inside the window is judged
+        # like a schedule entry there
+        text = TOWN1.read_text()
+        start, end = text.index("  metrics:\n"), text.index("  amendment:\n")
+        m1 = "  metrics:\n    - id: w\n      formula: \"x\"\n      target: \">= 40\"\n" \
+             "      measure: { window: 3600s }\n"
+        v1 = tmp_path / "v1.cadl"
+        v1.write_text(text[:start] + m1 + text[end:])
+        v2 = tmp_path / "v2.cadl"
+        v2.write_text(TOWN2.read_text().replace(
+            TOWN2.read_text()[TOWN2.read_text().index("  metrics:\n"):
+                              TOWN2.read_text().index("  amendment:\n")],
+            m1.replace(">= 40", ">= 45")))
+        recs = tmp_path / "r.jsonl"
+        recs.write_text("".join(json.dumps(x) + "\n" for x in (
+            {"metric": "w", "t": 0, "value": 42}, {"metric": "w", "t": 1, "value": 42},
+            {"metric": "w", "t": 3600, "value": 42}, {"metric": "w", "t": 2, "value": 42,
+                                                         "values": {"a": None}})))
+        r = metrics_files(v1, recs, [v2], HOUR)
+        assert [m["verdict"] for m in r["measurements"]] == [
+            "met", "not judged", "not met", "not judged"]
+        assert "version 2, in force from t=3600" in r["measurements"][1]["reason"]
+
+    def test_null_term_is_not_judged(self, tmp_path):
+        f = TestMetricsEval()._file(tmp_path, "", target=">= 0.5 * count(orders)")
+        recs = tmp_path / "r.jsonl"
+        recs.write_text(json.dumps({"metric": "m", "t": 0, "value": 3,
+                                    "values": {"count(orders)": None}}) + "\n")
+        m = metrics_files(f, recs)["measurements"][0]
+        assert m["verdict"] == "not judged" and "no value" in m["reason"]
+
+    @pytest.mark.parametrize("origin", ["Infinity", "1e400", "nan"])
+    def test_bad_origin_is_a_usage_error(self, origin):
+        code, _, err = _cli("norms-eval", V1, "--version", V2, "--period", "3600s", "--origin",
+                            origin, "--trace", TRACES / "amendment_norms_v1_a_switch.jsonl")
+        assert code == 2 and "Error:" in err and "Traceback" not in err
+
+    def test_versions_without_time_base_warn(self):
+        code, _, err = _cli("norms-eval", V1, "--version", V2, "--trace",
+                            TRACES / "amendment_norms_v1_a_switch.jsonl")
+        assert code == 0 and "no time base" in err
+
+    def test_amend_to_a_keep_version_warns(self, tmp_path):
+        (tmp_path / V2.name).write_text(V2.read_text())
+        trace = _trace(tmp_path, [{"t": 0, "bindings": {"i": 2}}, {"t": 10, "amend": V2.name}])
+        notes: list = []
+        r = evaluate_files(V1, trace, notes=notes)
+        assert [a["t"] for a in r["amendments"]] == [10]
+        assert len(notes) == 1 and "switch in Assigned" in notes[0]
+        code, _, err = _cli("norms-eval", V1, "--trace", trace)
+        assert "Warning: 'amend' to amendment_norms_v2.cadl" in err
+
+    def test_monitor_amend_warning(self, monitors, tmp_path):
+        m = monitors["m1"].NormsMonitor("DELIVERY_SLA", bindings={"i": 2},
+                                        versions={"v2": _monitor_model(tmp_path, V2)})
+        m.observe({"t": 0})
+        m.observe({"t": 10, "amend": "v2"})
+        assert len(m.amend_warnings) == 1 and "switch in Assigned" in m.amend_warnings[0]
+        assert "warnings" in m.result() and not any(
+            "transitional" in w for w in m.result()["warnings"])

@@ -36,6 +36,8 @@ def generate_version_module(sos: SoSDefinition) -> str:
         else:
             params[p.id] = _num(p.value.value)
             units[p.id] = p.unit
+    schedules = {m["id"]: [(dict(e["from"]), e["target"]) for e in m["schedule"]]
+                 for m in a.metrics if m.get("schedule")}
     transitional = {
         "default": a.transitional_default,
         "contracts": {c: {"rule": r, "in_states": list(st)}
@@ -63,6 +65,8 @@ def generate_version_module(sos: SoSDefinition) -> str:
         "# another value while the regime is current.",
         f"PARAMETERS = {params!r}",
         f"PARAMETER_UNITS = {units!r}",
+        "# The schedules of the metrics (schedule:, K.5): metric -> [(from, target)].",
+        f"SCHEDULES = {schedules!r}",
         "",
         "",
         "def transitional_rule(contract_id: str) -> tuple:",

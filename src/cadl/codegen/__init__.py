@@ -212,7 +212,8 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
         _write(output_dir / "transitions.py",
                generate_transitions_module(sos.transitions, bindings, declared_params,
                                            initial_regime(sos)))
-        _write(output_dir / "metrics.py", generate_metrics_module(sos.metrics))
+        _write(output_dir / "metrics.py",
+               generate_metrics_module(sos.metrics, _metric_schedules(sos)))
         _write(output_dir / "runtime.py", generate_runtime_module(sos))
 
     if monitor is not None:
@@ -225,6 +226,29 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
 
     # Generate __init__.py
     _write(output_dir / "__init__.py", _generate_init(sos, norms_monitor=monitor is not None))
+
+
+def _metric_schedules(sos: SoSDefinition) -> dict:
+    """The schedules of the metrics of a file that declares amendment 0.1
+    (Appendix K, K.5), for the target checks of metrics.py (K.11)."""
+    from ..amendment import amendment_declared, analyse
+    if not amendment_declared(sos) or getattr(sos, "amendment", None) is None:
+        return {}
+    a = analyse(sos)
+    out = {}
+    for m in a.metrics:
+        if not m.get("schedule"):
+            continue
+        entries = []
+        for e in m["schedule"]:
+            (form, v), = e["from"].items()
+            if form == "version":
+                when = {"effective": a.effective} if v == a.version else None
+            else:
+                when = dict(e["from"])
+            entries.append((when, e["target"]))
+        out[m["id"]] = entries
+    return out
 
 
 def _write(path: Path, content: str) -> None:

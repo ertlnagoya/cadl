@@ -158,7 +158,7 @@ def _value_of(expr: Any, terms: dict) -> Fraction:
     except Exception:
         raise _NotJudged("the target is not an arithmetic expression of numbers, durations "
                          "and terms") from None
-    if _key(text) not in terms:
+    if terms.get(_key(text)) is None:
         raise _NotJudged(f"the measurement gives no value for '{text}' of the target")
     return terms[_key(text)]
 
@@ -256,22 +256,14 @@ class _Run:
         out["value"] = self.value(rec, measure, window, every, where)
         terms = {}
         for name, v in dict(rec.get("values") or {}).items():
-            terms[_key(str(name))] = _number(v, f"the value of '{name}'", where)
+            # a null value is no value: the term is then missing (not judged)
+            terms[_key(str(name))] = None if v is None else _number(
+                v, f"the value of '{name}'", where)
         try:
-            current, source, decision = target, "target", None
-            for entry in schedule or []:
-                t = self.entry_time(entry)
-                if t <= s:
-                    current, decision = entry["target"], entry.get("decision")
-                    source = f"schedule from {_from_text(entry['from'])}"
+            current, source, decision = self.target_at(target, schedule, s)
             out["target"], out["target_from"], out["decision"] = current, source, decision
             if window is not None:
-                for entry in schedule or []:
-                    t = self.entry_time(entry)
-                    if s < t < s + window and entry["target"] != current:
-                        raise _NotJudged(
-                            f"the target changes inside the window, at "
-                            f"{_from_text(entry['from'])} (t={_fmt_t(t)})")
+                self.same_target(metric, vi, current, s, s + window)
             if current is None:
                 raise _NotJudged("the metric has no target")
             met, bound = compare(current, out["value"], terms)
@@ -280,6 +272,47 @@ class _Run:
         except _NotJudged as e:
             out["reason"] = str(e)
         return out
+
+    def target_at(self, target: Any, schedule: Any, x: Fraction) -> tuple:
+        """(target, its source, its decision) at time x under one declaration."""
+        current, source, decision = target, "target", None
+        for entry in schedule or []:
+            if self.entry_time(entry) <= x:
+                current, decision = entry["target"], entry.get("decision")
+                source = f"schedule from {_from_text(entry['from'])}"
+        return current, source, decision
+
+    def same_target(self, metric: str, vi: int, current: Any, s: Fraction, end: Fraction) -> None:
+        """Raise `_NotJudged` when the target in force changes inside (s, end):
+        by an entry of the schedule, or by a version that takes effect there
+        and gives another target (K.11), so that a change written as a new
+        version and one written as a schedule entry are judged alike."""
+        k = vi
+        start = s
+        while True:
+            nxt = None
+            if self.chain is not None and self.chain.timed and k + 1 < len(self.versions):
+                nxt = self.chain.times[k + 1]
+            stop = end if nxt is None or nxt >= end else nxt
+            decl = _declarations(self.versions[k].sos).get(metric)
+            if decl is None:
+                raise _NotJudged(f"version {self.versions[k].name}, in force inside the window "
+                                 f"from t={_fmt_t(start)}, has no metric '{metric}'")
+            target, schedule, _ = decl
+            here = self.target_at(target, schedule, start)[0]
+            if here != current:
+                raise _NotJudged(f"the target changes inside the window: version "
+                                 f"{self.versions[k].name}, in force from t={_fmt_t(start)}, "
+                                 f"has the target {here}")
+            for entry in schedule or []:
+                t = self.entry_time(entry)
+                if start < t < stop and entry["target"] != current:
+                    raise _NotJudged(
+                        f"the target changes inside the window, at "
+                        f"{_from_text(entry['from'])} (t={_fmt_t(t)})")
+            if stop >= end:
+                return
+            k, start = k + 1, stop
 
     def value(self, rec: dict, measure: dict, window: Any, every: Any, where: str) -> Fraction:
         runs = measure.get("runs")
