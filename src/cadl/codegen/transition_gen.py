@@ -20,8 +20,8 @@ def generate_transitions_module(
     A.7.1, `cadl.regimes.checked`), or None for a file without the block; the
     module is then the same as without them. ``declared_params`` maps each
     bound parameter to its declared value. ``initial`` is the regime in
-    which a run starts (A.7.1, `cadl.regimes.initial_regime`); it is used
-    with bindings only, so that a file without them keeps its module."""
+    which a run starts (A.7.1, `cadl.regimes.initial_regime`), for every
+    file with transitions."""
     if not transitions:
         return _empty_module()
 
@@ -50,8 +50,8 @@ def generate_transitions_module(
 
     # Constructor
     first_regime = transitions[0].from_regime if transitions else "UNKNOWN"
-    if bindings is not None and initial is not None:
-        first_regime = initial          # the initial regime of A.7.1
+    if initial is not None:
+        first_regime = initial          # the initial regime of A.7.1 ("Runs")
     lines.append(f"    def __init__(self, initial_regime: str = '{first_regime}') -> None:")
     if bindings is not None:
         lines.append("        if initial_regime not in self.REGIMES:")

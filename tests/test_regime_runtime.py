@@ -1044,8 +1044,8 @@ def test_solidity_invariant_reads_only_set_values(tmp_path):
     cannot express (`len(queue)`), refuses the transition, as in Python."""
     out = _solidity(tmp_path, GOOD)
     ctl = (out / "RegimeController.sol").read_text()
-    assert 'if (!(isSet["robots_on_road"] && ((stateUint["robots_on_road"] == 0)))) {' in ctl
-    assert "isSet[key] = true;" in ctl
+    assert 'if (!(isSetUint["robots_on_road"] && ((stateUint["robots_on_road"] == 0)))) {' in ctl
+    assert "isSetUint[key] = true;" in ctl and "isSetBool[key] = true;" in ctl
     other = _solidity(tmp_path / "len", GOOD.replace('safety_invariant: "robots_on_road == 0"',
                                                      'safety_invariant: "len(queue) == 0"'))
     assert "if (!(false)) {" in (other / "RegimeController.sol").read_text()
@@ -1065,6 +1065,9 @@ def test_solidity_unset_value_refuses_on_an_evm(tmp_path):
     rc = ["regimeController"]
     steps = [["send", [], "setUint", ["orders_in_window", 10]],   # robots_on_road never set
              ["send", [], "runMonitorCycle", []], ["call", rc, "currentRegime", []],
+             # a boolean of the same name does not set the number
+             ["send", [], "setBool", ["robots_on_road", False]],
+             ["send", [], "runMonitorCycle", []], ["call", rc, "currentRegime", []],
              ["send", [], "setUint", ["robots_on_road", 0]],
              ["send", [], "runMonitorCycle", []], ["call", rc, "currentRegime", []]]
     (tmp_path / "job.json").write_text(json.dumps(
@@ -1074,4 +1077,42 @@ def test_solidity_unset_value_refuses_on_an_evm(tmp_path):
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr[-3000:]
     got = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
-    assert got == ["ok", "ok", [1], "ok", "ok", [0]]     # Distributed = 1, Centralized = 0
+    assert got == ["ok", "ok", [1], "ok", "ok", [1], "ok", "ok", [0]]   # Distributed = 1
+
+
+
+def test_runs_without_regimes(tmp_path):
+    """A.7.1 "Runs" applies to every file with transitions: without
+    regimes: the Python and Solidity controllers start in the initial
+    regime, check the invariant explicitly, and Solidity has the setters,
+    isSetUint / isSetBool and the orchestrator; the bindings do not apply."""
+    sos = parse(ORDER)
+    pkg = tmp_path / "order_py"
+    generate(sos, pkg)
+    text = (pkg / "transitions.py").read_text()
+    assert "initial_regime: str = 'A1'" in text and "apply_bindings" not in text
+    assert "raise ValueError" not in text
+    out = tmp_path / "order_sol"
+    generate(sos, out, target="solidity")
+    ctl = (out / "RegimeController.sol").read_text()
+    assert "Regime public currentRegime = Regime.A1;" in ctl
+    assert "function evaluateTransitions() public onlyOrchestrator {" in ctl
+    assert "mapping(string => bool) public isSetUint;" in ctl and "contractActive" not in ctl
+    main_ = (out / "Order.sol").read_text()
+    assert "function runMonitorCycle() public onlyReporter {" in main_
+    assert "function setUint(string calldata key, uint256 value) external onlyReporter {" in main_
+    assert "function runMonitorCycle() public onlyOrchestrator {" in (out / "C.sol").read_text()
+    # robot_delivery (no regimes:) checks its invariants in Solidity now
+    ex = tmp_path / "rd"
+    generate(parse_file(ROOT / "examples" / "robot_delivery.cadl"), ex, target="solidity")
+    rc = (ex / "RegimeController.sol").read_text()
+    assert "emit RegimeTransitionRefused" in rc
+    if S.solc_binary():
+        # the controller compiles (the contracts of this example do not, as in
+        # 0.3.32: their predicates read actor fields and functions)
+        proc = subprocess.run([S.solc_binary(), "--bin", "RegimeController.sol"], cwd=ex,
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        proc = subprocess.run([S.solc_binary(), "--bin", "Order.sol"], cwd=out,
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr[-2000:]
