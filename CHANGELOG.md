@@ -35,8 +35,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   evaluated, is not taken and is reported: the Python controller of a
   file with `regimes:` checks it explicitly (no `assert`) and records it
   in `refused_transitions`, and the Solidity `RegimeController` emits
-  `RegimeTransitionRefused`. The Python controller raises `ValueError`
-  for a name that is not a regime.
+  `RegimeTransitionRefused`; it records which values were set (`isSet`),
+  and an invariant that reads a value never set, or that Solidity cannot
+  express (`len(queue)`, an actor field, a text), refuses the transition.
+  The Python controller raises `ValueError` for a name that is not a
+  regime.
 - Solidity, for a file with `regimes:`: one step is one
   `runMonitorCycle()` of the orchestrator, which only its deployer may
   call and which sets the observed state of every contract and the
@@ -119,7 +122,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   disjunctive normal form (NOT pushed to the comparisons; more than 64
   disjuncts: a value the host gives). A text item (an opaque predicate)
   was a string, which Rego reads as true; it is now
-  `input.items["TEXT"] == true`, as is an item with `IN` or a list.
+  `input.items["TEXT"] == true`, as is an item with `IN` or a list, and a
+  text that is an operand of `AND`, `OR` or `NOT`.
+- `cadl codegen -t opa`: a negated literal (`NOT ok`, `NOT (y == 3)`) held
+  when a value it reads was missing, since OPA's `not input.y == 3` holds
+  then. Each input reference is now bound before the negation
+  (`neg_1 := input.y; not neg_1 == 3`), so a negation never holds on a
+  missing value, and `flag != true` and `NOT (flag == true)` agree. A
+  value that the host does not give leaves a guarantee violated and makes
+  an assumption fail.
 
 ## [0.3.32] — 2026-11-16
 
