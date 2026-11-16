@@ -1339,8 +1339,9 @@ def _time_base(args: argparse.Namespace):
             from decimal import Decimal, InvalidOperation
             from fractions import Fraction
             origin = Fraction(Decimal(args.origin))
-        except (InvalidOperation, ValueError):
-            raise NormsEvalError(f"--origin must be a number of seconds, not {args.origin!r}") \
+        except (InvalidOperation, ValueError, OverflowError):
+            raise NormsEvalError(f"--origin must be a finite number of seconds, not "
+                                 f"{args.origin!r}") \
                 from None
     period = None if args.period is None else parse_duration_seconds(args.period)
     return TimeBase(period, origin, args.epoch)
@@ -1352,9 +1353,10 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
     from .norms_eval import (NormsEvalError, TraceError, evaluate_files, format_text,
                              format_text_versions)
 
+    notes: list = []
     try:
         result = evaluate_files(args.file, args.trace, args.contract,
-                                args.version_files, _time_base(args))
+                                args.version_files, _time_base(args), notes)
     except TraceError as e:
         print(f"Trace error: {args.trace}: {e}", file=sys.stderr)
         return 2
@@ -1367,6 +1369,8 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
         print(format_text_versions(result, format_text(result)))
+    for note in notes:
+        print(f"Warning: {note}", file=sys.stderr)
     return 0 if result["ok"] else 1
 
 

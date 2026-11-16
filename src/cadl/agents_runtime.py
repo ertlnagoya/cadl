@@ -1516,6 +1516,11 @@ class AgentsRuntime:
         changed = [cid for cid in old_ids
                    if _plain(self._ast(cid)) != _plain(next(c for c in new.contracts
                                                             if c.id == cid))]
+        from .norms_eval import amend_rule_warning
+        for cid in changed:                        # Appendix K, K.11
+            note = amend_rule_warning(new, name, cid, t)
+            if note is not None and note not in self.warnings:
+                self.warnings.append(note)
         return new, policy, changed
 
     def _finish_amendment(self, name: str, new, policy, changed: list[str], t: float) -> None:

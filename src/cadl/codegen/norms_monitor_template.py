@@ -808,26 +808,32 @@ _REGIMES_PART = _REGIMES_DATA is not None
 
 
 def _version_infos(own: dict, versions: Any) -> list:
-    """The versions of a run: this model and the models among `versions`
-    that carry the data of a version."""
+    """The versions of a run: this model and the models of `run_versions`
+    (a dict of models, or a list), each of which carries the data of a
+    version."""
     def info(model: dict) -> Any:
         m = _Model(model)
         m.regimes = model.get("regimes")
         return VersionInfo(model["amendment"], m)
 
     infos = [info(own)]
-    for model in dict(versions or {}).values():
-        if isinstance(model, dict) and isinstance(model.get("amendment"), dict):
-            infos.append(info(model))
+    models = list(versions.values()) if isinstance(versions, dict) else list(versions or ())
+    for k, model in enumerate(models):
+        if not isinstance(model, dict) or not isinstance(model.get("amendment"), dict):
+            raise MonitorError(
+                f"run_versions[{k}] is not the MODEL of a norms monitor generated from a file "
+                f"that declares amendment 0.1 with an amendment: block")
+        infos.append(info(model))
     return infos
 
 
 class NormsMonitor(NormsMonitor):
     __doc__ = (NormsMonitor.__doc__ or "") + """
-    Versions (Appendix K, K.11). The ``MODEL`` of the monitor generated
-    from another version of the file, given in `versions`, is a version of
-    the run when that file declares ``amendment: 0.1``; the versions form
-    one sequence by ``previous:``. `period` (seconds), `origin` (the time
+    Versions (Appendix K, K.11). `run_versions` gives the ``MODEL`` of the
+    monitor generated from each other version of the run (files that
+    declare ``amendment: 0.1`` with an ``amendment:`` block); with this
+    model they form one sequence by ``previous:``. `versions` keeps its
+    meaning: the models that an ``amend`` key names. `period` (seconds), `origin` (the time
     stamp at which period 1 starts) and `epoch` (time stamps are seconds
     since 1970-01-01T00:00:00Z) give the time base of the effective times.
     An observation may name the version in force with the key
@@ -837,20 +843,45 @@ class NormsMonitor(NormsMonitor):
     its contract in that version: ``keep`` leaves it as it is, ``switch``
     amends it (F.6), and ``switch`` with ``in_states`` amends it at the
     first observation in one of those states. Such a monitor refuses an
-    observation with ``amend``, and one that names a regime.
+    observation with ``amend``, and one that names a regime; once an
+    ``amend`` has been applied, it refuses an observation that names a
+    version.
     """
 
     def __init__(self, contract: str | None = None, bindings: dict | None = None,
                  request: dict | None = None, quantities: Any = None,
                  versions: dict | None = None, _option: str = "contract=",
-                 period: Any = None, origin: Any = 0, epoch: bool = False) -> None:
+                 period: Any = None, origin: Any = 0, epoch: bool = False,
+                 run_versions: Any = None) -> None:
         super().__init__(contract, bindings, request, quantities, versions, _option)
         base = TimeBase(period, origin, epoch)
-        self._chain = VersionChain(_version_infos(MODEL, versions), base)
+        self._chain = VersionChain(_version_infos(MODEL, run_versions), base)
         self._active = len(self._chain.infos) > 1 or self._chain.timed
         self._tracker: Any = None
         self._next_named: Any = None
         self._named_regime = False
+        self._amended = False        # an `amend` has been applied
+        # An `amend` to a version whose transitional rule is not a plain
+        # switch is applied as a switch; the monitor says so (K.11).
+        self.amend_warnings: list = []
+        lookup = self._versions
+        cid = self._contract.id
+
+        def warned(name: str) -> Any:
+            model = lookup.models.get(name)
+            data = model.get("amendment") if isinstance(model, dict) else None
+            if isinstance(data, dict):
+                rule, states = VersionInfo(data).rule_for(cid)
+                if rule == "keep" or states:
+                    what = "keep" if rule == "keep" else f"switch in {', '.join(states)}"
+                    note = (f"'amend' to {name} amends {cid}, but the transitional rule of "
+                            f"that version for {cid} is {what} (Appendix K, K.4): the "
+                            f"amendment is applied as a switch (K.11)")
+                    if note not in self.amend_warnings:
+                        self.amend_warnings.append(note)
+            return lookup(name)
+        warned.models = lookup.models
+        self._versions = warned
         if self._active:
             self._check_regimes()
 
@@ -890,6 +921,10 @@ class NormsMonitor(NormsMonitor):
                 if active and (regime or self._named_regime):
                     raise ObservationError(_VERSIONS_NO_REGIMES)
                 if named is not None and not self._active:
+                    if self._amended:
+                        raise ObservationError(
+                            "an observation with 'amend' has amended the contract, so the "
+                            "trace cannot name a version (Appendix K, K.11)")
                     self._activate()
         self._next_named = named
         before = (self._named_regime, self._tracker.save() if self._tracker else None)
@@ -902,6 +937,9 @@ class NormsMonitor(NormsMonitor):
             raise
         if isinstance(observation, dict) and observation.get("regime") is not None:
             self._named_regime = True
+        if isinstance(observation, dict) and observation.get("amend") is not None \
+                and not self.ended:
+            self._amended = True
         return changes
 
     def _activate(self) -> None:
@@ -963,11 +1001,11 @@ class NormsMonitor(NormsMonitor):
 
 def replay(lines: Any, contract: str | None = None, versions: dict | None = None,
            path: str | None = None, _option: str = "contract=", period: Any = None,
-           origin: Any = 0, epoch: bool = False) -> dict:
+           origin: Any = 0, epoch: bool = False, run_versions: Any = None) -> dict:
     """As above, for a run that may have versions (Appendix K, K.11)."""
     lines = list(lines)
     kw = {"versions": versions, "_option": _option, "period": period, "origin": origin,
-          "epoch": epoch}
+          "epoch": epoch, "run_versions": run_versions}
     probe = NormsMonitor(contract, **kw)
     regimes = None
     if _REGIMES_PART:
@@ -1012,8 +1050,12 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--contract", help="contract id, when the file has several")
     ap.add_argument("--format", choices=["json", "text"], default="json")
     ap.add_argument("--model-version", action="append", default=[], metavar="NAME=MODEL.json",
-                    help="the model of another version of the file (write it with "
-                         "--dump-model of the monitor generated from that version)")
+                    help="the model of a new version of the file, for a line with "
+                         "\"amend\": \"NAME\" (write it with --dump-model of the monitor "
+                         "generated from that version)")
+    ap.add_argument("--run-version", action="append", default=[], metavar="MODEL.json",
+                    help="the model of another version of the run (Appendix K, K.11); "
+                         "may be repeated")
     ap.add_argument("--period", default=None, metavar="SECONDS",
                     help="length of a period, for effective: { period: k }")
     ap.add_argument("--origin", default="0", metavar="SECONDS",
@@ -1036,18 +1078,23 @@ def main(argv: list | None = None) -> int:
                 raise NormsEvalError(f"--model-version needs NAME=MODEL.json, not '{spec}'")
             with open(file, encoding="utf-8") as f:
                 versions[name] = json.load(f)
+        run_versions = []
+        for file in args.run_version:
+            with open(file, encoding="utf-8") as f:
+                run_versions.append(json.load(f))
         try:
             period = None if args.period is None else Fraction(Decimal(args.period))
             origin = Fraction(Decimal(args.origin))
-        except ArithmeticError:
-            raise NormsEvalError("--period and --origin are numbers of seconds") from None
+        except (ArithmeticError, ValueError):
+            raise NormsEvalError("--period and --origin are finite numbers of seconds") from None
         try:
             with open(args.trace, encoding="utf-8") as f:
                 lines = f.readlines()
         except OSError:
             raise NormsEvalError(f"File not found: {args.trace}") from None
         result = replay(lines, args.contract, versions, path=str(args.trace),
-                        _option="--contract", period=period, origin=origin, epoch=args.epoch)
+                        _option="--contract", period=period, origin=origin, epoch=args.epoch,
+                        run_versions=run_versions)
     except TraceError as e:
         print(f"Trace error: {args.trace}: {e}", file=sys.stderr)
         return 2

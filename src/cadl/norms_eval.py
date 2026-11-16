@@ -3109,9 +3109,12 @@ class TimeBase:
     def __init__(self, period: Any = None, origin: Any = 0, epoch: bool = False) -> None:
         for name, v in (("period", period), ("origin", origin)):
             if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float, Fraction))
-                                  or not math.isfinite(v)):
+                                  or (isinstance(v, float) and not math.isfinite(v))):
                 raise NormsEvalError(f"the {name} of the time base must be a finite number "
                                      f"of seconds")
+            if v is not None and abs(v) > MAX_T:
+                raise NormsEvalError(f"the {name} of the time base must be at most 2**53 "
+                                     f"seconds in absolute value, as a time of a trace")
         if period is not None and period <= 0:
             raise NormsEvalError("the length of a period must be positive")
         self.period = None if period is None else _exact(period)
@@ -3316,7 +3319,10 @@ class VersionTracker:
             self.follows = v
             self.pending = None
 
-        tried = False
+        # A waiting switch whose state holds before this observation is made
+        # first; then the versions that take effect here apply (K.11).
+        if self.pending is not None and state in self.pending[1]:
+            switch(self.pending[0], f"in state {state}, ")
         for v in range(self.current + 1, k + 1):
             rule, states = infos[v].rule_for(self.contract_id)
             if self.pending is not None:
@@ -3341,9 +3347,6 @@ class VersionTracker:
                     t, v, "wait", f"{head} (transitional: switch, in_states: "
                                   f"{', '.join(states)}); the instance is in state {state} "
                                   f"and switches at the first observation in one of them"))
-            tried = True
-        if self.pending is not None and not tried and state in self.pending[1]:
-            switch(self.pending[0], f"in state {state}, ")
         self.current = k
         self.events.extend(events)
         self.memo[n] = (names, events)
@@ -3518,7 +3521,8 @@ def load_version(path) -> SoSDefinition:
 
 
 def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
-             versions: dict | None = None, chain: VersionChain | None = None) -> dict:
+             versions: dict | None = None, chain: VersionChain | None = None,
+             notes: list | None = None) -> dict:
     """Compute the verdicts of one contract instance on a trace (F.5),
     applying the amendments the trace names (F.6).
 
@@ -3527,12 +3531,14 @@ def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
     `chain` is the sequence of versions of the run (Appendix K, K.11), whose
     first version is `sos` or comes before it; it applies when it has
     several versions or a time base, or when the trace names a version.
+    `notes`, when given, receives a warning for each ``amend`` to a version
+    whose transitional rule for the contract is not a plain `switch`.
     Returns a JSON-serializable dict; see the README for its keys."""
     if not norms_declared(sos):
         raise NormsEvalError("the file does not declare 'norms: 0.1' under extensions:")
     contract = select_contract(sos, contract_id)
 
-    def loader(name: str) -> SoSDefinition:
+    def load(name: str) -> SoSDefinition:
         if versions and name in versions:
             new = versions[name]
             if not norms_declared(new):
@@ -3540,6 +3546,13 @@ def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
             return new
         base = Path(trace.path).parent if trace.path else Path(".")
         return load_version(base / name)
+
+    def loader(name: str) -> SoSDefinition:
+        new = load(name)
+        note = amend_rule_warning(new, name, contract.id)
+        if notes is not None and note is not None and note not in notes:
+            notes.append(note)
+        return new
 
     bindings = regime_bindings(sos)
     if names_regime(trace) and bindings is None:
@@ -3553,6 +3566,26 @@ def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
         # before the first `regime` the trace is in the initial regime (A.7.1)
         return run_regime_trace(contract, trace, bindings, declared_actors(sos))
     return run_trace(contract, trace, loader, declared_actors(sos))
+
+
+def amend_rule_warning(sos: SoSDefinition, name: str, contract_id: str, t: Any = None) -> str | None:
+    """The warning for an ``amend`` to a version whose transitional rule for
+    the contract is `keep` or `switch` with `in_states:` (Appendix K, K.11):
+    the key amends the instance at that observation whatever the rule
+    says. None for another rule or a file without an amendment: block."""
+    from .amendment import amendment_declared, analyse
+    raw = getattr(sos, "amendment", None)
+    if not amendment_declared(sos) or raw is None or not raw.has_block:
+        return None
+    a = analyse(sos)
+    rule, states = a.transitional.get(contract_id, (a.transitional_default, []))
+    if rule == "switch" and not states:
+        return None
+    what = "keep" if rule == "keep" else f"switch in {', '.join(states)}"
+    at = "" if t is None else f" at t={_fmt_t(t)}"
+    return (f"'amend' to {name}{at} amends {contract_id} there, but the transitional rule of "
+            f"that version for {contract_id} is {what} (Appendix K, K.4): the amendment is "
+            f"applied as a switch; give the versions of the run to apply the rule (K.11)")
 
 
 def _check_version_regimes(chain: VersionChain, contract_id: str, trace: Trace) -> None:
@@ -3727,7 +3760,8 @@ def format_text(result: dict) -> str:
 # <<< monitor-runtime
 
 def evaluate_files(cadl_path, trace_path, contract_id: str | None = None,
-                   version_paths: Any = (), base: TimeBase | None = None) -> dict:
+                   version_paths: Any = (), base: TimeBase | None = None,
+                   notes: list | None = None) -> dict:
     """Parse and type-check a CADL file, read a trace and evaluate it.
     `version_paths` are the later versions of the run and `base` its time
     base (Appendix K, K.11)."""
@@ -3745,6 +3779,11 @@ def evaluate_files(cadl_path, trace_path, contract_id: str | None = None,
     else:
         with open(trace_path, encoding="utf-8") as f:
             trace = parse_trace_regimes(f, path=str(trace_path), bindings=bindings)
-    result = evaluate(sos, trace, contract_id, chain=chain)
+    if (notes is not None and version_paths and chain is not None and not chain.timed
+            and not names_version(trace)):
+        notes.append("--version is given, but there is no time base (--period, --epoch) and "
+                     "the trace names no version, so the first version is in force throughout "
+                     "(Appendix K, K.11)")
+    result = evaluate(sos, trace, contract_id, chain=chain, notes=notes)
     result["file"] = str(cadl_path)
     return result
