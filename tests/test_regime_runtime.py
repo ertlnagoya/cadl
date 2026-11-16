@@ -219,6 +219,32 @@ class TestProjection:
         with pytest.raises(NormsEvalError, match="not in force at any observation"):
             _eval(robot_sos, _lines(dict(START, regime="STORM"), {"t": 5, "end": False}))
 
+    def test_before_the_first_regime_the_run_is_in_the_initial_regime(self):
+        """A.7.1: a trace that names no regime is in the initial regime
+        (NORMAL here), which does not have the contract in force; naming it
+        gives the same result."""
+        text = _with_regimes(EXAMPLE, "DELIVERY_SLA").replace("STORM:\n", "NORMAL:\n")
+        sos = parse(text)
+        assert regime_bindings(sos).initial == "NORMAL"
+        recs = [START, {"t": 1, "messages": [ASSIGN], "state": "Assigned"}, {"t": 10, "end": True}]
+        plain = _eval(sos, _lines(*recs))
+        named = _eval(sos, _lines(dict(START, regime="NORMAL"), *recs[1:]))
+        assert plain == named
+        assert _norm(plain, "acknowledge")["activated_at"] is None
+        assert plain["instance"]["observations"] == 1
+        # an amendment is refused for such a contract, also without `regime`
+        with pytest.raises(NormsEvalError, match="cannot also amend"):
+            _eval(sos, _lines(START, {"t": 1, "amend": "v2.cadl"}))
+
+    def test_only_observation_is_an_end_while_not_in_force(self, robot_sos):
+        """The start activations happen there too, as for an instance that
+        is in force at its only observation."""
+        out = _eval(robot_sos, _lines(dict(START, regime="STORM", end=True)))
+        inside = _eval(robot_sos, _lines(dict(START, regime="NORMAL", end=True)))
+        assert [(n["id"], n["state"], n["reason"]) for n in out["norms"]] == \
+               [(n["id"], n["state"], n["reason"]) for n in inside["norms"]]
+        assert out["timeline"][0]["kind"] == "start"
+
     def test_prefix_that_ends_while_not_in_force_is_not_settled(self, robot_sos):
         r = _eval(robot_sos, _lines(
             dict(START, regime="NORMAL"),
@@ -301,7 +327,7 @@ def _clock_trace(sos, contract, lines: list):
     names a quantity first."""
     from decimal import Decimal
     b = regime_bindings(sos)
-    regime, out_since, offset = None, None, Decimal(0)
+    regime, out_since, offset = b.initial, None, Decimal(0)
     recs = [json.loads(l, parse_float=Decimal) for l in lines]
     out, snapshot, late_names = [], {}, False
     for k, rec in enumerate(recs):

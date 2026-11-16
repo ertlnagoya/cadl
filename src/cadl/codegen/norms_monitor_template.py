@@ -599,8 +599,8 @@ class NormsMonitor(NormsMonitor):
     __doc__ = (NormsMonitor.__doc__ or "") + """
     Regimes (Appendix A, A.7.1). An observation may name the current
     regime with the key ``regime``; it stays current until another
-    observation names one. Before the first such key the regime is not
-    known and the contract is in force. At an observation of a regime that
+    observation names one. Before the first such key the run is in the
+    initial regime of A.7.1. At an observation of a regime that
     does not have the contract in force, the instance sees nothing: the
     observation returns no change, its values are seen from the next
     observation at which the contract is in force, and the deadlines and
@@ -608,14 +608,15 @@ class NormsMonitor(NormsMonitor):
     "Contracts not in force"). `next_deadline` and `next_check` are then
     None. An instance that ends at such an observation (``"end": true``, a
     terminal state, or `end`) is settled there. A monitor that has been
-    given a regime refuses an amendment, and the other way round.
+    given a regime refuses an amendment, and the other way round; so does
+    a monitor of a contract that the initial regime does not have in force.
     """
 
     def __init__(self, contract: str | None = None, bindings: dict | None = None,
                  request: dict | None = None, quantities: Any = None,
                  versions: dict | None = None, _option: str = "contract=") -> None:
         super().__init__(contract, bindings, request, quantities, versions, _option)
-        self._regimes = RegimeBindings(_REGIMES["regimes"], _REGIMES["suspended"])
+        self._regimes = RegimeBindings(_REGIMES["regimes"], _REGIMES["suspended"], _REGIMES["initial"])
         self._clock = _ContractClock(self._regimes, self._contract.id)
         self._held: Any = None       # the last observation, left out
         self._left_out = 0           # observations left out so far
@@ -630,8 +631,9 @@ class NormsMonitor(NormsMonitor):
         where = where or f"observation {n + self._ignored + self._left_out + 1}"
         observation, regime = split_regime(observation, where, self._regimes)
         amend = isinstance(observation, dict) and observation.get("amend") is not None
+        apart = not self._regimes.in_force(self._contract.id, self._regimes.initial)
         if not self.ended and ((regime is not None and self._amended)
-                               or (amend and (self._named or regime))):
+                               or (amend and (self._named or regime or apart))):
             raise ObservationError(_REGIMES_NO_AMEND)
         reader = self._reader
         saved = (dict(reader.snapshot), reader.state, reader.prev_t,
@@ -765,7 +767,7 @@ def replay(lines: Any, contract: str | None = None, versions: dict | None = None
            path: str | None = None, _option: str = "contract=") -> dict:
     """As above, for a trace that may name regimes."""
     lines = list(lines)
-    regimes = RegimeBindings(_REGIMES["regimes"], _REGIMES["suspended"])
+    regimes = RegimeBindings(_REGIMES["regimes"], _REGIMES["suspended"], _REGIMES["initial"])
     trace = parse_trace_regimes(lines, path=path, bindings=regimes)
     records = [loads_strict(line) for line in lines if line.strip()]
     where = [f"line {i}" for i, line in enumerate(lines, start=1) if line.strip()]

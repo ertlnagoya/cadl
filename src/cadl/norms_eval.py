@@ -2655,8 +2655,8 @@ def run_trace(contract: ContractDef, trace: Trace, loader=None,
 #
 # A file with `regimes:` binds, per regime, the contracts in force. A trace
 # names the current regime with the key ``regime``; from that observation
-# on the named regime is current, and before the first one the regime is
-# not known and the contract is in force. A contract instance whose
+# on the named regime is current, and before the first one the initial
+# regime of A.7.1 is. A contract instance whose
 # contract is not in force sees nothing of an observation: it is judged on
 # the projection of the trace (F.5, "Contracts not in force"), the
 # observations at which the contract is in force. Their deadlines and the
@@ -2666,8 +2666,9 @@ def run_trace(contract: ContractDef, trace: Trace, loader=None,
 # observation at which the contract is not in force is settled there
 # (F.5, item 6) on the clock as it stood when the contract left force.
 #
-# A trace that names no regime is judged by `run_trace` above, as before
-# regimes existed. The norms monitor of the Python target contains this
+# A trace for a file without `regimes:` is judged by `run_trace` above, and
+# so is one that names no regime when the initial regime has the contract
+# in force (the projection is then the trace). The norms monitor of the Python target contains this
 # part only when the file has `regimes:`.
 
 REGIME_KEY = "regime"
@@ -2677,11 +2678,13 @@ _REGIMES_NO_AMEND = (
 
 
 class RegimeBindings:
-    """The regimes of a file and, per regime, the contracts not in force."""
+    """The regimes of a file, per regime the contracts not in force, and the
+    initial regime (A.7.1), in which a trace is until it names a regime."""
 
-    def __init__(self, regimes: Any, suspended: Any) -> None:
+    def __init__(self, regimes: Any, suspended: Any, initial: str) -> None:
         self.regimes = list(regimes)
         self.suspended = {str(r): list(c) for r, c in dict(suspended).items()}
+        self.initial = initial
 
     def in_force(self, contract_id: str, regime: str | None) -> bool:
         return regime is None or contract_id not in self.suspended.get(regime, ())
@@ -2712,7 +2715,7 @@ class _ContractClock:
     def __init__(self, bindings: RegimeBindings, contract_id: str) -> None:
         self.bindings = bindings
         self.contract_id = contract_id
-        self.regime: str | None = None
+        self.regime: str | None = bindings.initial
         self.out_since: Any = None        # when the contract left force
         self.offset: Any = 0              # time not in force, before out_since
 
@@ -2859,6 +2862,8 @@ class _RegimeEngine(_Engine):
         # in force: only the settlement (F.5, item 6) applies.
         self._amend_violated = []
         self._check_state(n)
+        if n == 0:
+            self._start()          # the instance starts and ends here
         if self.lifecycle and o.state_after in self.lifecycle.terminal:
             reason = f"terminal state {o.state_after}"
         elif o.end is True:
@@ -3090,11 +3095,13 @@ def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
         base = Path(trace.path).parent if trace.path else Path(".")
         return load_version(base / name)
 
-    if names_regime(trace):
-        bindings = regime_bindings(sos)
-        if bindings is None:
-            raise NormsEvalError("the trace names a regime ('regime'), but the file has no "
-                                 "regimes: block (Appendix A, A.7.1)")
+    bindings = regime_bindings(sos)
+    if names_regime(trace) and bindings is None:
+        raise NormsEvalError("the trace names a regime ('regime'), but the file has no "
+                             "regimes: block (Appendix A, A.7.1)")
+    if bindings is not None and (names_regime(trace)
+                                 or not bindings.in_force(contract.id, bindings.initial)):
+        # before the first `regime` the trace is in the initial regime (A.7.1)
         return run_regime_trace(contract, trace, bindings, declared_actors(sos))
     return run_trace(contract, trace, loader, declared_actors(sos))
 
@@ -3107,7 +3114,9 @@ def regime_bindings(sos: SoSDefinition) -> RegimeBindings | None:
     bindings = checked(sos)
     if bindings is None:
         return None
-    return RegimeBindings([b.name for b in bindings], {b.name: b.suspended for b in bindings})
+    from .regimes import initial_regime
+    return RegimeBindings([b.name for b in bindings], {b.name: b.suspended for b in bindings},
+                          initial_regime(sos))
 
 
 # >>> monitor-runtime

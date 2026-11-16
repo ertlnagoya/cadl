@@ -237,9 +237,10 @@ def build_model(sos: SoSDefinition) -> dict:
     }
     bindings = norms_eval.regime_bindings(sos)
     if bindings is not None:
-        # the regimes and, per regime, the contracts not in force (A.7.1)
+        # the regimes, per regime the contracts not in force, and the initial regime (A.7.1)
         model["regimes"] = {"regimes": list(bindings.regimes),
-                            "suspended": {r: list(c) for r, c in bindings.suspended.items()}}
+                            "suspended": {r: list(c) for r, c in bindings.suspended.items()},
+                            "initial": bindings.initial}
     return model
 
 
