@@ -5,6 +5,8 @@ Analogous to expr_compiler.py (Python) but emits OPA Rego source strings.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import Set
 
@@ -35,6 +37,32 @@ class RegoContext:
     """Compilation context for Rego expression translation."""
     input_prefix: str = "input"
     locals: Set[str] = field(default_factory=set)
+    # counter of the variables that negate_rego binds
+    fresh: int = 0
+
+
+# A reference to the input in generated Rego: input.a.b, input.r[x],
+# input.calls["TEXT"] (the key a JSON string).
+_INPUT_REF_RE = re.compile(r'input(?:\.[A-Za-z_][A-Za-z0-9_]*|\[(?:"(?:[^"\\]|\\.)*"|[^\]"]*)\])+')
+
+
+def negate_rego(literal: str, ctx: RegoContext) -> str:
+    """`not literal`, with every input reference bound to a variable first,
+    so that the negation does not hold when a value is missing (an
+    undefined reference makes the binding, and so the rule body, fail;
+    a bare `not input.y == 3` holds when y is missing). Several literals
+    joined by "; " in one body."""
+    refs: dict = {}
+
+    def bind(m: "re.Match") -> str:
+        ref = m.group(0)
+        if ref not in refs:
+            ctx.fresh += 1
+            refs[ref] = f"neg_{ctx.fresh}"
+        return refs[ref]
+    body = _INPUT_REF_RE.sub(bind, literal)
+    binds = [f"{var} := {ref}" for ref, var in refs.items()]
+    return "; ".join(binds + [f"not {body}"])
 
 
 def expr_to_rego(expr: Expression, ctx: RegoContext | None = None) -> str:
@@ -132,8 +160,7 @@ def expr_to_rego(expr: Expression, ctx: RegoContext | None = None) -> str:
 
     if isinstance(expr, UnaryOp):
         if expr.op == "NOT":
-            operand = expr_to_rego(expr.operand, ctx)
-            return f"not {operand}"
+            return negate_rego(expr_to_rego(expr.operand, ctx), ctx)
         operand = expr_to_rego(expr.operand, ctx)
         return f"{expr.op} {operand}"
 

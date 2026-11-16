@@ -991,3 +991,49 @@ def test_rego_or_on_opa(tmp_path):
         ["Guarantee violated in C"]
     # NOT (load > 5 AND busy == true): the assumption fails, so no violation and no allow
     assert run(dict(base, a=0, b=0, busy=True)) == {"allow": False, "v": []}
+
+
+
+MISSING_FILE = textwrap.dedent("""\
+    sos:
+      name: MissTown
+      actors: [{id: A, role: a}]
+      contracts:
+        - {id: N1, parties: [A], guarantee: ["NOT ok"]}
+        - {id: N2, parties: [A], guarantee: ["NOT (flag == true)"]}
+        - {id: N3, parties: [A], guarantee: ["flag != true"]}
+        - {id: N4, parties: [A], guarantee: ["x > 5 OR NOT (y == 3)"]}
+        - {id: N5, parties: [A], guarantee: ["x > 5 AND \\"the operator approves\\""]}
+        - {id: N6, parties: [A], assume: ["NOT (y == 3)"], guarantee: ["x > 0"]}
+    """)
+
+
+@pytest.mark.skipif(S.opa_binary() is None, reason="the opa binary is not on PATH")
+def test_rego_missing_values_never_satisfy_a_negation(tmp_path):
+    """0.3.33 (Fixed): a negated literal does not hold when a value it reads
+    is missing (OPA's `not input.y == 3` does), `flag != true` and
+    `NOT (flag == true)` agree, and a text inside AND is a host value."""
+    out = tmp_path / "opa"
+    generate(parse(MISSING_FILE), out, target="opa")
+    files = sorted(str(f) for f in out.glob("*.rego") if f.name != "main.rego")
+
+    def run(inp: dict) -> dict:
+        (tmp_path / "in.json").write_text(json.dumps(inp), encoding="utf-8")
+        args = [S.opa_binary(), "eval", "-f", "raw", "-i", str(tmp_path / "in.json")]
+        for f in files:
+            args += ["-d", f]
+        q = "{" + ", ".join(f'"{c}": [data.cadl.{c.lower()}.allow, count(data.cadl.{c.lower()}.violation)]'
+                            for c in ("N1", "N2", "N3", "N4", "N5", "N6")) + "}"
+        proc = subprocess.run(args + [q], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout)
+
+    missing = run({"x": 1})
+    # guarantee with a missing value: a violation; assumption: it fails (no allow, no violation)
+    assert missing == {"N1": [False, 1], "N2": [False, 1], "N3": [False, 1], "N4": [False, 1],
+                       "N5": [False, 1], "N6": [False, 0]}
+    full = run({"x": 1, "y": 4, "ok": False, "flag": False,
+                "items": {"the operator approves": True}})
+    assert full == {"N1": [True, 0], "N2": [True, 0], "N3": [True, 0], "N4": [True, 0],
+                    "N5": [False, 1], "N6": [True, 0]}
+    assert run({"x": 9, "items": {"the operator approves": True}})["N5"] == [True, 0]

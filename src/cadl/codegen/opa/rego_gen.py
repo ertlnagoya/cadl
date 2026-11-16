@@ -17,7 +17,7 @@ from ...ast_nodes import (
 )
 from ...norms import omitted_comment, omitted_in_codegen
 from ..emitter import sanitize_id, snake_case
-from .rego_expr import RegoContext, expr_to_rego
+from .rego_expr import RegoContext, expr_to_rego, negate_rego
 
 
 def generate_rego(sos: SoSDefinition, output_dir: Path) -> None:
@@ -363,7 +363,7 @@ def _compile_item(expr: Expression, ctx: RegoContext, name: str, helpers: list) 
     from ...ast_nodes import StringLiteral
     if isinstance(expr, StringLiteral) or _untranslated(expr):
         return _host_item(expr, ctx)
-    if not _needs_dnf(expr):
+    if not _needs_dnf(expr) and not _text_operand(expr):
         return expr_to_rego(expr, ctx)
     dnf = _dnf(expr, False, ctx)
     if dnf is None:
@@ -384,6 +384,17 @@ def _host_item(expr: Expression, ctx: RegoContext) -> str:
         from ...unparse import expr_to_source
         text = expr_to_source(expr)
     return f"{ctx.input_prefix}.items[{json.dumps(text)}] == true"
+
+
+def _text_operand(expr) -> bool:
+    """Whether a text (an opaque predicate) is an operand of AND, OR or NOT."""
+    from ...ast_nodes import BinaryOp, StringLiteral, UnaryOp
+    if isinstance(expr, BinaryOp) and expr.op in ("AND", "OR"):
+        return any(isinstance(x, StringLiteral) or _text_operand(x)
+                   for x in (expr.left, expr.right))
+    if isinstance(expr, UnaryOp) and expr.op == "NOT":
+        return isinstance(expr.operand, StringLiteral) or _text_operand(expr.operand)
+    return False
 
 
 def _needs_dnf(expr) -> bool:
@@ -415,8 +426,10 @@ def _dnf(expr, negated: bool, ctx: RegoContext):
         else:                                      # a conjunction
             out = [a + b for a in left for b in right]
         return out if len(out) <= _MAX_DISJUNCTS else None
-    lit = expr_to_rego(expr, ctx)
-    return [[f"not {lit}" if negated else lit]]
+    from ...ast_nodes import StringLiteral
+    # a text in a boolean position (an opaque predicate): a value the host gives
+    lit = _host_item(expr, ctx) if isinstance(expr, StringLiteral) else expr_to_rego(expr, ctx)
+    return [[negate_rego(lit, ctx) if negated else lit]]
 
 
 def _untranslated(expr) -> bool:

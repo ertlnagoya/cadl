@@ -138,14 +138,14 @@ class TestRegoExpr:
     def test_unary_not(self):
         expr = UnaryOp("NOT", Identifier("x"))
         result = expr_to_rego(expr)
-        assert result == "not input.x"
+        # 0.3.33: the reference is bound first, so a missing x is not "not x"
+        assert result == "neg_1 := input.x; not neg_1"
 
     def test_unary_not_nested(self):
         inner = BinaryOp("==", Identifier("a"), IntLiteral(0))
         expr = UnaryOp("NOT", inner)
         result = expr_to_rego(expr)
-        assert result.startswith("not ")
-        assert "input.a == 0" in result
+        assert result == "neg_1 := input.a; not neg_1 == 0"
 
     # -- MemberAccess --
 
