@@ -77,7 +77,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   with the block: its controllers start in the initial regime of A.7.1
   and its Rego contract policies require `input.regime`.
 - A file without `regimes:` gives the same output as 0.3.32 for every
-  command and target, apart from the `opa` corrections below, and a trace
+  command and target, apart from the `opa` and `transitions.py`
+  corrections below, and a trace
   without `regime` the same result (checked on all files of `examples/`
   and `tests/data/`).
 
@@ -96,6 +97,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   example.
 - The generator functions of the Rego and Solidity norms monitors refuse a
   contract that a regime suspends, as `cadl codegen` already did.
+- `cadl codegen -t python`: the regime controller checked the safety
+  invariant of a transition with `assert`, so a failing invariant raised
+  `AssertionError`, and under `python -O` the transition was taken. In
+  every file it is now checked explicitly: a transition whose invariant
+  does not hold, cannot be evaluated or cannot be compiled is not taken,
+  the regime stays, and the refusal is recorded in `refused_transitions`
+  and the log (A.7.1). `transitions.py` changes for every file with
+  `transitions:`.
+- `cadl codegen -t opa`: an `assume:` or `guarantee:` item with a
+  quantifier or a comprehension was written as Rego that OPA rejects
+  (`not` inside an expression, a comprehension as a comment;
+  `tests/data/norms_wildcards_quantified.cadl`) or that ranged over no
+  member. It is now a truth value that the host gives,
+  `input.items["TEXT"] == true`. The `opa check` test covers every file
+  of `examples/` and `tests/data/` that `cadl codegen -t opa` accepts.
 
 ## [0.3.32] — 2026-11-16
 
