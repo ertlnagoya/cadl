@@ -57,7 +57,35 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   regime, or whose initial regime does not have the contract in force,
   cannot have versions (Appendix K, K.11 leaves this open).
 - Files without the extension, and runs without `--version`, a time
-  base or the key `version`, give the outputs of 0.3.33, byte for byte.
+  base or the key `version`, give the outputs of 0.3.33, byte for byte,
+  apart from the target checks of `metrics.py` that cannot be compiled
+  (see Fixed).
+- At one observation, a waiting `in_states:` switch whose state holds is
+  made before the versions that take effect there apply (K.11).
+- `cadl metrics-eval` does not judge a measurement whose window contains
+  the effective time of a version that gives the metric another target
+  (as for an entry of `schedule:`), and a `null` term value is not
+  judged instead of a usage error.
+- The norms monitor takes the versions of a run as `run_versions=`
+  (`--run-version` on its command line); `versions=` keeps its meaning,
+  the models that `amend` names. Once an `amend` has been applied, the
+  monitor refuses an observation that names a version.
+- An `amend` to a version whose transitional rule for the contract is
+  `keep` or `switch` with `in_states:` is applied as a switch with a
+  warning (`cadl norms-eval` standard error, the monitor's
+  `amend_warnings`, the warnings of `cadl agents-run` and the gateways).
+  `cadl norms-eval --version` without a time base and without a named
+  version warns that the first version is in force throughout.
+- In `metrics.py` of the Python target, the target check of a metric
+  with `schedule:` takes the time and the time base and returns `None`
+  (not judged) without them; `version.py` carries the schedules.
+
+### Fixed
+
+- In `metrics.py` of the Python target, a target check whose target
+  cannot be compiled (such as `>= 0.9 * count(orders)`) returned `True`,
+  so the target was met whatever the value; it now returns `None` (not
+  judged).
 
 ## [0.3.33] — 2026-11-17
 
