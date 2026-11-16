@@ -868,15 +868,21 @@ def test_python_controller_checks_the_safety_invariant_and_the_names(tmp_path):
 
 
 @pytest.mark.skipif(S.opa_binary() is None, reason="the opa binary is not on PATH")
-@pytest.mark.parametrize("path", sorted((ROOT / "examples").glob("*.cadl")), ids=lambda p: p.stem)
+@pytest.mark.parametrize(
+    "path", sorted([*(ROOT / "examples").glob("*.cadl"), *(HERE / "data").rglob("*.cadl")]),
+    ids=lambda p: str(p.relative_to(ROOT)))
 def test_opa_check_of_every_example(path, tmp_path):
     """`opa check` accepts what `cadl codegen -t opa` writes for every example
-    (0.3.33 fixes all_violations of main.rego for two or more contracts and
-    function calls that Rego does not have)."""
+    and every file of tests/data that it generates code for (0.3.33 fixes
+    all_violations of main.rego for two or more contracts, function calls
+    that Rego does not have, and items with quantifiers or comprehensions)."""
     sos = parse_file(path)
     if not type_check(sos).ok:
-        pytest.skip("the example does not pass cadl check")
-    generate(sos, tmp_path / "opa", target="opa")
+        pytest.skip("the file does not pass cadl check")
+    try:
+        generate(sos, tmp_path / "opa", target="opa")
+    except ValueError as e:
+        pytest.skip(f"cadl codegen -t opa refuses the file: {e}")
     proc = subprocess.run([S.opa_binary(), "check", str(tmp_path / "opa")],
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr

@@ -340,8 +340,30 @@ def generate_main_rego(sos: SoSDefinition, bindings: list | None = None) -> str:
 
 
 def _compile_predicate(expr: Expression, ctx: RegoContext) -> str:
-    """Compile a predicate expression to Rego."""
+    """Compile a predicate expression to Rego. An item with a quantifier or
+    a comprehension, which the expression translation does not write as
+    valid Rego, is a truth value that the host gives, keyed by the text of
+    the item: `input.items["TEXT"] == true`. Up to 0.3.32 such an item was
+    written as Rego that OPA rejects (a comprehension as a comment, `not`
+    inside an expression) or that ranged over no member."""
+    if _untranslated(expr):
+        import json
+        from ...unparse import expr_to_source
+        return f"{ctx.input_prefix}.items[{json.dumps(expr_to_source(expr))}] == true"
     return expr_to_rego(expr, ctx)
+
+
+def _untranslated(expr) -> bool:
+    import dataclasses
+    from ...ast_nodes import Comprehension, QuantifiedExpr
+    if isinstance(expr, (QuantifiedExpr, Comprehension)):
+        return True
+    if isinstance(expr, list):
+        return any(_untranslated(x) for x in expr)
+    if dataclasses.is_dataclass(expr) and not isinstance(expr, type):
+        return any(_untranslated(getattr(expr, f.name)) for f in dataclasses.fields(expr)
+                   if f.name != "loc")
+    return False
 
 
 def _predicate_label(expr: Expression) -> str:
