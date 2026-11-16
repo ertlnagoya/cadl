@@ -35,16 +35,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   evaluated, is not taken and is reported: the Python controller of a
   file with `regimes:` checks it explicitly (no `assert`) and records it
   in `refused_transitions`, and the Solidity `RegimeController` emits
-  `RegimeTransitionRefused`; it records which values were set (`isSet`),
+  `RegimeTransitionRefused`; it records which values were set, per type
+  (`isSetUint`, `isSetBool`),
   and an invariant that reads a value never set, or that Solidity cannot
   express (`len(queue)`, an actor field, a text), refuses the transition.
   The Python controller raises `ValueError` for a name that is not a
   regime.
-- Solidity, for a file with `regimes:`: one step is one
-  `runMonitorCycle()` of the orchestrator, which only its deployer may
-  call and which sets the observed state of every contract and the
-  controller (`setUint`, `setBool`); only the orchestrator runs their
-  steps.
 - Solidity: `RegimeController.contractActive(id)`; a contract that some
   regime suspends takes the controller in its constructor and skips
   `runMonitorCycle()` while it is not in force, and `ALPHA`, `BETA`,
@@ -62,10 +58,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - `cadl verify`: a pair of contracts that no regime has in force
   together gets an `info` line also when the two contradict each other
   (a warning in 0.3.32), since they are never in force at the same step.
-- The Python regime controller and the Solidity `RegimeController` of a
-  file with `regimes:` start in the initial regime of A.7.1 (before: the
+- A.7.1 "Runs" applies to every file with `transitions:`, with or without
+  `regimes:`: the Python regime controller and the Solidity
+  `RegimeController` start in the initial regime of A.7.1 (before: the
   `from:` of the first transition, and the first regime in alphabetical
-  order); a file without the block keeps its start.
+  order), as `cadl regime-map` and `cadl verify` already did. In
+  Solidity one step is one `runMonitorCycle()` of the orchestrator: its
+  deployer (the reporter) alone calls it and sets the observed state
+  (`setUint`, `setBool`, passed to every contract and the controller),
+  and only the orchestrator runs the steps of the contracts and the
+  controller. The bindings (parameter values, contracts in force,
+  `ValueError` for an unknown regime, Rego `input.regime`) apply only to a
+  file with the block.
 - What cannot read the current regime is refused instead of generated
   without it: the norms monitors of the `opa` and `solidity` targets for
   a contract that some regime does not have in force (a warning names the
@@ -80,8 +84,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   with the block: its controllers start in the initial regime of A.7.1
   and its Rego contract policies require `input.regime`.
 - A file without `regimes:` gives the same output as 0.3.32 for every
-  command and target, apart from the `opa` and `transitions.py`
-  corrections below, and a trace
+  command and target, apart from the generated code of a file with
+  `transitions:` (above and below) and the `opa` corrections below, and a trace
   without `regime` the same result (checked on all files of `examples/`
   and `tests/data/`).
 
@@ -108,6 +112,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the regime stays, and the refusal is recorded in `refused_transitions`
   and the log (A.7.1). `transitions.py` changes for every file with
   `transitions:`.
+- `cadl codegen -t solidity`, a file with `transitions:`: the
+  `RegimeController` did not check the safety invariant, had no setter of
+  the observed state (so a condition read 0), and its
+  `evaluateTransitions()` and the contracts' `runMonitorCycle()` could be
+  called by anyone. It now checks the invariant with the values set and
+  refuses a failing transition (`RegimeTransitionRefused`); the
+  orchestrator sets the state and alone runs the steps.
 - `cadl codegen -t opa`: an `assume:` or `guarantee:` item with a
   quantifier or a comprehension was written as Rego that OPA rejects
   (`not` inside an expression, a comprehension as a comment;
