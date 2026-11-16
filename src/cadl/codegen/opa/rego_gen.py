@@ -150,16 +150,17 @@ def generate_contract_rego(contract: ContractDef, sos: SoSDefinition,
     # Default allow
     lines.append("default allow := false")
     lines.append("")
+    helpers: list[str] = []      # rules of items with OR (one body per disjunct)
 
     # assumptions_hold rule
     lines.append("# Assumptions: all must hold")
     lines.append("assumptions_hold if {")
     generated = 0
-    for pred in contract.assume:
+    for pos, pred in enumerate(contract.assume, start=1):
         if omitted_in_codegen(pred):
             lines.append(f"    # {omitted_comment(pred)}")
             continue
-        rego_expr = _compile_predicate(pred, ctx)
+        rego_expr = _compile_item(pred, ctx, "assumption_{}".format(pos), helpers)
         label = _predicate_label(pred)
         lines.append(f"    # {label}")
         lines.append(f"    {rego_expr}")
@@ -173,11 +174,11 @@ def generate_contract_rego(contract: ContractDef, sos: SoSDefinition,
     lines.append("# Guarantees: all must hold")
     lines.append("guarantees_hold if {")
     generated = 0
-    for pred in contract.guarantee:
+    for pos, pred in enumerate(contract.guarantee, start=1):
         if omitted_in_codegen(pred):
             lines.append(f"    # {omitted_comment(pred)}")
             continue
-        rego_expr = _compile_predicate(pred, ctx)
+        rego_expr = _compile_item(pred, ctx, "guarantee_{}".format(pos), helpers)
         label = _predicate_label(pred)
         lines.append(f"    # {label}")
         lines.append(f"    {rego_expr}")
@@ -186,6 +187,10 @@ def generate_contract_rego(contract: ContractDef, sos: SoSDefinition,
         lines.append("    true")
     lines.append("}")
     lines.append("")
+
+    if helpers:
+        lines.append("# Items with OR: one rule body per disjunct")
+        lines.extend(helpers)
 
     # allow rule
     lines.append("# Contract satisfied when assumptions imply guarantees hold")
@@ -339,25 +344,90 @@ def generate_main_rego(sos: SoSDefinition, bindings: list | None = None) -> str:
     return "\n".join(lines)
 
 
-def _compile_predicate(expr: Expression, ctx: RegoContext) -> str:
-    """Compile a predicate expression to Rego. An item with a quantifier or
-    a comprehension, which the expression translation does not write as
-    valid Rego, is a truth value that the host gives, keyed by the text of
-    the item: `input.items["TEXT"] == true`. Up to 0.3.32 such an item was
-    written as Rego that OPA rejects (a comprehension as a comment, `not`
-    inside an expression) or that ranged over no member."""
-    if _untranslated(expr):
-        import json
+_MAX_DISJUNCTS = 64
+_REGO_OPERATORS = frozenset({"==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "AND", "OR"})
+
+
+def _compile_item(expr: Expression, ctx: RegoContext, name: str, helpers: list) -> str:
+    """One `assume:` / `guarantee:` item as a literal of a rule body.
+
+    - An item with OR, or with NOT over AND, OR or NOT, is a rule `name`
+      with one body per disjunct of its disjunctive normal form (NOT pushed
+      down to the comparisons); up to 0.3.32 `A OR B` was written as
+      `(A) # OR (B)`, which drops B, and `NOT (A AND B)` as `not A; B`.
+    - A text item (an opaque predicate, A.10), and an item with a
+      quantifier, a comprehension, or more than 64 disjuncts, is a truth
+      value the host gives (`input.items["TEXT"] == true`); up to 0.3.32 a
+      text item was a string, which Rego reads as true.
+    """
+    from ...ast_nodes import StringLiteral
+    if isinstance(expr, StringLiteral) or _untranslated(expr):
+        return _host_item(expr, ctx)
+    if not _needs_dnf(expr):
+        return expr_to_rego(expr, ctx)
+    dnf = _dnf(expr, False, ctx)
+    if dnf is None:
+        return _host_item(expr, ctx)
+    for conj in dnf:
+        helpers.append(f"{name} if {{")
+        helpers.extend(f"    {lit}" for lit in conj)
+        helpers.append("}")
+        helpers.append("")
+    return name
+
+
+def _host_item(expr: Expression, ctx: RegoContext) -> str:
+    import json
+    from ...ast_nodes import StringLiteral
+    text = expr.value if isinstance(expr, StringLiteral) else None
+    if text is None:
         from ...unparse import expr_to_source
-        return f"{ctx.input_prefix}.items[{json.dumps(expr_to_source(expr))}] == true"
-    return expr_to_rego(expr, ctx)
+        text = expr_to_source(expr)
+    return f"{ctx.input_prefix}.items[{json.dumps(text)}] == true"
+
+
+def _needs_dnf(expr) -> bool:
+    from ...ast_nodes import BinaryOp, UnaryOp
+    if isinstance(expr, BinaryOp):
+        if expr.op == "OR":
+            return True
+        return expr.op == "AND" and (_needs_dnf(expr.left) or _needs_dnf(expr.right))
+    if isinstance(expr, UnaryOp) and expr.op == "NOT":
+        inner = expr.operand
+        return (isinstance(inner, BinaryOp) and inner.op in ("AND", "OR")) or (
+            isinstance(inner, UnaryOp) and inner.op == "NOT")
+    return False
+
+
+def _dnf(expr, negated: bool, ctx: RegoContext):
+    """The disjunctive normal form as lists of Rego literals, or None when
+    it has more than _MAX_DISJUNCTS disjuncts."""
+    from ...ast_nodes import BinaryOp, UnaryOp
+    if isinstance(expr, UnaryOp) and expr.op == "NOT":
+        return _dnf(expr.operand, not negated, ctx)
+    if isinstance(expr, BinaryOp) and expr.op in ("AND", "OR"):
+        left = _dnf(expr.left, negated, ctx)
+        right = _dnf(expr.right, negated, ctx)
+        if left is None or right is None:
+            return None
+        if (expr.op == "OR") != negated:          # a disjunction
+            out = left + right
+        else:                                      # a conjunction
+            out = [a + b for a in left for b in right]
+        return out if len(out) <= _MAX_DISJUNCTS else None
+    lit = expr_to_rego(expr, ctx)
+    return [[f"not {lit}" if negated else lit]]
 
 
 def _untranslated(expr) -> bool:
     import dataclasses
-    from ...ast_nodes import Comprehension, QuantifiedExpr
+    from ...ast_nodes import BinaryOp, Comprehension, QuantifiedExpr
     if isinstance(expr, (QuantifiedExpr, Comprehension)):
         return True
+    if isinstance(expr, BinaryOp) and expr.op not in _REGO_OPERATORS:
+        return True                     # IN of a monitor rule, for example
+    if type(expr).__name__ in ("ListLiteral", "DistLiteral"):
+        return True                     # written as `true # unsupported`
     if isinstance(expr, list):
         return any(_untranslated(x) for x in expr)
     if dataclasses.is_dataclass(expr) and not isinstance(expr, type):

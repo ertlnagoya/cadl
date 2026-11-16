@@ -934,3 +934,60 @@ def test_python_controller_checks_the_invariant_without_regimes(tmp_path):
                           capture_output=True, text=True, env={"PYTHONPATH": str(ROOT / "src")})
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.splitlines() == ["False DISTRIBUTED 1", "True CENTRALIZED"]
+
+
+OR_FILE = textwrap.dedent("""\
+    sos:
+      name: OrTown
+      actors: [{id: A, role: a}]
+      contracts:
+        - id: C
+          parties: [A]
+          assume:
+            - "NOT (load > 5 AND busy == true)"
+          guarantee:
+            - "a == 1 OR b == 1"
+            - "(a == 1 OR b == 1) AND NOT (c == 1 OR d == 1)"
+            - "the robots behave"
+    """)
+
+
+def test_rego_or_not_and_text_items():
+    """0.3.33 (Fixed): `A OR B` is a rule with one body per disjunct (it was
+    `(A) # OR (B)`, which drops B), NOT is pushed to the comparisons, and a
+    text item is a value the host gives (a string, which Rego reads as true)."""
+    from cadl.codegen.opa.rego_gen import generate_contract_rego
+    sos = parse(OR_FILE)
+    text = generate_contract_rego(sos.contracts[0], sos)
+    assert "# OR" not in text and "# unsupported" not in text
+    assert 'input.items["the robots behave"] == true' in text
+    assert text.count("guarantee_2 if {") == 2 and text.count("assumption_1 if {") == 2
+
+
+@pytest.mark.skipif(S.opa_binary() is None, reason="the opa binary is not on PATH")
+def test_rego_or_on_opa(tmp_path):
+    out = tmp_path / "opa"
+    generate(parse(OR_FILE), out, target="opa")
+    assert subprocess.run([S.opa_binary(), "check", str(out)], capture_output=True).returncode == 0
+
+    def run(inp: dict) -> dict:
+        (tmp_path / "in.json").write_text(json.dumps(inp), encoding="utf-8")
+        proc = subprocess.run(
+            [S.opa_binary(), "eval", "-d", str(out / "c.rego"), "-i", str(tmp_path / "in.json"),
+             "--format", "json", 'x := {"allow": data.cadl.c.allow, "v": data.cadl.c.violation}'],
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout)["result"][0]["bindings"]["x"]
+
+    base = {"load": 9, "busy": False, "c": 0, "d": 0, "items": {"the robots behave": True}}
+    # A false, B true: not a violation (0.3.32 reported one)
+    assert run(dict(base, a=0, b=1)) == {"allow": True, "v": []}
+    assert run(dict(base, a=1, b=0)) == {"allow": True, "v": []}
+    assert run(dict(base, a=0, b=0))["v"] == ["Guarantee violated in C"]
+    # NOT (c == 1 OR d == 1)
+    assert run(dict(base, a=1, b=0, d=1))["v"] == ["Guarantee violated in C"]
+    # the text item is what the host says
+    assert run(dict(base, a=1, b=1, items={"the robots behave": False}))["v"] == \
+        ["Guarantee violated in C"]
+    # NOT (load > 5 AND busy == true): the assumption fails, so no violation and no allow
+    assert run(dict(base, a=0, b=0, busy=True)) == {"allow": False, "v": []}
