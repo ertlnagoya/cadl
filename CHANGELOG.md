@@ -4,6 +4,65 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Regime bindings at run time (Appendix A, A.7.1, "Runs"): every step of
+  a run is in one regime, a run starts in the initial regime (the first
+  `from:` that is no `to:`, the initial state of `cadl regime-map`), the
+  first transition whose condition holds is taken after the evaluations
+  of a step, and the bindings change with the regime between two steps.
+- `cadl norms-eval` and the norms monitor of the Python target read the
+  key `regime` of an observation (only for a file with a `regimes:`
+  block; the value must be a regime of the file). A contract instance
+  whose contract the current regime does not have in force sees nothing
+  of the observation: messages there do not count, values given there
+  are seen from the next observation in force, and deadlines, the time
+  spent suspended and the intervals of the temporal operators run on the
+  clock of the contract, which stops while it is not in force (F.5,
+  "Contracts not in force"). Reported times are those of the trace. An
+  instance that ends while its contract is not in force is only settled
+  there, on the stopped clock. The monitor gets `in_force`, and
+  `next_deadline()` / `next_check()` are `None` while the contract is not
+  in force. A trace that names a regime cannot also amend the contract.
+- `cadl regime-map` shows the bindings of each regime: a section of the
+  text output, node labels in DOT, and the key `regimes` in JSON (`null`
+  for a block that breaks R-1 to R-6).
+- Solidity: `RegimeController.contractActive(id)`; a contract that some
+  regime suspends takes the controller in its constructor and skips
+  `runMonitorCycle()` while it is not in force, and `ALPHA`, `BETA`,
+  `LAMBDA` of a contract whose value a regime binds are view functions
+  that return the value of the current regime.
+- Rego: each contract policy reads `input.regime` (`regimes`,
+  `regime_error`, `in_force`); a contract that is not in force is allowed
+  and has no violation, `alpha`, `beta`, `lambda_` have the value of the
+  regime, and a missing or unknown regime allows nothing. `main.rego`
+  gives `regimes`, `initial_regime` and `parameters`.
+
+### Changed
+
+- `cadl verify`: a pair of contracts that no regime has in force
+  together gets an `info` line also when the two contradict each other
+  (a warning in 0.3.32), since they are never in force at the same step.
+- The Python regime controller and the Solidity `RegimeController` of a
+  file with `regimes:` start in the initial regime of A.7.1 (before: the
+  `from:` of the first transition, and the first regime in alphabetical
+  order); a file without the block keeps its start.
+- What cannot read the current regime is refused instead of generated
+  without it: the norms monitors of the `opa` and `solidity` targets for
+  a contract that some regime does not have in force (a warning names the
+  regimes; the python target monitors the contract), `cadl codegen -t
+  unity-csharp` for a file in which a regime suspends a contract with
+  `lifecycle:` or `monitors:`, and the boundary policy of the agent
+  governance extension (`agent-rego`, `agent-cedar`, `agents-decide`,
+  `agents-run`, the gateways) for a file in which a regime suspends an
+  enforced contract. For a contract in force in every regime these
+  outputs are those of the file without `regimes:`.
+- A file without `regimes:` gives the same output as 0.3.32 for every
+  command and target, and a trace without `regime` the same result
+  (checked on all files of `examples/` and `tests/data/`).
+
 ## [0.3.32] — 2026-11-16
 
 ### Added
