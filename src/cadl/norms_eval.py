@@ -3327,6 +3327,30 @@ class VersionChain:
                         f"version {order[k].name} takes effect at t={_fmt_t(self.times[k])}, "
                         f"not after version {order[k - 1].name} (t={_fmt_t(prev)}); effective "
                         f"times increase along the sequence (Appendix K, K.11)")
+        else:
+            # Without a time base, effective times of the same form are
+            # ordered by their period or instant (from cadl 0.3.35); a
+            # period and an instant are not compared.
+            def key(e: Any) -> Any:
+                (form, v), = e.items()
+                return form, (int(v) if form == "period" else _epoch_seconds(str(v)))
+            for k in range(1, len(order)):
+                if not order[k].effective:
+                    continue
+                fk, vk = key(order[k].effective)
+                for j in range(k - 1, -1, -1):
+                    if not order[j].effective:
+                        continue
+                    fj, vj = key(order[j].effective)
+                    if fj == fk:
+                        if not vk > vj:
+                            raise NormsEvalError(
+                                f"version {order[k].name} takes effect at "
+                                f"{_describe_effective(order[k].effective)}, not after version "
+                                f"{order[j].name} ({_describe_effective(order[j].effective)}); "
+                                f"effective times increase along the sequence (Appendix K, "
+                                f"K.11)")
+                        break
 
     @property
     def timed(self) -> bool:

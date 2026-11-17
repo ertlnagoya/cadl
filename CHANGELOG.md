@@ -90,6 +90,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the versions in force at some step (versions that take effect and are
   replaced at the same step are not used); `previous:` naming a version
   outside the run no longer blocks the inference for the others.
+- Without a time base, an explicit `previous:` sequence is checked against
+  the effective times of the same form (period numbers with each other,
+  instants with each other) and refused when it contradicts them; a
+  period and an instant are not compared, as in 0.3.34.
 - Tests: wall-clock bounds that guard against blow-ups were raised so
   that a slow runner does not fail them: `test_groups_of_eight_members_are_translated`
   and `test_large_groups_are_refused_with_the_reason` from 120 s to

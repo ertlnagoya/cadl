@@ -980,3 +980,19 @@ class TestReview0335:
                          period=3600)
         r.pop("file")
         assert got == json.loads(json.dumps(r))
+
+
+def test_order_of_explicit_previous_without_time_base(tmp_path):
+    """Re-review: without a time base, effective times of the same form are
+    compared along an explicit sequence; a period and an instant are not."""
+    one = _version(tmp_path, "o1.cadl", "1", None, "{ period: 5 }")
+    two = _version(tmp_path, "o2.cadl", "2", "1", "{ period: 1 }")
+    sw = TRACES / "amendment_norms_v1_a_switch.jsonl"
+    with pytest.raises(NormsEvalError, match="version 2 takes effect at period 1, not after "
+                                             "version 1 \\(period 5\\)"):
+        evaluate_files(one, sw, None, [two])
+    with pytest.raises(NormsEvalError, match="not after version 1"):
+        evaluate_files(one, sw, None, [two], HOUR)
+    mixed = _version(tmp_path, "o3.cadl", "2", "1", '{ at: "2020-01-01" }')
+    r = evaluate_files(one, sw, None, [mixed])        # not compared, as in 0.3.34
+    assert r["versions"]["sequence"] == ["1", "2"]
