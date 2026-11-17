@@ -4,6 +4,68 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Versions and regime bindings combine (Appendix K, K.11, "Versions and
+  regimes"). At the boundary between two steps the regime named at the
+  step is taken first, then the versions take effect. Whether a contract
+  is in force is decided by the `regimes:` of the version in force, by
+  contract name; the version an instance follows selects only its
+  definition. A version that takes effect while the contract is not in
+  force reaches the instance at that step (`keep`, `switch`, and a
+  waiting `switch` with `in_states:`, judged on the lifecycle state the
+  instance sees); the amendment is applied at the next step at which the
+  contract is in force, or at which the instance ends, on the stopped
+  clock. `cadl norms-eval` and the norms monitor of the Python target.
+- `cadl agents-run`, `cadl mcp-gateway` and `cadl a2a-gateway` take
+  `--version FILE`, `--period`, `--origin` and `--epoch` and switch the
+  enforcement point to a version at the first line whose time reaches its
+  effective time, before anything else of the line; the instances created
+  at that line start under the new version. With `--epoch`, an instant is
+  placed on `t` through the `epoch` of the first line. An `amend` at the
+  same line is applied after the versions that take effect there.
+- The target checks of `metrics.py` of the Python target, for a file with
+  an `amendment:` block, take `versions=` (the `version.py` modules of the
+  run in the order of the sequence) and then judge as `cadl metrics-eval`:
+  entries `from: { version: X }` are placed at the effective time of `X`,
+  and a check returns `None` when its version is not in force, an entry
+  cannot be placed, or the target changes inside the window of its
+  `measure:`. `version.py` gets `TARGETS`.
+
+### Changed
+
+- A version of a run may leave out `previous:`: it then replaces the
+  version with the latest effective time strictly before its own. Two
+  candidates at the same time, or effective times that cannot be ordered,
+  are refused with a request for `previous:`; an explicit `previous:`
+  against the order of the effective times is refused as before.
+- The trace key `version` is read also for a file without an `amendment:`
+  block: the file's own `sos.version` is accepted, any other value is
+  refused because the file declares no versions to switch to (up to
+  0.3.34: "unknown key"). The model of the norms monitor gets
+  `sos_version`.
+- A run with versions that names a regime, or whose versions bind
+  regimes, is no longer refused (0.3.34). A regime current at some step
+  must be a regime of every version the run uses, and a run without
+  regimes cannot use a version with `regimes:`; such runs are refused with
+  the regime and the version. A run of 0.3.34 whose versions have
+  different initial regimes and that names no regime is now judged in the
+  initial regime of the version in force at its first step, and refused
+  when that regime is not one of a later version.
+- In `cadl agents-run` and the gateways, a version whose transitional
+  rule for a changed enforced contract is `keep` or `switch` with
+  `in_states:` is refused while an instance of that contract runs: the
+  enforcement point holds one version of the file and its boundary
+  policy. A gateway refuses versions that change the actors or the
+  counts_as rules that create `approval` or `rejection`.
+- Tests: wall-clock bounds that guard against blow-ups were raised so
+  that a slow runner does not fail them: `test_groups_of_eight_members_are_translated`
+  and `test_large_groups_are_refused_with_the_reason` from 120 s to
+  600 s, `test_huge_bound_is_evaluated_as_an_open_domain` from 2 s to
+  30 s.
+
 ## [0.3.34] — 2026-11-17
 
 ### Added
