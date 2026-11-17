@@ -22,8 +22,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - `cadl agents-run`, `cadl mcp-gateway` and `cadl a2a-gateway` take
   `--version FILE`, `--period`, `--origin` and `--epoch` and switch the
   enforcement point to a version at the first line whose time reaches its
-  effective time, before anything else of the line; the instances created
-  at that line start under the new version. With `--epoch`, an instant is
+  effective time: after the expired holds, withdrawals and host events of
+  the line, and before its instances are created (they start under the
+  new version), its time and values observed, and its messages decided. With `--epoch`, an instant is
   placed on `t` through the `epoch` of the first line. An `amend` at the
   same line is applied after the versions that take effect there.
 - The target checks of `metrics.py` of the Python target, for a file with
@@ -76,6 +77,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   A version without `previous:` and with no `effective:` or
   `effective: { period: 1 }` is always a first version, also when
   `previous:` is inferred.
+- An `amend` applied to an instance cancels its waiting `switch` with
+  `in_states:`; the result key `versions.follows` names the file the
+  `amend` gave (norms-eval and the monitor; agents-run has no waiting
+  switches).
+- `metrics.py` with `versions=`: a version whose effective time the time
+  base cannot place raises `ValueError` (as `cadl metrics-eval` refuses
+  it); without a time base the first version is in force unless
+  `version=` names the version in force.
+- With versions, a trace that names a regime is checked against the
+  regimes of the versions, not of the file alone; a regime must be one of
+  the versions in force at some step (versions that take effect and are
+  replaced at the same step are not used); `previous:` naming a version
+  outside the run no longer blocks the inference for the others.
 - Tests: wall-clock bounds that guard against blow-ups were raised so
   that a slow runner does not fail them: `test_groups_of_eight_members_are_translated`
   and `test_large_groups_are_refused_with_the_reason` from 120 s to
