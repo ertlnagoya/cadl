@@ -843,9 +843,9 @@ class NormsMonitor(NormsMonitor):
     and when a version takes effect it follows the transitional rule of
     its contract in that version: ``keep`` leaves it as it is, ``switch``
     amends it (F.6), and ``switch`` with ``in_states`` amends it at the
-    first observation in one of those states. Such a monitor refuses an
-    observation with ``amend``; once an ``amend`` has been applied, it
-    refuses an observation that names a version. When a version of the run
+    first observation in one of those states. An observation with
+    ``amend`` amends the instance after the versions that take effect at
+    it (from cadl 0.3.35; refused when regimes combine with the versions). When a version of the run
     binds regimes, or an observation names one, the regime and the
     versions combine as `cadl norms-eval` combines them (K.11, "Versions
     and regimes", from cadl 0.3.35): the regime named at an observation is
@@ -928,14 +928,7 @@ class NormsMonitor(NormsMonitor):
             observation = {k: v for k, v in observation.items() if k != VERSION_KEY}
             if not self.ended:
                 regime = observation.get("regime") is not None
-                active = self._active or named is not None
-                if active and observation.get("amend") is not None:
-                    raise ObservationError(_VERSIONS_NO_AMEND)
                 if named is not None and not self._active:
-                    if self._amended:
-                        raise ObservationError(
-                            "an observation with 'amend' has amended the contract, so the "
-                            "trace cannot name a version (Appendix K, K.11)")
                     self._activate(regime)
         if self._combined:
             changes = self._observe_combined(observation, named, where)
@@ -1026,7 +1019,8 @@ class NormsMonitor(NormsMonitor):
             return []
         touched = False
         try:
-            o.amend = None
+            if o.amend:
+                raise ObservationError(_VERSIONS_NO_AMEND)
             inside, o.c = self._run.step(o.t, named, regime)
             o.out = not inside
             eng = self._engine
@@ -1188,14 +1182,17 @@ class NormsMonitor(NormsMonitor):
             if contract is None:
                 raise ObservationError(f"version {start.name}, in force at the start of the "
                                        f"instance, has no contract '{self._contract.id}'")
+            if not hasattr(o, "host_amend"):
+                o.host_amend = o.amend       # applied after the versions (K.11)
             o.amend = None
             eng = _VersionEngine(contract, self._trace, self._chain, tracker,
-                                 declared_actors(start.sos))
+                                 declared_actors(start.sos), self._versions)
             self._tracker = tracker
             self._check_parsed()
             if _STATE_IGNORED in eng.warnings:   # said in _step, see there
                 eng.warnings.remove(_STATE_IGNORED)
-            eng._check_state(n)
+            if not o.host_amend:
+                eng._check_state(n)
             eng.ev.known.update(self._quantities)
             return eng
         self._tracker = eng.tracker

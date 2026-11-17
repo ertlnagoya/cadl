@@ -107,6 +107,10 @@ class Line:
     withdraw: list[str] = field(default_factory=list)
     # Event records of the host at this line (`host_events`).
     host_events: list[dict] = field(default_factory=list)
+    # The version in force that the line names (`version`, Appendix K,
+    # K.11), or None; `missing` when the line does not have the key.
+    version: Any = None
+    has_version: bool = False
 
 
 @dataclass
@@ -213,7 +217,10 @@ def _first_line_keys(rec: dict, where: str, first: bool) -> tuple:
     `withdraw` and `host_events`."""
     epoch = quantities = hosted = None
     more: dict[str, Any] = {"run_id": None, "approvals": None, "withdraw": [],
-                            "host_events": []}
+                            "host_events": [], "version": None, "has_version": False}
+    if "version" in rec:            # checked by the runtime, which knows the versions
+        more["version"] = rec.pop("version")
+        more["has_version"] = True
     if "approvals" in rec:
         if not first:
             raise TraceError(f"{where}: 'approvals' is allowed only on the first line")
@@ -311,7 +318,8 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
         _check_epoch_range(epoch, o.t, lineno)
     return RunTrace(
         lines=[Line(obs=o, state=s, instances=e, lineno=n, withdraw=x["withdraw"],
-                    host_events=x["host_events"])
+                    host_events=x["host_events"], version=x["version"],
+                    has_version=x["has_version"])
                for o, (s, e, n, x) in zip(base.observations, extras)],
         bindings=base.bindings, request=base.request, epoch=epoch, path=path,
         quantities=quantities, host_instances=hosted, run_id=run_id,
@@ -354,7 +362,8 @@ class RunTraceReader:
             trace.approvals = more["approvals"]
         _check_epoch_range(trace.epoch, obs.t, lineno)
         line = Line(obs=obs, state=state, instances=entries, lineno=lineno,
-                    withdraw=more["withdraw"], host_events=more["host_events"])
+                    withdraw=more["withdraw"], host_events=more["host_events"],
+                    version=more["version"], has_version=more["has_version"])
         trace.lines.append(line)
         return line
 
@@ -935,25 +944,48 @@ class AgentsRuntime:
         if not self.chain.timed:
             self.warnings.append(
                 "versions are given, but there is no time base (--period, --epoch), so the "
-                "first version is in force throughout (Appendix K, K.11)")
+                "first version is in force until a line names another with 'version' "
+                "(Appendix K, K.11)")
 
     def _version_time(self, t: Any) -> Any:
         """The time stamp of the time base for the time t of a line: with
         --epoch and an 'epoch' on the first line, t counts from that instant."""
         from fractions import Fraction as _F
         base = self.chain.base
-        if base.epoch and self.trace.epoch is not None:
+        if base is not None and base.epoch and self.trace.epoch is not None:
             d = self.trace.epoch - datetime(1970, 1, 1, tzinfo=timezone.utc)
             return _F(t) + _F(d.days * 86400 + d.seconds) + _F(d.microseconds, 1000000)
         return t
 
-    def _versions_at(self, t: Any) -> list:
-        """The indices of the versions that take effect at a line at time t,
-        in order. At the first line the version in force is set and
-        nothing takes effect."""
+    def _named(self, line: Line) -> Any:
+        """The version that a line names with the key `version` (K.11):
+        with versions of the run, one of them; without, only the file's own
+        sos.version, as in `cadl norms-eval`."""
+        if not line.has_version:
+            return None
+        where = f"line {line.lineno}"
+        if self.chain is not None:
+            return self.chain.check_name(line.version, where)
+        from .norms_eval import own_version
+        own, named = own_version(self.sos), line.version
+        if own is None or not isinstance(named, str) or named != own:
+            got = f"'{named}'" if isinstance(named, str) else "a value that is not a string"
+            mine = ("and gives no sos.version" if own is None
+                    else f"and has one version, its sos.version '{own}'")
+            raise TraceError(
+                f"{where}: 'version' names {got}, but no versions of the run are given "
+                f"(--version) and the file declares no versions to switch to "
+                f"(Appendix K, K.11) {mine}")
+        return None
+
+    def _versions_at(self, t: Any, named: Any = None) -> list:
+        """The indices of the versions that take effect at a line at time t
+        that names the version `named` (or None), in order. At the first
+        line the version in force is set and nothing takes effect."""
         if self.chain is None:
             return []
-        k = self.chain.by_time(self._version_time(t)) if self.chain.timed else 0
+        from .norms_eval import _version_in_force
+        k = _version_in_force(self.chain, self._vk, self._version_time(t), named)
         if self._vk is None:
             self._vk = k
             info = self.chain.infos[k]
@@ -1664,7 +1696,7 @@ class AgentsRuntime:
         # version in force; then an `amend` of the line.
         running = [i for i in self._running()]
         scheduled = []
-        for v in self._versions_at(t):
+        for v in self._versions_at(t, self._named(line)):
             label = f"version {self.chain.infos[v].name}"
             prep = self._prepare_amendment(label, t, scheduled=True)
             self._check_rule(v, prep[2], t)

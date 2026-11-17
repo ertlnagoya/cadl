@@ -3109,8 +3109,8 @@ def run_regime_trace(contract: ContractDef, trace: Trace, bindings: RegimeBindin
 
 VERSION_KEY = "version"
 _VERSIONS_NO_AMEND = (
-    "a run with versions cannot also amend the contract with 'amend': the transitional "
-    "rules decide when an instance is amended (Appendix K, K.11)")
+    "a run with versions and regime bindings cannot also amend the contract with 'amend' "
+    "(cadl does not apply regime bindings and amendments together)")
 
 
 def _version_label(name: str) -> str:
@@ -3220,13 +3220,16 @@ def _infer_previous(infos: list, base: Any) -> None:
     """Give a version without `previous:` the version that it replaces
     (Appendix K, K.11, from cadl 0.3.35): the version with the latest
     effective time strictly earlier than its own, among the versions of the
-    run. A version without `effective:`, or with no version effective
-    earlier, is a first version and needs none. Refuse when this is
+    run. A version without `effective:` or with `effective: { period: 1 }`,
+    or with no version effective earlier, is a first version and needs
+    none. Refuse when this is
     ambiguous: two candidates with the same effective time, or effective
     times that cannot be ordered."""
     if sum(1 for i in infos if i.previous is None) <= 1:
         return                      # one first version: the sequence of 0.3.34
-    missing = [i for i in infos if i.previous is None and i.effective]
+    from .amendment import first_only
+    # effective: { period: 1 } and no effective: are first versions
+    missing = [i for i in infos if i.previous is None and not first_only(i.effective)]
     if not missing:
         return
     key = _effective_order(infos, base)
@@ -3363,14 +3366,23 @@ class VersionTracker:
         self.started: Any = None       # index of the version at the start
         self.memo: dict = {}
         self.events: list = []
+        # the file an `amend` of the trace amended the instance to, until a
+        # version switches it (K.11, from cadl 0.3.35)
+        self.amended: Any = None
 
     def save(self) -> tuple:
         return (self.current, self.follows, self.pending, self.started, dict(self.memo),
-                list(self.events))
+                list(self.events), self.amended)
 
     def restore(self, saved: tuple) -> None:
-        (self.current, self.follows, self.pending, self.started, memo, events) = saved
+        (self.current, self.follows, self.pending, self.started, memo, events,
+         self.amended) = saved
         self.memo, self.events = dict(memo), list(events)
+
+    def _following(self) -> str:
+        if self.amended is not None:
+            return f"{self.amended} (by 'amend')"
+        return f"version {self.chain.infos[self.follows].name}"
 
     def in_force(self, t: Any, named: Any) -> int:
         return _version_in_force(self.chain, self.current, t, named)
@@ -3404,10 +3416,11 @@ class VersionTracker:
 
         def switch(v: int, why: str) -> None:
             events.append(self._event(
-                t, v, "switch", f"{why}the instance switches from version "
-                                f"{infos[self.follows].name} to version {infos[v].name}"))
+                t, v, "switch", f"{why}the instance switches from "
+                                f"{self._following()} to version {infos[v].name}"))
             names.append(_version_label(infos[v].name))
             self.follows = v
+            self.amended = None
             self.pending = None
 
         # A waiting switch whose state holds before this observation is made
@@ -3425,8 +3438,8 @@ class VersionTracker:
             head = f"version {infos[v].name} takes effect"
             if rule == "keep":
                 events.append(self._event(
-                    t, v, "keep", f"{head}; the instance keeps version "
-                                  f"{infos[self.follows].name} (transitional: keep)"))
+                    t, v, "keep", f"{head}; the instance keeps "
+                                  f"{self._following()} (transitional: keep)"))
             elif states is None:
                 switch(v, f"{head} (transitional: switch); ")
             elif state in states:
@@ -3473,23 +3486,39 @@ class _VersionEngine(_Engine):
     gives, one after the other (F.6)."""
 
     def __init__(self, contract: ContractDef, trace: Trace, chain: VersionChain,
-                 tracker: VersionTracker, actors: dict | None = None) -> None:
-        super().__init__(contract, trace, chain.sos_of, actors)
+                 tracker: VersionTracker, actors: dict | None = None,
+                 host_loader: Any = None) -> None:
+        labels = {_version_label(i.name) for i in chain.infos}
+
+        def load(name: str) -> Any:
+            # a version of the run, or a file that an `amend` of the trace names
+            if name in labels or host_loader is None:
+                return chain.sos_of(name)
+            return host_loader(name)
+        super().__init__(contract, trace, load, actors)
         self.tracker = tracker
         self._logged: set = set()
 
     def decide(self, n: int) -> tuple:
         """(the versions to amend to at observation n, the events); sets
-        ``amend`` of the observation. Logs nothing: `_step` does."""
+        ``amend`` of the observation: the versions that take effect there,
+        then the file that its own `amend` names (K.11, from cadl 0.3.35).
+        Logs nothing: `_step` does."""
         o = self.obs[n]
+        if not hasattr(o, "host_amend"):
+            o.host_amend = o.amend
+        host = [o.host_amend] if o.host_amend else []
         if n == 0:
-            return [], []
-        state = o.state if self.lifecycle is not None else None
-        if self.lifecycle is not None and state is None:
-            state = self.lifecycle.initial
-        names, events = self.tracker.step(n, o.t, getattr(o, "version", None), state)
-        o.amend = tuple(names) or None
-        return names, events
+            names, events = [], []
+        else:
+            state = o.state if self.lifecycle is not None else None
+            if self.lifecycle is not None and state is None:
+                state = self.lifecycle.initial
+            names, events = self.tracker.step(n, o.t, getattr(o, "version", None), state)
+        if host:
+            self.tracker.amended = host[0]
+        o.amend = tuple(names + host) or None
+        return names + host, events
 
     def _step(self, n: int, is_last: bool) -> bool:
         _, events = self.decide(n)
@@ -3817,11 +3846,12 @@ def names_version(trace: Trace) -> bool:
     return any(getattr(o, "version", None) is not None for o in trace.observations)
 
 
-def run_version_trace(contract_id: str, trace: Trace, chain: VersionChain, actors_of) -> dict:
+def run_version_trace(contract_id: str, trace: Trace, chain: VersionChain, actors_of,
+                      loader: Any = None) -> dict:
     """`run_trace` for a run with versions (K.11). `actors_of(sos)` gives the
-    declared actors of a version."""
-    if any(o.amend for o in trace.observations):
-        raise NormsEvalError(_VERSIONS_NO_AMEND)
+    declared actors of a version, `loader(name)` the file that an `amend`
+    of the trace names; at one observation the versions that take effect
+    are applied first, then the `amend` (from cadl 0.3.35)."""
 
     def once(observations: list) -> Any:
         part = Trace(observations=observations, bindings=trace.bindings,
@@ -3834,8 +3864,10 @@ def run_version_trace(contract_id: str, trace: Trace, chain: VersionChain, actor
             raise NormsEvalError(f"version {start.name}, in force at the start of the instance, "
                                  f"has no contract '{contract_id}'")
         for o in observations:
+            if not hasattr(o, "host_amend"):
+                o.host_amend = o.amend
             o.amend = None
-        eng = _VersionEngine(contract, part, chain, tracker, actors_of(start.sos))
+        eng = _VersionEngine(contract, part, chain, tracker, actors_of(start.sos), loader)
         eng.run()
         return eng
 
@@ -3946,7 +3978,7 @@ def evaluate(sos: SoSDefinition, trace: Trace, contract_id: str | None = None,
         if names_regime(trace) or any(i.regimes is not None for i in chain.infos):
             # versions and regime bindings (K.11, from cadl 0.3.35)
             return run_version_regime_trace(contract.id, trace, chain, declared_actors)
-        return run_version_trace(contract.id, trace, chain, declared_actors)
+        return run_version_trace(contract.id, trace, chain, declared_actors, loader)
     if bindings is not None and (names_regime(trace)
                                  or not bindings.in_force(contract.id, bindings.initial)):
         # before the first `regime` the trace is in the initial regime (A.7.1)

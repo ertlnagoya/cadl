@@ -684,3 +684,171 @@ class TestGatewayVersions:
                     list().append, list().append, run_versions=[load_version(v2)],
                     base=TimeBase(100))
         assert not (tmp_path / "a.jsonl").exists()
+
+
+# --- `amend` together with versions: one order for every processor ----------------
+
+_OBLIGATION = '''        - id: file_report
+          kind: obligation
+          bearer: PLANNER
+          content: "PLANNER -> TICKETS : create_ticket"
+          deadline: {deadline}
+'''
+
+
+def _obligation_versions(tmp: Path):
+    """Versions 1 and 2 of the agents example with an obligation whose
+    deadline changes (300 s, then 120 s from period 2), and a file
+    `amend.cadl` (60 s) that an `amend` line names."""
+    def make(src: Path, name: str, deadline: str, header=None) -> Path:
+        text = src.read_text(encoding="utf-8").replace(
+            "      delegations:\n", _OBLIGATION.format(deadline=deadline) + "      delegations:\n")
+        if header is not None:
+            text = text.replace(*header)
+        out = tmp / name
+        out.write_text(text, encoding="utf-8")
+        return out
+    v1 = make(AV1, "o1.cadl", "300s")
+    v2 = make(AV2, "o2.cadl", "120s")
+    amend = make(AV1, "amend.cadl", "60s", ('version: "1"', 'version: "9"'))
+    return v1, v2, amend
+
+
+@pytest.mark.parametrize("seed", range(120))
+def test_amend_with_versions_agents_run_equals_norms_eval(tmp_path, seed):
+    """`cadl agents-run` and `cadl norms-eval` on the same file and trace,
+    with versions and an `amend` line (also at the line at which a version
+    takes effect): the same amendments, in the same order, and the same
+    norm states and verdicts."""
+    import random
+    from cadl.agents_runtime import load_run_trace, run
+    from cadl.norms_eval import load_version
+    rng = random.Random(4400 + seed)
+    v1, v2, amend = _obligation_versions(tmp_path)
+    t, lines = 0, []
+    amended = False
+    for k in range(rng.randint(2, 9)):
+        line = {"t": t}
+        if rng.random() < 0.3:
+            line["messages"] = [{"from": "PLANNER", "to": "TICKETS", "name": "create_ticket"}]
+        if k > 0 and not amended and rng.random() < 0.3:
+            line["amend"] = amend.name
+            amended = True
+        lines.append(line)
+        t += rng.choice([10, 30, 60, 100, 150])
+    if rng.random() < 0.4:       # the amend at the line at which version 2 takes effect
+        at = next((i for i, x in enumerate(lines) if x["t"] >= 100 and i > 0), None)
+        if at is not None:
+            for x in lines:
+                x.pop("amend", None)
+            lines[at]["amend"] = amend.name
+    agents_lines = [dict(lines[0], quantities=[], epoch=EPOCH)] + lines[1:]
+    a_trace = _trace(tmp_path, agents_lines, "a.jsonl")
+    n_trace = _trace(tmp_path, lines, "n.jsonl")
+    got = run(load_version(v1), load_run_trace(a_trace), run_versions=[load_version(v2)],
+              base=TimeBase(100))
+    ref = evaluate_files(v1, n_trace, None, [v2], TimeBase(100))
+    assert ([(a["file"]) for a in got["amendments"]]
+            == [a["file"] for a in ref["amendments"]])
+    inst = got["instances"][0]
+    assert ({(x["id"], x["state"], x["verdict"]) for x in inst["norms"]}
+            == {(x["id"], x["state"], x["verdict"]) for x in ref["norms"]})
+
+
+@pytest.mark.parametrize("seed", range(80))
+def test_amend_with_versions_monitor_equals_norms_eval(tmp_path, seed):
+    """The norms monitor against `cadl norms-eval` with versions and an
+    `amend` line (the versions first at one observation)."""
+    import random
+    rng = random.Random(5500 + seed)
+    rule, states = rng.choice(_RULES)
+    v2 = _version(tmp_path, "w2.cadl", "2", "1", "{ period: 2 }", _transitional(rule, states),
+                  pickup=rng.choice(["60s", "90s", "150s"]))
+    other = _version(tmp_path, "other.cadl", "7", "1", "{ period: 9 }",
+                     pickup=rng.choice(["60s", "180s"]))
+    t, state = 3400 + rng.choice([0, 100, 190]), "Assigned"
+    lines = [{"t": t, "bindings": {"i": 2}}]
+    for _ in range(rng.randint(2, 8)):
+        t += rng.choice([10, 30, 60, 100, 600])
+        line = {"t": t}
+        if state == "Assigned" and rng.random() < 0.3:
+            state = "PickedUp"
+            line.update(values={"ROBOT[2].status": "PickedUp"}, state=state)
+        lines.append(line)
+    pick = [i for i, x in enumerate(lines) if i > 0]
+    lines[rng.choice(pick)]["amend"] = other.name
+    if rng.random() < 0.4:
+        at = next((i for i, x in enumerate(lines) if x["t"] >= 3600 and i > 0), None)
+        if at is not None:
+            for x in lines:
+                x.pop("amend", None)
+            lines[at]["amend"] = other.name
+    trace = _trace(tmp_path, lines)
+    ref = evaluate_files(V1, trace, None, [v2], HOUR)
+    mod = _module(tmp_path, V1, f"mon_am_{seed}")
+    got = mod.replay(trace.read_text().splitlines(keepends=True),
+                     versions={other.name: _model(other)}, run_versions=[_model(v2)],
+                     path=str(trace), period=3600)
+    ref.pop("file")
+    assert got == json.loads(json.dumps(ref))
+
+
+class TestAgentsVersionKey:
+    def test_without_versions(self, tmp_path):
+        ok = [dict(_read(0), quantities=[], epoch=EPOCH, version="1"), _read(10)]
+        r = _agents(tmp_path, ok)
+        assert [d[2] for d in _decisions(r)] == ["deny", "deny"]
+        from cadl.norms_eval import TraceError
+        bad = [dict(_read(0), quantities=[], epoch=EPOCH), dict(_read(10), version="2")]
+        with pytest.raises(TraceError, match="line 2: 'version' names '2', but no versions of "
+                                             "the run are given"):
+            _agents(tmp_path, bad, name="b.jsonl")
+
+    def test_named_versions_as_in_norms_eval(self, tmp_path):
+        lines = [dict(_read(0), quantities=[], epoch=EPOCH), dict(_read(10), version="2"),
+                 _read(20)]
+        r = _agents(tmp_path, lines, [AV2])            # no time base: named only
+        assert [d[2] for d in _decisions(r)] == ["deny", "allow", "allow"]
+        assert [a["file"] for a in r["amendments"]] == ["version 2"]
+        from cadl.norms_eval import TraceError
+        with pytest.raises(TraceError, match="by the effective times version 1"):
+            _agents(tmp_path, lines, [AV2], TimeBase(100), name="c.jsonl")
+        back = [dict(_read(0), quantities=[], epoch=EPOCH, version="2"),
+                dict(_read(10), version="1")]
+        with pytest.raises(TraceError, match="comes before version 2"):
+            _agents(tmp_path, back, [AV2], name="d.jsonl")
+
+
+class TestPossibleLaterVersion:
+    """A version without previous: whose effective time is not period 1 may
+    replace another (A2), so the D.5 monitors and Unity C# treat it so."""
+
+    def test_d5_and_unity_refuse(self, tmp_path):
+        from cadl.codegen import generate, norms_monitors
+        from cadl.parser import parse_file
+        later = _version(tmp_path, "l3.cadl", "3", None, "{ period: 3 }")
+        sos = parse_file(later)
+        for target in ("opa", "solidity"):
+            entry = next(m for m in norms_monitors(sos, target) if m["contract"] == "DELIVERY_SLA")
+            assert entry["text"] is None
+            assert "gives no previous: and takes effect at period 3" in entry["reasons"][0]
+        with pytest.raises(ValueError, match="an effective time other than period 1"):
+            generate(sos, tmp_path / "u", "unity-csharp")
+        kept = _version(tmp_path, "k3.cadl", "3", None, "{ period: 3 }",
+                        "    transitional: { default: keep }\n")
+        entry = next(m for m in norms_monitors(parse_file(kept), "opa")
+                     if m["contract"] == "DELIVERY_SLA")
+        assert entry["text"] is not None
+
+    def test_period_one_is_a_first_version(self, tmp_path):
+        from cadl.codegen import norms_monitors
+        from cadl.parser import parse_file
+        for path in (V1, EXAMPLES / "amendment_robot_town_v1.cadl"):
+            sos = parse_file(path)
+            assert all(m["text"] is not None or "previous" not in " ".join(m["reasons"])
+                       for m in norms_monitors(sos, "opa"))
+        # and the inference never places it after another version
+        first = _version(tmp_path, "f1.cadl", "1", None, None)
+        one = _version(tmp_path, "p1.cadl", "2", None, "{ period: 1 }")
+        with pytest.raises(NormsEvalError, match="one sequence"):
+            evaluate_files(first, TestPreviousInferred.SWITCH, None, [one], HOUR)

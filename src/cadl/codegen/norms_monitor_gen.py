@@ -401,7 +401,8 @@ _EVALUATE_TAIL = "return run_trace(contract, trace, loader, declared_actors(sos)
 _EVALUATE_REGIMES = "return run_regime_trace(contract, trace, bindings, declared_actors(sos))"
 # And a run with versions (Appendix K, K.11): the monitor of a file that
 # declares amendment 0.1 contains run_version_trace.
-_EVALUATE_VERSIONS = "return run_version_trace(contract.id, trace, chain, declared_actors)"
+_EVALUATE_VERSIONS = (
+    "return run_version_trace(contract.id, trace, chain, declared_actors, loader)")
 # A run with versions and regime bindings (K.11, from cadl 0.3.35).
 _EVALUATE_VERSION_REGIMES = (
     "return run_version_regime_trace(contract.id, trace, chain, declared_actors)")
