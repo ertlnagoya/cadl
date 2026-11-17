@@ -60,6 +60,22 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   enforcement point holds one version of the file and its boundary
   policy. A gateway refuses versions that change the actors or the
   counts_as rules that create `approval` or `rejection`.
+- `amend` together with versions: `cadl norms-eval` and the norms
+  monitor apply, at one observation, the versions that take effect first
+  and then the `amend`, as `cadl agents-run` and the gateways do (up to
+  0.3.34 refused; still refused when regime bindings combine with the
+  versions). The monitor no longer refuses a named version after an
+  `amend`.
+- `cadl agents-run` reads the trace key `version`: with versions of the
+  run it names the version in force as in `cadl norms-eval`; without, the
+  file's own `sos.version` is accepted and any other value refused.
+- A version without `previous:` whose effective time is not `period: 1`
+  may be a later version, so the norms monitors of the Rego and Solidity
+  targets and `unity-csharp` treat it as one: a contract whose running
+  instances switch to it gets no monitor (Unity C#: the file is refused).
+  A version without `previous:` and with no `effective:` or
+  `effective: { period: 1 }` is always a first version, also when
+  `previous:` is inferred.
 - Tests: wall-clock bounds that guard against blow-ups were raised so
   that a slow runner does not fail them: `test_groups_of_eight_members_are_translated`
   and `test_large_groups_are_refused_with_the_reason` from 120 s to
