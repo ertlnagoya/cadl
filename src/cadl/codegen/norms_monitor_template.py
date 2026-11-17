@@ -200,7 +200,7 @@ class NormsMonitor:
         self._actors = declared_actors(model)
         self._trace = Trace(observations=[], bindings=copy.deepcopy(dict(bindings or {})),
                             request=copy.deepcopy(dict(request or {})))
-        self._reader = _TraceReader(self._trace)
+        self._reader = _TraceReader(self._trace, MODEL.get("sos_version"))
         self._quantities = {_canon_actor(q) for q in (quantities or ())}
         self._versions = _Versions(versions)
         # False only in `replay`, for a trace with an amendment: `cadl
@@ -506,7 +506,8 @@ def replay(lines: Any, contract: str | None = None, versions: dict | None = None
     taken from all observations of the contract instance, and the instance
     ends at the last line unless that line says ``"end": false``."""
     lines = list(lines)
-    trace = parse_trace(lines, path=path)        # the whole trace is well-formed
+    # the whole trace is well-formed
+    trace = parse_trace(lines, path=path, own_version=MODEL.get("sos_version"))
     records = [loads_strict(line) for line in lines if line.strip()]
     where = [f"line {i}" for i, line in enumerate(lines, start=1) if line.strip()]
     # First find where the instance ends: what follows is not part of it.
@@ -768,7 +769,8 @@ def replay(lines: Any, contract: str | None = None, versions: dict | None = None
     """As above, for a trace that may name regimes."""
     lines = list(lines)
     regimes = RegimeBindings(_REGIMES["regimes"], _REGIMES["suspended"], _REGIMES["initial"])
-    trace = parse_trace_regimes(lines, path=path, bindings=regimes)
+    trace = parse_trace_regimes(lines, path=path, bindings=regimes,
+                                own_version=MODEL.get("sos_version"))
     records = [loads_strict(line) for line in lines if line.strip()]
     where = [f"line {i}" for i, line in enumerate(lines, start=1) if line.strip()]
     probe = NormsMonitor(contract, versions=versions, _option=_option)

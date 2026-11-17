@@ -868,11 +868,16 @@ class _TraceReader:
     """Reads the observations of one contract instance into a `Trace`, one
     at a time."""
 
-    def __init__(self, trace: Trace) -> None:
+    def __init__(self, trace: Trace, own_version: Any = False) -> None:
         self.trace = trace
         self.snapshot: dict[str, Any] = {}
         self.state: str | None = None
         self.prev_t: float | None = None
+        # The key ``version`` in a file that declares no versions of a run
+        # (Appendix K, K.11, from cadl 0.3.35): `own_version` is the
+        # sos.version of the file (None: it has none). False: the key is
+        # not read here (the trace of `cadl agents-run`).
+        self.own_version = own_version
 
     def add(self, rec: Any, where: str) -> Observation:
         """Check one observation and append it to the trace. Nothing is
@@ -880,6 +885,16 @@ class _TraceReader:
         trace = self.trace
         if not isinstance(rec, dict):
             raise TraceError(f"{where}: an observation must be a JSON object")
+        if "version" in rec and self.own_version is not False:
+            named, own = rec["version"], self.own_version
+            if own is None or not isinstance(named, str) or named != own:
+                got = f"'{named}'" if isinstance(named, str) else "a value that is not a string"
+                mine = ("and gives no sos.version" if own is None
+                        else f"and has one version, its sos.version '{own}'")
+                raise TraceError(
+                    f"{where}: 'version' names {got}, but the file declares no versions to "
+                    f"switch to (it has no amendment: block, Appendix K, K.11) {mine}")
+            rec = {k: v for k, v in rec.items() if k != "version"}
         unknown = sorted(set(rec) - _TRACE_KEYS)
         if unknown:
             raise TraceError(f"{where}: unknown key(s) {', '.join(unknown)}")
@@ -952,11 +967,12 @@ class _TraceReader:
         return obs
 
 
-def parse_trace(lines, path: str | None = None) -> Trace:
+def parse_trace(lines, path: str | None = None, own_version: Any = False) -> Trace:
     """Read a trace from an iterable of JSON Lines. The lifecycle state is
-    left as written; `evaluate` fills in the initial state."""
+    left as written; `evaluate` fills in the initial state. `own_version`:
+    see `_TraceReader`."""
     trace = Trace(observations=[], path=path)
-    reader = _TraceReader(trace)
+    reader = _TraceReader(trace, own_version)
     for lineno, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -975,9 +991,9 @@ def parse_trace(lines, path: str | None = None) -> Trace:
     return trace
 
 
-def load_trace(path) -> Trace:
+def load_trace(path, own_version: Any = False) -> Trace:
     with open(path, encoding="utf-8") as f:
-        return parse_trace(f, path=str(path))
+        return parse_trace(f, path=str(path), own_version=own_version)
 
 
 def _fmt_t(t: Any) -> str:
@@ -2762,11 +2778,12 @@ def _regime_check_state(o: Observation, contract: ContractDef) -> None:
 
 
 def parse_trace_regimes(lines, path: str | None = None,
-                        bindings: RegimeBindings | None = None) -> Trace:
+                        bindings: RegimeBindings | None = None,
+                        own_version: Any = False) -> Trace:
     """`parse_trace` for a trace that may name regimes: each observation
     gets the attribute ``regime``, the regime it names or None."""
     trace = Trace(observations=[], path=path)
-    reader = _TraceReader(trace)
+    reader = _TraceReader(trace, own_version)
     for lineno, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -3161,6 +3178,69 @@ class VersionInfo:
         return rule, (list(states) or None)
 
 
+def _effective_order(infos: list, base: Any) -> Any:
+    """A function that gives a comparable key of an effective time, or None
+    when the effective times of the versions cannot be ordered: with a
+    time base, the time stamp; without one, the period or the instant
+    itself when all versions use the same form of `effective:`."""
+    if base is not None:
+        def key(e: Any) -> Any:
+            return base.time_of(e)
+        if all(key(i.effective) is not None for i in infos if i.effective):
+            return key
+        return None
+    forms = {next(iter(i.effective)) for i in infos if i.effective}
+    if len(forms) > 1:
+        return None
+
+    def same_form(e: Any) -> Any:
+        (form, v), = e.items()
+        return int(v) if form == "period" else _epoch_seconds(str(v))
+    return same_form
+
+
+def _infer_previous(infos: list, base: Any) -> None:
+    """Give a version without `previous:` the version that it replaces
+    (Appendix K, K.11, from cadl 0.3.35): the version with the latest
+    effective time strictly earlier than its own, among the versions of the
+    run. A version without `effective:`, or with no version effective
+    earlier, is a first version and needs none. Refuse when this is
+    ambiguous: two candidates with the same effective time, or effective
+    times that cannot be ordered."""
+    if sum(1 for i in infos if i.previous is None) <= 1:
+        return                      # one first version: the sequence of 0.3.34
+    missing = [i for i in infos if i.previous is None and i.effective]
+    if not missing:
+        return
+    key = _effective_order(infos, base)
+
+    def ask(i: Any, why: str) -> NormsEvalError:
+        return NormsEvalError(
+            f"version {i.name} gives no previous:, and {why}; give previous: (Appendix K, "
+            f"K.11)")
+    if key is None:
+        raise ask(missing[0], "the effective times of the versions cannot be ordered "
+                              "(a period and an instant, or no time base for them)")
+    for i in missing:
+        own = key(i.effective)
+        earlier = [(key(j.effective), j) for j in infos
+                   if j is not i and j.effective and key(j.effective) < own]
+        firsts = [j for j in infos if j is not i and not j.effective]
+        if not earlier:
+            if firsts:
+                if len(firsts) > 1:
+                    raise ask(i, f"versions {', '.join(j.name for j in firsts)} give no "
+                                 f"effective: either")
+                i.previous = firsts[0].name
+            continue
+        latest = max(k for k, _ in earlier)
+        at = [j for k, j in earlier if k == latest]
+        if len(at) > 1:
+            raise ask(i, f"versions {', '.join(j.name for j in at)} take effect at the same "
+                         f"time before it")
+        i.previous = at[0].name
+
+
 class VersionChain:
     """The versions of a run, in the order of the sequence (K.11)."""
 
@@ -3172,11 +3252,13 @@ class VersionChain:
                     f"two versions of the run have the version '{name}'; the versions of a "
                     f"run have distinct sos.version (Appendix K, K.11)")
         by_name = {i.name: i for i in infos}
+        _infer_previous(infos, base if base is not None and base.given else None)
         heads = [i for i in infos if i.previous not in by_name]
         if len(heads) != 1:
             raise NormsEvalError(
                 "the versions do not form one sequence by previous: (Appendix K, K.11): "
-                + ("every version but the first must name the version before it with previous:"
+                + ("every version but the first must name the version before it with "
+                   "previous: or give effective: to place it after one"
                    if len(heads) > 1 else "previous: goes round in a circle"))
         order = [heads[0]]
         while len(order) < len(infos):
@@ -3600,6 +3682,12 @@ def _check_version_regimes(chain: VersionChain, contract_id: str, trace: Trace) 
                                  f"version {info.name} does not have {contract_id} in force)")
 
 
+def own_version(sos: SoSDefinition) -> str | None:
+    """The sos.version of a file as text, or None (Appendix K, K-2)."""
+    from .amendment import _scalar_text
+    return _scalar_text(getattr(sos, "version", None))
+
+
 def version_info(sos: SoSDefinition, path: Any = None) -> VersionInfo:
     """The version of a run that a parsed file is (Appendix K, K.11)."""
     from .amendment import amendment_declared, analyse
@@ -3775,10 +3863,11 @@ def evaluate_files(cadl_path, trace_path, contract_id: str | None = None,
             trace = parse_trace_versions(f, path=str(trace_path), chain=chain,
                                          bindings=bindings)
     elif bindings is None:
-        trace = load_trace(trace_path)
+        trace = load_trace(trace_path, own_version(sos))
     else:
         with open(trace_path, encoding="utf-8") as f:
-            trace = parse_trace_regimes(f, path=str(trace_path), bindings=bindings)
+            trace = parse_trace_regimes(f, path=str(trace_path), bindings=bindings,
+                                        own_version=own_version(sos))
     if (notes is not None and version_paths and chain is not None and not chain.timed
             and not names_version(trace)):
         notes.append("--version is given, but there is no time base (--period, --epoch) and "

@@ -240,6 +240,9 @@ def build_model(sos: SoSDefinition) -> dict:
         "actors": [_encode(dataclasses.replace(a.id, loc=None)) for a in sos.actors],
         "contracts": [_contract_model(c) for c in sos.contracts],
         "parsed": _record_parses(sos.contracts),
+        # the one version of a file without versions of a run, for the key
+        # `version` of an observation (Appendix K, K.11, from cadl 0.3.35)
+        "sos_version": norms_eval.own_version(sos),
     }
     bindings = norms_eval.regime_bindings(sos)
     if bindings is not None:

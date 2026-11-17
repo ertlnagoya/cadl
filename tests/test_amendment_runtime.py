@@ -141,10 +141,16 @@ class TestNormsEval:
             evaluate_files(V1, _trace(tmp_path, lines), None, [V2], HOUR)
 
     def test_version_key_without_the_extension(self, tmp_path):
-        # as in cadl 0.3.33: the key is unknown for a file without the extension
+        # from cadl 0.3.35 the key is read also for a file without the
+        # extension: its own sos.version is accepted, another value refused
         f = EXAMPLES / "norms_amendment_v1.cadl"
-        with pytest.raises(TraceError, match="unknown key"):
+        with pytest.raises(TraceError, match="declares no versions to switch to .* "
+                                             "sos.version '1.0.0'"):
             evaluate_files(f, _trace(tmp_path, [{"t": 0, "version": "1"}]))
+        same = evaluate_files(f, _trace(tmp_path, [{"t": 0, "version": "1.0.0"}], "s.jsonl"))
+        plain = evaluate_files(f, _trace(tmp_path, [{"t": 0}], "p.jsonl"))
+        same.pop("trace"), plain.pop("trace")
+        assert same == plain
         with pytest.raises(NormsEvalError, match="does not declare 'amendment: 0.1'"):
             evaluate_files(f, _trace(tmp_path, [{"t": 0}]), None, [V2])
 
