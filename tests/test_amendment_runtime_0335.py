@@ -596,8 +596,10 @@ class TestAgentsRun:
         plain = [dict(x) for x in lines]
         for e, name in zip(eff, ("av2.cadl", "av3.cadl")):
             at = next((i for i, x in enumerate(plain) if x["t"] >= e and i > 0), None)
-            if at is None or "amend" in plain[at]:
-                return               # one amend per line; no switch inside the trace
+            if at is None:
+                break                # this version does not take effect in the trace
+            if "amend" in plain[at]:
+                return               # one amend per line
             plain[at]["amend"] = name
         ref = _agents(tmp_path, plain, (), None, "p.jsonl")
         assert _decisions(got) == _decisions(ref)
