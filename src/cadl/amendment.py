@@ -1132,6 +1132,21 @@ class _Checker:
         return out
 
 
+def first_only(effective) -> bool:
+    """Whether a version that gives no `previous:` and this `effective:`
+    is always a first version of its run (Appendix K, K.11, from cadl
+    0.3.35): it gives no effective time, or the first period. Any other
+    effective time may come after that of another version, so such a
+    version may replace one."""
+    return not effective or dict(effective) == {"period": 1}
+
+
+def may_replace(a) -> bool:
+    """Whether the version of an analysis may replace another one: it names
+    it with `previous:`, or its effective time may come after another."""
+    return a.previous is not None or not first_only(a.effective)
+
+
 def analyse(sos: SoSDefinition) -> Analysis:
     """Interpret the keys of the extension (whether or not it is declared)."""
     return _Checker(sos).run()

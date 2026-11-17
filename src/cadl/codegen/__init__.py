@@ -146,7 +146,9 @@ def _check_unity_versions(sos: SoSDefinition) -> None:
     moved = [c.id for c in sos.contracts if c.lifecycle is not None and c.id in switching]
     if moved:
         raise ValueError(
-            f"target 'unity-csharp': this version replaces another (amendment.previous) and "
+            f"target 'unity-csharp': this version replaces another (amendment.previous, or "
+            f"from cadl 0.3.35 an effective time other than period 1 without previous:, "
+            f"which may come after another version) and "
             f"the running instances of {', '.join(moved)} switch to it (Appendix K, K.4); the "
             f"generated lifecycle instances cannot be moved to a new version, so the file is "
             f"refused (K.11); declare 'keep' for these contracts in amendment.transitional")
