@@ -72,6 +72,7 @@ from typing import Any, Callable
 from . import agents as G
 from .audit_log import AuditKeyError, canonical, loads_unique, read_key
 from .gateway_core import (  # noqa: F401 - the names of this module before 0.3.25
+    gateway_versions,
     _AFTER_DEADLINE,
     _IDENT_HOLD_RE,
     _IDENT_RE,
@@ -150,7 +151,8 @@ class Gateway(EnforcementPoint):
                  insecure_approvals: bool = False,
                  allow_methods: tuple = (),
                  run_id: str | None = None,
-                 hold_key: bytes | None = None) -> None:
+                 hold_key: bytes | None = None,
+                 run_versions: list | None = None, base=None) -> None:
         self.to_client = to_client
         self.to_server = to_server
         self.filter_tools = filter_tools
@@ -173,7 +175,8 @@ class Gateway(EnforcementPoint):
         self.approval_rules = self._approval_rules(self.server, self.agent)
         self._check_approvable(self.server)
         self._open(audit, trace_out, key, inbox, init, clock, wall, approver_keys,
-                   insecure_approvals, run_id, hold_key=hold_key)
+                   insecure_approvals, run_id, hold_key=hold_key, run_versions=run_versions,
+                   base=base)
 
     # --- client -> server -------------------------------------------------------
 
@@ -590,7 +593,8 @@ def cli_gateway(args) -> int:
                        filter_tools=not args.no_filter_tools, approver_keys=ring,
                        hold_key=read_key(args.hold_key) if args.hold_key else None,
                        insecure_approvals=args.insecure_approvals,
-                       allow_methods=tuple(args.allow_method))
+                       allow_methods=tuple(args.allow_method),
+                       **gateway_versions(args))
         code = serve(gw_args, server, poll=args.poll, restore_signals=False)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)

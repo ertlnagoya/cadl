@@ -638,7 +638,12 @@ class _BoundaryEngine(_Engine):
             norm.verdict = "excused"
             norm.reason += "; excused: the contract denied or held the content (G.5)"
 
-    def _amend(self, n: int, name: str) -> None:
+    def _amend(self, n: int, name: Any) -> None:
+        if isinstance(name, tuple):
+            # versions that take effect at this line, then an `amend` (K.11)
+            for label in name:
+                self._amend(n, label)
+            return
         old = {nid: self.by_id[nid].d for nid in self.kept}
         super()._amend(n, name)
         self._harden()
@@ -838,7 +843,8 @@ class AgentsRuntime:
 
     def __init__(self, sos: SoSDefinition, trace: RunTrace | None = None,
                  versions: dict | None = None, check: bool = True,
-                 path: str | None = None) -> None:
+                 path: str | None = None, run_versions: Any = None,
+                 base: Any = None) -> None:
         if not G.agents_active(sos):
             raise NormsEvalError(
                 "the file does not declare the agent governance extension: add "
@@ -890,8 +896,96 @@ class AgentsRuntime:
         self._bare -= set(self.policy["actors"]) | {"now", "state", "request"}
         self._valued: set[str] = set()
         self.host_managed: set[str] = set()
+        self._chain_of(sos, run_versions, base)
         if trace.lines:
             self._begin(trace.lines[0])
+
+    # --- versions of a run (Appendix K, K.11, from cadl 0.3.35) -----------------------
+
+    def _chain_of(self, sos: SoSDefinition, run_versions: Any, base: Any) -> None:
+        """The versions of the run (the file and `run_versions`, parsed
+        files) and the time base: at the first line whose time reaches the
+        effective time of a version, the enforcement point switches to it.
+        None of this without versions and without a time base."""
+        from .norms_eval import VersionChain, version_info
+        self.chain = None
+        self._vk: Any = None
+        run_versions = list(run_versions or ())
+        if not run_versions and (base is None or not base.given):
+            return
+        infos = [version_info(sos, "the file")]
+        for k, v in enumerate(run_versions):
+            if not G.agents_active(v):
+                raise NormsEvalError(f"version {k + 2} of the run does not declare 'norms: 0.1' "
+                                     f"and 'agents: 0.1'")
+            if self.check:
+                _require_valid(v, f"version {getattr(v, 'version', k + 2)}")
+            infos.append(version_info(v, f"version {getattr(v, 'version', k + 2)}"))
+        self.chain = VersionChain(infos, base)
+        ids = [c["id"] for c in self.policy["contracts"]]
+        for info in self.chain.infos:
+            label = f"version {info.name}"
+            other = [c["id"] for c in G.build_policy(info.sos)["contracts"]]
+            if other != ids:
+                raise NormsEvalError(
+                    f"{label} of the run has other enforced contracts ({', '.join(other) or 'none'}) "
+                    f"than the file ({', '.join(ids)}); the runtime switches the definitions of "
+                    f"contracts but does not add or remove enforced contracts")
+            self.versions[label] = info.sos
+        if not self.chain.timed:
+            self.warnings.append(
+                "versions are given, but there is no time base (--period, --epoch), so the "
+                "first version is in force throughout (Appendix K, K.11)")
+
+    def _version_time(self, t: Any) -> Any:
+        """The time stamp of the time base for the time t of a line: with
+        --epoch and an 'epoch' on the first line, t counts from that instant."""
+        from fractions import Fraction as _F
+        base = self.chain.base
+        if base.epoch and self.trace.epoch is not None:
+            d = self.trace.epoch - datetime(1970, 1, 1, tzinfo=timezone.utc)
+            return _F(t) + _F(d.days * 86400 + d.seconds) + _F(d.microseconds, 1000000)
+        return t
+
+    def _versions_at(self, t: Any) -> list:
+        """The indices of the versions that take effect at a line at time t,
+        in order. At the first line the version in force is set and
+        nothing takes effect."""
+        if self.chain is None:
+            return []
+        k = self.chain.by_time(self._version_time(t)) if self.chain.timed else 0
+        if self._vk is None:
+            self._vk = k
+            info = self.chain.infos[k]
+            if info.sos is not self.sos:
+                self.sos, self.policy = info.sos, G.build_policy(info.sos)
+            return []
+        out = list(range(self._vk + 1, k + 1))
+        self._vk = k
+        return out
+
+    def _check_rule(self, v: int, changed: list, t: Any) -> None:
+        """Appendix K, K.11: a running instance of a contract that changes
+        follows the transitional rule of the new version. The enforcement
+        point holds one version of the file (one boundary policy), so it
+        switches instances; `keep` and `switch` with `in_states:` are
+        refused when a running instance would need them."""
+        info = self.chain.infos[v]
+        for cid in changed:
+            rule, states = info.rule_for(cid)
+            if rule == "switch" and not states:
+                continue
+            running = [i.name for i in self._running() if i.contract == cid]
+            if not running:
+                continue
+            what = "keep" if rule == "keep" else f"switch in {', '.join(states)}"
+            raise NormsEvalError(
+                f"at t={_fmt_t(t)} version {info.name} takes effect and its transitional rule "
+                f"for {cid} is {what}, while instance(s) {', '.join(running)} of {cid} are "
+                f"running: the enforcement point holds one version of the file and its "
+                f"boundary policy, so it cannot keep an instance on another version or let "
+                f"it wait (Appendix K, K.11); declare switch for {cid}, or end the instances "
+                f"before the effective time")
 
     def _begin(self, head: Line) -> None:
         """Which contracts have host-created instances is known at the first
@@ -1133,9 +1227,10 @@ class AgentsRuntime:
                     self.policy, self._contract(inst.contract), sender, receiver,
                     m["name"])):
                 continue
+            amends = amend or {}
             o = Observation(t=t, values=self._snapshot, messages=[m] if m else [],
                             state=inst.state, state_after=inst.state, end=None,
-                            amend=(amend or {}).get(inst.contract))
+                            amend=amends.get(inst.key, amends.get(inst.contract)))
             self._push(inst, o, (exempt or {}).get(inst.key, ()))
         self._current = None
         for hold in self._resolve(m, t):             # G.6, "after step 6"
@@ -1501,7 +1596,7 @@ class AgentsRuntime:
 
     # --- amendments (F.6, G.7) ----------------------------------------------------------------
 
-    def _prepare_amendment(self, name: str, t: float):
+    def _prepare_amendment(self, name: str, t: float, scheduled: bool = False):
         new = self._load(name)
         if not G.agents_active(new):
             raise NormsEvalError(f"{name} does not declare 'norms: 0.1' and 'agents: 0.1'")
@@ -1517,7 +1612,7 @@ class AgentsRuntime:
                    if _plain(self._ast(cid)) != _plain(next(c for c in new.contracts
                                                             if c.id == cid))]
         from .norms_eval import amend_rule_warning
-        for cid in changed:                        # Appendix K, K.11
+        for cid in changed if not scheduled else ():   # Appendix K, K.11
             note = amend_rule_warning(new, name, cid, t)
             if note is not None and note not in self.warnings:
                 self.warnings.append(note)
@@ -1564,6 +1659,17 @@ class AgentsRuntime:
         for e in line.host_events:
             self._event(t, e["event"], e["message"], [], hold_id=e["hold_id"],
                         reason=e["reason"])
+        # Versions that take effect at this line (Appendix K, K.11): before
+        # the instances of this line are created, which start under the
+        # version in force; then an `amend` of the line.
+        running = [i for i in self._running()]
+        scheduled = []
+        for v in self._versions_at(t):
+            label = f"version {self.chain.infos[v].name}"
+            prep = self._prepare_amendment(label, t, scheduled=True)
+            self._check_rule(v, prep[2], t)
+            scheduled.append((label, *prep))
+            self.sos, self.policy = prep[0], prep[1]
         amendment = self._prepare_amendment(o.amend, t) if o.amend else None
 
         entries = {(e["contract"], e["instance"]): e for e in line.instances}
@@ -1609,7 +1715,16 @@ class AgentsRuntime:
 
         # The time and the values of the line, and an amendment (F.6).
         amend = {c: o.amend for c in amendment[2]} if amendment else None
+        if scheduled:
+            amend = dict(amend or {})
+            for inst in running:
+                labels = tuple(lab for lab, _, _, changed in scheduled if inst.contract in changed)
+                if amendment and inst.contract in amendment[2]:
+                    labels += (o.amend,)
+                amend[inst.key] = labels or None
         self._observe(None, t, amend=amend)
+        for label, new, policy, changed in scheduled:
+            self._finish_amendment(label, new, policy, changed, t)
         if amendment:
             self._finish_amendment(o.amend, *amendment, t)
 
@@ -1658,7 +1773,8 @@ class AgentsRuntime:
 
     @classmethod
     def open(cls, sos, versions: dict | None = None, check: bool = True,
-             path: str | None = None) -> "AgentsRuntime":
+             path: str | None = None, run_versions: Any = None,
+             base: Any = None) -> "AgentsRuntime":
         """An enforcement point that is driven one line at a time:
         `observe` for each line as it happens, `close` at the end. `sos` is
         a parsed file or the path of one. `path` is the path that a trace of
@@ -1670,7 +1786,7 @@ class AgentsRuntime:
         line ``{"t": time}``: `run` is a loop over the same steps."""
         if not isinstance(sos, SoSDefinition):
             sos = load_version(sos)
-        return cls(sos, None, versions, check, path=path)
+        return cls(sos, None, versions, check, path=path, run_versions=run_versions, base=base)
 
     def observe(self, line: dict) -> dict:
         """Process one trace line (a dict with the keys of a trace line) at
@@ -1874,7 +1990,7 @@ def _require_valid(sos: SoSDefinition, what: str) -> None:
 
 
 def run(sos: SoSDefinition, trace: RunTrace, versions: dict | None = None,
-        check: bool = True) -> dict:
+        check: bool = True, run_versions: Any = None, base: Any = None) -> dict:
     """Replay a trace through the enforcement point of a file (G.5 to
     G.8). `versions` maps the value of an ``amend`` key to a parsed file;
     a value that is not in it is read as a path relative to the trace
@@ -1885,8 +2001,15 @@ def run(sos: SoSDefinition, trace: RunTrace, versions: dict | None = None,
     otherwise NormsEvalError or TraceError is raised. ``check=False``
     switches both tests off. It is **unsafe**: the runtime then relies on
     its fail-closed resolution of unknown occurrences alone. It exists for
-    the tests of that resolution."""
-    return AgentsRuntime(sos, trace, versions, check).run()
+    the tests of that resolution.
+
+    `run_versions` (parsed files) are the later versions of the run and
+    `base` its time base (`cadl.norms_eval.TimeBase`, Appendix K, K.11):
+    at the first line whose time reaches the effective time of a version,
+    the enforcement point switches to it before anything else at that line
+    and before an `amend` of the line (from cadl 0.3.35)."""
+    return AgentsRuntime(sos, trace, versions, check, run_versions=run_versions,
+                         base=base).run()
 
 
 def run_files(cadl_path, trace_path) -> dict:
