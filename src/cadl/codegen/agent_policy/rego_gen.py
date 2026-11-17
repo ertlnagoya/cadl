@@ -31,8 +31,43 @@ def _comment(text: str) -> str:
     return " ".join(str(text).split())
 
 
+# The lines of the library that read the current regime, for a file whose
+# regime bindings take an enforced contract out of force in some regime
+# (Appendix A, A.7.1): the input names the regime, and a contract that it
+# does not have in force governs no message.
+_REGIME_EDITS = [
+    ("""governing contains c.id if {
+	some c in policy.contracts
+	party_match(c, sender)""", """governing contains c.id if {
+	some c in policy.contracts
+	contract_in_force(c)
+	party_match(c, sender)"""),
+    ("""governing contains c.id if {
+	some c in policy.contracts
+	tool_server""", """governing contains c.id if {
+	some c in policy.contracts
+	contract_in_force(c)
+	tool_server"""),
+    ("""	instances_ok
+}
+""", """	instances_ok
+	regime_ok
+}
+
+# The current regime (regimes:, Appendix A, A.7.1): a regime of the file.
+regime_ok if {
+	is_string(input.regime)
+	input.regime in policy.regimes.regimes
+}
+
+# A contract that the current regime does not have in force governs nothing.
+contract_in_force(c) if not c.id in policy.regimes.out[input.regime]
+"""),
+]
+
+
 def generate_agent_rego_text(sos: SoSDefinition) -> str:
-    policy = build_policy(sos)
+    policy = build_policy(sos, regimes=True)
     lines: list[str] = []
     add = lines.append
 
@@ -42,6 +77,10 @@ def generate_agent_rego_text(sos: SoSDefinition) -> str:
     add("#")
     add("# input:  the policy input of G.10 (message; optional now; optional instances")
     add("#         with bindings, in_force and derived).")
+    if "regimes" in policy:
+        add("#         regime: the current regime, one of " + ", ".join(policy["regimes"]["regimes"])
+            + " (regimes:, Appendix A, A.7.1);")
+        add("#         a contract that it does not have in force governs no message.")
     add(f"# output: data.{PACKAGE}.result, the result object of G.10 (decision, reason,")
     add("#         contracts, norms, provenance, escalate_to, timeout, fallback, notify),")
     add(f"#         and data.{PACKAGE}.decision (allow, deny or escalate).")
@@ -93,7 +132,12 @@ def generate_agent_rego_text(sos: SoSDefinition) -> str:
     else:
         add("policy := json.unmarshal(`" + text + "`)")
     add("")
-    add(_LIBRARY_HEAD.strip("\n"))
+    head = _LIBRARY_HEAD.strip("\n")
+    if "regimes" in policy:
+        for old, new in _REGIME_EDITS:
+            assert head.count(old) == 1, old
+            head = head.replace(old, new)
+    add(head)
     add("")
     add("# --- Norms -------------------------------------------------------------------")
     add("# One rule per permission and prohibition that takes part in decisions.")

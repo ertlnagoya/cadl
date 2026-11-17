@@ -72,12 +72,14 @@ from typing import Any
 from . import agents as G
 from .ast_nodes import ActorRef, SoSDefinition
 from .norms_eval import (
+    _END_LAST,
     UNKNOWN,
     NormsEvalError,
     Observation,
     Trace,
     TraceError,
     _Engine,
+    _RegimeEngine,
     _TraceReader,
     _fmt_t,
     _table,
@@ -111,6 +113,10 @@ class Line:
     # K.11), or None; `missing` when the line does not have the key.
     version: Any = None
     has_version: bool = False
+    # The regime that the line names (`regime`, Appendix A, A.7.1), or
+    # None; checked by the runtime, which knows the regimes of the file.
+    regime: Any = None
+    has_regime: bool = False
 
 
 @dataclass
@@ -182,7 +188,9 @@ HOST_EVENTS = ("method_refused", "unsolicited_response", "unauthorised_approval"
                "task_cancel", "overloaded", "read_timeout",
                # cadl a2a-gateway: mutual TLS and push notifications
                "handshake_failed", "push_config", "push_refused", "push_sent",
-               "push_failed", "push_dropped")
+               "push_failed", "push_dropped",
+               # a change of regime that a gateway accepts or refuses (0.3.36)
+               "regime_change", "regime_refused")
 _HOST_EVENT_KEYS = {"event", "reason", "hold_id", "message"}
 
 
@@ -217,10 +225,14 @@ def _first_line_keys(rec: dict, where: str, first: bool) -> tuple:
     `withdraw` and `host_events`."""
     epoch = quantities = hosted = None
     more: dict[str, Any] = {"run_id": None, "approvals": None, "withdraw": [],
-                            "host_events": [], "version": None, "has_version": False}
+                            "host_events": [], "version": None, "has_version": False,
+                            "regime": None, "has_regime": False}
     if "version" in rec:            # checked by the runtime, which knows the versions
         more["version"] = rec.pop("version")
         more["has_version"] = True
+    if "regime" in rec:             # checked by the runtime, which knows the regimes
+        more["regime"] = rec.pop("regime")
+        more["has_regime"] = True
     if "approvals" in rec:
         if not first:
             raise TraceError(f"{where}: 'approvals' is allowed only on the first line")
@@ -319,7 +331,8 @@ def parse_run_trace(lines, path: str | None = None) -> RunTrace:
     return RunTrace(
         lines=[Line(obs=o, state=s, instances=e, lineno=n, withdraw=x["withdraw"],
                     host_events=x["host_events"], version=x["version"],
-                    has_version=x["has_version"])
+                    has_version=x["has_version"], regime=x["regime"],
+                    has_regime=x["has_regime"])
                for o, (s, e, n, x) in zip(base.observations, extras)],
         bindings=base.bindings, request=base.request, epoch=epoch, path=path,
         quantities=quantities, host_instances=hosted, run_id=run_id,
@@ -363,7 +376,8 @@ class RunTraceReader:
         _check_epoch_range(trace.epoch, obs.t, lineno)
         line = Line(obs=obs, state=state, instances=entries, lineno=lineno,
                     withdraw=more["withdraw"], host_events=more["host_events"],
-                    version=more["version"], has_version=more["has_version"])
+                    version=more["version"], has_version=more["has_version"],
+                    regime=more["regime"], has_regime=more["has_regime"])
         trace.lines.append(line)
         return line
 
@@ -425,6 +439,13 @@ class _Instance:
         self.engine: _BoundaryEngine = None       # type: ignore[assignment]
         self.derived: dict[str, list[_Derived]] = {}
         self.until_terms: dict[str, _Term] = {}
+        # The clock of the contract (regimes, F.5): when the contract left
+        # force, the time it spent not in force before, the clock at the
+        # current line, and the versions that took effect meanwhile.
+        self.out_since: Any = None
+        self.offset: Any = 0
+        self.clock: Any = started
+        self.deferred: list = []
 
     @property
     def key(self) -> tuple[str, str]:
@@ -628,8 +649,20 @@ class _BoundaryEngine(_Engine):
         self.owner._after_step1(self.inst, n, created)        # G.6, "after step 1"
         super()._powers(n, created)
 
+    def _clock(self, n: int) -> Any:
+        """The time on which the deadlines of observation n are measured:
+        the time of the trace (the clock of the contract with regimes)."""
+        return self.obs[n].t
+
+    def _at(self, x: Any, n: int) -> Any:
+        """The time of the trace at the clock x, at most that of observation n."""
+        return x
+
+    def _base_amend(self, n: int, name: Any) -> None:
+        super()._amend(n, name)
+
     def _set(self, norm, n: int, state: str, reason: str, log: bool = True) -> None:
-        t = self.obs[n].t
+        t = self._clock(n)
         excused = False
         if state == "violated" and norm.d.kind == "prohibition":
             remaining = None
@@ -641,7 +674,7 @@ class _BoundaryEngine(_Engine):
             due = t
             if norm.deadline is not None and norm.elapsed(t) > norm.deadline:
                 due = t - (norm.elapsed(t) - norm.deadline)
-            excused = self.owner._blocked(self.inst, norm, due)
+            excused = self.owner._blocked(self.inst, norm, self._at(due, n))
         super()._set(norm, n, state, reason, log)
         if excused and norm.verdict == "violated":
             norm.verdict = "excused"
@@ -654,7 +687,7 @@ class _BoundaryEngine(_Engine):
                 self._amend(n, label)
             return
         old = {nid: self.by_id[nid].d for nid in self.kept}
-        super()._amend(n, name)
+        self._base_amend(n, name)
         self._harden()
         new = {d.id: d for d in self.contract.norms}
         for nid, k in self.kept.items():
@@ -664,7 +697,7 @@ class _BoundaryEngine(_Engine):
 
     def _after(self, n: int) -> None:
         """Keep the in-force flag of the violated prohibitions (G.5)."""
-        t = self.obs[n].t
+        t = self._clock(n)
         for nid, k in self.kept.items():
             if not k["on"]:
                 continue
@@ -832,6 +865,54 @@ class _BoundaryEngine(_Engine):
         return False
 
 
+class _BoundaryRegimeEngine(_BoundaryEngine, _RegimeEngine):
+    """`_BoundaryEngine` for a run whose regime bindings take an enforced
+    contract out of force (Appendix A, A.7.1, "Runs"; F.5, "Contracts not
+    in force"), from cadl 0.3.36. The runtime pushes only the observations
+    at which the contract is in force, and the one at which the instance
+    ends while it is not; every observation carries the clock of the
+    contract (``c``, the time of the trace without the time the contract
+    spent not in force since the instance was created) and ``out``. The
+    deadlines, the windows of the temporal items and the in-force flag of
+    a violated prohibition (G.5) are measured on that clock, as in
+    `cadl norms-eval` (`_RegimeEngine`). A version that takes effect while
+    the contract is not in force reaches the instance at the next
+    observation that it sees (K.11, "Versions and regimes")."""
+
+    def _clock(self, n: int) -> Any:
+        return self.obs[n].c
+
+    def _at(self, x: Any, n: int) -> Any:
+        return self._real(x, n)
+
+    def _base_amend(self, n: int, name: Any) -> None:
+        _Engine._amend(self, n, name)          # _RegimeEngine refuses `amend`
+
+    def _step(self, n: int, is_last: bool) -> bool:
+        o = self.obs[n]
+        if not o.out:
+            return super()._step(n, is_last)
+        # The instance ends at an observation at which the contract is not
+        # in force: the versions that took effect meanwhile, then the
+        # settlement on the stopped clock (F.5, item 6).
+        self._amend_violated = []
+        if n == 0:
+            self._start()          # the instance starts and ends here
+        if o.amend:
+            self._amend(n, o.amend)
+        self._check_state(n)
+        for norm in self._amend_violated:
+            self._on_violation(norm, n, activate=False)
+        if self.lifecycle and o.state_after in self.lifecycle.terminal:
+            reason = f"terminal state {o.state_after}"
+        elif o.end is True:
+            reason = "end of the instance in the trace"
+        else:
+            reason = _END_LAST
+        self._settle(n, f"{reason}, while the contract is not in force")
+        return True
+
+
 def _plain(obj: Any) -> Any:
     """A definition without source locations, for comparison."""
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
@@ -865,7 +946,7 @@ class AgentsRuntime:
         if check:
             _require_valid(sos, "the file")
         self.sos = sos
-        self.policy = G.build_policy(sos)
+        self.policy = G.build_policy(sos, regimes=True)
         # Offline, `trace` holds every line; online (`open`), the reader
         # fills it one line at a time and `path` is where versions named by
         # `amend` are looked up.
@@ -906,6 +987,7 @@ class AgentsRuntime:
         self._valued: set[str] = set()
         self.host_managed: set[str] = set()
         self._chain_of(sos, run_versions, base)
+        self._regimes_of()
         if trace.lines:
             self._begin(trace.lines[0])
 
@@ -934,7 +1016,7 @@ class AgentsRuntime:
         ids = [c["id"] for c in self.policy["contracts"]]
         for info in self.chain.infos:
             label = f"version {info.name}"
-            other = [c["id"] for c in G.build_policy(info.sos)["contracts"]]
+            other = [c["id"] for c in G.build_policy(info.sos, regimes=True)["contracts"]]
             if other != ids:
                 raise NormsEvalError(
                     f"{label} of the run has other enforced contracts ({', '.join(other) or 'none'}) "
@@ -993,7 +1075,7 @@ class AgentsRuntime:
             self._vk = k
             info = self.chain.infos[k]
             if info.sos is not self.sos:
-                self.sos, self.policy = info.sos, G.build_policy(info.sos)
+                self.sos, self.policy = info.sos, G.build_policy(info.sos, regimes=True)
             return []
         out = list(range(self._vk + 1, k + 1))
         self._vk = k
@@ -1021,6 +1103,101 @@ class AgentsRuntime:
                 f"boundary policy, so it cannot keep an instance on another version or let "
                 f"it wait (Appendix K, K.11); declare switch for {cid}, or end the instances "
                 f"before the effective time")
+
+    # --- regimes of a run (Appendix A, A.7.1, "Runs"; from cadl 0.3.36) ----------------
+
+    def _regimes_of(self) -> None:
+        """The regimes of the run: the file's, or with versions those of any
+        of its versions. `regimes_on` when the bindings of some version take
+        an enforced contract out of force; only then does the enforcement
+        point follow the current regime (a line names it with the key
+        `regime`; before the first such line the run is in the initial
+        regime of A.7.1). Without that the results are those of 0.3.35."""
+        from .norms_eval import regime_bindings
+        files = [self.sos] if self.chain is None else [i.sos for i in self.chain.infos]
+        self._bindings = [regime_bindings(f) for f in files]
+        self.regime: Any = None
+        self._named_regimes: list = []
+        for b in self._bindings:
+            if b is not None:
+                self._named_regimes += [r for r in b.regimes if r not in self._named_regimes]
+        self.regimes_on = any("regimes" in G.build_policy(f, regimes=True) for f in files)
+        self._seen: list = []           # the regimes current at some line
+        self._used: list = []           # the versions in force at some line
+
+    def _named_regime(self, line: Line) -> Any:
+        """The regime that a line names with the key `regime`, or None."""
+        if not line.has_regime:
+            return None
+        where = f"line {line.lineno}"
+        if not any(b is not None for b in self._bindings):
+            what = "no version of the run has" if self.chain is not None else "the file has no"
+            raise TraceError(f"{where}: 'regime' names the current regime, but {what} "
+                             f"regimes: block (Appendix A, A.7.1)")
+        regime = line.regime
+        if not isinstance(regime, str) or regime not in self._named_regimes:
+            got = f"'{regime}'" if isinstance(regime, str) else "a value that is not a string"
+            raise TraceError(f"{where}: 'regime' must name a regime of the file "
+                             f"({', '.join(self._named_regimes)}), got {got}")
+        return regime
+
+    def _enter_regime(self, named: Any, first: bool, t: Any) -> None:
+        """The current regime of a line (A.7.1, "Runs"): the one it names,
+        or the one of the line before; at the first line, without a name,
+        the initial regime of the version in force. With versions, a regime
+        that is current at some line must be a regime of every version that
+        the run uses (K.11, "Versions and regimes", as `cadl norms-eval`)."""
+        from .norms_eval import regime_bindings
+        if named is not None:
+            self.regime = named
+        elif first:
+            b = regime_bindings(self.sos)
+            self.regime = None if b is None else b.initial
+        if self.chain is None:
+            return
+        infos = self.chain.infos
+        if self._vk not in self._used:
+            self._used.append(self._vk)
+        if self.regime not in self._seen:
+            self._seen.append(self.regime)
+        for v in self._used:
+            b = self._bindings[v]
+            for r in self._seen:
+                if (b is None) if r is None else (b is not None and r in b.regimes):
+                    continue
+                if r is None:
+                    other = next(infos[u].name for u in self._used if self._bindings[u] is None)
+                    raise NormsEvalError(
+                        f"at t={_fmt_t(t)}: version {infos[v].name} binds regimes (regimes:) "
+                        f"and version {other}, also used by the run, has none, so the run is "
+                        f"in no regime of version {infos[v].name}; a regime of a run with "
+                        f"versions must be a regime of every version that the run uses "
+                        f"(Appendix K, K.11)")
+                raise NormsEvalError(
+                    f"at t={_fmt_t(t)}: the run is in regime {r}, which is not a regime of "
+                    f"version {infos[v].name}"
+                    + ("" if b is not None else " (it has no regimes:)")
+                    + "; a regime of a run with versions must be a regime of every version "
+                      "that the run uses (Appendix K, K.11)")
+
+    def in_force(self, cid: str) -> bool:
+        """Whether an enforced contract is in force in the current regime,
+        by the bindings of the version in force (A.7.1)."""
+        bound = self.policy.get("regimes")
+        return bound is None or self.regime is None or cid not in bound["out"].get(self.regime, ())
+
+    def _tick(self, inst: _Instance, t: Any) -> None:
+        """The clock of an instance at a line at time t (F.5): it stops
+        while the contract is not in force."""
+        if self.in_force(inst.contract):
+            if inst.out_since is not None:
+                inst.offset += t - inst.out_since
+                inst.out_since = None
+            inst.clock = t - inst.offset if inst.offset else t
+        else:
+            if inst.out_since is None:
+                inst.out_since = t
+            inst.clock = inst.out_since - inst.offset
 
     def _begin(self, head: Line) -> None:
         """Which contracts have host-created instances is known at the first
@@ -1081,7 +1258,7 @@ class AgentsRuntime:
             if contracts is not None:
                 if c["id"] not in contracts:
                     continue
-            elif not (sender and receiver
+            elif not (sender and receiver and self.in_force(c["id"])
                       and G.governs(self.policy, c, sender, receiver, m["name"])):
                 continue
             out += [{"contract": i.contract, "instance": i.name}
@@ -1159,15 +1336,22 @@ class AgentsRuntime:
         self._require_bindings(cid, name, bindings)
         inst = _Instance(cid, name, dict(bindings), dict(request), t)
         inst.state = state
-        trace = Trace(observations=[], bindings=inst.bindings, request=inst.request,
-                      path=self.trace.path)
-        inst.engine = _BoundaryEngine(self._ast(cid), trace, self._load, self, inst)
-        inst.engine.ev.known = self._known_names(inst)
-        inst.engine.ev.actors = declared_actors(self.sos)
-        self._build_until(inst)
+        self._engine(inst)
+        if self.regimes_on:
+            self._tick(inst, t)
         self.instances.append(inst)
         self._event(t, "instance_start", None, [self._where(inst)])
         return inst
+
+    def _engine(self, inst: _Instance) -> None:
+        """A new verdict engine for an instance, on the version in force."""
+        trace = Trace(observations=[], bindings=inst.bindings, request=inst.request,
+                      path=self.trace.path)
+        kind = _BoundaryRegimeEngine if self.regimes_on else _BoundaryEngine
+        inst.engine = kind(self._ast(inst.contract), trace, self._load, self, inst)
+        inst.engine.ev.known = self._known_names(inst)
+        inst.engine.ev.actors = declared_actors(self.sos)
+        self._build_until(inst)
 
     @staticmethod
     def _where(inst: _Instance) -> dict:
@@ -1224,6 +1408,17 @@ class AgentsRuntime:
     # --- observations -------------------------------------------------------------
 
     def _push(self, inst: _Instance, o: Observation, exempt=()) -> None:
+        if self.regimes_on:
+            o.c, o.out = inst.clock, inst.out_since is not None
+            if inst.deferred:
+                # versions that took effect while the contract was not in
+                # force (K.11, "Versions and regimes"); an instance that has
+                # seen nothing yet starts on the version in force
+                if inst.engine.obs:
+                    o.amend = tuple(inst.deferred) + (tuple(o.amend) if o.amend else ())
+                else:
+                    self._engine(inst)
+                inst.deferred = []
         eng = inst.engine
         n = len(eng.obs)
         if exempt:
@@ -1263,6 +1458,15 @@ class AgentsRuntime:
                     m["name"])):
                 continue
             amends = amend or {}
+            if self.regimes_on and inst.out_since is not None:
+                # the contract is not in force: the instance sees nothing
+                # (F.5); a version that takes effect waits for it
+                label = amends.get(inst.key, amends.get(inst.contract))
+                if m is None and label:
+                    inst.deferred += list(label) if isinstance(label, tuple) else [label]
+                if m is None and self.trace.quantities is None:
+                    inst.engine.ev.known.update(self._snapshot)
+                continue
             o = Observation(t=t, values=self._snapshot, messages=[m] if m else [],
                             state=inst.state, state_after=inst.state, end=None,
                             amend=amends.get(inst.key, amends.get(inst.contract)))
@@ -1415,6 +1619,8 @@ class AgentsRuntime:
                            if any(" not yet named" in q or q == "the bound of a range"
                                   for q in names)
                            else "Give initial values on the first line"))
+                    if not self.in_force(c["id"]):
+                        continue                   # it decides nothing now
                     if (inst.key, nid) not in self._warned_missing:    # once per norm
                         self._warned_missing.add((inst.key, nid))
                         self.warnings.append(warning)
@@ -1424,7 +1630,10 @@ class AgentsRuntime:
                 instances.append({"contract": c["id"], "instance": inst.name,
                                   "bindings": dict(inst.bindings),
                                   "in_force": in_force, "derived": derived})
-        return {"message": self._head(m), "now": self._time(t), "instances": instances}
+        inp = {"message": self._head(m), "now": self._time(t), "instances": instances}
+        if "regimes" in self.policy:
+            inp["regime"] = self.regime        # A.7.1; G.5 reads it (agents-decide)
+        return inp
 
     def _message(self, m: dict, t: float) -> None:
         inp = self.policy_input(m, t)
@@ -1541,6 +1750,8 @@ class AgentsRuntime:
         denials = []
         for c in self.policy["contracts"]:
             cid = c["id"]
+            if not self.in_force(cid):
+                continue                    # it governs no message (F.5, A.7.1)
             if any(cc == cid for cc, _ in hold.instances):
                 if any(key not in running for key in hold.instances if key[0] == cid):
                     denials.append(G._result("deny", "no_instance", contracts=[cid]))
@@ -1635,7 +1846,15 @@ class AgentsRuntime:
         new = self._load(name)
         if not G.agents_active(new):
             raise NormsEvalError(f"{name} does not declare 'norms: 0.1' and 'agents: 0.1'")
-        policy = G.build_policy(new)
+        policy = G.build_policy(new, regimes=True)
+        if not scheduled and (self.regimes_on or "regimes" in policy):
+            raise NormsEvalError(
+                f"amendment at t={_fmt_t(t)}: {name} is named by 'amend' in a run whose "
+                f"regime bindings take an enforced contract out of force (regimes:, Appendix "
+                f"A, A.7.1); cadl does not apply regime bindings and amendments with 'amend' "
+                f"together, as cadl norms-eval does not: F.6 amends an instance at an "
+                f"observation, and an instance whose contract is not in force has none. "
+                f"Versions of the run (--version) are applied (Appendix K, K.11)")
         old_ids = [c["id"] for c in self.policy["contracts"]]
         if [c["id"] for c in policy["contracts"]] != old_ids:
             raise NormsEvalError(
@@ -1699,6 +1918,9 @@ class AgentsRuntime:
         # version in force; then an `amend` of the line.
         running = [i for i in self._running()]
         scheduled = []
+        named_regime = self._named_regime(line)
+        if named_regime is not None:
+            self.regime = named_regime          # A.7.1: the regime first, then versions
         for v in self._versions_at(t, self._named(line)):
             label = f"version {self.chain.infos[v].name}"
             prep = self._prepare_amendment(label, t, scheduled=True)
@@ -1706,6 +1928,10 @@ class AgentsRuntime:
             scheduled.append((label, *prep))
             self.sos, self.policy = prep[0], prep[1]
         amendment = self._prepare_amendment(o.amend, t) if o.amend else None
+        self._enter_regime(named_regime, first, t)
+        if self.regimes_on:
+            for inst in running:
+                self._tick(inst, t)
 
         entries = {(e["contract"], e["instance"]): e for e in line.instances}
         if first:
@@ -1779,6 +2005,14 @@ class AgentsRuntime:
             end = end_all or bool(e.get("end"))
             if state is None and not end:
                 continue
+            if self.regimes_on and inst.out_since is not None:
+                # not in force: only an end or a terminal state counts (F.5)
+                lc = inst.engine.lifecycle
+                if lc is not None and state is not None and state not in lc.states:
+                    raise TraceError(f"state '{state}' at t={_fmt_t(t)} is not a state of "
+                                     f"the lifecycle of {inst.contract}")
+                if not end and not (lc is not None and state in lc.terminal):
+                    continue
             self._current = None
             self._events = []
             closing = Observation(t=t, values=self._snapshot, messages=[],

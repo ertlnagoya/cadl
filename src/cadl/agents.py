@@ -419,17 +419,26 @@ def _actor_entry(actor: ActorDef) -> dict:
     return entry
 
 
-def build_policy(sos: SoSDefinition) -> dict:
+def build_policy(sos: SoSDefinition, regimes: bool = False) -> dict:
     """The boundary policy of a file: its actors and enforced contracts,
     reduced to what the decision function reads. Plain data, so that the
     generators can embed it. Requires the extension to be declared.
+
+    A file whose regime bindings (`regimes:`, Appendix A, A.7.1) take an
+    enforced contract out of force in some regime is refused unless
+    `regimes` is true; the policy then has the key ``regimes``
+    (``{"regimes": [...], "out": {regime: [contract ids]}}``, the enforced
+    contracts each regime does not have in force), and the decision reads
+    the current regime from the key ``regime`` of the policy input.
     """
     if not agents_active(sos):
         raise ValueError(
             "the file does not declare the agent governance extension: add "
             "'norms: 0.1' and 'agents: 0.1' under extensions: (Appendix G)"
         )
-    _refuse_regimes(sos)
+    bound = _regime_part(sos)
+    if bound is not None and not regimes:
+        _refuse_regimes(sos)
     contracts = []
     for c in sos.contracts:
         if c.enforcement is None:
@@ -481,18 +490,41 @@ def build_policy(sos: SoSDefinition) -> dict:
             "non_static": non_static,
             "no_effect": no_effect,
         })
-    return {
+    policy = {
         "sos": sos.name,
         "actors": {a.id.name: _actor_entry(a) for a in sos.actors},
         "contracts": contracts,
     }
+    if bound is not None:
+        policy["regimes"] = bound
+    return policy
+
+
+def _regime_part(sos: SoSDefinition) -> dict | None:
+    """The regimes of a file and, per regime, the enforced contracts it does
+    not have in force; None when every regime has every enforced contract in
+    force (the policy is then that of the file without `regimes:`)."""
+    if not sos.transitions:
+        return None
+    from .regimes import checked
+    bindings = checked(sos)
+    if not bindings:
+        return None
+    enforced = [c.id for c in sos.contracts if c.enforcement is not None]
+    out = {b.name: [c for c in enforced if c not in b.active] for b in bindings}
+    if not any(out.values()):
+        return None
+    return {"regimes": [b.name for b in bindings], "out": out}
 
 
 def _refuse_regimes(sos: SoSDefinition) -> None:
-    """The boundary policy does not read the current regime. A file whose
-    regime bindings (`regimes:`, Appendix A, A.7.1) take an enforced
-    contract out of force in some regime is refused: the policy would
-    enforce the contract in every regime."""
+    """A caller of build_policy that does not pass the current regime with
+    the policy input (regimes=False) cannot apply regime bindings: a file
+    whose bindings (`regimes:`, Appendix A, A.7.1) take an enforced
+    contract out of force in some regime is refused there, since the
+    contract would be enforced in every regime. `cadl agents-decide`, the
+    generated policies, `cadl agents-run` and the gateways (from cadl
+    0.3.36) use regimes=True."""
     if not sos.transitions:
         return
     from .regimes import checked, suspended_somewhere
@@ -501,10 +533,13 @@ def _refuse_regimes(sos: SoSDefinition) -> None:
         apart = suspended_somewhere(bindings, c.id) if c.enforcement is not None else []
         if apart:
             raise ValueError(
-                f"the boundary policy cannot apply the regime bindings: the regime(s) "
+                f"the boundary policy cannot apply the regime bindings here: the regime(s) "
                 f"{', '.join(apart)} do not have the enforced contract '{c.id}' in force "
-                f"(regimes:, Appendix A, A.7.1), and the policy does not read the current "
-                f"regime, so it would enforce the contract in every regime")
+                f"(regimes:, Appendix A, A.7.1), and this caller does not give the "
+                f"current regime, so it would enforce the contract in every regime; "
+                f"build the policy with regimes=True and give the regime with the key "
+                f"'regime' of the policy input, as cadl agents-decide, agents-run and the "
+                f"gateways do")
 
 
 def _party_ref(ref) -> dict:
@@ -773,6 +808,30 @@ def _grounds(policy, contract, running, sender, receiver, name) -> list:
     return out
 
 
+def _check_regime(policy: dict, inp: Any) -> str | None:
+    """The current regime of a policy input (the key ``regime``), for a
+    policy with regime bindings; None for one without."""
+    bound = policy.get("regimes")
+    if bound is None:
+        return None
+    regime = inp.get("regime") if isinstance(inp, dict) else None
+    if not isinstance(regime, str) or regime not in bound["regimes"]:
+        got = repr(regime) if regime is not None else "nothing"
+        raise AgentsInputError(
+            f"'regime' must name the current regime, one of {', '.join(bound['regimes'])} "
+            f"(regimes:, Appendix A, A.7.1), got {got}")
+    return regime
+
+
+def _in_force_contracts(policy: dict, regime: str | None) -> list[dict]:
+    """The enforced contracts in force in the current regime: a contract
+    that the regime does not have in force governs no message (F.5)."""
+    if regime is None:
+        return policy["contracts"]
+    out = set(policy["regimes"]["out"].get(regime, ()))
+    return [c for c in policy["contracts"] if c["id"] not in out]
+
+
 def applying_prohibitions(policy: dict, inp: Any) -> list[dict]:
     """The prohibitions that apply to the message of a policy input, over
     all governing contracts and whatever the decision is: per prohibition
@@ -783,8 +842,9 @@ def applying_prohibitions(policy: dict, inp: Any) -> list[dict]:
     runtime needs all of them when it creates a hold and when it re-checks
     a released message (G.6)."""
     sender, receiver, name, instances = _check_input(inp)
+    regime = _check_regime(policy, inp)
     out = []
-    for c in policy["contracts"]:
+    for c in _in_force_contracts(policy, regime):
         if not governs(policy, c, sender, receiver, name):
             continue
         for n, where in _grounds(policy, c, _running(c, instances),
@@ -802,13 +862,14 @@ def decide(policy: dict, inp: Any) -> dict:
     :class:`AgentsInputError` for an input that does not have that form.
     """
     sender, receiver, name, instances = _check_input(inp)
+    regime = _check_regime(policy, inp)
 
     kind = message_kind(policy, receiver, name)
     tool_server = kind != "ordinary"
     tool_call = kind == "tool_call"
 
     # Step 1: ungoverned.
-    governing = [c for c in policy["contracts"]
+    governing = [c for c in _in_force_contracts(policy, regime)
                  if governs(policy, c, sender, receiver, name)]
     if not governing:
         return _result("allow", "ungoverned")

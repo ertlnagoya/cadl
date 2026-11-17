@@ -4,6 +4,278 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.36] — 2026-11-18
+
+### Changed
+
+- Targets that refused a contract that some regime of `regimes:` does not
+  have in force (0.3.33) now follow the current regime as `cadl
+  norms-eval` and the norms monitor of the Python target do (Appendix A,
+  A.7.1, "Runs"; F.5, "Contracts not in force"):
+  - The norms monitor of the `opa` target for such a contract reads the
+    key `regime` of an observation; before the first one the run is in the
+    initial regime. At an observation of a regime that does not have the
+    contract in force the result has no change, its values are seen from
+    the next observation in force, its messages are not seen, and the
+    clock of the contract stops: deadlines and the intervals of the
+    temporal operators run on that clock, while `now`, `next_deadline` and
+    the times of the result are times of the trace. An instance that ends
+    there (`"end": true`, a terminal state, or `{"finish": true}` after
+    it) is settled on the stopped clock. The state the host stores keeps
+    the clock (format `cadl-norms-monitor-regimes/1`); the result has
+    `in_force`. The library of the core monitor is copied with five lines
+    changed (`input.clock`, the trace time for `now`, the state given
+    while not in force, `core_result`).
+  - The norms monitor of the `solidity` target for such a contract derives
+    from `CadlNormsMonitorRegimes`: its constructor takes the reporter and
+    the orchestrator, `setRegime(name)` (only the orchestrator) makes a
+    regime current from the next observation on, `inForce()`,
+    `lastTraceT()` and `regime()` read the state, and `observe`, `finish`
+    and `nextDeadline` follow the regime as the Rego monitor does; the
+    times of the events are times of the trace. The runtime code of such a
+    monitor is about 3 kB larger (19.6 kB with solc 0.8.24 and 0.8.37, below the
+    24 kB of EIP-170).
+  - `cadl codegen -t unity-csharp` writes `Generated/CadlRegimes.cs` for a
+    file in which a regime does not have a contract with `lifecycle:` or
+    `monitors:` in force: the host sets the current regime with
+    `CadlRegimes.Set(regime, tMs)`, and an instance of such a contract
+    (constructed with the `CadlRegimes` object, or in the initial regime)
+    sees no event and no tick while not in force; when it is in force
+    again its deadlines and periodic monitors are moved on by the time it
+    was not in force.
+  - `cadl agents-decide` and the targets `agent-rego` and `agent-cedar`
+    read the current regime from the key `regime` of the policy input (in
+    Cedar `context.regime`) for a file in which a regime does not have an
+    enforced contract in force: such a contract governs no message in that
+    regime, and an input without a regime of the file is refused
+    (`agents-decide` exit status 2, Rego `result` undefined and `decision`
+    deny, Cedar the forbid `regime`).
+  - `cadl agents-run`, `cadl mcp-gateway` and `cadl a2a-gateway` follow
+    the current regime for such a file (refused in 0.3.33 to 0.3.35). A
+    trace line names the regime with the key `regime`, as for `cadl
+    norms-eval`; before the first one the run is in the initial regime of
+    A.7.1. At a line the named regime is current first, then the versions
+    of the run take effect (K.11), then the instances of the line are
+    created and its values and messages observed. A contract that the
+    regime does not have in force governs no message (each decision is
+    that of `agents-decide` on the policy input, which now carries
+    `regime`; audit records list only the instances of contracts in
+    force), and its instances see nothing: deadlines, windows and the
+    in-force flag of a violated prohibition run on the clock of the
+    contract, a state change other than a terminal state is not seen, and
+    an instance that ends while not in force is settled on the stopped
+    clock. A hold of such a contract stays held (its approval is a message
+    the contract does not govern then) until it expires or the contract is
+    in force again. With versions, a version that takes effect while the
+    contract is not in force reaches the instance at its next observation
+    (an instance that has seen nothing yet starts on the version in force),
+    and a regime must be a regime of every version that the run uses. A
+    gateway takes the regime of its first line from `--init` (key
+    `regime`) and later changes from its inbox: `cadl mcp-regime DIR
+    REGIME [--key FILE]` drops a file that the gateway authenticates with
+    `--regime-key FILE` (HMAC-SHA256 with the run id and a nonce, verified
+    whenever the gateway has a regime key, also with
+    `--insecure-approvals`; `DIR/run.json` then says `regimes_signed`).
+    With `--approver-keys` and without `--regime-key` every such file is
+    refused; with `--insecure-approvals` and without `--regime-key` it is
+    read as it is. `cadl mcp-regime` without `--key` refuses (exit status
+    2) an inbox whose `run.json` says `approver_keys` or `regimes_signed`.
+    The gateway writes a trace line with `regime` and the host event
+    `regime_change` (reason: the regime). A refused file gives
+    `regime_refused`: the file is authenticated first (reason
+    `unauthenticated`, `wrong_run` or `replayed`), so a file that is not
+    authenticated is recorded with that reason only; then its regime is
+    checked (`no_regimes`: the file has no `regimes:`; `unknown_regime`:
+    not a regime of the file or, with versions, not a regime of a version
+    that the run used, of the version in force or of a later version of
+    the run, so that the gateway does not fail when that version takes
+    effect, K.11). The regime of the first line (`--init` or the initial
+    regime) is checked the same way when the gateway starts, and a run
+    that starts in no regime is refused at the start when a version of the
+    run has `regimes:`; a gateway that does not start removes the audit
+    log, the trace and `run.json` it created.
+    `agents-run` on the trace of a gateway writes the same audit log, byte
+    for byte. Still refused, with the reason in the
+    message: `amend` in a run whose regime bindings take an enforced
+    contract out of force (as in `cadl norms-eval`, cadl does not apply
+    regime bindings and amendments together: F.6 amends an instance at an
+    observation, and an instance whose contract is not in force has none),
+    and, as before, `keep` and `switch` with `in_states:` of a version for
+    a running instance. Compared on random traces with `agents.decide` (every
+    decision and its regime) and with `cadl norms-eval` on the observations
+    the enforcement point made (the verdicts of every contract instance):
+    400 traces of five files, and 120 runs with two versions whose regime
+    bindings differ, without a difference.
+- For a file without `regimes:`, and for a contract that every regime has
+  in force, every target gives the output of 0.3.35, byte for byte, except
+  the text of the messages with which a processor refuses its input.
+
+### Added
+
+- `cadl norms-check --version` models a version whose transitional rule
+  for the contract is `keep` or `switch` with `in_states:` (refused in
+  0.3.34 and 0.3.35), as Appendix K, K.11 applies it. Every file declares
+  the extension with an `amendment:` block and the later versions are given
+  in the order of `previous:`. The next version takes effect at any
+  observation (no time base); each instance has the version it follows,
+  the version of a waiting `in_states:` switch and the class of its
+  lifecycle state, which the environment sets at every observation (states
+  that no rule tells apart are one class). Witness traces name the version
+  in force (`version`) and the state (`state`) for `cadl norms-eval
+  --version`. The limits on commands report a model that grows too large
+  (`in_states:` with several instances that start on their own reaches
+  them quickly). Compared with `cadl norms-eval --version` on random paths:
+  780 random paths of seven models (3900 with
+  `CADL_NORMS_CHECK_K11_PATHS=300`), 0 differences.
+- `cadl codegen --version FILE` (repeatable): the other versions of a run,
+  as for `cadl norms-eval --version`.
+  - `-t opa`: the norms monitor of each contract contains the contract of
+    every version and follows the version in force that an observation
+    names with the key `version` (the caller computes it from the effective
+    times): the transitional rules (`keep`, `switch`, `switch` with
+    `in_states:`) and the amendment of F.6 (carry over with the elapsed time
+    and, for the same content, the pending candidates; `discharge`;
+    `transform:`; new norms without trigger activated; norms violated by
+    the amendment with their reparations; items continued by their text,
+    new ones from the amendment, undecided ones closed; norms and items no
+    longer in the version kept at the end of the result; the acts of the
+    powers of an instance kept from an earlier version). Compared after
+    every observation with the norms monitor of the Python target with
+    `run_versions`: 900 random traces of 70 random runs of two or three
+    versions, 0 differences. When a version of the run binds regimes
+    (`regimes:`), the monitor also follows K.11, "Versions and regimes" as
+    `cadl norms-eval` and the Python monitor do (the part
+    `norms_monitor_regimes_versions.rego` wraps the part for versions,
+    whose `result` becomes `v_result`; state format
+    `cadl-norms-monitor-regimes-versions/1`): an observation may name the
+    regime (`regime`) and the version (`version`); the regime becomes
+    current first, then the versions take effect; the contract is in force
+    by the bindings of the version in force (before the first `regime`,
+    the initial regime of the version in force at the first observation);
+    a regime current at some observation must be a regime of every version
+    in force at some observation; the instance starts at the first
+    observation in force (or at which it ends), under the version in force
+    there; while the contract is not in force the clock stops, the
+    transitional rule of a version that takes effect then is applied on the
+    lifecycle state the instance saw last, and the amendment is made at the
+    next observation in force, or at the end of the instance on the stopped
+    clock, where a norm it violates is reported without reparation or
+    transition; `amend` is refused, as in `cadl norms-eval`; a `version`
+    that names no version of the run is refused also after the end of the
+    instance, as `cadl norms-eval` and the Solidity monitor do (both Rego
+    parts). Compared after
+    every observation with the norms monitor of the Python target with
+    `run_versions`: 3600 random traces of 300 random runs of two or three
+    versions whose regimes take the contract out of force (half of them
+    with random `assume:` and `guarantee:` items, a quarter in which a
+    version may have no `regimes:`, half of the traces with more lifecycle
+    states), 1633 traces with an observation out of force, 502 that switch,
+    385 refused by both, 0 differences; seven directed traces check the
+    state seen while out of force, a violation by a deferred switch at the
+    end and at the finish, and a start under a later version. Refused with
+    versions: a version with a `guarantee:` item that the Rego monitor
+    leaves out (the combination with regimes, refused before 0.3.36, is
+    monitored).
+  - `-t unity-csharp`: per contract with `lifecycle:` or `monitors:` a body
+    class per version and a class that follows the version the host sets
+    with `SetVersion(name, tMs)`; a moved instance keeps its state, the time
+    at which the deadlines of that state were armed and the last times of
+    its periodic monitors. When a version of the run binds regimes, the
+    versioned class follows them as K.11, "Versions and regimes" says (it
+    was refused before 0.3.36 for a contract that a regime does not have in
+    force): `Generated/CadlRegimes.cs` holds the regimes of every version
+    and the contracts each does not have in force (`new CadlRegimes(rt,
+    version)`, the run starting in the initial regime of that version), and
+    the versioned class takes it as its last constructor argument. The
+    contract is in force by the bindings of the version in force; the
+    instance starts (its body is created) at the first time the contract is
+    in force, under the version in force then; while it is not in force
+    the instance sees no event and no tick and its clock stops (the body
+    moves its deadlines, the time they were armed and its periodic monitors
+    on by the time not in force); a version that takes effect then is
+    applied when the contract is in force again, before anything else, on
+    the state the instance had, and the `<version>` Lifecycle event of a
+    switch it makes has the time at which the version took effect (the
+    `tMs` of `SetVersion`, as `versions.events` of `cadl norms-eval`; a
+    waiting switch with `in_states:` has the time at which it happens);
+    `SetVersion` and `CadlRegimes.Set` throw for a regime that is not a
+    regime of every version the instance has had in force. `Set` does not
+    call `Tick`: a deadline that passed on the clock of the contract before
+    it left force is decided by the first `Tick` after it is in force again
+    (after the waiting versions), as `cadl norms-eval` decides it at the
+    next step in force; the generated README says to call `Set`, then
+    `Tick`, then post the events of that time. After the end of an
+    instance `SetVersion` checks only the name of the version, as `cadl
+    norms-eval` does. Compared with the code generated from the same versions
+    without regimes on the projection of the run (the steps in force on
+    the clock of the contract, the versions that took effect while not in
+    force applied at the return): 1000 random runs of 25 random sets of two
+    or three versions of the robot town (31 000 steps, 14 549 of them not in
+    force, 459 versions that took effect while not in force, 109 runs whose
+    instance starts after the start), Mono, 0 differences.
+  - `-t solidity`: the norms monitor of each contract derives from
+    `CadlNormsMonitorVersions` and contains the definitions of the
+    contract in every version, one after the other. The instance has its
+    own list of norm instances, each with the definition it follows, and
+    its own list of items, each with its definition, its start and its
+    identity; the temporal content of a norm keeps its candidates in a
+    slot that the definitions of the norm with the same content share
+    across versions, so a carried instance keeps its pending candidates.
+    The constructor takes the reporter and the orchestrator;
+    `setVersion(name)` (only the orchestrator) sets the version in force
+    from the next observation on (the first version before the first
+    call) and reverts for a name that is not a version of the run and,
+    until the instance has ended, for a version before the one in force
+    at the last observation; `version()` and `versions()` read them. The
+    transitional rules and the amendment of F.6 are those of the Rego
+    monitor. `normIds()` and `verdicts()` follow the norms and items of
+    the instance (those the version no longer has at the end), and
+    `NormChanged` gives 255 as the previous state and verdict of a norm
+    new in the version and as the state and verdict of one it removes.
+    The new library `CadlNormsVersions` is deployed and linked after
+    `CadlNormsActs`. When a version of the run binds regimes (`regimes:`),
+    the monitor derives from `CadlNormsMonitorRegimesVersions` and follows
+    K.11, "Versions and regimes" as `cadl norms-eval` and the Python
+    monitor do: the orchestrator sets the regime (`setRegime`) and the
+    version (`setVersion`); at an observation the regime becomes current
+    first, then the versions take effect; the contract is in force by the
+    bindings of the version in force (before the first `setRegime`, the
+    initial regime of the version in force at the first observation); a
+    regime current at some observation must be a regime of every version
+    in force at some observation; while the contract is not in force the
+    clock stops, and a switch decided then (on the lifecycle state the
+    instance saw last) is applied at the next observation in force or at
+    the end of the instance, where a norm it violates is reported without
+    reparation or transition. Runtime code (solc 0.8.24 and 0.8.37, 1 or
+    200 optimizer runs; EIP-170: 24 576 bytes): the monitor 19.3 kB with
+    versions and 23.9 kB with versions and regimes (16.7 kB without
+    either), `CadlNormsVersions` 13.2 kB, `CadlNormsItems` 2.5 kB.
+    Creation code of the robot delivery example: about 33 kB with two
+    versions and 37 kB with three, 36 to 38 kB and 42 to 43 kB with
+    regimes (EIP-3860: 49 152 bytes; a monitor whose estimated creation
+    code is above it is refused, which happened to 2 of 32 random runs of
+    three versions with regimes). Deploying a monitor of three versions
+    with regimes takes up to about 24 million gas. Compared after every
+    observation with the norms monitor of the Python target with
+    `run_versions` on an EVM: with versions, 240 random traces of 20 random runs of
+    two or three versions with random `assume:` and `guarantee:` items
+    (1330 observations, solc 0.8.37); with versions and
+    regimes, 372 random traces of 32 random runs of two or three versions
+    whose regimes take the contract out of force (1895 observations, 204
+    traces with an observation out of force, 39 that switch while out of
+    force; solc 0.8.37 and 0.8.24), 0 differences. Refused with versions,
+    besides a `guarantee:` item that the monitor leaves out: versions whose
+    lifecycles or declared actors differ (the monitor keeps one of each;
+    per-version lifecycles and actors would need keys by version at every
+    place the base reads them, and the runtime code of the monitor with
+    regimes is 0.7 kB below the limit), and a norm whose content has the
+    same text in two versions but that the monitor reads differently in
+    them (F.6 keeps its pending candidates).
+  - Other targets refuse `--version`.
+  Without `--version` the `solidity` target writes the same files as
+  before for every file of `examples/` and `tests/data/` (checked by
+  their hashes).
+
 ## [0.3.35] — 2026-11-18
 
 ### Added

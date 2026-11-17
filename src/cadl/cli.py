@@ -47,6 +47,13 @@ def main(argv: list[str] | None = None) -> int:
                                   "(agents 0.1)")
     codegen_cmd.add_argument("--output", "-o", type=Path, default=Path("generated"),
                              help="Output directory (default: generated/)")
+    codegen_cmd.add_argument("--version", dest="version_files", action="append", default=[],
+                             type=Path, metavar="FILE",
+                             help="Another version of the file (amendment 0.1); the versions "
+                                  "form one sequence by previous: (Appendix K, K.11). The norms "
+                                  "monitors of the opa and solidity targets and the code of "
+                                  "unity-csharp then follow the version in force that the caller "
+                                  "names; may be repeated")
 
     # agents-decide command
     decide_cmd = subparsers.add_parser(
@@ -177,7 +184,13 @@ def main(argv: list[str] | None = None) -> int:
     gw_cmd.add_argument("--init", type=Path, default=None, metavar="FILE.json",
                         help="Keys for the first line of the trace: bindings, "
                              "request, values, quantities, instances, "
-                             "host_instances, state")
+                             "host_instances, state, regime")
+    gw_cmd.add_argument("--regime-key", type=Path, default=None, metavar="FILE",
+                        help="The key (HMAC-SHA256) with which the host's changes of "
+                             "regime in the inbox are authenticated (mcp-regime), also "
+                             "with --insecure-approvals; without it they are refused "
+                             "with --approver-keys and read as they are with "
+                             "--insecure-approvals")
     gw_cmd.add_argument("--no-filter-tools", action="store_true",
                         help="Do not remove undeclared tools from tools/list results")
     gw_cmd.add_argument("--poll", type=float, default=0.05, metavar="SECONDS",
@@ -243,7 +256,13 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--init", type=Path, default=None, metavar="FILE.json",
                          help="Keys for the first line of the trace: bindings, "
                               "request, values, quantities, instances, "
-                              "host_instances, state")
+                              "host_instances, state, regime")
+    a2a_cmd.add_argument("--regime-key", type=Path, default=None, metavar="FILE",
+                         help="The key (HMAC-SHA256) with which the host's changes of "
+                              "regime in the inbox are authenticated (mcp-regime), also "
+                              "with --insecure-approvals; without it they are refused "
+                              "with --approver-keys and read as they are with "
+                              "--insecure-approvals")
     a2a_cmd.add_argument("--listen", default="127.0.0.1:8470", metavar="HOST:PORT",
                          help="Address to listen on (default 127.0.0.1:8470; port 0 "
                               "picks a free port). An address other than loopback "
@@ -401,6 +420,22 @@ def main(argv: list[str] | None = None) -> int:
                          help="An argument of the message (repeatable; strings)")
     msg_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
                          help="The key of the sender (HMAC-SHA256)")
+
+    # mcp-regime command
+    mreg_cmd = subparsers.add_parser(
+        "mcp-regime",
+        help="Name the current regime of a running mcp-gateway or a2a-gateway "
+             "(Appendix A, A.7.1)",
+        description="Drop a change of regime into the inbox directory of a gateway. "
+                    "The gateway writes a trace line with the key regime: from that "
+                    "line on the regime is current, and the enforced contracts that "
+                    "it does not have in force govern no message. Without --key it "
+                    "refuses an inbox whose run.json says approver_keys or "
+                    "regimes_signed. Exit status: 0 written, 2 usage error.")
+    mreg_cmd.add_argument("inbox", type=Path, metavar="DIR", help="Inbox directory")
+    mreg_cmd.add_argument("regime", metavar="REGIME", help="A regime of the file")
+    mreg_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
+                          help="The regime key of the gateway (--regime-key)")
 
     # regime-map command
     regime_cmd = subparsers.add_parser("regime-map", help="Analyze regime transitions and build a regime map")
@@ -690,6 +725,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "mcp-message":
         from .mcp_gateway import cli_message
         return cli_message(args)
+    elif args.command == "mcp-regime":
+        from .gateway_core import cli_regime
+        return cli_regime(args)
     elif args.command == "norms-eval":
         return _cmd_norms_eval(args)
     elif args.command == "metrics-eval":
@@ -922,8 +960,22 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
     target = args.target
     output_dir = args.output
     from .codegen import norms_monitors
+    versions = []
+    for vp in args.version_files:
+        try:
+            vs = parse_file(vp)
+        except Exception as e:
+            print(f"Parse error: {vp}: {e}", file=sys.stderr)
+            return 1
+        vtc = type_check(vs)
+        if not vtc.ok:
+            for e in vtc.errors:
+                print(f"  {e}", file=sys.stderr)
+            print(f"Type check failed: {vp}", file=sys.stderr)
+            return 1
+        versions.append(vs)
     try:
-        monitors = {m["contract"]: m for m in norms_monitors(sos, target)}
+        monitors = {m["contract"]: m for m in norms_monitors(sos, target, versions)}
     except Exception as e:
         print(f"Code generation error: {e}", file=sys.stderr)
         return 1
@@ -952,7 +1004,7 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
             print(f"  [WARNING]: {key} item {pos} of contract '{m['contract']}' is not "
                   f"monitored by {m['file']} ({reason}): {text}", file=sys.stderr)
     try:
-        generate(sos, output_dir, target=target)
+        generate(sos, output_dir, target=target, versions=versions)
     except Exception as e:
         print(f"Code generation error: {e}", file=sys.stderr)
         return 1
@@ -1004,7 +1056,7 @@ def _cmd_agents_decide(args: argparse.Namespace) -> int:
             print(f"  {e}", file=sys.stderr)
         return usage_error("Type check failed: cannot decide")
     try:
-        policy = build_policy(sos)
+        policy = build_policy(sos, regimes=True)
     except ValueError as e:
         return usage_error(str(e))
 
