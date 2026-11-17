@@ -100,6 +100,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   600 s, `test_huge_bound_is_evaluated_as_an_open_domain` from 2 s to
   30 s.
 
+### Fixed
+
+- Effective times and `--epoch` values with the suffix `Z` (for example
+  `2026-11-10T09:01:00Z`) were refused on Python 3.9 and 3.10, whose
+  `datetime.fromisoformat` does not accept it. The amendment checks,
+  norms-eval and the generated Python runtimes and `metrics.py` now read
+  `Z` as `+00:00` on every Python version.
+
 ## [0.3.34] — 2026-11-17
 
 ### Added

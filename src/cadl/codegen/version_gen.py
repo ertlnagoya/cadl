@@ -97,6 +97,8 @@ def generate_version_module(sos: SoSDefinition) -> str:
         "        return Fraction(origin) + (int(value) - 1) * Fraction(period)",
         "    if not epoch:",
         "        return None",
+        "    if value[-1:] in ('Z', 'z'):",
+        "        value = value[:-1] + '+00:00'",
         "    try:",
         "        t = _dt.datetime.fromisoformat(value)",
         "    except ValueError:",

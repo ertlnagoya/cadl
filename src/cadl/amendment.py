@@ -535,18 +535,25 @@ def _time_point(v) -> Optional[str]:
     text = v.strip()
     for parse in (_dt.datetime.fromisoformat, _dt.date.fromisoformat):
         try:
-            parse(text)
+            parse(_iso_utc(text))
             return text
         except ValueError:
             continue
     return None
 
 
+def _iso_utc(text: str) -> str:
+    """`fromisoformat` before Python 3.11 does not accept the suffix Z."""
+    if text[-1:] in ("Z", "z"):
+        return text[:-1] + "+00:00"
+    return text
+
+
 def _time_order(text: str):
     """A key that orders time points; dates count as midnight UTC, and a
     date-time without an offset as UTC."""
     try:
-        t = _dt.datetime.fromisoformat(text)
+        t = _dt.datetime.fromisoformat(_iso_utc(text))
     except ValueError:
         t = _dt.datetime.combine(_dt.date.fromisoformat(text), _dt.time())
     if t.tzinfo is None:

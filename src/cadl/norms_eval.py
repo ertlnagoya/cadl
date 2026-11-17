@@ -3122,6 +3122,8 @@ def _epoch_seconds(text: str) -> Fraction:
     1970-01-01T00:00:00Z; a date is 00:00 UTC, a date-time without an
     offset is UTC (K.4)."""
     import datetime as _dt
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"   # fromisoformat before 3.11
     try:
         t = _dt.datetime.fromisoformat(text)
     except ValueError:
