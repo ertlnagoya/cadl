@@ -213,7 +213,7 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
                generate_transitions_module(sos.transitions, bindings, declared_params,
                                            initial_regime(sos)))
         _write(output_dir / "metrics.py",
-               generate_metrics_module(sos.metrics, _metric_schedules(sos)))
+               generate_metrics_module(sos.metrics, _metric_schedules(sos), _metric_run(sos)))
         _write(output_dir / "runtime.py", generate_runtime_module(sos))
 
     if monitor is not None:
@@ -249,6 +249,27 @@ def _metric_schedules(sos: SoSDefinition) -> dict:
             entries.append((when, e["target"]))
         out[m["id"]] = entries
     return out
+
+
+def _metric_run(sos: SoSDefinition) -> dict | None:
+    """For a file that declares amendment 0.1 with an amendment: block, what
+    the target checks of metrics.py need to judge in a run with versions
+    (Appendix K, K.11, from cadl 0.3.35); None otherwise."""
+    from .version_gen import has_version_module
+    if not has_version_module(sos):
+        return None
+    from ..amendment import analyse
+    a = analyse(sos)
+    windows, schedules = {}, {}
+    for m in a.metrics:
+        window = (m.get("measure") or {}).get("window")
+        if window is not None:
+            from fractions import Fraction
+            v = Fraction(window.value) / 1000
+            windows[m["id"]] = int(v) if v.denominator == 1 else float(v)
+        if m.get("schedule"):
+            schedules[m["id"]] = [(dict(e["from"]), e["target"]) for e in m["schedule"]]
+    return {"version": a.version, "windows": windows, "schedules": schedules}
 
 
 def _write(path: Path, content: str) -> None:
