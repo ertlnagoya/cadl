@@ -800,8 +800,9 @@ class TestAgentsVersionKey:
         assert [d[2] for d in _decisions(r)] == ["deny", "deny"]
         from cadl.norms_eval import TraceError
         bad = [dict(_read(0), quantities=[], epoch=EPOCH), dict(_read(10), version="2")]
-        with pytest.raises(TraceError, match="line 2: 'version' names '2', but no versions of "
-                                             "the run are given"):
+        # AV1 has an amendment: block: no other versions were given (review L7)
+        with pytest.raises(TraceError, match="line 2: 'version' names '2', but no other "
+                                             "versions were given to the run"):
             _agents(tmp_path, bad, name="b.jsonl")
 
     def test_named_versions_as_in_norms_eval(self, tmp_path):
@@ -852,3 +853,130 @@ class TestPossibleLaterVersion:
         one = _version(tmp_path, "p1.cadl", "2", None, "{ period: 1 }")
         with pytest.raises(NormsEvalError, match="one sequence"):
             evaluate_files(first, TestPreviousInferred.SWITCH, None, [one], HOUR)
+
+
+# --- review of 0.3.35 (S/rv35): regression tests --------------------------------------
+
+class TestReview0335:
+    def _metrics(self, tmp: Path, path: Path, name: str):
+        from cadl.codegen import _metric_run, _metric_schedules
+        from cadl.codegen.metric_gen import generate_metrics_module
+        from cadl.codegen.version_gen import generate_version_module
+        from cadl.parser import parse_file
+        sos = parse_file(path)
+        ver = _load_module(f"rv_ver_{name}", generate_version_module(sos))
+        met = _load_module(f"rv_met_{name}", generate_metrics_module(
+            sos.metrics, _metric_schedules(sos), _metric_run(sos)))
+        return ver, met.MetricsCollector()
+
+    def _town(self, tmp: Path):
+        v2b = tmp / "v2b.cadl"
+        v2b.write_text((EXAMPLES / "amendment_robot_town_v2.cadl").read_text()
+                       .replace('target: "<= 600s"', 'target: "<= 300s"')
+                       .replace("effective: { period: 2 }", 'effective: { at: "2030-06-01" }'))
+        return EXAMPLES / "amendment_robot_town_v1.cadl", v2b
+
+    def test_h1_unplaceable_effective_time_raises(self, tmp_path):
+        v1, v2b = self._town(tmp_path)
+        ver1, c1 = self._metrics(tmp_path, v1, "h1a")
+        ver2, c2 = self._metrics(tmp_path, v2b, "h1b")
+        with pytest.raises(ValueError, match="version 2 takes effect at 2030-06-01, and the "
+                                             "time base has no epoch"):
+            c2.check_blocked_time_target(400, t=0, period=3600, versions=[ver1, ver2])
+        from cadl.metrics_eval import evaluate_files as metrics_files
+        meas = _trace(tmp_path, [{"metric": "blocked_time", "t": 0, "value": 400}], "m.jsonl")
+        with pytest.raises(NormsEvalError, match="has no epoch"):
+            metrics_files(v1, meas, [v2b], TimeBase(3600))
+
+    def test_m1_without_time_base_the_first_version(self, tmp_path):
+        v1, v2b = self._town(tmp_path)
+        ver1, c1 = self._metrics(tmp_path, v1, "m1a")
+        ver2, c2 = self._metrics(tmp_path, v2b, "m1b")
+        assert c2.check_blocked_time_target(400, t=0, versions=[ver1, ver2]) is None
+        assert c1.check_blocked_time_target(400, t=0, versions=[ver1, ver2]) is True
+        assert c2.check_blocked_time_target(400, t=0, versions=[ver1, ver2],
+                                            version="2") is False
+        from cadl.metrics_eval import evaluate_files as metrics_files
+        meas = _trace(tmp_path, [{"metric": "blocked_time", "t": 0, "value": 400}], "m.jsonl")
+        r = metrics_files(v1, meas, [v2b])
+        assert r["measurements"][0]["version"] == "1"
+        assert r["measurements"][0]["verdict"] == "met"
+
+    def test_m2_regime_of_a_later_version(self, tmp_path):
+        """e3: the first version has no regimes:, version 2 has them."""
+        v2 = _with_regimes(tmp_path, _version(tmp_path, "x2.cadl", "2", "1", "{ period: 2 }",
+                                              "    transitional: { default: switch }\n",
+                                              pickup="60s"), "v2.cadl", _bindings("B"))
+        lines = [{"t": 3700, "bindings": {"i": 2}, "values": {"ROBOT[2].status": "Waiting"}},
+                 {"t": 3720, "regime": "B"}, {"t": 3800, "regime": "A"}, {"t": 3850}]
+        tr = _trace(tmp_path, lines)
+        ref = evaluate_files(V1, tr, None, [v2], HOUR)
+        assert ref["versions"]["start"] == "2"
+        mod = _module(tmp_path, V1, "rv_m2")
+        got = mod.replay(tr.read_text().splitlines(keepends=True), run_versions=[_model(v2)],
+                         path=str(tr), period=3600)
+        ref.pop("file")
+        assert got == json.loads(json.dumps(ref))
+
+    def test_l1_skipped_versions_are_not_used(self, tmp_path):
+        """e4: version 2 (regimes A, C) takes effect at the same step as
+        version 3 and is never in force; the run in regime B is accepted."""
+        ab = _bindings("B")
+        ac = (ab.replace("to: B", "to: C").replace("from: B", "from: C")
+              .replace("    B:\n", "    C:\n"))
+        first = _with_regimes(tmp_path, V1, "first.cadl", ab)
+        v2 = _with_regimes(tmp_path, _version(tmp_path, "x2.cadl", "2", "1", "{ period: 2 }",
+                                              ""), "v2.cadl", ac)
+        v3 = _with_regimes(tmp_path, _version(tmp_path, "x3.cadl", "3", "2", "{ period: 3 }",
+                                              ""), "v3.cadl", ab)
+        lines = [{"t": 3500, "bindings": {"i": 2}}, {"t": 3510, "regime": "B"},
+                 {"t": 3520, "regime": "A"}, {"t": 7300}]
+        r = evaluate_files(first, _trace(tmp_path, lines), None, [v2, v3], HOUR)
+        assert r["versions"]["follows"] == "3"
+        # version 2 in force at a step: refused
+        lines = [{"t": 3500, "bindings": {"i": 2}}, {"t": 3510, "regime": "B"},
+                 {"t": 3520, "regime": "A"}, {"t": 3700}]
+        with pytest.raises(NormsEvalError, match="regime B, which is not a regime of version 2"):
+            evaluate_files(first, _trace(tmp_path, lines, "b.jsonl"), None, [v2, v3], HOUR)
+
+    def test_l2_previous_outside_the_run(self, tmp_path):
+        """e5: A names a previous: that is not in the run, B has none."""
+        a = _version(tmp_path, "a.cadl", "2", "1", "{ period: 2 }")
+        b = _version(tmp_path, "b.cadl", "3", None, "{ period: 3 }")
+        sw = TRACES / "amendment_norms_v1_a_switch.jsonl"
+        r = evaluate_files(a, sw, None, [b])
+        assert r["versions"]["sequence"] == ["2", "3"]
+        c = _version(tmp_path, "c.cadl", "4", "9", "{ period: 4 }")
+        with pytest.raises(NormsEvalError, match="version 4 names 9 as previous:, which is "
+                                                 "not a version of the run"):
+            evaluate_files(a, sw, None, [c])
+
+    def test_l6_follows_after_amend(self, tmp_path):
+        """e6: the instance follows the file the `amend` gave it."""
+        _version(tmp_path, "am.cadl", "9", "1", "{ period: 5 }", pickup="60s")
+        v2 = _version(tmp_path, "v2.cadl", "2", "1", "{ period: 2 }",
+                      "    transitional: { default: keep }\n", pickup="150s")
+        lines = [{"t": 3500, "bindings": {"i": 2}}, {"t": 3600, "amend": "am.cadl"},
+                 {"t": 3700}]
+        r = evaluate_files(V1, _trace(tmp_path, lines), None, [v2], HOUR)
+        assert r["versions"]["follows"] == "am.cadl"
+
+    def test_l10_amend_cancels_a_waiting_switch(self, tmp_path):
+        _version(tmp_path, "am.cadl", "9", "1", "{ period: 5 }", pickup="150s")
+        v2 = _version(tmp_path, "v2.cadl", "2", "1", "{ period: 2 }",
+                      _transitional("switch", ["PickedUp"]), pickup="60s")
+        lines = [{"t": 3500, "bindings": {"i": 2}}, {"t": 3600},          # v2 waits
+                 {"t": 3610, "amend": "am.cadl"},                         # cancels it
+                 {"t": 3620, "values": {"ROBOT[2].status": "PickedUp"}, "state": "PickedUp"},
+                 {"t": 3630}]
+        tr = _trace(tmp_path, lines)
+        r = evaluate_files(V1, tr, None, [v2], HOUR)
+        assert [a["file"] for a in r["amendments"]] == ["am.cadl"]
+        assert [e["event"] for e in r["versions"]["events"]] == ["wait", "dropped"]
+        assert r["versions"]["follows"] == "am.cadl"
+        mod = _module(tmp_path, V1, "rv_l10")
+        got = mod.replay(tr.read_text().splitlines(keepends=True), run_versions=[_model(v2)],
+                         versions={"am.cadl": _model(tmp_path / "am.cadl")}, path=str(tr),
+                         period=3600)
+        r.pop("file")
+        assert got == json.loads(json.dumps(r))

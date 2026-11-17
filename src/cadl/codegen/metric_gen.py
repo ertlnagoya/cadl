@@ -223,6 +223,12 @@ _RUN_HELPER = [
     "        if k and not eff:",
     "            raise ValueError(f'version {name} gives no effective:')",
     "        at = _from_time(eff, period, origin, epoch) if eff else None",
+    "        if eff and at is None and (period is not None or epoch):",
+    "            (form, value), = eff.items()",
+    "            when = f'period {value}' if form == 'period' else str(value)",
+    "            raise ValueError(f'version {name} takes effect at {when}, and the time base '",
+    "                             f'has no ' + ('length of a period' if form == 'period'",
+    "                                           else 'epoch for a date or date-time'))",
     "        if k and at is not None and seq[-1][1] is not None and not at > seq[-1][1]:",
     "            raise ValueError(f'version {name} does not take effect after version '",
     "                             f'{seq[-1][0]}')",
@@ -255,7 +261,8 @@ _RUN_HELPER = [
     "    return current",
     "",
     "",
-    "def _judge_in_run(metric, own, value, t, window, versions, period, origin, epoch, checks):",
+    "def _judge_in_run(metric, own, value, t, window, versions, period, origin, epoch, checks,",
+    "                  named=None):",
     '    """The target check of `metric` in version `own` for a measurement',
     "    whose window starts at t, as `cadl metrics-eval` judges it",
     "    (Appendix K, K.11): None (not judged) when the version in force at t",
@@ -271,12 +278,21 @@ _RUN_HELPER = [
     "    if own not in names:",
     "        raise ValueError(f'versions does not contain this version, {own}')",
     "    k = names.index(own)",
+    "    live = 0                           # without a time base: the first version",
     "    if timed:",
-    "        live = [j for j, x in enumerate(seq) if x[1] is None or x[1] <= t]",
-    "        if not live:",
+    "        placed = [j for j, x in enumerate(seq) if x[1] is None or x[1] <= t]",
+    "        if not placed:",
     "            raise ValueError(f'no version is in force at t={t}')",
-    "        if live[-1] != k:",
-    "            return None                # the host runs the version in force",
+    "        live = placed[-1]",
+    "    if named is not None:",
+    "        if named not in names:",
+    "            raise ValueError(f'version {named!r} is not a version of the run')",
+    "        if timed and names.index(named) != live:",
+    "            raise ValueError(f'version {named} is named, but by the effective times '",
+    "                             f'version {names[live]} is in force at t={t}')",
+    "        live = names.index(named)",
+    "    if live != k:",
+    "        return None                    # the host runs the version in force",
     "    try:",
     "        targets, schedules = seq[k][3], seq[k][4]",
     "        current = _target_at(targets.get(metric), schedules.get(metric), t, seq,",
@@ -322,7 +338,7 @@ def _run_check(metric: MetricDef, entries: list | None, run: dict) -> list:
     window = run["windows"].get(metric.id)
     body = [
         f"    def {name}(self, value: float, t=None, period=None, origin=0, epoch=False,",
-        "                  versions=None):",
+        "                  versions=None, version=None):",
         f'        """Check {metric.id} against its target (Appendix K, K.11).',
         "",
         "        With `versions`, the versions of the run in the order of the",
@@ -333,14 +349,17 @@ def _run_check(metric: MetricDef, entries: list | None, run: dict) -> list:
         "        version is not in force at t, an entry cannot be placed, the",
         f"        target changes inside the window of {window}s (None: an instant),",
         "        or the target cannot be compiled. `period`, `origin` and `epoch`",
-        '        give the time base."""',
+        "        give the time base; without one, the first version is in force",
+        "        unless `version` names the version in force (Appendix K, K.11). A",
+        "        version whose effective time the time base cannot place raises",
+        '        ValueError, as cadl metrics-eval refuses it."""',
         "        if versions is not None:",
         f"            return _judge_in_run({metric.id!r}, {run['version']!r}, value, t, {window!r},",
         "                                 versions, period, origin, epoch, {",
     ]
     for text, fn in checks.items():
         body.append(f"                                     {text!r}: {fn},")
-    body.append("                                 })")
+    body.append("                                 }, version)")
     if entries is not None:
         old = _scheduled_check(metric, entries)
         # the body of the 0.3.34 check, after its docstring

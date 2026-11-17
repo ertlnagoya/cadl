@@ -972,10 +972,13 @@ class AgentsRuntime:
             got = f"'{named}'" if isinstance(named, str) else "a value that is not a string"
             mine = ("and gives no sos.version" if own is None
                     else f"and has one version, its sos.version '{own}'")
-            raise TraceError(
-                f"{where}: 'version' names {got}, but no versions of the run are given "
-                f"(--version) and the file declares no versions to switch to "
-                f"(Appendix K, K.11) {mine}")
+            from .codegen.version_gen import has_version_module
+            what = ("no other versions were given to the run (--version)"
+                    if has_version_module(self.sos) else
+                    "no versions were given to the run (--version) and the file declares "
+                    "no versions to switch to (it has no amendment: block)")
+            raise TraceError(f"{where}: 'version' names {got}, but {what} (Appendix K, K.11) "
+                             f"{mine}")
         return None
 
     def _versions_at(self, t: Any, named: Any = None) -> list:
