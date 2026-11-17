@@ -228,7 +228,9 @@ class TestNormsEval:
         assert [a["file"] for a in r["amendments"]] == ["version 2", "version 3"]
         assert all(a["t"] == 7300 for a in r["amendments"])
 
-    def test_regimes_are_refused(self, tmp_path):
+    def test_regimes(self, tmp_path):
+        # refused up to cadl 0.3.34; from 0.3.35 versions and regime bindings
+        # combine (K.11, "Versions and regimes"; tests/test_amendment_runtime_0335.py)
         extra = ("  transitions:\n    - { from: A, to: B, condition: \"x > 1\" }\n"
                  "  regimes:\n    B:\n      contracts: { suspended: [DELIVERY_SLA] }\n")
         v1 = tmp_path / "r1.cadl"
@@ -236,17 +238,19 @@ class TestNormsEval:
         v2 = tmp_path / "r2.cadl"
         v2.write_text(V2.read_text().replace("  amendment:\n", extra + "  amendment:\n"))
         lines = [{"t": 3550, "bindings": {"i": 2}}, {"t": 3600, "regime": "B"}]
-        with pytest.raises(NormsEvalError, match="does not settle"):
-            evaluate_files(v1, _trace(tmp_path, lines), None, [v2], HOUR)
-        # no regime named: judged as a file without regimes:
+        r = evaluate_files(v1, _trace(tmp_path, lines), None, [v2], HOUR)
+        assert r["versions"]["follows"] == "2"
+        assert _norms(r)["pick_up"] == ("discharged", "fulfilled")
+        # no regime named: the initial regime A has the contract in force
         lines = [{"t": 3550, "bindings": {"i": 2}}, {"t": 3600}, {"t": 3660}]
         r = evaluate_files(v1, _trace(tmp_path, lines), None, [v2], HOUR)
         assert _norms(r)["pick_up"] == ("violated", "violated")
+        # version 2 does not have the contract in force in A: its clock stops
         bad = tmp_path / "r3.cadl"
         bad.write_text(V2.read_text().replace(
             "  amendment:\n", extra.replace("B:\n", "A:\n") + "  amendment:\n"))
-        with pytest.raises(NormsEvalError, match="initial regime A of version 2"):
-            evaluate_files(v1, _trace(tmp_path, lines), None, [bad], HOUR)
+        r = evaluate_files(v1, _trace(tmp_path, lines), None, [bad], HOUR)
+        assert _norms(r)["pick_up"] == ("discharged", "fulfilled")
 
     def test_cli_text_and_exit(self):
         code, out, err = _cli("norms-eval", V1, "--version", V2, "--period", "1h", "--trace",
