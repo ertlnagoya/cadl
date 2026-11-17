@@ -38,6 +38,7 @@ def generate_version_module(sos: SoSDefinition) -> str:
             units[p.id] = p.unit
     schedules = {m["id"]: [(dict(e["from"]), e["target"]) for e in m["schedule"]]
                  for m in a.metrics if m.get("schedule")}
+    targets = {m.id: m.target for m in sos.metrics}
     transitional = {
         "default": a.transitional_default,
         "contracts": {c: {"rule": r, "in_states": list(st)}
@@ -67,6 +68,9 @@ def generate_version_module(sos: SoSDefinition) -> str:
         f"PARAMETER_UNITS = {units!r}",
         "# The schedules of the metrics (schedule:, K.5): metric -> [(from, target)].",
         f"SCHEDULES = {schedules!r}",
+        "# The targets of the metrics (target:): metric -> target. With SCHEDULES, what",
+        "# the target checks of metrics.py read of each version of a run (K.11).",
+        f"TARGETS = {targets!r}",
         "",
         "",
         "def transitional_rule(contract_id: str) -> tuple:",
@@ -93,6 +97,8 @@ def generate_version_module(sos: SoSDefinition) -> str:
         "        return Fraction(origin) + (int(value) - 1) * Fraction(period)",
         "    if not epoch:",
         "        return None",
+        "    if value[-1:] in ('Z', 'z'):",
+        "        value = value[:-1] + '+00:00'",
         "    try:",
         "        t = _dt.datetime.fromisoformat(value)",
         "    except ValueError:",

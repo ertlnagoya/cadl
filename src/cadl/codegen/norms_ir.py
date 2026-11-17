@@ -100,15 +100,17 @@ def check_regimes(sos: SoSDefinition, contract: ContractDef, target: str) -> Non
 def switching_contracts(sos: SoSDefinition) -> dict:
     """The contracts whose running instances switch to this version when it
     takes effect (Appendix K, K.4 and K.11), with their rule: empty unless
-    the file declares amendment 0.1 and names the version it replaces
-    (`previous:`), since only then can an instance be running under
-    another version."""
-    from ..amendment import amendment_declared, analyse
+    the file declares amendment 0.1 and may replace another version: it
+    names it (`previous:`), or (from cadl 0.3.35, when `previous:` may be
+    left out) it gives an effective time other than period 1, which may
+    come after that of another version (K.11). Only then can an instance
+    be running under another version."""
+    from ..amendment import amendment_declared, analyse, may_replace
     raw = getattr(sos, "amendment", None)
     if not amendment_declared(sos) or raw is None or not raw.has_block:
         return {}
     a = analyse(sos)
-    if a.previous is None:
+    if not may_replace(a):
         return {}
     out = {}
     for c in sos.contracts:
@@ -126,15 +128,22 @@ def check_versions(sos: SoSDefinition, contract: ContractDef, target: str) -> No
     rule = switching_contracts(sos).get(contract.id)
     if rule is not None:
         raise NormsTargetUnsupported([
-            f"this version replaces version {_previous(sos)} and its transitional rule for "
+            f"this version replaces {_previous(sos)} and its transitional rule for "
             f"{contract.id} is {rule} (Appendix K, K.4), and the norms monitor of the "
             f"{target} target cannot take over a running instance of the old version "
             f"(it does not apply amendments, F.6); the python target does (K.11)"])
 
 
 def _previous(sos: SoSDefinition) -> str:
+    """The version this one replaces, in words."""
     from ..amendment import analyse
-    return str(analyse(sos).previous)
+    a = analyse(sos)
+    if a.previous is not None:
+        return f"version {a.previous}"
+    (form, v), = a.effective.items()
+    return (f"the version before it (it gives no previous: and takes effect at {form} {v}, "
+            f"so it may be a later version of a run, K.11; if it is the first version, "
+            f"declare effective: {{ period: 1 }} or leave effective: out)")
 
 
 def _number(value: float, what: str) -> float:

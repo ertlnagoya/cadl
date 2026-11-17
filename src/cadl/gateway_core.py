@@ -53,7 +53,7 @@ from .audit_log import (
     new_run_id,
     read_key,
 )
-from .norms_eval import NormsEvalError, load_version
+from .norms_eval import NormsEvalError, TraceError, load_version
 
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -70,6 +70,21 @@ _IDENT_HOLD_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Seconds after a deadline at which the expiry is observed: the runtime
 # expires a hold at a time strictly later than its deadline.
 _AFTER_DEADLINE = 0.001
+
+
+def gateway_versions(args) -> dict:
+    """The keyword arguments `run_versions` and `base` of a gateway from
+    --version, --period, --origin and --epoch (Appendix K, K.11)."""
+    from .cli import _time_base
+    files = list(getattr(args, "version_files", None) or [])
+    try:
+        base = _time_base(args)
+        run_versions = [load_version(p) for p in files]
+    except NormsEvalError as e:
+        raise GatewayError(str(e)) from None
+    if not files and base is None:
+        return {}
+    return {"run_versions": run_versions, "base": base}
 
 
 class GatewayError(ValueError):
@@ -286,7 +301,8 @@ class EnforcementPoint:
               init: dict | None, clock: Callable[[], float], wall: datetime | None,
               approver_keys: dict[str, bytes] | None, insecure_approvals: bool,
               run_id: str | None, more_first: dict | None = None,
-              hold_key: bytes | None = None) -> None:
+              hold_key: bytes | None = None, run_versions: list | None = None,
+              base=None) -> None:
         """Check the options, create the logs and the inbox, and decide the
         first line of the trace."""
         self.inbox = None if inbox is None else Path(inbox)
@@ -331,7 +347,12 @@ class EnforcementPoint:
         self.epoch = wall.astimezone(timezone.utc)
         self.t0 = clock()
         self.last_t = 0.0
-        self.runtime = AgentsRuntime.open(self.sos, path=str(trace_out))
+        try:
+            self.runtime = AgentsRuntime.open(self.sos, path=str(trace_out),
+                                              run_versions=run_versions, base=base)
+        except (NormsEvalError, TraceError) as e:
+            raise GatewayError(str(e)) from None
+        self._check_versions()
         self.approvals_mode = ("none" if self.inbox is None else
                                "authenticated" if approver_keys is not None else "insecure")
         self.chain = AuditChain(file_sha256(self.file), epoch_text(self.epoch), key,
@@ -356,6 +377,29 @@ class EnforcementPoint:
             self._step(first)
         except Exception as e:      # noqa: BLE001
             raise GatewayError(f"the first line of the trace is not accepted: {e}") from None
+
+    def _check_versions(self) -> None:
+        """The gateway reads the actors and the rules that create approvals
+        and rejections once, from the file. The versions of its run
+        (Appendix K, K.11) may change contracts, not these."""
+        from .agents_runtime import _plain
+        chain = self.runtime.chain
+        if chain is None:
+            return
+
+        def fixed(sos) -> tuple:
+            rules = tuple((c.id, r.creates, r.when) for c in sos.contracts
+                          if c.enforcement is not None for r in c.counts_as
+                          if r.creates in G.HOLD_EVENTS)
+            return _plain(sos.actors), rules
+        own = fixed(self.sos)
+        for info in chain.infos:
+            if fixed(info.sos) != own:
+                raise GatewayError(
+                    f"version {info.name} of the run changes the actors or the counts_as "
+                    f"rules that create approval or rejection; the gateway reads them once "
+                    f"from the file, so the versions of its run must keep them (Appendix K, "
+                    f"K.11)")
 
     def _actor(self, text: str, option: str) -> dict:
         actor = G.parse_concrete_actor(text)

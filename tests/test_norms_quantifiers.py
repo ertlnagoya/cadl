@@ -257,7 +257,9 @@ class TestReviewFixes:
         assert ev.holds(_rule("for all j in S: S[j].x == 1"), 0, 0) is False
         assert ev.holds(_rule("exists j in S: S[j].x == 7"), 0, 0) is UNKNOWN
         assert ev.holds(_rule("sum(S[j].x for j in S) > 0"), 0, 0) is UNKNOWN
-        assert time.perf_counter() - start < 2
+        # 30 s guards against enumerating the 10**7 members (minutes), not
+        # against the speed of the runner (0.14 s locally)
+        assert time.perf_counter() - start < 30
         assert any("10000000 members, more than 10000" in w for w in ev.warnings)
         # MAX_DOMAIN members are still a closed domain
         values = {f"S[{i}].x": 0 for i in range(1, 10 ** 4 + 1)}

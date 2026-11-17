@@ -2523,12 +2523,16 @@ def test_large_groups_are_refused_with_the_reason():
     reads all seven, and the value F that no valuation gives keeps every
     state). Every pair of eight members ordered by their indices and the
     maximum of eight members, refused by 0.3.31, are translated from
-    0.3.32 (test_groups_of_eight_members_are_translated)."""
+    0.3.32 (test_groups_of_eight_members_are_translated).
+
+    The bound of 600 s guards against an elimination without the limit,
+    which does not end in hours; it does not measure the speed of the
+    runner (about 9 s locally, up to about 7 times that on CI)."""
     import time
     t = time.monotonic()
     with pytest.raises(NormsCheckError) as e:
         build_model(_members_sos(COUNT_NEVER_FALSE), members=["R=6"])
-    assert time.monotonic() - t < 120
+    assert time.monotonic() - t < 600
     text = str(e.value)
     assert "valuations by types and patterns" in text and "more than 50000" in text, text
     assert "adding the quantities one at a time" in text, text
@@ -2606,12 +2610,16 @@ def test_groups_of_eight_members_are_translated(contents):
     """Groups that 0.3.31 refused (more than 50 000 states): every pair of
     eight members ordered by their indices, and min and max of eight
     members with a member named by its index; the values of random
-    valuations are vectors of the model."""
+    valuations are vectors of the model.
+
+    The bound of 600 s guards against the exponential blow-up of the
+    elimination before 0.3.32, not against the speed of the runner: the
+    build takes about 17 s locally and took 122.6 s on a slow CI runner."""
     import random as _random
     import time
     t = time.monotonic()
     m = build_model(_members_sos(*contents), members=["R=8"])
-    assert time.monotonic() - t < 120
+    assert time.monotonic() - t < 600
     tr = m.trs[0]
     assert all(n.status == "model" for n in tr.norms)
     _values_reach_choices(tr, _random.Random(8), 300 if LONG else 100,

@@ -135,16 +135,26 @@ class TestNormsEval:
         with pytest.raises(TraceError, match="no version is in force"):
             evaluate_files(V2, _trace(tmp_path, [{"t": 10}]), None, [], HOUR)
 
-    def test_amend_key_is_refused(self, tmp_path):
-        lines = [{"t": 0, "bindings": {"i": 2}}, {"t": 1, "amend": "x.cadl"}]
-        with pytest.raises(NormsEvalError, match="cannot also amend"):
-            evaluate_files(V1, _trace(tmp_path, lines), None, [V2], HOUR)
+    def test_amend_key_after_the_versions(self, tmp_path):
+        # refused up to cadl 0.3.34; from 0.3.35 the versions that take
+        # effect at an observation are applied first, then the `amend`
+        (tmp_path / V1.name).write_text(V1.read_text())
+        lines = [{"t": 3550, "bindings": {"i": 2}}, {"t": 3600, "amend": V1.name}]
+        r = evaluate_files(V1, _trace(tmp_path, lines), None, [V2], HOUR)
+        assert [a["file"] for a in r["amendments"]] == ["version 2", V1.name]
+        assert "amendment_norms_v1.cadl (by 'amend')" not in str(r["versions"])
 
     def test_version_key_without_the_extension(self, tmp_path):
-        # as in cadl 0.3.33: the key is unknown for a file without the extension
+        # from cadl 0.3.35 the key is read also for a file without the
+        # extension: its own sos.version is accepted, another value refused
         f = EXAMPLES / "norms_amendment_v1.cadl"
-        with pytest.raises(TraceError, match="unknown key"):
+        with pytest.raises(TraceError, match="declares no versions to switch to .* "
+                                             "sos.version '1.0.0'"):
             evaluate_files(f, _trace(tmp_path, [{"t": 0, "version": "1"}]))
+        same = evaluate_files(f, _trace(tmp_path, [{"t": 0, "version": "1.0.0"}], "s.jsonl"))
+        plain = evaluate_files(f, _trace(tmp_path, [{"t": 0}], "p.jsonl"))
+        same.pop("trace"), plain.pop("trace")
+        assert same == plain
         with pytest.raises(NormsEvalError, match="does not declare 'amendment: 0.1'"):
             evaluate_files(f, _trace(tmp_path, [{"t": 0}]), None, [V2])
 
@@ -222,7 +232,9 @@ class TestNormsEval:
         assert [a["file"] for a in r["amendments"]] == ["version 2", "version 3"]
         assert all(a["t"] == 7300 for a in r["amendments"])
 
-    def test_regimes_are_refused(self, tmp_path):
+    def test_regimes(self, tmp_path):
+        # refused up to cadl 0.3.34; from 0.3.35 versions and regime bindings
+        # combine (K.11, "Versions and regimes"; tests/test_amendment_runtime_0335.py)
         extra = ("  transitions:\n    - { from: A, to: B, condition: \"x > 1\" }\n"
                  "  regimes:\n    B:\n      contracts: { suspended: [DELIVERY_SLA] }\n")
         v1 = tmp_path / "r1.cadl"
@@ -230,17 +242,19 @@ class TestNormsEval:
         v2 = tmp_path / "r2.cadl"
         v2.write_text(V2.read_text().replace("  amendment:\n", extra + "  amendment:\n"))
         lines = [{"t": 3550, "bindings": {"i": 2}}, {"t": 3600, "regime": "B"}]
-        with pytest.raises(NormsEvalError, match="does not settle"):
-            evaluate_files(v1, _trace(tmp_path, lines), None, [v2], HOUR)
-        # no regime named: judged as a file without regimes:
+        r = evaluate_files(v1, _trace(tmp_path, lines), None, [v2], HOUR)
+        assert r["versions"]["follows"] == "2"
+        assert _norms(r)["pick_up"] == ("discharged", "fulfilled")
+        # no regime named: the initial regime A has the contract in force
         lines = [{"t": 3550, "bindings": {"i": 2}}, {"t": 3600}, {"t": 3660}]
         r = evaluate_files(v1, _trace(tmp_path, lines), None, [v2], HOUR)
         assert _norms(r)["pick_up"] == ("violated", "violated")
+        # version 2 does not have the contract in force in A: its clock stops
         bad = tmp_path / "r3.cadl"
         bad.write_text(V2.read_text().replace(
             "  amendment:\n", extra.replace("B:\n", "A:\n") + "  amendment:\n"))
-        with pytest.raises(NormsEvalError, match="initial regime A of version 2"):
-            evaluate_files(v1, _trace(tmp_path, lines), None, [bad], HOUR)
+        r = evaluate_files(v1, _trace(tmp_path, lines), None, [bad], HOUR)
+        assert _norms(r)["pick_up"] == ("discharged", "fulfilled")
 
     def test_cli_text_and_exit(self):
         code, out, err = _cli("norms-eval", V1, "--version", V2, "--period", "1h", "--trace",
@@ -400,7 +414,8 @@ class TestMonitor:
         changes = m.observe({"t": 3600})
         assert m.version == "2"
         assert any(c["id"] == "pick_up" for c in changes) or changes == []
-        with pytest.raises(monitors["m1"].ObservationError, match="cannot also amend"):
+        # from cadl 0.3.35 `amend` is applied after the versions; x is unknown
+        with pytest.raises(monitors["m1"].ObservationError, match="has no version 'x'"):
             m.observe({"t": 3601, "amend": "x"})
         assert m.version == "2"
         m.observe({"t": 3641})
@@ -438,19 +453,23 @@ class TestMonitor:
         assert got == json.loads(json.dumps(ref)) and "versions" not in got
         assert [a["t"] for a in got["amendments"]] == [3560]
 
-    def test_named_version_after_amend_is_refused(self, monitors, tmp_path):
+    def test_named_version_after_amend(self, monitors, tmp_path):
+        # refused up to cadl 0.3.34; from 0.3.35 the monitor and norms-eval
+        # apply both, the versions first
         (tmp_path / V2.name).write_text(V2.read_text())
         m = monitors["m1"].NormsMonitor("DELIVERY_SLA", bindings={"i": 2},
                                         versions={V2.name: _monitor_model(tmp_path, V2)})
         m.observe({"t": 0})
         m.observe({"t": 10, "amend": V2.name})
-        with pytest.raises(monitors["m1"].ObservationError, match="cannot name a version"):
-            m.observe({"t": 15, "version": "1"})
-        assert [a["t"] for a in m.result()["amendments"]] == [10]
+        m.observe({"t": 15, "version": "1"})
+        m.end()
         trace = _trace(tmp_path, [{"t": 0, "bindings": {"i": 2}}, {"t": 10, "amend": V2.name},
                                   {"t": 15, "version": "1"}])
-        with pytest.raises(NormsEvalError, match="cannot also amend"):
-            evaluate_files(V1, trace)
+        ref = evaluate_files(V1, trace)
+        got = m.result()
+        assert [a["t"] for a in got["amendments"]] == [10]
+        for key in ("norms", "amendments", "versions", "ok"):
+            assert got[key] == json.loads(json.dumps(ref[key])), key
 
     def test_run_versions_must_carry_a_version(self, monitors, tmp_path):
         model = _monitor_model(tmp_path, EXAMPLES / "norms_amendment_v2.cadl")

@@ -240,6 +240,9 @@ def build_model(sos: SoSDefinition) -> dict:
         "actors": [_encode(dataclasses.replace(a.id, loc=None)) for a in sos.actors],
         "contracts": [_contract_model(c) for c in sos.contracts],
         "parsed": _record_parses(sos.contracts),
+        # the one version of a file without versions of a run, for the key
+        # `version` of an observation (Appendix K, K.11, from cadl 0.3.35)
+        "sos_version": norms_eval.own_version(sos),
     }
     bindings = norms_eval.regime_bindings(sos)
     if bindings is not None:
@@ -398,7 +401,11 @@ _EVALUATE_TAIL = "return run_trace(contract, trace, loader, declared_actors(sos)
 _EVALUATE_REGIMES = "return run_regime_trace(contract, trace, bindings, declared_actors(sos))"
 # And a run with versions (Appendix K, K.11): the monitor of a file that
 # declares amendment 0.1 contains run_version_trace.
-_EVALUATE_VERSIONS = "return run_version_trace(contract.id, trace, chain, declared_actors)"
+_EVALUATE_VERSIONS = (
+    "return run_version_trace(contract.id, trace, chain, declared_actors, loader)")
+# A run with versions and regime bindings (K.11, from cadl 0.3.35).
+_EVALUATE_VERSION_REGIMES = (
+    "return run_version_regime_trace(contract.id, trace, chain, declared_actors)")
 
 
 def _check_evaluate(source: str) -> None:
@@ -417,13 +424,13 @@ def _check_evaluate(source: str) -> None:
             if isinstance(last, ast.Return) and ast.unparse(last) == _EVALUATE_TAIL \
                     and texts in ([_EVALUATE_TAIL], sorted([_EVALUATE_TAIL, _EVALUATE_REGIMES]),
                                   sorted([_EVALUATE_TAIL, _EVALUATE_REGIMES,
-                                          _EVALUATE_VERSIONS])):
+                                          _EVALUATE_VERSIONS, _EVALUATE_VERSION_REGIMES])):
                 return
             break
     raise NormsMonitorError(
         "norms monitor: `evaluate` of cadl/norms_eval.py must end with "
-        f"`{_EVALUATE_TAIL}` and return nothing else (but `{_EVALUATE_REGIMES}` and "
-        f"`{_EVALUATE_VERSIONS}`): "
+        f"`{_EVALUATE_TAIL}` and return nothing else (but `{_EVALUATE_REGIMES}`, "
+        f"`{_EVALUATE_VERSIONS}` and `{_EVALUATE_VERSION_REGIMES}`): "
         "the generated monitor contains run_trace and what it calls, not what evaluate "
         "does to its result")
 

@@ -91,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     run_cmd.add_argument("--audit-key", type=Path, default=None, metavar="FILE",
                          help="Key the hash chain of the audit log (HMAC-SHA256) with "
                               "the key in FILE (at least 16 bytes)")
+    _add_version_options(run_cmd, "the file, whose enforced contracts are switched at "
+                                  "its effective time")
 
     # audit-verify command
     averify_cmd = subparsers.add_parser(
@@ -162,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="JSON object from actor to the key file (or {\"hex\": ...}) "
                              "with which its inbox files are authenticated "
                              "(HMAC-SHA256); required with --approvals")
+    _add_version_options(gw_cmd, "the file, whose enforced contracts are switched at "
+                                 "its effective time; t of the trace counts from the start")
     gw_cmd.add_argument("--hold-key", type=Path, default=None, metavar="FILE",
                         help="Sign every published hold with this key (HMAC-SHA256); "
                              "approvers verify it with mcp-approve --hold-key")
@@ -229,6 +233,8 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--approver-keys", type=Path, default=None, metavar="FILE",
                          help="The keys of the approvers and other senders of the "
                               "inbox; required with --approvals")
+    _add_version_options(a2a_cmd, "the file, whose enforced contracts are switched at "
+                                  "its effective time; t of the trace counts from the start")
     a2a_cmd.add_argument("--hold-key", type=Path, default=None, metavar="FILE",
                          help="Sign every published hold with this key (HMAC-SHA256); "
                               "approvers verify it with mcp-approve --hold-key")
@@ -1485,7 +1491,9 @@ def _cmd_agents_run(args: argparse.Namespace) -> int:
             raise NormsEvalError(f"File not found: {args.trace}")
         sos = load_version(args.file)
         trace = load_run_trace(args.trace)
-        result = {"file": str(args.file), **run(sos, trace)}
+        result = {"file": str(args.file),
+                  **run(sos, trace, run_versions=[load_version(p) for p in args.version_files],
+                        base=_time_base(args))}
         log = None
         if args.audit is not None:
             log = "".join(line + "\n" for line in chain_lines(
