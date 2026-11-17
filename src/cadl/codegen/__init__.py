@@ -80,7 +80,8 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
     items the monitor leaves out. An empty list for other files and
     targets."""
     from ..norms import norms_declared
-    from .norms_ir import NormsTargetUnsupported, build_ir, check_regimes, unsupported_items
+    from .norms_ir import (NormsTargetUnsupported, build_ir, check_regimes, check_versions,
+                           unsupported_items)
     if target not in ("opa", "solidity") or not norms_declared(sos):
         return []
     ir_of = build_ir
@@ -100,6 +101,8 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
         try:
             # first: a contract that a regime does not have in force (A.7.1)
             check_regimes(sos, contract, target)
+            # then: one whose running instances switch to this version (K.11)
+            check_versions(sos, contract, target)
             ir = ir_of(sos, contract)
             entry["left_out"] = unsupported_items(ir)
             entry["text"] = gen(sos, contract)
@@ -124,6 +127,7 @@ def _generate_target(sos: SoSDefinition, output_dir: Path, target: str) -> None:
         _write_monitors(output_dir, monitors)
     elif target == "unity-csharp":
         from .unity_csharp import generate_unity_csharp
+        _check_unity_versions(sos)
         generate_unity_csharp(sos, output_dir)
     elif target == "agent-rego":
         from .agent_policy import generate_agent_rego
@@ -131,6 +135,21 @@ def _generate_target(sos: SoSDefinition, output_dir: Path, target: str) -> None:
     elif target == "agent-cedar":
         from .agent_policy import generate_agent_cedar
         generate_agent_cedar(sos, output_dir)
+
+
+def _check_unity_versions(sos: SoSDefinition) -> None:
+    """The Unity C# target keeps lifecycle instances with their deadlines; it
+    cannot move one that started under the version this one replaces
+    (Appendix K, K.11). Refuse such a version."""
+    from .norms_ir import switching_contracts
+    switching = switching_contracts(sos)
+    moved = [c.id for c in sos.contracts if c.lifecycle is not None and c.id in switching]
+    if moved:
+        raise ValueError(
+            f"target 'unity-csharp': this version replaces another (amendment.previous) and "
+            f"the running instances of {', '.join(moved)} switch to it (Appendix K, K.4); the "
+            f"generated lifecycle instances cannot be moved to a new version, so the file is "
+            f"refused (K.11); declare 'keep' for these contracts in amendment.transitional")
 
 
 def _write_monitors(output_dir: Path, monitors: list[dict]) -> None:
@@ -152,6 +171,9 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
       - norms_monitor.py   Monitor of the norms extension (Appendix F), for
                            a file that declares norms 0.1; it does not
                            import cadl
+      - version.py         The version of the model (Appendix K, K.11), for
+                           a file that declares amendment 0.1 with an
+                           amendment: block
       - __init__.py        Package exports
     """
     from .actor_gen import generate_actors_module
@@ -190,14 +212,43 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
         _write(output_dir / "transitions.py",
                generate_transitions_module(sos.transitions, bindings, declared_params,
                                            initial_regime(sos)))
-        _write(output_dir / "metrics.py", generate_metrics_module(sos.metrics))
+        _write(output_dir / "metrics.py",
+               generate_metrics_module(sos.metrics, _metric_schedules(sos)))
         _write(output_dir / "runtime.py", generate_runtime_module(sos))
 
     if monitor is not None:
         _write(output_dir / f"{MODULE_NAME}.py", monitor)
 
+    from .version_gen import generate_version_module, has_version_module
+    if has_version_module(sos):
+        # the version of the model, for the host (Appendix K, K.11)
+        _write(output_dir / "version.py", generate_version_module(sos))
+
     # Generate __init__.py
     _write(output_dir / "__init__.py", _generate_init(sos, norms_monitor=monitor is not None))
+
+
+def _metric_schedules(sos: SoSDefinition) -> dict:
+    """The schedules of the metrics of a file that declares amendment 0.1
+    (Appendix K, K.5), for the target checks of metrics.py (K.11)."""
+    from ..amendment import amendment_declared, analyse
+    if not amendment_declared(sos) or getattr(sos, "amendment", None) is None:
+        return {}
+    a = analyse(sos)
+    out = {}
+    for m in a.metrics:
+        if not m.get("schedule"):
+            continue
+        entries = []
+        for e in m["schedule"]:
+            (form, v), = e["from"].items()
+            if form == "version":
+                when = {"effective": a.effective} if v == a.version else None
+            else:
+                when = dict(e["from"])
+            entries.append((when, e["target"]))
+        out[m["id"]] = entries
+    return out
 
 
 def _write(path: Path, content: str) -> None:

@@ -1,0 +1,4 @@
+{"t": 3550, "bindings": {"i": 2}, "values": {"ROBOT[2].status": "Waiting"}}
+{"t": 3600}
+{"t": 3660, "values": {"ROBOT[2].status": "PickedUp"}, "state": "PickedUp"}
+{"t": 3760, "values": {"ROBOT[2].status": "Delivered"}, "state": "Delivered"}

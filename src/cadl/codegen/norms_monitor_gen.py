@@ -26,6 +26,11 @@ The generated module does not import cadl. It consists of
    template, which let an observation name the current regime. The model
    then has the key ``regimes``. A file without the block gets the module
    it got before regime bindings existed.
+6. for a file that declares ``amendment: 0.1`` with an ``amendment:``
+   block (Appendix K, K.11) only: the text between the ``monitor-versions``
+   marks of `cadl/norms_eval.py` (with the ``monitor-regimes`` text, whose
+   trace reader it uses) and part 4 of the template, which apply the
+   versions of a run. The model then has the key ``amendment``.
 
 Before the text is returned it is checked (`check_module`): it compiles,
 and every global name it uses is defined in it or is a builtin. A helper
@@ -69,6 +74,7 @@ class NormsMonitorError(ValueError):
 
 _BEGIN, _END = "# >>> monitor-runtime", "# <<< monitor-runtime"
 _REGIMES_BEGIN, _REGIMES_END = "# >>> monitor-regimes", "# <<< monitor-regimes"
+_VERSIONS_BEGIN, _VERSIONS_END = "# >>> monitor-versions", "# <<< monitor-versions"
 
 _HEADER = '''"""Norms monitor (Appendix F of the CADL specification, norms 0.1).
 
@@ -241,6 +247,13 @@ def build_model(sos: SoSDefinition) -> dict:
         model["regimes"] = {"regimes": list(bindings.regimes),
                             "suspended": {r: list(c) for r, c in bindings.suspended.items()},
                             "initial": bindings.initial}
+    if norms_eval.version_chain(sos) is not None:
+        # the version of the run that the file is (Appendix K, K.11)
+        info = norms_eval.version_info(sos)
+        model["amendment"] = {
+            "version": info.name, "previous": info.previous, "effective": info.effective,
+            "default": info.default,
+            "contracts": {c: [r, list(st)] for c, (r, st) in sorted(info.rules.items())}}
     return model
 
 
@@ -383,6 +396,9 @@ _EVALUATE_TAIL = "return run_trace(contract, trace, loader, declared_actors(sos)
 # The other return of `evaluate`: a trace that names a regime (A.7.1). The
 # monitor of a file with `regimes:` contains run_regime_trace.
 _EVALUATE_REGIMES = "return run_regime_trace(contract, trace, bindings, declared_actors(sos))"
+# And a run with versions (Appendix K, K.11): the monitor of a file that
+# declares amendment 0.1 contains run_version_trace.
+_EVALUATE_VERSIONS = "return run_version_trace(contract.id, trace, chain, declared_actors)"
 
 
 def _check_evaluate(source: str) -> None:
@@ -399,12 +415,15 @@ def _check_evaluate(source: str) -> None:
             texts = sorted(ast.unparse(r) for r in returns)
             last = node.body[-1]
             if isinstance(last, ast.Return) and ast.unparse(last) == _EVALUATE_TAIL \
-                    and texts in ([_EVALUATE_TAIL], sorted([_EVALUATE_TAIL, _EVALUATE_REGIMES])):
+                    and texts in ([_EVALUATE_TAIL], sorted([_EVALUATE_TAIL, _EVALUATE_REGIMES]),
+                                  sorted([_EVALUATE_TAIL, _EVALUATE_REGIMES,
+                                          _EVALUATE_VERSIONS])):
                 return
             break
     raise NormsMonitorError(
         "norms monitor: `evaluate` of cadl/norms_eval.py must end with "
-        f"`{_EVALUATE_TAIL}` and return nothing else (but `{_EVALUATE_REGIMES}`): "
+        f"`{_EVALUATE_TAIL}` and return nothing else (but `{_EVALUATE_REGIMES}` and "
+        f"`{_EVALUATE_VERSIONS}`): "
         "the generated monitor contains run_trace and what it calls, not what evaluate "
         "does to its result")
 
@@ -424,11 +443,12 @@ def _sources() -> dict:
 _MAIN = 'if __name__ == "__main__":\n    sys.exit(main())'
 
 
-def assemble_runtime(sources: dict, regimes: bool = False) -> str:
+def assemble_runtime(sources: dict, regimes: bool = False, versions: bool = False) -> str:
     """The part of the generated module that is the same for every file
     (everything but the header and ``MODEL``), from the source texts. With
     `regimes`, for a file with `regimes:`, the parts that read regimes are
-    added at the end."""
+    added at the end; with `versions`, for a file that declares amendment
+    0.1 with an `amendment:` block, the parts that apply versions (K.11)."""
     template = sources["template"]
     part1, part2 = _regions(template, "# >>> part 1", "# <<< part 1") + \
         _regions(template, "# >>> part 2", "# <<< part 2")
@@ -447,18 +467,27 @@ def assemble_runtime(sources: dict, regimes: bool = False) -> str:
         *engine,
         part2,
     ]
-    if regimes:
-        # part 3 replaces NormsMonitor and replay of part 2, so the module
-        # runs main() after it
+    if regimes or versions:
+        # parts 3 and 4 replace NormsMonitor and replay of part 2, so the
+        # module runs main() after them
         if not part2.endswith(_MAIN):
             raise NormsMonitorError("norms monitor: part 2 of the template must end with "
                                     "the call of main()")
         sections[-1] = part2[:-len(_MAIN)].rstrip("\n")
-        sections += [
-            *_regions(sources["norms_eval"], _REGIMES_BEGIN, _REGIMES_END),
-            *_regions(template, "# >>> part 3", "# <<< part 3"),
-            _MAIN,
-        ]
+        if regimes:
+            sections += [
+                *_regions(sources["norms_eval"], _REGIMES_BEGIN, _REGIMES_END),
+                *_regions(template, "# >>> part 3", "# <<< part 3"),
+            ]
+        if versions:
+            if not regimes:
+                # the trace reader of the versions also reads the key `regime`
+                sections += _regions(sources["norms_eval"], _REGIMES_BEGIN, _REGIMES_END)
+            sections += [
+                *_regions(sources["norms_eval"], _VERSIONS_BEGIN, _VERSIONS_END),
+                *_regions(template, "# >>> part 4", "# <<< part 4"),
+            ]
+        sections.append(_MAIN)
     return "\n\n\n".join(sections) + "\n"
 
 
@@ -472,6 +501,13 @@ def runtime_source() -> str:
 def runtime_source_regimes() -> str:
     """`assemble_runtime` of the installed cadl, for a file with `regimes:`."""
     return assemble_runtime(_sources(), regimes=True)
+
+
+@functools.lru_cache(maxsize=None)
+def runtime_source_versions(regimes: bool) -> str:
+    """`assemble_runtime` of the installed cadl, for a file that declares
+    amendment 0.1 with an `amendment:` block."""
+    return assemble_runtime(_sources(), regimes=regimes, versions=True)
 
 
 # Names the module may read without defining them.
@@ -526,5 +562,8 @@ def generate_norms_monitor_module(sos: SoSDefinition) -> str:
     Raises `NormsMonitorError` (a ValueError) when it cannot be generated;
     nothing is written then."""
     model = build_model(sos)
-    runtime = runtime_source_regimes() if "regimes" in model else runtime_source()
+    if "amendment" in model:
+        runtime = runtime_source_versions("regimes" in model)
+    else:
+        runtime = runtime_source_regimes() if "regimes" in model else runtime_source()
     return assemble_module(model, runtime)

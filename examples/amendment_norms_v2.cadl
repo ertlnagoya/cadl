@@ -1,0 +1,83 @@
+# =====================================================================
+# amendment_norms_v2.cadl -- version 2 of amendment_norms_v1.cadl
+# (Appendix K): the pickup deadline is 90 s instead of 120 s from
+# period 2 on. An order under way at that time switches to version 2
+# only while it is still Assigned (in_states); an order already picked
+# up keeps version 1 until it ends.
+# =====================================================================
+
+sos:
+  name: "RobotTownOrders"
+  type: Collaborative
+  version: "2"
+
+  extensions:
+    - sos-dsl: 0.1
+    - norms: 0.1
+    - amendment: 0.1
+
+  actors:
+    - id: TOWN_STEWARD
+      role: "road_steward"
+      autonomy: low
+      capabilities: [assign_order]
+    - id: "ROBOT[1..N]"
+      role: "delivery_robot"
+      autonomy: high
+      capabilities: [pickup, dropoff]
+    - id: OPERATOR
+      role: "service_operator"
+      autonomy: high
+      capabilities: [decide_amendment]
+
+  contracts:
+    - id: DELIVERY_SLA
+      parties: [TOWN_STEWARD, "ROBOT[*]"]
+      lifecycle:
+        states: [Assigned, PickedUp, Delivered]
+        initial: Assigned
+        terminal: [Delivered]
+        transitions:
+          - { id: pickup, from: Assigned, to: PickedUp, on: "ROBOT[i].status == PickedUp" }
+          - { id: dropoff, from: PickedUp, to: Delivered, on: "ROBOT[i].status == Delivered" }
+      norms:
+        - id: pick_up
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: TOWN_STEWARD
+          content: "ROBOT[i].status == PickedUp"
+          deadline: 90s
+          on_violation: { severity: Major }
+        - id: deliver
+          kind: obligation
+          bearer: "ROBOT[i]"
+          counterparty: TOWN_STEWARD
+          trigger: "ROBOT[i].status == PickedUp"
+          content: "ROBOT[i].status == Delivered"
+          deadline: 120s
+          on_violation: { severity: Major }
+
+  amendment:
+    previous: "1"
+    effective: { period: 2 }
+    transitional:
+      default: keep
+      contracts:
+        - { contract: DELIVERY_SLA, rule: switch, in_states: [Assigned] }
+    layers:
+      contract: { decided_by: OPERATOR }
+    parameters:
+      - id: pickup_deadline
+        layer: contract
+        value: 90s
+        min: 60s
+        max: 180s
+        step: 30s
+        at: [contracts.DELIVERY_SLA.norms.pick_up.deadline]
+      - id: dropoff_deadline
+        layer: contract
+        value: 120s
+        min: 60s
+        max: 180s
+        step: 30s
+        at: [contracts.DELIVERY_SLA.norms.deliver.deadline]

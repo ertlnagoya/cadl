@@ -1,0 +1,6 @@
+{"metric": "on_time_deliveries", "period": 1, "runs": [44, 46, 45, 43, 47], "values": {"count(orders)": 50}}
+{"metric": "blocked_time", "t": 3000, "value": 700}
+{"metric": "on_time_deliveries", "period": 2, "runs": [42, 43, 44, 41, 40], "values": {"count(orders)": 50}}
+{"metric": "blocked_time", "t": 7200, "value": 512}
+{"metric": "on_time_deliveries", "t": 14000, "runs": [43, 43, 44, 42, 43], "values": {"count(orders)": 50}}
+{"metric": "on_time_deliveries", "period": 5, "runs": [43, 43, 44, 42, 43], "values": {"count(orders)": 50}}

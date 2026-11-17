@@ -4,6 +4,89 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.34] — 2026-11-17
+
+### Added
+
+- Versions of a model apply while a system runs (Appendix K, K.11). The
+  versions of a run declare `amendment: 0.1` and form one sequence by
+  `previous:`; the version in force at an observation comes from the
+  effective times on a time base (`--period`, `--origin` for
+  `effective: { period: k }`, `--epoch` for `effective: { at: ... }`) or
+  from the new trace key `version`, or both, which must agree. A version
+  takes effect at the first observation at or after its effective time.
+  A contract instance follows the version in force at its first
+  observation; when a version takes effect it follows the transitional
+  rule of its contract in that version: `keep` leaves it as it is,
+  `switch` amends it there (F.6), `switch` with `in_states:` at the first
+  observation whose state before it is one of them. A waiting switch is
+  dropped when a later version takes effect first.
+- `cadl norms-eval --version FILE [--period D] [--origin T] [--epoch]`
+  applies them to a trace; the result gets the key `versions` (sequence,
+  start, follows, events) and the text report a section "Versions".
+- The norms monitor of the Python target applies them for a file that
+  declares `amendment: 0.1` with an `amendment:` block: `versions=` with
+  the models of the other versions, `period=`, `origin=`, `epoch=`, the
+  key `version` of an observation, and `m.version`; the module carries
+  the version in `MODEL["amendment"]`.
+- `cadl metrics-eval FILE --measurements M.jsonl` judges measured values
+  of metrics against the target in force at the start of the window
+  (`target:` or `schedule:`, also `from: { version: X }`), combining
+  samples by `aggregate:` and runs by `across_runs:` exactly; a
+  measurement whose target changes inside its window, whose schedule
+  entry cannot be placed, or whose target is not a comparison is not
+  judged, with the reason.
+- The Python target writes `version.py` (version, previous, effective
+  time, transitional rules, parameter values) for a file that declares
+  the extension with an `amendment:` block.
+- Examples `amendment_norms_v1.cadl` / `_v2.cadl` with two traces, and
+  `examples/measurements/amendment_robot_town.jsonl`.
+
+### Changed
+
+- `cadl norms-check --version` refuses a version that declares
+  `amendment: 0.1` and whose transitional rule for the contract is
+  `keep` or `switch` with `in_states:`: the model amends every instance
+  at any observation, which such a version does not allow.
+- The norms monitors of the Rego and Solidity targets are not generated
+  (with a warning) for a contract whose running instances switch to a
+  version that names `previous:`, since they cannot take over an
+  instance of the old version; `unity-csharp` refuses such a version
+  when a contract with `lifecycle:` switches.
+- Versions and regime bindings are not combined: a run that names a
+  regime, or whose initial regime does not have the contract in force,
+  cannot have versions (Appendix K, K.11 leaves this open).
+- Files without the extension, and runs without `--version`, a time
+  base or the key `version`, give the outputs of 0.3.33, byte for byte,
+  apart from the target checks of `metrics.py` that cannot be compiled
+  (see Fixed).
+- At one observation, a waiting `in_states:` switch whose state holds is
+  made before the versions that take effect there apply (K.11).
+- `cadl metrics-eval` does not judge a measurement whose window contains
+  the effective time of a version that gives the metric another target
+  (as for an entry of `schedule:`), and a `null` term value is not
+  judged instead of a usage error.
+- The norms monitor takes the versions of a run as `run_versions=`
+  (`--run-version` on its command line); `versions=` keeps its meaning,
+  the models that `amend` names. Once an `amend` has been applied, the
+  monitor refuses an observation that names a version.
+- An `amend` to a version whose transitional rule for the contract is
+  `keep` or `switch` with `in_states:` is applied as a switch with a
+  warning (`cadl norms-eval` standard error, the monitor's
+  `amend_warnings`, the warnings of `cadl agents-run`).
+  `cadl norms-eval --version` without a time base and without a named
+  version warns that the first version is in force throughout.
+- In `metrics.py` of the Python target, the target check of a metric
+  with `schedule:` takes the time and the time base and returns `None`
+  (not judged) without them; `version.py` carries the schedules.
+
+### Fixed
+
+- In `metrics.py` of the Python target, a target check whose target
+  cannot be compiled (such as `>= 0.9 * count(orders)`) returned `True`,
+  so the target was met whatever the value; it now returns `None` (not
+  judged).
+
 ## [0.3.33] — 2026-11-17
 
 ### Added
