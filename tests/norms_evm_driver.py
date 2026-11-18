@@ -11,7 +11,14 @@ JOB.json: {"contracts": {name: {"abi": [...], "bin": "..."}}, "libraries":
 [names in the order of deployment], "monitor": name, "runs": [run, ...]}.
 A run is {"begin": [bindings, request, quantities] or null, "steps":
 [{"observe": [t, values, messages, hasState, state, end]} or {"finish":
-true}, with "as": k to send it from account k instead of the reporter, ...]}; values and arguments are [name, kind, n, s].
+true}, with "as": k to send it from account k instead of the reporter,
+"regime": name to call setRegime(name) before it, and "version": name to
+call setVersion(name) before it, ...]}; values and
+arguments are [name, kind, n, s]. "ctor_args": the number of address
+arguments of the constructor (1, or 2 for the monitor of a contract that a
+regime does not have in force or that follows versions: reporter and
+orchestrator); "ids": true to read normIds() after each step (the monitor
+with versions changes its norms).
 OUT.json: per run, per step: {"error": text} for a reverted call, or
 {"verdicts": [states, verdicts, assumptions, guarantees], "logs": [...]}.
 """
@@ -25,7 +32,9 @@ from eth_abi import decode, encode
 from eth_tester import EthereumTester, PyEVMBackend
 from eth_utils import keccak
 
-GAS = 25_000_000
+# the gas of a transaction; the deployment of a monitor with three versions
+# and regimes takes up to about 24 million (the block gas limit is 30 million)
+GAS = 29_500_000
 
 
 def _types(abi_inputs: list) -> list[str]:
@@ -91,7 +100,8 @@ def main() -> int:
     for other, addr in addresses.items():
         code = link(code, other, addr)
     # the constructor argument: the reporter (zero: the deployer)
-    code += encode(["address"], ["0x" + "00" * 20]).hex()
+    nargs = job.get("ctor_args", 1)
+    code += encode(["address"] * nargs, ["0x" + "00" * 20] * nargs).hex()
     # one deployment; each run starts from a snapshot of the chain taken after it
     address = chain.deploy(code)
     t = chain.t
@@ -135,6 +145,16 @@ def main() -> int:
                 results.append(r)
         for st in run["steps"]:
             sender = st.get("as", 0)          # another account than the reporter
+            if "regime" in st:
+                r = call("setRegime", [st["regime"]], True, st.get("regime_as", 0))
+                if "error" in r:
+                    results.append(r)
+                    continue
+            if "version" in st:
+                r = call("setVersion", [st["version"]], True, st.get("version_as", 0))
+                if "error" in r:
+                    results.append(r)
+                    continue
             if "finish" in st:
                 r = call("finish", [], True, sender)
             else:
@@ -143,6 +163,8 @@ def main() -> int:
                 r["verdicts"] = call("verdicts", [], False)
                 r["ended"] = call("ended", [], False)[0]
                 r["deadline"] = call("nextDeadline", [], False)
+                if job.get("ids"):
+                    r["ids"] = call("normIds", [], False)[0]
             results.append(r)
         out.append(results)
     with open(sys.argv[2], "w", encoding="utf-8") as f:

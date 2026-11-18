@@ -68,6 +68,13 @@ def main(argv: list[str] | None = None) -> int:
                                   "(agents 0.1)")
     codegen_cmd.add_argument("--output", "-o", type=Path, default=Path("generated"),
                              help="Output directory (default: generated/)")
+    codegen_cmd.add_argument("--version", dest="version_files", action="append", default=[],
+                             type=Path, metavar="FILE",
+                             help="Another version of the file (amendment 0.1); the versions "
+                                  "form one sequence by previous: (Appendix K, K.11). The norms "
+                                  "monitors of the opa and solidity targets and the code of "
+                                  "unity-csharp then follow the version in force that the caller "
+                                  "names; may be repeated")
 
     # agents-decide command
     decide_cmd = subparsers.add_parser(
@@ -112,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     run_cmd.add_argument("--audit-key", type=Path, default=None, metavar="FILE",
                          help="Key the hash chain of the audit log (HMAC-SHA256) with "
                               "the key in FILE (at least 16 bytes)")
+    _add_version_options(run_cmd, "the file, whose enforced contracts are switched at "
+                                  "its effective time")
 
     # audit-verify command
     averify_cmd = subparsers.add_parser(
@@ -183,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="JSON object from actor to the key file (or {\"hex\": ...}) "
                              "with which its inbox files are authenticated "
                              "(HMAC-SHA256); required with --approvals")
+    _add_version_options(gw_cmd, "the file, whose enforced contracts are switched at "
+                                 "its effective time; t of the trace counts from the start")
     gw_cmd.add_argument("--hold-key", type=Path, default=None, metavar="FILE",
                         help="Sign every published hold with this key (HMAC-SHA256); "
                              "approvers verify it with mcp-approve --hold-key")
@@ -194,7 +205,13 @@ def main(argv: list[str] | None = None) -> int:
     gw_cmd.add_argument("--init", type=Path, default=None, metavar="FILE.json",
                         help="Keys for the first line of the trace: bindings, "
                              "request, values, quantities, instances, "
-                             "host_instances, state")
+                             "host_instances, state, regime")
+    gw_cmd.add_argument("--regime-key", type=Path, default=None, metavar="FILE",
+                        help="The key (HMAC-SHA256) with which the host's changes of "
+                             "regime in the inbox are authenticated (mcp-regime), also "
+                             "with --insecure-approvals; without it they are refused "
+                             "with --approver-keys and read as they are with "
+                             "--insecure-approvals")
     gw_cmd.add_argument("--no-filter-tools", action="store_true",
                         help="Do not remove undeclared tools from tools/list results")
     gw_cmd.add_argument("--poll", type=float, default=0.05, metavar="SECONDS",
@@ -250,6 +267,8 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--approver-keys", type=Path, default=None, metavar="FILE",
                          help="The keys of the approvers and other senders of the "
                               "inbox; required with --approvals")
+    _add_version_options(a2a_cmd, "the file, whose enforced contracts are switched at "
+                                  "its effective time; t of the trace counts from the start")
     a2a_cmd.add_argument("--hold-key", type=Path, default=None, metavar="FILE",
                          help="Sign every published hold with this key (HMAC-SHA256); "
                               "approvers verify it with mcp-approve --hold-key")
@@ -258,7 +277,13 @@ def main(argv: list[str] | None = None) -> int:
     a2a_cmd.add_argument("--init", type=Path, default=None, metavar="FILE.json",
                          help="Keys for the first line of the trace: bindings, "
                               "request, values, quantities, instances, "
-                              "host_instances, state")
+                              "host_instances, state, regime")
+    a2a_cmd.add_argument("--regime-key", type=Path, default=None, metavar="FILE",
+                         help="The key (HMAC-SHA256) with which the host's changes of "
+                              "regime in the inbox are authenticated (mcp-regime), also "
+                              "with --insecure-approvals; without it they are refused "
+                              "with --approver-keys and read as they are with "
+                              "--insecure-approvals")
     a2a_cmd.add_argument("--listen", default="127.0.0.1:8470", metavar="HOST:PORT",
                          help="Address to listen on (default 127.0.0.1:8470; port 0 "
                               "picks a free port). An address other than loopback "
@@ -417,6 +442,22 @@ def main(argv: list[str] | None = None) -> int:
     msg_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
                          help="The key of the sender (HMAC-SHA256)")
 
+    # mcp-regime command
+    mreg_cmd = subparsers.add_parser(
+        "mcp-regime",
+        help="Name the current regime of a running mcp-gateway or a2a-gateway "
+             "(Appendix A, A.7.1)",
+        description="Drop a change of regime into the inbox directory of a gateway. "
+                    "The gateway writes a trace line with the key regime: from that "
+                    "line on the regime is current, and the enforced contracts that "
+                    "it does not have in force govern no message. Without --key it "
+                    "refuses an inbox whose run.json says approver_keys or "
+                    "regimes_signed. Exit status: 0 written, 2 usage error.")
+    mreg_cmd.add_argument("inbox", type=Path, metavar="DIR", help="Inbox directory")
+    mreg_cmd.add_argument("regime", metavar="REGIME", help="A regime of the file")
+    mreg_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
+                          help="The regime key of the gateway (--regime-key)")
+
     # regime-map command
     regime_cmd = subparsers.add_parser("regime-map", help="Analyze regime transitions and build a regime map")
     regime_cmd.add_argument("file", type=Path, help="CADL file to analyze")
@@ -464,6 +505,22 @@ def main(argv: list[str] | None = None) -> int:
                            help="Contract to evaluate (default: the only one with norms)")
     norms_cmd.add_argument("--format", choices=["text", "json"], default="text",
                            help="Output format (default: text)")
+    _add_version_options(norms_cmd, "the run")
+
+    # metrics-eval command (amendment extension, Appendix K, K.11)
+    meval_cmd = subparsers.add_parser("metrics-eval",
+        help="Judge measured values of metrics against their targets and schedules "
+             "(Appendix K, K.11)",
+        description="Judge each measurement under the declaration of the metric in the "
+                    "version in force at the start of its window, against the target in "
+                    "force then. Exit status: 0 when no measurement fails its target, 1 "
+                    "otherwise, 2 on a usage error.")
+    meval_cmd.add_argument("file", type=Path, help="CADL file that declares the metrics")
+    meval_cmd.add_argument("--measurements", type=Path, required=True,
+                           help="Measurements (JSON Lines; see the README)")
+    meval_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                           help="Output format (default: text)")
+    _add_version_options(meval_cmd, "the model")
 
     # norms-check command
     nchk_cmd = subparsers.add_parser("norms-check",
@@ -691,8 +748,13 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "mcp-message":
         from .mcp_gateway import cli_message
         return cli_message(args)
+    elif args.command == "mcp-regime":
+        from .gateway_core import cli_regime
+        return cli_regime(args)
     elif args.command == "norms-eval":
         return _cmd_norms_eval(args)
+    elif args.command == "metrics-eval":
+        return _cmd_metrics_eval(args)
     elif args.command == "norms-check":
         return _cmd_norms_check(args)
     elif args.command == "norms-diff":
@@ -952,8 +1014,22 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
     target = args.target
     output_dir = args.output
     from .codegen import norms_monitors
+    versions = []
+    for vp in args.version_files:
+        try:
+            vs = parse_file(vp)
+        except Exception as e:
+            print(f"Parse error: {vp}: {e}", file=sys.stderr)
+            return 1
+        vtc = type_check(vs)
+        if not vtc.ok:
+            for e in vtc.errors:
+                print(f"  {e}", file=sys.stderr)
+            print(f"Type check failed: {vp}", file=sys.stderr)
+            return 1
+        versions.append(vs)
     try:
-        monitors = {m["contract"]: m for m in norms_monitors(sos, target)}
+        monitors = {m["contract"]: m for m in norms_monitors(sos, target, versions)}
     except Exception as e:
         print(f"Code generation error: {e}", file=sys.stderr)
         return 1
@@ -982,7 +1058,7 @@ def _cmd_codegen(args: argparse.Namespace) -> int:
             print(f"  [WARNING]: {key} item {pos} of contract '{m['contract']}' is not "
                   f"monitored by {m['file']} ({reason}): {text}", file=sys.stderr)
     try:
-        generate(sos, output_dir, target=target)
+        generate(sos, output_dir, target=target, versions=versions)
     except Exception as e:
         print(f"Code generation error: {e}", file=sys.stderr)
         return 1
@@ -1034,7 +1110,7 @@ def _cmd_agents_decide(args: argparse.Namespace) -> int:
             print(f"  {e}", file=sys.stderr)
         return usage_error("Type check failed: cannot decide")
     try:
-        policy = build_policy(sos)
+        policy = build_policy(sos, regimes=True)
     except ValueError as e:
         return usage_error(str(e))
 
@@ -1346,13 +1422,53 @@ def _cmd_sim_gen(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_version_options(cmd: argparse.ArgumentParser, what: str) -> None:
+    """--version, --period, --origin and --epoch (Appendix K, K.11)."""
+    cmd.add_argument("--version", dest="version_files", action="append", default=[],
+                     type=Path, metavar="FILE",
+                     help=f"Another version of {what} (amendment 0.1); the versions form one "
+                          f"sequence by previous: (Appendix K, K.11); may be repeated")
+    cmd.add_argument("--period", default=None, metavar="DURATION",
+                     help="Length of a period of the time stamps, e.g. 3600s, for "
+                          "effective: { period: k } (K.11)")
+    cmd.add_argument("--origin", default=None, metavar="SECONDS",
+                     help="Time stamp at which period 1 starts (default: 0)")
+    cmd.add_argument("--epoch", action="store_true",
+                     help="Time stamps are seconds since 1970-01-01T00:00:00Z, for "
+                          "effective: { at: ... } (K.11)")
+
+
+def _time_base(args: argparse.Namespace):
+    """The time base of --period, --origin and --epoch, or None."""
+    from .norms_eval import NormsEvalError, TimeBase, parse_duration_seconds
+    if args.period is None and args.origin is not None:
+        raise NormsEvalError("--origin needs --period")
+    if args.period is None and not args.epoch:
+        return None
+    origin = 0
+    if args.origin is not None:
+        try:
+            from decimal import Decimal, InvalidOperation
+            from fractions import Fraction
+            origin = Fraction(Decimal(args.origin))
+        except (InvalidOperation, ValueError, OverflowError):
+            raise NormsEvalError(f"--origin must be a finite number of seconds, not "
+                                 f"{args.origin!r}") \
+                from None
+    period = None if args.period is None else parse_duration_seconds(args.period)
+    return TimeBase(period, origin, args.epoch)
+
+
 def _cmd_norms_eval(args: argparse.Namespace) -> int:
     """Exit status: 0 when no norm or guarantee is `violated` (`excused`
     and `pending` do not fail), 1 otherwise, 2 on a usage error."""
-    from .norms_eval import NormsEvalError, TraceError, evaluate_files, format_text
+    from .norms_eval import (NormsEvalError, TraceError, evaluate_files, format_text,
+                             format_text_versions)
 
+    notes: list = []
     try:
-        result = evaluate_files(args.file, args.trace, args.contract)
+        result = evaluate_files(args.file, args.trace, args.contract,
+                                args.version_files, _time_base(args), notes)
     except TraceError as e:
         print(f"Trace error: {args.trace}: {e}", file=sys.stderr)
         return 2
@@ -1360,6 +1476,31 @@ def _cmd_norms_eval(args: argparse.Namespace) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 2
 
+    if args.format == "json":
+        import json
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_text_versions(result, format_text(result)))
+    for note in notes:
+        print(f"Warning: {note}", file=sys.stderr)
+    return 0 if result["ok"] else 1
+
+
+def _cmd_metrics_eval(args: argparse.Namespace) -> int:
+    """Exit status: 0 when no measurement fails its target (`not judged`
+    does not fail), 1 otherwise, 2 on a usage error."""
+    from .metrics_eval import evaluate_files, format_text
+    from .norms_eval import NormsEvalError, TraceError
+
+    try:
+        result = evaluate_files(args.file, args.measurements, args.version_files,
+                                _time_base(args))
+    except TraceError as e:
+        print(f"Measurement error: {args.measurements}: {e}", file=sys.stderr)
+        return 2
+    except NormsEvalError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
     if args.format == "json":
         import json
         print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -1456,7 +1597,9 @@ def _cmd_agents_run(args: argparse.Namespace) -> int:
             raise NormsEvalError(f"File not found: {args.trace}")
         sos = load_version(args.file)
         trace = load_run_trace(args.trace)
-        result = {"file": str(args.file), **run(sos, trace)}
+        result = {"file": str(args.file),
+                  **run(sos, trace, run_versions=[load_version(p) for p in args.version_files],
+                        base=_time_base(args))}
         log = None
         if args.audit is not None:
             log = "".join(line + "\n" for line in chain_lines(

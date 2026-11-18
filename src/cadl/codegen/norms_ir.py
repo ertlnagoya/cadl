@@ -80,6 +80,76 @@ class NormsTargetUnsupported(ValueError):
         super().__init__("; ".join(self.reasons))
 
 
+def regime_data(sos: SoSDefinition, contract: ContractDef) -> dict | None:
+    """The regimes of a file with `regimes:` (Appendix A, A.7.1) for the
+    monitor of a contract that some regime does not have in force:
+    ``{"regimes": [...], "out": [regimes without the contract in force],
+    "initial": regime}``; None when every regime has it in force (the
+    monitor is then that of the file without the block) or the file has no
+    block. The monitors of the Rego and Solidity targets then follow the
+    current regime as `cadl norms-eval` does (F.5, "Contracts not in
+    force")."""
+    if not sos.transitions:
+        return None
+    from ..norms_eval import regime_bindings
+    b = regime_bindings(sos)
+    if b is None:
+        return None
+    out = [r for r in b.regimes if not b.in_force(contract.id, r)]
+    if not out:
+        return None
+    return {"regimes": list(b.regimes), "out": out, "initial": b.initial}
+
+
+def switching_contracts(sos: SoSDefinition) -> dict:
+    """The contracts whose running instances switch to this version when it
+    takes effect (Appendix K, K.4 and K.11), with their rule: empty unless
+    the file declares amendment 0.1 and may replace another version: it
+    names it (`previous:`), or (from cadl 0.3.35, when `previous:` may be
+    left out) it gives an effective time other than period 1, which may
+    come after that of another version (K.11). Only then can an instance
+    be running under another version."""
+    from ..amendment import amendment_declared, analyse, may_replace
+    raw = getattr(sos, "amendment", None)
+    if not amendment_declared(sos) or raw is None or not raw.has_block:
+        return {}
+    a = analyse(sos)
+    if not may_replace(a):
+        return {}
+    out = {}
+    for c in sos.contracts:
+        rule, states = a.transitional.get(c.id, (a.transitional_default, []))
+        if rule == "switch":
+            out[c.id] = (f"switch in {', '.join(states)}" if states else "switch")
+    return out
+
+
+def check_versions(sos: SoSDefinition, contract: ContractDef, target: str) -> None:
+    """Raise `NormsTargetUnsupported` for a contract whose running instances
+    switch to this version (Appendix K, K.11): the monitors of the Rego and
+    Solidity targets do not apply amendments (F.6), so they could not take
+    over an instance that started under the version this one replaces."""
+    rule = switching_contracts(sos).get(contract.id)
+    if rule is not None:
+        raise NormsTargetUnsupported([
+            f"this version replaces {_previous(sos)} and its transitional rule for "
+            f"{contract.id} is {rule} (Appendix K, K.4): to take over a running instance "
+            f"of the old version the norms monitor of the {target} target needs the other "
+            f"versions of the run (cadl codegen --version FILE, from cadl 0.3.36; K.11)"])
+
+
+def _previous(sos: SoSDefinition) -> str:
+    """The version this one replaces, in words."""
+    from ..amendment import analyse
+    a = analyse(sos)
+    if a.previous is not None:
+        return f"version {a.previous}"
+    (form, v), = a.effective.items()
+    return (f"the version before it (it gives no previous: and takes effect at {form} {v}, "
+            f"so it may be a later version of a run, K.11; if it is the first version, "
+            f"declare effective: {{ period: 1 }} or leave effective: out)")
+
+
 def _number(value: float, what: str) -> float:
     if isinstance(value, float) and not math.isfinite(value):
         raise NormsTargetUnsupported([f"{what}: the number {value!r} is not finite"])

@@ -296,6 +296,11 @@ def to_ir(sos: SoSDefinition) -> Any:
     bindings = checked(sos)
     if bindings is None:
         return None
+    return to_ir_bindings(bindings)
+
+
+def to_ir_bindings(bindings: list[RegimeBinding]) -> list[dict]:
+    """Resolved bindings in the form of the IR (and of `cadl regime-map`)."""
     return [
         {
             "name": b.name,
@@ -305,3 +310,20 @@ def to_ir(sos: SoSDefinition) -> Any:
         }
         for b in bindings
     ]
+
+
+def initial_regime(sos: SoSDefinition) -> str | None:
+    """The regime in which a run starts (A.7.1): the first `from:` that is
+    not the `to:` of any transition, otherwise the `from:` of the first
+    transition; None for a file without transitions. It is the initial
+    state of `cadl regime-map`."""
+    targets = {t.to_regime for t in sos.transitions}
+    for t in sos.transitions:
+        if t.from_regime not in targets:
+            return t.from_regime
+    return sos.transitions[0].from_regime if sos.transitions else None
+
+
+def suspended_somewhere(bindings: list[RegimeBinding] | None, contract_id: str) -> list[str]:
+    """The regimes in which a contract is not in force (empty without bindings)."""
+    return [b.name for b in (bindings or []) if contract_id not in b.active]

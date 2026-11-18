@@ -36,7 +36,10 @@ import tempfile
 import textwrap
 from pathlib import Path
 
-from cadl.agents import build_policy, decide, governs, message_kind, parse_concrete_actor, ref_match
+from cadl.agents import (
+    AgentsInputError, _in_force_contracts, build_policy, decide, governs, message_kind,
+    parse_concrete_actor, ref_match,
+)
 from cadl.codegen import generate
 from cadl.parser import parse
 from cadl.type_checker import type_check
@@ -137,9 +140,11 @@ def _q(text: str) -> str:
     return json.dumps(text)
 
 
-def random_file(rng: random.Random) -> str:
+def random_file(rng: random.Random, regimes: bool = False) -> str:
     """The text of a random file: one to three enforced contracts, and with
-    some probability a contract that is not enforced."""
+    some probability a contract that is not enforced. With `regimes`: two
+    or three regimes, each without some of the contracts in force
+    (regimes:, Appendix A, A.7.1)."""
     contracts = []
     k = rng.choice([1, 1, 2, 2, 3])
     for ci in range(k):
@@ -147,6 +152,16 @@ def random_file(rng: random.Random) -> str:
     if rng.random() < .25:
         contracts.append(_random_contract(rng, "P", enforced=False))
     body = "contracts:\n" + "".join(textwrap.indent(c, "  ") for c in contracts)
+    if regimes:
+        names = ["CALM", "STORM", "FLOOD"][:rng.choice([2, 3])]
+        ids = [f"C{ci + 1}" for ci in range(k)] + (["P"] if "- id: P" in "".join(contracts) else [])
+        body += "transitions:\n" + "".join(
+            f"  - {{ from: {a}, to: {b}, condition: \"wind >= {j}\" }}\n"
+            for j, (a, b) in enumerate(zip(names, names[1:] + names[:1])))
+        body += "regimes:\n"
+        for r in names:
+            out = [c for c in ids if rng.random() < .45]
+            body += f"  {r}:\n    contracts: {{ suspended: [{', '.join(out)}] }}\n"
     return ("sos:\n  name: Random\n  extensions:\n    - norms: 0.1\n    - agents: 0.1\n"
             "  actors:\n" + textwrap.indent(textwrap.dedent(RANDOM_ACTORS).strip() + "\n", "    ")
             + textwrap.indent(body, "  "))
@@ -239,9 +254,9 @@ def _random_contract(rng: random.Random, cid: str, enforced: bool) -> str:
     return "\n".join(lines) + "\n"
 
 
-def random_valid_file(rng: random.Random, tries: int = 200) -> str:
+def random_valid_file(rng: random.Random, tries: int = 200, regimes: bool = False) -> str:
     for _ in range(tries):
-        text = random_file(rng)
+        text = random_file(rng, regimes)
         try:
             sos = parse(text)
         except Exception:
@@ -293,7 +308,10 @@ def random_instance_set(rng: random.Random, policy: dict):
 
 
 def random_inputs(rng: random.Random, policy: dict, n_sets: int) -> list[dict]:
+    """With regime bindings, each input names a regime of the file, and one
+    in twenty an unknown regime or none."""
     sets = [random_instance_set(rng, policy) for _ in range(n_sets)]
+    bound = policy.get("regimes")
     out = []
     for s in RANDOM_SENDERS:
         for r in RANDOM_RECEIVERS:
@@ -302,8 +320,26 @@ def random_inputs(rng: random.Random, policy: dict, n_sets: int) -> list[dict]:
                     inp = {"message": {"from": s, "to": r, "name": n}}
                     if instances is not None:
                         inp["instances"] = instances
+                    if bound is not None:
+                        x = rng.random()
+                        if x < .025:
+                            inp["regime"] = "NOWHERE"
+                        elif x >= .05:
+                            inp["regime"] = rng.choice(bound["regimes"])
                     out.append(inp)
     return out
+
+
+def regime_of(inp: dict):
+    return inp.get("regime")
+
+
+def decide_or_error(policy: dict, inp: dict) -> dict | None:
+    """decide, or None for an input it refuses (the generated policies deny it)."""
+    try:
+        return decide(policy, inp)
+    except AgentsInputError:
+        return None
 
 
 # --- Cedar ----------------------------------------------------------------------
@@ -360,8 +396,11 @@ def cedar_answers(sos, policy: dict, messages: list[tuple], workdir: Path) -> di
     parsed = subprocess.run([CEDAR, "check-parse", "--policies", str(policy_file)],
                             capture_output=True, text=True, timeout=120)
     assert parsed.returncode == 0, parsed.stderr
+    # (sender, receiver, name) or (sender, receiver, name, regime or None)
+    keys = list(messages)
+    messages = [tuple(m) + (None,) * (4 - len(m)) for m in messages]
     entities, known = cedar_entities(table, messages)
-    for s, r, _ in messages:
+    for s, r, _, _ in messages:
         for a in (s, r):
             e = _members_of_unbounded(policy, a)
             if e is not None and a not in known:
@@ -370,8 +409,9 @@ def cedar_answers(sos, policy: dict, messages: list[tuple], workdir: Path) -> di
     pids = list(table["policies"])
     requests = [{"principal": f"CADL::Actor::{json.dumps(s)}",
                  "action": f"CADL::Action::{json.dumps(n)}",
-                 "resource": f"CADL::Actor::{json.dumps(r)}", "context": {}}
-                for s, r, n in messages]
+                 "resource": f"CADL::Actor::{json.dumps(r)}",
+                 "context": {} if g is None else {"regime": g}}
+                for s, r, n, g in messages]
     # First pass: the decisions; a test that expects allow fails on Deny.
     status = _run_tests(policy_file, workdir, [
         {"name": f"{k}", "request": req, "entities": entities,
@@ -396,7 +436,7 @@ def cedar_answers(sos, policy: dict, messages: list[tuple], workdir: Path) -> di
             assert res == "ok" or res.startswith("fail: missing reason"), res
             if res == "ok":
                 reasons.append(p)
-        out[m] = (decisions[k], reasons)
+        out[keys[k]] = (decisions[k], reasons)
     return {"answers": out, "table": table}
 
 
@@ -427,7 +467,7 @@ def cedar_decides(policy: dict, table: dict, inp: dict, answer: tuple) -> tuple[
     name = m["name"]
     instances = inp.get("instances")
     roles = table["policies"]
-    governing = [c for c in policy["contracts"]
+    governing = [c for c in _in_force_contracts(policy, inp.get("regime"))
                  if governs(policy, c, sender, receiver, name)]
 
     def running(cid):
@@ -477,9 +517,9 @@ def compare_cedar(sos, inputs: list[dict], workdir: Path) -> dict:
     answer is the decision of G.5 for the full input. Counted: per reason
     for which G.10 leaves an input to the runtime, how many inputs there
     are and on how many the Cedar answer differs from the decision."""
-    policy = build_policy(sos)
+    policy = build_policy(sos, regimes=True)
     messages = list(dict.fromkeys((i["message"]["from"], i["message"]["to"],
-                                   i["message"]["name"]) for i in inputs))
+                                   i["message"]["name"], regime_of(i)) for i in inputs))
     res = cedar_answers(sos, policy, messages, workdir)
     answers, table = res["answers"], res["table"]
     reduced = static_only(policy)
@@ -487,13 +527,20 @@ def compare_cedar(sos, inputs: list[dict], workdir: Path) -> dict:
               "not_decided": 0, "not_decided_differ": 0, "clauses": {}, "left": {},
               "left_differ": {}}
     for m in messages:
-        want = outcome(decide(reduced, {"message": dict(zip(("from", "to", "name"), m))})
-                       ["decision"])
+        alone = {"message": dict(zip(("from", "to", "name"), m[:3]))}
+        if m[3] is not None:
+            alone["regime"] = m[3]
+        got = decide_or_error(reduced, alone)
+        want = "deny" if got is None else outcome(got["decision"])
         assert answers[m][0] == want, ("semantics of the Cedar target", m, answers[m], want)
     for inp in inputs:
-        m = (inp["message"]["from"], inp["message"]["to"], inp["message"]["name"])
+        m = (inp["message"]["from"], inp["message"]["to"], inp["message"]["name"],
+             regime_of(inp))
         answer = answers[m]
-        full = decide(policy, inp)
+        full = decide_or_error(policy, inp)
+        if full is None:
+            counts["refused"] = counts.get("refused", 0) + 1
+            continue
         decided, why = cedar_decides(policy, table, inp, answer)
         differ = outcome(full["decision"]) != answer[0]
         if not decided:
@@ -546,21 +593,26 @@ def compare_opa(sos, inputs: list[dict], workdir: Path) -> int:
     assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
     values = json.loads(proc.stdout)["result"][0]["expressions"][0]["value"]
     assert len(values) == len(inputs)
-    policy = build_policy(sos)
+    policy = build_policy(sos, regimes=True)
     for inp, value in zip(inputs, values):
-        want = decide(policy, inp)
+        want = decide_or_error(policy, inp)
+        if want is None:
+            assert value["result"] is None and value["decision"] == "deny", (
+                "OPA decides an input that the decision function refuses", inp, value)
+            continue
         assert value["result"] == want and value["decision"] == want["decision"], (
             "OPA differs", inp, value, want)
     return len(inputs)
 
 
-def run_random(seed: int, n_files: int, n_sets: int, cedar=True, opa=True) -> dict:
+def run_random(seed: int, n_files: int, n_sets: int, cedar=True, opa=True,
+               regimes: bool = False) -> dict:
     rng = random.Random(seed)
     totals: dict = {"files": 0, "cedar": {}, "opa_inputs": 0}
     for _ in range(n_files):
-        text = random_valid_file(rng)
+        text = random_valid_file(rng, regimes=regimes)
         sos = parse(text)
-        policy = build_policy(sos)
+        policy = build_policy(sos, regimes=True)
         inputs = random_inputs(rng, policy, n_sets)
         totals["files"] += 1
         with tempfile.TemporaryDirectory() as d:

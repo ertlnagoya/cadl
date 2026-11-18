@@ -53,7 +53,7 @@ from .audit_log import (
     new_run_id,
     read_key,
 )
-from .norms_eval import NormsEvalError, load_version
+from .norms_eval import NormsEvalError, TraceError, load_version
 
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -62,7 +62,7 @@ INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
 INIT_KEYS = {"bindings", "request", "values", "quantities", "instances",
-             "host_instances", "state"}
+             "host_instances", "state", "regime"}
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _NONCE_RE = re.compile(r"[0-9a-f]{32}")
 _MAC_RE = re.compile(r"[0-9a-f]{64}")
@@ -70,6 +70,27 @@ _IDENT_HOLD_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Seconds after a deadline at which the expiry is observed: the runtime
 # expires a hold at a time strictly later than its deadline.
 _AFTER_DEADLINE = 0.001
+
+
+def gateway_versions(args) -> dict:
+    """The keyword arguments `run_versions` and `base` of a gateway from
+    --version, --period, --origin and --epoch (Appendix K, K.11)."""
+    from .cli import _time_base
+    files = list(getattr(args, "version_files", None) or [])
+    try:
+        base = _time_base(args)
+        run_versions = [load_version(p) for p in files]
+    except NormsEvalError as e:
+        raise GatewayError(str(e)) from None
+    if not files and base is None:
+        return {}
+    return {"run_versions": run_versions, "base": base}
+
+
+def gateway_regime_key(args) -> dict:
+    """The keyword argument `regime_key` of a gateway from --regime-key."""
+    path = getattr(args, "regime_key", None)
+    return {} if path is None else {"regime_key": read_key(path)}
 
 
 class GatewayError(ValueError):
@@ -279,18 +300,29 @@ class EnforcementPoint:
             raise GatewayError(str(e)) from None
         if not G.agents_active(self.sos):
             raise GatewayError("the file does not declare 'norms: 0.1' and 'agents: 0.1'")
-        self.policy = G.build_policy(self.sos)
+        self.policy = G.build_policy(self.sos, regimes=True)
         self.approval_rules = self._approval_rules()
 
     def _open(self, audit: Path, trace_out: Path, key: bytes | None, inbox: Path | None,
               init: dict | None, clock: Callable[[], float], wall: datetime | None,
               approver_keys: dict[str, bytes] | None, insecure_approvals: bool,
               run_id: str | None, more_first: dict | None = None,
-              hold_key: bytes | None = None) -> None:
+              hold_key: bytes | None = None, run_versions: list | None = None,
+              base=None, regime_key: bytes | None = None) -> None:
         """Check the options, create the logs and the inbox, and decide the
         first line of the trace."""
         self.inbox = None if inbox is None else Path(inbox)
         self.hold_key = hold_key
+        self.regime_key = regime_key
+        if regime_key is not None:
+            if inbox is None:
+                raise GatewayError("--regime-key authenticates the changes of regime in the "
+                                   "inbox; give --approvals")
+            others = [k for k in (key, hold_key) if k is not None] \
+                + list((approver_keys or {}).values())
+            if any(hmac.compare_digest(regime_key, k) for k in others):
+                raise GatewayError("the regime key is the key of the audit log, the hold key "
+                                   "or an approver key; use another")
         if hold_key is not None:
             if inbox is None:
                 raise GatewayError("--hold-key signs the holds published in the inbox; "
@@ -331,13 +363,44 @@ class EnforcementPoint:
         self.epoch = wall.astimezone(timezone.utc)
         self.t0 = clock()
         self.last_t = 0.0
-        self.runtime = AgentsRuntime.open(self.sos, path=str(trace_out))
+        try:
+            self.runtime = AgentsRuntime.open(self.sos, path=str(trace_out),
+                                              run_versions=run_versions, base=base)
+        except (NormsEvalError, TraceError) as e:
+            raise GatewayError(str(e)) from None
+        self._check_versions()
         self.approvals_mode = ("none" if self.inbox is None else
                                "authenticated" if approver_keys is not None else "insecure")
         self.chain = AuditChain(file_sha256(self.file), epoch_text(self.epoch), key,
                                 self.run_id, self.approvals_mode)
+        created: list = []
+        try:
+            self._start(audit, trace_out, init, approver_keys, more_first, hold_key,
+                        regime_key, created)
+        except BaseException:
+            # a gateway that does not start leaves no log, trace or run.json
+            # behind, so that a corrected start can create them
+            for f in (getattr(self, "audit_f", None), getattr(self, "trace_f", None)):
+                try:
+                    if f is not None:
+                        f.close()
+                except OSError:
+                    pass
+            for path in created:
+                try:
+                    Path(path).unlink()
+                except OSError:
+                    pass
+            raise
+
+    def _start(self, audit, trace_out, init, approver_keys, more_first, hold_key,
+               regime_key, created: list) -> None:
+        """Create the logs, publish run.json and process the first line;
+        `created` collects the files made here."""
         self.audit_f = open(audit, "x", encoding="utf-8")
+        created.append(audit)
         self.trace_f = open(trace_out, "x", encoding="utf-8")
+        created.append(trace_out)
         self._write(self.audit_f, self.chain.header())
         # Three digits of the fraction always: Python 3.9 reads no other
         # length with `datetime.fromisoformat`.
@@ -351,11 +414,55 @@ class EnforcementPoint:
                    **(more_first or {})}
             if hold_key is not None:
                 run["holds_signed"] = True
+            if regime_key is not None:
+                run["regimes_signed"] = True
             self._publish("run.json", run)
+            created.append(self.inbox / "run.json")
         try:
             self._step(first)
         except Exception as e:      # noqa: BLE001
             raise GatewayError(f"the first line of the trace is not accepted: {e}") from None
+        regime = self.runtime.regime
+        lacking = self._regime_lacking(regime)
+        if lacking and regime is None:
+            raise GatewayError(
+                f"the run starts in no regime (the version in force at its start has no "
+                f"regimes:), and version {lacking[0]} of the run binds regimes; a run in no "
+                f"regime must not use a version with regimes: (Appendix K, K.11), so the "
+                f"gateway would fail when that version takes effect; give versions that all "
+                f"have regimes: or none")
+        if lacking:
+            how = ("--init names regime" if (init or {}).get("regime") is not None
+                   else "the run starts in the initial regime")
+            raise GatewayError(
+                f"{how} {regime}, which is not a regime of version {lacking[0]} of the run; "
+                f"a regime of a run with versions must be a regime of every version that "
+                f"the run uses (Appendix K, K.11), so the gateway would fail when that "
+                f"version takes effect; name a regime that every version has, or give "
+                f"other versions")
+
+    def _check_versions(self) -> None:
+        """The gateway reads the actors and the rules that create approvals
+        and rejections once, from the file. The versions of its run
+        (Appendix K, K.11) may change contracts, not these."""
+        from .agents_runtime import _plain
+        chain = self.runtime.chain
+        if chain is None:
+            return
+
+        def fixed(sos) -> tuple:
+            rules = tuple((c.id, r.creates, r.when) for c in sos.contracts
+                          if c.enforcement is not None for r in c.counts_as
+                          if r.creates in G.HOLD_EVENTS)
+            return _plain(sos.actors), rules
+        own = fixed(self.sos)
+        for info in chain.infos:
+            if fixed(info.sos) != own:
+                raise GatewayError(
+                    f"version {info.name} of the run changes the actors or the counts_as "
+                    f"rules that create approval or rejection; the gateway reads them once "
+                    f"from the file, so the versions of its run must keep them (Appendix K, "
+                    f"K.11)")
 
     def _actor(self, text: str, option: str) -> dict:
         actor = G.parse_concrete_actor(text)
@@ -621,9 +728,13 @@ class EnforcementPoint:
                                          message=e.message)
                     continue
                 self._move(path, "done")
+                line: dict[str, Any] = {"t": self.now(), "host_events": events}
+                if m is None:                   # a change of regime
+                    line["regime"] = events[0].pop("regime")
+                else:
+                    line["messages"] = [m]
                 try:
-                    self._settle(self._step({"t": self.now(), "host_events": events,
-                                             "messages": [m]}))
+                    self._settle(self._step(line))
                 except Exception:       # noqa: BLE001
                     self._fail_held()
                     return
@@ -695,7 +806,10 @@ class EnforcementPoint:
                         "reason": reason, "message": head}]
         if kind == "message":
             return self._other_message(obj), []
-        raise _Refused("'kind' is neither approval nor message")
+        if kind == "regime":
+            regime = self._regime_change(obj)
+            return None, [{"event": "regime_change", "reason": regime, "regime": regime}]
+        raise _Refused("'kind' is neither approval, message nor regime")
 
     def _check_mac(self, obj: dict, actor: str, event: str, hold_id: str | None,
                    m: dict | None) -> None:
@@ -756,6 +870,76 @@ class EnforcementPoint:
                                event=record, hold_id=hold_id, message=m,
                                reason="wrong_message")
         return m, hold_id
+
+    def _regime_change(self, obj: dict) -> str:
+        """A change of the current regime (Appendix A, A.7.1, "Runs"): the
+        host of the gateway takes the transitions and names the regime that
+        is current from the next line of the trace on. With --regime-key
+        the file is authenticated (a MAC over the file, a nonce, the run
+        id), also under --insecure-approvals; with --approver-keys and no
+        --regime-key every change is refused; under --insecure-approvals
+        without --regime-key it is read as it is. The file is authenticated
+        before its regime is looked at, so a file that is not authenticated
+        is recorded as `unauthenticated` (`wrong_run`, `replayed`) and
+        nothing else; then a regime that the run cannot take is refused
+        (`no_regimes`, `unknown_regime`) and the run goes on."""
+        allowed = {"kind", "regime", "run_id", "nonce", "mac"}
+        if set(obj) - allowed:
+            raise _Refused("unknown keys: " + ", ".join(sorted(set(obj) - allowed)))
+
+        def refuse(reason, why):
+            raise _Refused(why, event="regime_refused", reason=reason)
+        if self.regime_key is not None:
+            mac = obj.get("mac")
+            if not isinstance(mac, str) or not _MAC_RE.fullmatch(mac) \
+                    or not hmac.compare_digest(mac, message_mac(self.regime_key, obj)):
+                refuse("unauthenticated", "the MAC is missing or does not verify")
+            if obj.get("run_id") != self.run_id:
+                refuse("wrong_run", "the file is for another run")
+            nonce = obj.get("nonce")
+            if not isinstance(nonce, str) or not _NONCE_RE.fullmatch(nonce):
+                refuse("unauthenticated", "no nonce")
+            if nonce in self.nonces:
+                refuse("replayed", "the nonce was used before")
+            self.nonces.add(nonce)
+        elif self.approver_keys is None:        # --insecure-approvals
+            if obj.get("run_id") not in (None, self.run_id):
+                refuse("wrong_run", "the file is for another run")
+        else:
+            refuse("unauthenticated", "the gateway has no --regime-key")
+        regime = obj.get("regime")
+        names = self.runtime._named_regimes
+        if not names:
+            refuse("no_regimes", "the file has no regimes: block (Appendix A, A.7.1)")
+        if not isinstance(regime, str) or regime not in names:
+            refuse("unknown_regime", f"'regime' is not a regime of the file ({', '.join(names)})")
+        lacking = self._regime_lacking(regime)
+        if lacking:
+            refuse("unknown_regime",
+                   f"'regime' {regime} is not a regime of version {lacking[0]}, which is in "
+                   f"force, was in force or is still to take effect in this run; a regime of "
+                   f"a run with versions must be a regime of every version that the run uses "
+                   f"(Appendix K, K.11)")
+        return regime
+
+    def _regime_lacking(self, regime: Any) -> list:
+        """The versions of the run that do not have `regime` among their
+        regimes and that the run used or may still use: those in force at
+        some line so far, the one in force, and every later version of the
+        run (K.11, "Versions and regimes", item 3). For `regime` None (the
+        run in no regime), the versions that have regimes:. Empty without
+        versions."""
+        rt = self.runtime
+        if rt.chain is None or rt._vk is None:
+            return []
+        infos = rt.chain.infos
+        which = sorted(set(rt._used) | set(range(rt._vk, len(infos))))
+        out = []
+        for v in which:
+            b = rt._bindings[v]
+            if (b is not None) if regime is None else (b is None or regime not in b.regimes):
+                out.append(infos[v].name)
+        return out
 
     def _other_message(self, obj: dict) -> dict:
         allowed = {"kind", "message", "run_id", "nonce", "mac"}
@@ -1002,4 +1186,40 @@ def cli_message(args) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 2
     print(path)
+    return 0
+
+
+def regime_file(inbox: Path, regime: str, key: bytes | None) -> dict:
+    """The content of a change of regime: the run id of the gateway
+    (DIR/run.json), a fresh nonce and, with a key, the MAC."""
+    obj: dict[str, Any] = {"kind": "regime", "regime": regime}
+    run = Path(inbox) / "run.json"
+    if run.exists():
+        obj["run_id"] = _read_published(run).get("run_id")
+    elif key is not None:
+        raise GatewayError(f"{run} does not exist: is the gateway running?")
+    obj["nonce"] = secrets.token_hex(16)
+    if key is not None:
+        obj["mac"] = message_mac(key, obj)
+    return obj
+
+
+def cli_regime(args) -> int:
+    if not args.regime.strip():
+        print("Error: give the name of a regime of the file", file=sys.stderr)
+        return 2
+    try:
+        key = read_key(args.key) if args.key is not None else None
+        run = Path(args.inbox) / "run.json"
+        if key is None and run.exists():
+            published = _read_published(run)
+            if published.get("approver_keys") is True or published.get("regimes_signed") is True:
+                raise GatewayError("the gateway authenticates the changes of regime "
+                                   "(run.json says approver_keys or regimes_signed); give "
+                                   "--key with its regime key (--regime-key)")
+        path = _drop(args.inbox, regime_file(args.inbox, args.regime, key))
+    except (GatewayError, AuditKeyError, OSError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    print(f"{path}: regime {args.regime}" + ("" if key else " WITHOUT a MAC"))
     return 0

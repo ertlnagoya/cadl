@@ -12,13 +12,16 @@ def generate_transitions_module(
     transitions: List[TransitionDef],
     bindings: list | None = None,
     declared_params: dict | None = None,
+    initial: str | None = None,
 ) -> str:
     """Generate the transitions.py module with a RegimeController class.
 
     ``bindings`` are the resolved regime bindings of `regimes:` (Appendix A,
     A.7.1, `cadl.regimes.checked`), or None for a file without the block; the
     module is then the same as without them. ``declared_params`` maps each
-    bound parameter to its declared value."""
+    bound parameter to its declared value. ``initial`` is the regime in
+    which a run starts (A.7.1, `cadl.regimes.initial_regime`), for every
+    file with transitions."""
     if not transitions:
         return _empty_module()
 
@@ -47,9 +50,18 @@ def generate_transitions_module(
 
     # Constructor
     first_regime = transitions[0].from_regime if transitions else "UNKNOWN"
+    if initial is not None:
+        first_regime = initial          # the initial regime of A.7.1 ("Runs")
     lines.append(f"    def __init__(self, initial_regime: str = '{first_regime}') -> None:")
+    if bindings is not None:
+        lines.append("        if initial_regime not in self.REGIMES:")
+        lines.append("            raise ValueError(f'{initial_regime!r} is not a regime of the file "
+                     "({\", \".join(self.REGIMES)})')")
     lines.append("        self.current_regime = initial_regime")
     lines.append("        self.transition_history: list[tuple[str, str]] = []")
+    lines.append("        # (from, to, reason) of each transition not taken because its")
+    lines.append("        # safety invariant did not hold or could not be checked (A.7.1)")
+    lines.append("        self.refused_transitions: list[tuple[str, str, str]] = []")
     lines.append("")
 
     # Evaluate transitions
@@ -61,7 +73,13 @@ def generate_transitions_module(
         if t.condition:
             py_cond = _compile_expr_str(t.condition)
             if py_cond:
-                lines.append(f"            if {py_cond}:")
+                # a condition that cannot be evaluated (a value missing from
+                # ctx.state) does not hold, and the run goes on (A.7.1)
+                lines.append("            try:")
+                lines.append(f"                holds = bool({py_cond})")
+                lines.append("            except Exception:")
+                lines.append("                holds = False")
+                lines.append("            if holds:")
                 lines.append(f"                return '{t.to_regime}'")
             else:
                 cond_comment = t.condition.replace("\n", " ").strip()
@@ -73,36 +91,57 @@ def generate_transitions_module(
     lines.append("        return None")
     lines.append("")
 
-    # Execute transition
-    lines.append("    def execute_transition(self, target_regime: str, ctx: RuntimeContext) -> bool:")
-    lines.append('        """Execute a regime transition, checking safety invariants."""')
-    lines.append("        old = self.current_regime")
-
-    # Safety invariants
-    has_invariants = any(t.safety_invariant for t in transitions)
-    if has_invariants:
-        lines.append("        # Check safety invariants")
-        for t in transitions:
-            if t.safety_invariant:
-                py_inv = _compile_expr_str(t.safety_invariant)
-                lines.append(f"        if old == '{t.from_regime}' and target_regime == '{t.to_regime}':")
-                if py_inv:
-                    lines.append(f"            assert {py_inv}, 'Safety invariant violated: {t.safety_invariant}'")
-                else:
-                    lines.append(f"            # safety_invariant: {t.safety_invariant} (could not compile)")
-
-    lines.append("        self.current_regime = target_regime")
-    lines.append("        self.transition_history.append((old, target_regime))")
-    if bindings is not None:
-        lines.append("        self.apply_bindings(ctx)")
-    lines.append(f"        ctx.record_log(f'Regime transition: {{old}} -> {{target_regime}}')")
-    lines.append("        return True")
-    lines.append("")
+    _emit_checked_execute(lines, transitions, bindings is not None)
 
     content = "\n".join(lines)
     if not content.endswith("\n"):
         content += "\n"
     return content
+
+
+def _emit_checked_execute(lines: list, transitions: List[TransitionDef], bound: bool) -> None:
+    """execute_transition (A.7.1, "Runs"):
+    the safety invariant is checked explicitly (not with assert, which
+    `python -O` removes); when it does not hold, or cannot be compiled, the
+    transition is not taken, the regime stays, and the refusal is
+    recorded in `refused_transitions` and the log."""
+    lines.append("    def execute_transition(self, target_regime: str, ctx: RuntimeContext) -> bool:")
+    lines.append('        """Take a regime transition if its safety invariant holds (A.7.1).')
+    lines.append("        Returns False, and keeps the current regime, when it does not hold")
+    lines.append('        or cannot be checked."""')
+    if bound:
+        lines.append("        if target_regime not in self.REGIMES:")
+        lines.append("            raise ValueError(f'{target_regime!r} is not a regime of the file "
+                     "({\", \".join(self.REGIMES)})')")
+    lines.append("        old = self.current_regime")
+    for t in transitions:
+        if not t.safety_invariant:
+            continue
+        text = t.safety_invariant.replace("\n", " ").strip()
+        py_inv = _compile_expr_str(t.safety_invariant)
+        lines.append(f"        if old == {t.from_regime!r} and target_regime == {t.to_regime!r}:")
+        if py_inv:
+            lines.append("            try:")
+            lines.append(f"                holds = bool({py_inv})")
+            lines.append("            except Exception:")
+            lines.append("                holds = None")
+            lines.append("            if holds is not True:")
+            lines.append(f"                reason = ('safety invariant does not hold: ' if holds is False")
+            lines.append(f"                          else 'safety invariant cannot be evaluated: ') + {text!r}")
+            pad = "                "
+        else:
+            lines.append(f"            reason = 'safety invariant cannot be checked (not compiled): ' + {text!r}")
+            pad = "            "
+        lines.append(f"{pad}self.refused_transitions.append((old, target_regime, reason))")
+        lines.append(f"{pad}ctx.record_log(f'Regime transition refused: {{old}} -> {{target_regime}} ({{reason}})')")
+        lines.append(f"{pad}return False")
+    lines.append("        self.current_regime = target_regime")
+    lines.append("        self.transition_history.append((old, target_regime))")
+    if bound:
+        lines.append("        self.apply_bindings(ctx)")
+    lines.append("        ctx.record_log(f'Regime transition: {old} -> {target_regime}')")
+    lines.append("        return True")
+    lines.append("")
 
 
 def _emit_bindings(lines: list, bindings: list, declared_params: dict) -> None:

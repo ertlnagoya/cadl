@@ -200,7 +200,7 @@ class NormsMonitor:
         self._actors = declared_actors(model)
         self._trace = Trace(observations=[], bindings=copy.deepcopy(dict(bindings or {})),
                             request=copy.deepcopy(dict(request or {})))
-        self._reader = _TraceReader(self._trace)
+        self._reader = _TraceReader(self._trace, MODEL.get("sos_version"))
         self._quantities = {_canon_actor(q) for q in (quantities or ())}
         self._versions = _Versions(versions)
         # False only in `replay`, for a trace with an amendment: `cadl
@@ -506,7 +506,8 @@ def replay(lines: Any, contract: str | None = None, versions: dict | None = None
     taken from all observations of the contract instance, and the instance
     ends at the last line unless that line says ``"end": false``."""
     lines = list(lines)
-    trace = parse_trace(lines, path=path)        # the whole trace is well-formed
+    # the whole trace is well-formed
+    trace = parse_trace(lines, path=path, own_version=MODEL.get("sos_version"))
     records = [loads_strict(line) for line in lines if line.strip()]
     where = [f"line {i}" for i, line in enumerate(lines, start=1) if line.strip()]
     # First find where the instance ends: what follows is not part of it.
@@ -585,3 +586,733 @@ if __name__ == "__main__":
     sys.exit(main())
 
 # <<< part 2
+
+# >>> part 3
+# === Regime bindings (Appendix A, A.7.1) =====================================
+# This part is in the generated module only when the file has `regimes:`.
+# It replaces `NormsMonitor` and `replay` above by versions that read the
+# key ``regime`` of an observation (F.5, "Contracts not in force").
+
+_REGIMES = MODEL["regimes"]
+
+
+class NormsMonitor(NormsMonitor):
+    __doc__ = (NormsMonitor.__doc__ or "") + """
+    Regimes (Appendix A, A.7.1). An observation may name the current
+    regime with the key ``regime``; it stays current until another
+    observation names one. Before the first such key the run is in the
+    initial regime of A.7.1. At an observation of a regime that
+    does not have the contract in force, the instance sees nothing: the
+    observation returns no change, its values are seen from the next
+    observation at which the contract is in force, and the deadlines and
+    the intervals of the temporal operators do not advance (F.5,
+    "Contracts not in force"). `next_deadline` and `next_check` are then
+    None. An instance that ends at such an observation (``"end": true``, a
+    terminal state, or `end`) is settled there. A monitor that has been
+    given a regime refuses an amendment, and the other way round; so does
+    a monitor of a contract that the initial regime does not have in force.
+    """
+
+    def __init__(self, contract: str | None = None, bindings: dict | None = None,
+                 request: dict | None = None, quantities: Any = None,
+                 versions: dict | None = None, _option: str = "contract=") -> None:
+        super().__init__(contract, bindings, request, quantities, versions, _option)
+        self._regimes = RegimeBindings(_REGIMES["regimes"], _REGIMES["suspended"], _REGIMES["initial"])
+        self._clock = _ContractClock(self._regimes, self._contract.id)
+        self._held: Any = None       # the last observation, left out
+        self._left_out = 0           # observations left out so far
+        self._named = False          # an observation has named a regime
+        self._amended = False
+
+    def observe(self, observation: dict, where: str | None = None) -> list:
+        obs = self._trace.observations
+        n = len(obs)
+        if isinstance(observation, dict):
+            observation = copy.deepcopy(observation)
+        where = where or f"observation {n + self._ignored + self._left_out + 1}"
+        observation, regime = split_regime(observation, where, self._regimes)
+        amend = isinstance(observation, dict) and observation.get("amend") is not None
+        apart = not self._regimes.in_force(self._contract.id, self._regimes.initial)
+        if not self.ended and ((regime is not None and self._amended)
+                               or (amend and (self._named or regime or apart))):
+            raise ObservationError(_REGIMES_NO_AMEND)
+        reader = self._reader
+        saved = (dict(reader.snapshot), reader.state, reader.prev_t,
+                 self._trace.bindings, self._trace.request)
+        clock, held, left_out = self._clock.save(), self._held, self._left_out
+        o = reader.add(observation, where)
+        o.regime = regime
+        if self.ended:
+            # not part of the instance (F.5): only the order of time goes on
+            obs.pop()
+            reader.snapshot, reader.state = saved[0], saved[1]
+            self._ignored += 1
+            return []
+        inside, o.c = self._clock.step(o.t, regime)
+        o.out = not inside
+        self._held = None
+        try:
+            if not inside:
+                _regime_check_state(o, self._contract)
+                if not _regime_ends_at(o, self._contract.lifecycle, False):
+                    obs.pop()
+                    self._held = o
+                    self._left_out += 1
+                    self._named = self._named or regime is not None
+                    return []
+        except TraceError:
+            obs.pop()
+            (reader.snapshot, reader.state, reader.prev_t,
+             self._trace.bindings, self._trace.request) = saved
+            self._clock.restore(clock)
+            self._held, self._left_out = held, left_out
+            raise
+        touched = False
+        try:
+            eng = self._prepare(self._engine, n)
+            before = self._marks(eng)
+            touched = True
+            self._step(eng, n)
+        except Exception as e:
+            obs.pop()
+            (reader.snapshot, reader.state, reader.prev_t,
+             self._trace.bindings, self._trace.request) = saved
+            self._clock.restore(clock)
+            self._held, self._left_out = held, left_out
+            if touched:
+                self._engine = self._rebuilt()
+            if isinstance(e, (TraceError, ObservationError)):
+                raise
+            if isinstance(e, (NormsEvalError, MonitorError)):
+                raise ObservationError(str(e)) from None
+            raise
+        self._engine = eng
+        self._named = self._named or regime is not None
+        self._amended = self._amended or amend
+        return self._changes(before, o.t)
+
+    def end(self) -> list:
+        """End the contract instance at the last observation received and
+        settle its norms (F.5, item 6). Returns the changes, as `observe`.
+        When the contract was not in force at that observation, the
+        instance is settled there, on the clock as it stood when the
+        contract left force."""
+        if self._held is None or self.ended:
+            return super().end()
+        o, self._held = self._held, None
+        obs = self._trace.observations
+        n = len(obs)
+        obs.append(o)
+        eng = self._prepare(self._engine, n)
+        before = self._marks(eng)
+        eng._step(n, True)
+        eng._finish_items()
+        self._engine = eng
+        return self._changes(before, o.t)
+
+    @property
+    def in_force(self) -> bool:
+        """Whether the contract is in force in the current regime."""
+        return self._clock.in_force_now
+
+    def next_deadline(self) -> float | None:
+        """As above; None while the contract is not in force, since its
+        deadlines do not advance then."""
+        eng = self._started()
+        if eng.ended_at is not None or not self._clock.in_force_now:
+            return None
+        o = self._trace.observations[-1]
+        due = [o.c + max(x.deadline - x.elapsed(o.c), 0) for x in self._timed(eng, o.c)]
+        return float(min(due) - o.c + o.t) if due else None
+
+    def next_check(self) -> float | None:
+        """As above, on the clock of the contract; None while the contract
+        is not in force."""
+        eng = self._started()
+        if eng.ended_at is not None or not self._clock.in_force_now:
+            return None
+        obs = self._trace.observations
+        t, c = obs[-1].t, obs[-1].c
+        exact = []
+        for x in self._timed(eng, c):
+            exact.append(c + max(x.deadline - x.elapsed(c), 0))
+        for x in eng.norms:
+            if not x.frozen and x.state == "active" and x.content.kind == "predicate":
+                exact.extend(obs[k].c + self._span(eng, x.content.expr)[0] for k in x.candidates)
+        for key in ("assume", "guarantee"):
+            for item in eng.items[key]:
+                if (item["temporal"] and not item["error"] and not item["closed"]
+                        and item["value"] is None and item["start"] < len(obs)):
+                    exact.append(obs[item["start"]].c + self._span(eng, item["expr"])[0])
+        if not exact:
+            return None
+        return max(_after(min(exact) - c + t), _after(t))
+
+    def _prepare(self, eng: Any, n: int) -> Any:
+        if eng is None:
+            eng = _RegimeEngine(self._contract, self._trace, self._versions, self._actors)
+            self._check_parsed()
+            if _STATE_IGNORED in eng.warnings:   # said in _step, see there
+                eng.warnings.remove(_STATE_IGNORED)
+            eng._check_state(n)
+            eng.ev.known.update(self._quantities)
+            return eng
+        if eng.lifecycle is not None:
+            eng._fill_states(n)
+        eng._check_state(n)
+        eng.ev.known.update(self._trace.observations[n].values)
+        return eng
+
+
+def replay(lines: Any, contract: str | None = None, versions: dict | None = None,
+           path: str | None = None, _option: str = "contract=") -> dict:
+    """As above, for a trace that may name regimes."""
+    lines = list(lines)
+    regimes = RegimeBindings(_REGIMES["regimes"], _REGIMES["suspended"], _REGIMES["initial"])
+    trace = parse_trace_regimes(lines, path=path, bindings=regimes,
+                                own_version=MODEL.get("sos_version"))
+    records = [loads_strict(line) for line in lines if line.strip()]
+    where = [f"line {i}" for i, line in enumerate(lines, start=1) if line.strip()]
+    probe = NormsMonitor(contract, versions=versions, _option=_option)
+    count = 0
+    for rec, w in zip(records, where):
+        probe.observe(rec, where=w)
+        count += 1
+        if probe.ended:
+            break
+    if not probe.ended and records[-1].get("end") is not False:
+        probe.end()
+    if not probe.started:
+        raise NormsEvalError(
+            f"the contract {probe.contract} is not in force at any observation of the trace, "
+            f"which does not end the contract instance: there is nothing to judge")
+    inside = trace.observations[:count]
+    m = NormsMonitor(contract, quantities=inside[-1].values, versions=versions, _option=_option)
+    m._trace.path = path
+    m._warn_state = not any(o.amend for o in inside)
+    for rec, w in zip(records, where):
+        m.observe(rec, where=w)
+    if not m.ended and records[-1].get("end") is not False:
+        m.end()
+    return m.result()
+
+# <<< part 3
+
+# >>> part 4
+# === Versions while a system runs (Appendix K, K.11) =========================
+# This part is in the generated module only when the file declares
+# `amendment: 0.1` with an `amendment:` block. It replaces `NormsMonitor`
+# and `replay` above by versions that apply the versions of a run.
+
+def _version_infos(own: dict, versions: Any) -> list:
+    """The versions of a run: this model and the models of `run_versions`
+    (a dict of models, or a list), each of which carries the data of a
+    version."""
+    def info(model: dict) -> Any:
+        m = _Model(model)
+        m.regimes = model.get("regimes")
+        v = VersionInfo(model["amendment"], m)
+        r = model.get("regimes")
+        if r is not None:
+            v.regimes = RegimeBindings(r["regimes"], r["suspended"], r["initial"])
+        return v
+
+    infos = [info(own)]
+    models = list(versions.values()) if isinstance(versions, dict) else list(versions or ())
+    for k, model in enumerate(models):
+        if not isinstance(model, dict) or not isinstance(model.get("amendment"), dict):
+            raise MonitorError(
+                f"run_versions[{k}] is not the MODEL of a norms monitor generated from a file "
+                f"that declares amendment 0.1 with an amendment: block")
+        infos.append(info(model))
+    return infos
+
+
+class NormsMonitor(NormsMonitor):
+    __doc__ = (NormsMonitor.__doc__ or "") + """
+    Versions (Appendix K, K.11). `run_versions` gives the ``MODEL`` of the
+    monitor generated from each other version of the run (files that
+    declare ``amendment: 0.1`` with an ``amendment:`` block); with this
+    model they form one sequence by ``previous:``. `versions` keeps its
+    meaning: the models that an ``amend`` key names. `period` (seconds), `origin` (the time
+    stamp at which period 1 starts) and `epoch` (time stamps are seconds
+    since 1970-01-01T00:00:00Z) give the time base of the effective times.
+    An observation may name the version in force with the key
+    ``version``. With several versions, a time base, or a named version,
+    the instance follows the version in force at its first observation,
+    and when a version takes effect it follows the transitional rule of
+    its contract in that version: ``keep`` leaves it as it is, ``switch``
+    amends it (F.6), and ``switch`` with ``in_states`` amends it at the
+    first observation in one of those states. An observation with
+    ``amend`` amends the instance after the versions that take effect at
+    it (from cadl 0.3.35; refused when regimes combine with the versions). When a version of the run
+    binds regimes, or an observation names one, the regime and the
+    versions combine as `cadl norms-eval` combines them (K.11, "Versions
+    and regimes", from cadl 0.3.35): the regime named at an observation is
+    current from it on, then the versions take effect; the contract is in
+    force by the bindings of the version in force; and a switch made while
+    the contract is not in force reaches the instance at the next
+    observation at which it is.
+    """
+
+    def __init__(self, contract: str | None = None, bindings: dict | None = None,
+                 request: dict | None = None, quantities: Any = None,
+                 versions: dict | None = None, _option: str = "contract=",
+                 period: Any = None, origin: Any = 0, epoch: bool = False,
+                 run_versions: Any = None) -> None:
+        super().__init__(contract, bindings, request, quantities, versions, _option)
+        self._init_bindings = copy.deepcopy(self._trace.bindings)
+        self._init_request = copy.deepcopy(self._trace.request)
+        base = TimeBase(period, origin, epoch)
+        self._chain = VersionChain(_version_infos(MODEL, run_versions), base)
+        self._active = len(self._chain.infos) > 1 or self._chain.timed
+        self._tracker: Any = None
+        self._next_named: Any = None
+        self._named_regime = False
+        self._amended = False        # an `amend` has been applied
+        # An `amend` to a version whose transitional rule is not a plain
+        # switch is applied as a switch; the monitor says so (K.11).
+        self.amend_warnings: list = []
+        lookup = self._versions
+        cid = self._contract.id
+
+        def warned(name: str) -> Any:
+            model = lookup.models.get(name)
+            data = model.get("amendment") if isinstance(model, dict) else None
+            if isinstance(data, dict):
+                rule, states = VersionInfo(data).rule_for(cid)
+                if rule == "keep" or states:
+                    what = "keep" if rule == "keep" else f"switch in {', '.join(states)}"
+                    note = (f"'amend' to {name} amends {cid}, but the transitional rule of "
+                            f"that version for {cid} is {what} (Appendix K, K.4): the "
+                            f"amendment is applied as a switch (K.11)")
+                    if note not in self.amend_warnings:
+                        self.amend_warnings.append(note)
+            return lookup(name)
+        warned.models = lookup.models
+        self._versions = warned
+        # versions and regime bindings (K.11, from cadl 0.3.35)
+        self._names = chain_regimes(self._chain)
+        self._raw: list = []         # every observation given, for a rebuild
+        self._run: Any = None
+        self._combined = False
+        if self._active and self._names is not None:
+            self._combine()
+
+    def _combine(self) -> None:
+        """From now on the monitor runs the versions with the regime
+        bindings, as `run_version_regime_trace` of `cadl norms-eval`."""
+        self._combined = True
+        self._run = _RegimeRun(self._chain, self._contract.id)
+        self._clock = self._run
+        self._held = None
+        self._left_out = 0
+
+    @property
+    def version(self) -> str | None:
+        """The version that the contract instance follows, or None before
+        its first observation (or when no version applies)."""
+        if self._tracker is None or self._tracker.follows is None:
+            return None
+        return self._chain.infos[self._tracker.follows].name
+
+    def observe(self, observation: dict, where: str | None = None) -> list:
+        named = None
+        raw = copy.deepcopy(observation) if isinstance(observation, dict) else observation
+        if isinstance(observation, dict):
+            observation = copy.deepcopy(observation)
+            n = len(self._trace.observations) + self._ignored + getattr(self, "_left_out", 0)
+            spot = where or f"observation {n + 1}"
+            if VERSION_KEY in observation and not self.ended:
+                named = self._chain.check_name(observation[VERSION_KEY], spot)
+            observation = {k: v for k, v in observation.items() if k != VERSION_KEY}
+            if not self.ended:
+                regime = observation.get("regime") is not None
+                if named is not None and not self._active:
+                    self._activate(regime)
+        if self._combined:
+            changes = self._observe_combined(observation, named, where)
+            self._raw.append((raw, where))
+            return changes
+        self._next_named = named
+        before = (self._named_regime, self._tracker.save() if self._tracker else None)
+        try:
+            changes = super().observe(observation, where)
+        except Exception:
+            self._named_regime = before[0]
+            if self._tracker is not None and before[1] is not None:
+                self._tracker.restore(before[1])
+            raise
+        if isinstance(observation, dict) and observation.get("regime") is not None:
+            self._named_regime = True
+        if isinstance(observation, dict) and observation.get("amend") is not None \
+                and not self.ended:
+            self._amended = True
+        self._raw.append((raw, where))
+        return changes
+
+    def _activate(self, regime: bool = False) -> None:
+        """Apply the versions from now on, as from the first observation
+        (`cadl norms-eval` does so for a trace that names a version)."""
+        combine = self._names is not None and (
+            regime or self._named_regime or any(i.regimes is not None for i in self._chain.infos))
+        if combine:
+            saved = self.__dict__.copy()
+            try:
+                self._active = True
+                self._replay_combined()
+            except Exception:
+                self.__dict__.clear()
+                self.__dict__.update(saved)
+                raise
+            return
+        self._active = True
+        if self._engine is not None:
+            try:
+                self._engine = self._rebuilt()
+            except Exception:
+                self._active = False
+                self._engine = self._rebuilt()
+                raise
+
+    # --- versions with regime bindings (K.11, from cadl 0.3.35) --------------------
+
+    def _replay_combined(self) -> None:
+        """Process again, in the combined mode, every observation given so
+        far (they were accepted before)."""
+        raw = list(self._raw)
+        self._trace.observations[:] = []
+        self._reader = _TraceReader(self._trace, MODEL.get("sos_version"))
+        self._trace.bindings, self._trace.request = (copy.deepcopy(self._init_bindings),
+                                                     copy.deepcopy(self._init_request))
+        self._engine = None
+        self._ignored = 0
+        self._tracker = None
+        self._raw = []
+        self._combine()
+        for rec, where in raw:
+            if isinstance(rec, dict):
+                named = rec.get(VERSION_KEY)
+                rec = {k: v for k, v in rec.items() if k != VERSION_KEY}
+                named = None if named is None else self._chain.check_name(named, where or "")
+            else:
+                named = None
+            self._observe_combined(copy.deepcopy(rec), named, where)
+            self._raw.append((rec if named is None else dict(rec, version=named), where))
+
+    def _observe_combined(self, observation: Any, named: Any, where: str | None) -> list:
+        obs = self._trace.observations
+        n = len(obs)
+        where = where or f"observation {n + self._ignored + self._left_out + 1}"
+        observation, regime = split_regime(observation, where, self._names)
+        reader = self._reader
+        saved = (dict(reader.snapshot), reader.state, reader.prev_t,
+                 self._trace.bindings, self._trace.request)
+        run, held, left_out = self._run.save(), self._held, self._left_out
+        o = reader.add(observation, where)
+        o.regime, o.version = regime, named
+        if self.ended:
+            # not part of the instance (F.5): only the order of time goes on
+            obs.pop()
+            reader.snapshot, reader.state = saved[0], saved[1]
+            self._ignored += 1
+            return []
+        touched = False
+        try:
+            if o.amend:
+                raise ObservationError(_VERSIONS_NO_AMEND)
+            inside, o.c = self._run.step(o.t, named, regime)
+            o.out = not inside
+            eng = self._engine
+            contract = eng.contract if eng is not None else self._run.contract_of(self._run.k)
+            if contract is None:
+                raise ObservationError(
+                    f"version {self._chain.infos[self._run.k].name}, in force at the start of "
+                    f"the instance, has no contract '{self._contract.id}'")
+            member = inside
+            if not inside:
+                _regime_check_state(o, contract)
+                member = _regime_ends_at(o, contract.lifecycle, False)
+            self._held = None
+            names, events = self._run.instance(n + self._left_out, o.t,
+                                               _state_before(o, contract.lifecycle), member)
+            if not member:
+                obs.pop()
+                self._held = o
+                self._left_out += 1
+                return []
+            o.amend = tuple(names) or None
+            o.version_events = events
+            eng = self._prepare_combined(eng, n)
+            before = self._marks(eng)
+            touched = True
+            self._step_combined(eng, n, False)
+        except Exception as e:
+            if obs and obs[-1] is o:
+                obs.pop()
+            (reader.snapshot, reader.state, reader.prev_t,
+             self._trace.bindings, self._trace.request) = saved
+            self._run.restore(run)
+            self._held, self._left_out = held, left_out
+            if touched:
+                self._engine = self._rebuilt_combined()
+            if isinstance(e, (TraceError, ObservationError)):
+                raise
+            if isinstance(e, (NormsEvalError, MonitorError)):
+                raise ObservationError(str(e)) from None
+            raise
+        self._engine = eng
+        self._tracker = eng.tracker
+        self._named_regime = self._named_regime or regime is not None
+        return self._changes(before, o.t)
+
+    def _prepare_combined(self, eng: Any, n: int) -> Any:
+        o = self._trace.observations[n]
+        if eng is None:
+            start = self._chain.infos[self._run.k]
+            eng = _VersionRegimeEngine(self._run.contract_of(self._run.k), self._trace,
+                                       self._chain, self._run, declared_actors(start.sos))
+            self._check_parsed()
+            if _STATE_IGNORED in eng.warnings:   # said in _step, see there
+                eng.warnings.remove(_STATE_IGNORED)
+            eng.ev.known.update(self._quantities)
+        elif eng.lifecycle is not None:
+            eng._fill_states(n)
+        eng.ev.known.update(o.values)
+        return eng
+
+    def _step_combined(self, eng: Any, n: int, last: bool) -> None:
+        o = self._trace.observations[n]
+        eng.version_events[n] = getattr(o, "version_events", [])
+        eng._step(n, last)
+        self._run.frozen = _seen_state(o, eng.lifecycle)
+        self._check_parsed()
+        if (self._warn_state and eng.lifecycle is None and o.state_after is not None
+                and _STATE_IGNORED not in eng.warnings):
+            eng.warnings.insert(0, _STATE_IGNORED)
+        eng._finish_items()
+
+    def _rebuilt_combined(self) -> Any:
+        """The engine of the observations of the projection kept so far,
+        processed again (their amendments are on them)."""
+        obs = self._trace.observations
+        kept = obs[:]
+        del obs[:]
+        eng = None
+        for n, o in enumerate(kept):
+            obs.append(o)
+            eng = self._prepare_combined(eng, n)
+            self._step_combined(eng, n, False)
+        return eng
+
+    def end(self) -> list:
+        if not self._combined or self._held is None or self.ended:
+            return super().end()
+        o, self._held = self._held, None
+        names, events = self._run.flush()
+        o.amend = tuple(names) or None
+        o.version_events = events
+        obs = self._trace.observations
+        n = len(obs)
+        obs.append(o)
+        eng = self._prepare_combined(self._engine, n)
+        before = self._marks(eng)
+        self._step_combined(eng, n, True)
+        self._engine = eng
+        self._tracker = eng.tracker
+        return self._changes(before, o.t)
+
+    @property
+    def in_force(self) -> bool:
+        """Whether the contract is in force at the last observation."""
+        if self._combined:
+            return self._run.in_force_now
+        clock = getattr(self, "_clock", None)
+        return True if clock is None else clock.in_force_now
+
+    def next_deadline(self) -> float | None:
+        if not self._combined:
+            return super().next_deadline()
+        eng = self._started()
+        if eng.ended_at is not None or not self._run.in_force_now:
+            return None
+        o = self._trace.observations[-1]
+        due = [o.c + max(x.deadline - x.elapsed(o.c), 0) for x in self._timed(eng, o.c)]
+        return float(min(due) - o.c + o.t) if due else None
+
+    def next_check(self) -> float | None:
+        if not self._combined:
+            return super().next_check()
+        eng = self._started()
+        if eng.ended_at is not None or not self._run.in_force_now:
+            return None
+        obs = self._trace.observations
+        t, c = obs[-1].t, obs[-1].c
+        exact = []
+        for x in self._timed(eng, c):
+            exact.append(c + max(x.deadline - x.elapsed(c), 0))
+        for x in eng.norms:
+            if not x.frozen and x.state == "active" and x.content.kind == "predicate":
+                exact.extend(obs[k].c + self._span(eng, x.content.expr)[0] for k in x.candidates)
+        for key in ("assume", "guarantee"):
+            for item in eng.items[key]:
+                if (item["temporal"] and not item["error"] and not item["closed"]
+                        and item["value"] is None and item["start"] < len(obs)):
+                    exact.append(obs[item["start"]].c + self._span(eng, item["expr"])[0])
+        if not exact:
+            return None
+        return max(_after(min(exact) - c + t), _after(t))
+
+    def result(self) -> dict:
+        result = super().result()
+        if self._active and self._tracker is not None:
+            result["versions"] = versions_of(self._tracker)
+        return result
+
+    def _prepare(self, eng: Any, n: int) -> Any:
+        o = self._trace.observations[n]
+        if not hasattr(o, "version"):
+            o.version = self._next_named
+        if not self._active:
+            return super()._prepare(eng, n)
+        if eng is None:
+            tracker = VersionTracker(self._chain, self._contract.id)
+            start = self._chain.infos[tracker.start(o.t, o.version)]
+            contract = next((c for c in start.sos.contracts if c.id == self._contract.id), None)
+            if contract is None:
+                raise ObservationError(f"version {start.name}, in force at the start of the "
+                                       f"instance, has no contract '{self._contract.id}'")
+            if not hasattr(o, "host_amend"):
+                o.host_amend = o.amend       # applied after the versions (K.11)
+            o.amend = None
+            eng = _VersionEngine(contract, self._trace, self._chain, tracker,
+                                 declared_actors(start.sos), self._versions)
+            self._tracker = tracker
+            self._check_parsed()
+            if _STATE_IGNORED in eng.warnings:   # said in _step, see there
+                eng.warnings.remove(_STATE_IGNORED)
+            if not o.host_amend:
+                eng._check_state(n)
+            eng.ev.known.update(self._quantities)
+            return eng
+        self._tracker = eng.tracker
+        if eng.lifecycle is not None:
+            eng._fill_states(n)
+        eng.decide(n)            # sets o.amend; the events are logged by its _step
+        if not o.amend:
+            eng._check_state(n)
+        eng.ev.known.update(o.values)
+        return eng
+
+    def _rebuilt(self) -> Any:
+        eng = super()._rebuilt()
+        self._tracker = None if eng is None else getattr(eng, "tracker", None)
+        return eng
+
+
+def replay(lines: Any, contract: str | None = None, versions: dict | None = None,
+           path: str | None = None, _option: str = "contract=", period: Any = None,
+           origin: Any = 0, epoch: bool = False, run_versions: Any = None) -> dict:
+    """As above, for a run that may have versions (Appendix K, K.11)."""
+    lines = list(lines)
+    kw = {"versions": versions, "_option": _option, "period": period, "origin": origin,
+          "epoch": epoch, "run_versions": run_versions}
+    probe = NormsMonitor(contract, **kw)
+    trace = parse_trace_versions(lines, path=path, chain=probe._chain,
+                                 bindings=chain_regimes(probe._chain))
+    records = [loads_strict(line) for line in lines if line.strip()]
+    where = [f"line {i}" for i, line in enumerate(lines, start=1) if line.strip()]
+    count = 0
+    for rec, w in zip(records, where):
+        probe.observe(rec, where=w)
+        count += 1
+        if probe.ended:
+            break
+    if not probe.ended and records[-1].get("end") is not False:
+        probe.end()
+    if not probe.started:
+        raise NormsEvalError(
+            f"the contract {probe.contract} is not in force at any observation of the trace, "
+            f"which does not end the contract instance: there is nothing to judge")
+    inside = trace.observations[:count]
+    m = NormsMonitor(contract, quantities=inside[-1].values, **kw)
+    m._trace.path = path
+    m._warn_state = not any(o.amend for o in inside)
+    for rec, w in zip(records, where):
+        m.observe(rec, where=w)
+    if not m.ended and records[-1].get("end") is not False:
+        m.end()
+    return m.result()
+
+
+def main(argv: list | None = None) -> int:
+    """As above, with --period, --origin and --epoch for the time base of
+    the versions (Appendix K, K.11); give the other versions with
+    --model-version NAME=MODEL.json."""
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="norms_monitor",
+        description="Replay a recorded trace of one contract instance through the "
+                    "generated norms monitor (norms 0.1).")
+    ap.add_argument("trace", nargs="?", help="trace file (JSON Lines)")
+    ap.add_argument("--contract", help="contract id, when the file has several")
+    ap.add_argument("--format", choices=["json", "text"], default="json")
+    ap.add_argument("--model-version", action="append", default=[], metavar="NAME=MODEL.json",
+                    help="the model of a new version of the file, for a line with "
+                         "\"amend\": \"NAME\" (write it with --dump-model of the monitor "
+                         "generated from that version)")
+    ap.add_argument("--run-version", action="append", default=[], metavar="MODEL.json",
+                    help="the model of another version of the run (Appendix K, K.11); "
+                         "may be repeated")
+    ap.add_argument("--period", default=None, metavar="SECONDS",
+                    help="length of a period, for effective: { period: k }")
+    ap.add_argument("--origin", default="0", metavar="SECONDS",
+                    help="time stamp at which period 1 starts (default: 0)")
+    ap.add_argument("--epoch", action="store_true",
+                    help="time stamps are seconds since 1970-01-01T00:00:00Z")
+    ap.add_argument("--dump-model", action="store_true",
+                    help="print the model of this monitor as JSON and exit")
+    args = ap.parse_args(argv)
+    if args.dump_model:
+        print(json.dumps(MODEL, ensure_ascii=True, allow_nan=False))
+        return 0
+    if args.trace is None:
+        ap.error("the trace file is required")
+    versions = {}
+    try:
+        for spec in args.model_version:
+            name, sep, file = spec.partition("=")
+            if not sep:
+                raise NormsEvalError(f"--model-version needs NAME=MODEL.json, not '{spec}'")
+            with open(file, encoding="utf-8") as f:
+                versions[name] = json.load(f)
+        run_versions = []
+        for file in args.run_version:
+            with open(file, encoding="utf-8") as f:
+                run_versions.append(json.load(f))
+        try:
+            period = None if args.period is None else Fraction(Decimal(args.period))
+            origin = Fraction(Decimal(args.origin))
+        except (ArithmeticError, ValueError):
+            raise NormsEvalError("--period and --origin are finite numbers of seconds") from None
+        try:
+            with open(args.trace, encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            raise NormsEvalError(f"File not found: {args.trace}") from None
+        result = replay(lines, args.contract, versions, path=str(args.trace),
+                        _option="--contract", period=period, origin=origin, epoch=args.epoch,
+                        run_versions=run_versions)
+    except TraceError as e:
+        print(f"Trace error: {args.trace}: {e}", file=sys.stderr)
+        return 2
+    except (NormsEvalError, MonitorError, OSError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_text_versions(result, format_text(result)))
+    return 0 if result["ok"] else 1
+
+# <<< part 4

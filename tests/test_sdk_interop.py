@@ -729,3 +729,43 @@ def test_a2a_sdk_grpc_binding(tmp_path, a2a_sdk):
         ("publish", "allow", "approved"), ("summarize", "allow", "permission"),
         ("publish", "escalate", "prohibition"), ("approve", "allow", "permission"),
         ("publish", "allow", "approved")]
+
+
+def test_mcp_sdk_versions_switch_at_the_effective_time(tmp_path, mcp_sdk):
+    """Versions of the run (Appendix K, K.11, from cadl 0.3.35): version 2
+    lets PLANNER read from period 2 on, with periods of 10 s from the start
+    of the gateway. The first call comes before 10 s, the second after."""
+    anyio = mcp_sdk
+    from mcp.client.session import ClientSession
+    from mcp.client.stdio import stdio_client
+    from mcp.client.stdio import StdioServerParameters
+    data = Path(__file__).parent / "data"
+    v1, v2 = data / "agents_versions_v1.cadl", data / "agents_versions_v2.cadl"
+    args = ["-c", BOOT, "mcp-gateway", str(v1), "--agent", "PLANNER", "--server-actor",
+            "FILES", "--audit", str(tmp_path / "audit.jsonl"), "--version", str(v2),
+            "--period", "10s", "--", sys.executable,
+            str(Path(__file__).parent / "sdk_mcp_server.py"), str(tmp_path / "server.log")]
+    import os
+    # the environment of this process, so that the gateway runs this cadl
+    params = StdioServerParameters(command=sys.executable, args=args, env=dict(os.environ))
+    out: dict = {}
+
+    async def run():
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as s:
+                await s.initialize()
+                out["before"] = await s.call_tool("read_file", {"path": "/x"})
+                await anyio.sleep(10.5)
+                out["after"] = await s.call_tool("read_file", {"path": "/y"})
+
+    anyio.run(run)
+    assert out["before"].is_error and "reason: default" in out["before"].content[0].text
+    assert not out["after"].is_error and out["after"].content[0].text == "read /y"
+    audit = tmp_path / "audit.jsonl"
+    wait_for(lambda: audit.exists() and verify(audit)["complete"], "the end of the log")
+    replayed = tmp_path / "replayed.jsonl"
+    assert main(["agents-run", str(v1), "--trace", str(tmp_path / "audit.trace.jsonl"),
+                 "--audit", str(replayed), "--version", str(v2), "--period", "10s"]) == 0
+    assert replayed.read_bytes() == audit.read_bytes()
+    assert [r.get("reason") for r in read_records(audit) if r.get("event") == "amendment"] \
+        == ["version 2"]

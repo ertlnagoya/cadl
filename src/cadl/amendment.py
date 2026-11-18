@@ -535,18 +535,25 @@ def _time_point(v) -> Optional[str]:
     text = v.strip()
     for parse in (_dt.datetime.fromisoformat, _dt.date.fromisoformat):
         try:
-            parse(text)
+            parse(_iso_utc(text))
             return text
         except ValueError:
             continue
     return None
 
 
+def _iso_utc(text: str) -> str:
+    """`fromisoformat` before Python 3.11 does not accept the suffix Z."""
+    if text[-1:] in ("Z", "z"):
+        return text[:-1] + "+00:00"
+    return text
+
+
 def _time_order(text: str):
     """A key that orders time points; dates count as midnight UTC, and a
     date-time without an offset as UTC."""
     try:
-        t = _dt.datetime.fromisoformat(text)
+        t = _dt.datetime.fromisoformat(_iso_utc(text))
     except ValueError:
         t = _dt.datetime.combine(_dt.date.fromisoformat(text), _dt.time())
     if t.tzinfo is None:
@@ -1130,6 +1137,21 @@ class _Checker:
         if d is not None:
             out["decision"] = d
         return out
+
+
+def first_only(effective) -> bool:
+    """Whether a version that gives no `previous:` and this `effective:`
+    is always a first version of its run (Appendix K, K.11, from cadl
+    0.3.35): it gives no effective time, or the first period. Any other
+    effective time may come after that of another version, so such a
+    version may replace one."""
+    return not effective or dict(effective) == {"period": 1}
+
+
+def may_replace(a) -> bool:
+    """Whether the version of an analysis may replace another one: it names
+    it with `previous:`, or its effective time may come after another."""
+    return a.previous is not None or not first_only(a.effective)
 
 
 def analyse(sos: SoSDefinition) -> Analysis:

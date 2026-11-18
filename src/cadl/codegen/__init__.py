@@ -19,7 +19,8 @@ SUPPORTED_TARGETS = {"python", "solidity", "opa", "unity-csharp",
 AGENT_TARGETS = {"agent-rego", "agent-cedar"}
 
 
-def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> None:
+def generate(sos: SoSDefinition, output_dir: Path, target: str = "python",
+             versions: list | None = None) -> None:
     """Generate runtime code from a CADL SoS definition.
 
     Args:
@@ -30,6 +31,11 @@ def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> No
             Appendix E), or "agent-rego" / "agent-cedar" (boundary policy
             of the agent governance extension, Appendix G; the file must
             declare `agents: 0.1`).
+        versions: the other versions of a run (Appendix K, K.11), as parsed
+            files that declare `amendment: 0.1` with an `amendment:` block;
+            with them the norms monitors of the "opa" and "solidity"
+            targets and the lifecycle code of "unity-csharp" follow the
+            version in force that the caller names (from cadl 0.3.36).
     """
     if target not in SUPPORTED_TARGETS:
         raise ValueError(f"Unsupported target: {target!r}. Choose from: {sorted(SUPPORTED_TARGETS)}")
@@ -54,7 +60,7 @@ def generate(sos: SoSDefinition, output_dir: Path, target: str = "python") -> No
     # per contract (`norms_monitors`).
     from ..norms import norms_declared, temporal_items_omitted
     with temporal_items_omitted(norms_declared(sos)):
-        _generate_target(sos, output_dir, target)
+        _generate_target(sos, output_dir, target, list(versions or []))
 
 
 def omitted_temporal_items(sos: SoSDefinition) -> list[tuple[str, str, str]]:
@@ -70,25 +76,37 @@ def omitted_temporal_items(sos: SoSDefinition) -> list[tuple[str, str, str]]:
     ]
 
 
-def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
+def norms_monitors(sos: SoSDefinition, target: str, versions: list | None = None) -> list[dict]:
     """The norms monitors that the OPA or Solidity target generates for a
     file that declares norms 0.1 (Appendix F, F.5; Appendix D), one entry
     per contract: ``{"contract", "file", "text", "reasons", "left_out"}``.
     ``text`` is None when the contract cannot be monitored (``reasons``
-    says why); ``left_out`` lists the (key, position, text, reason) of the
+    says why); the monitor of a contract that a regime of `regimes:` does
+    not have in force follows the current regime (A.7.1, F.5); ``left_out`` lists the (key, position, text, reason) of the
     items the monitor leaves out. An empty list for other files and
-    targets."""
+    targets. With `versions` (the other versions of a run, K.11) each
+    monitor follows the version in force."""
     from ..norms import norms_declared
-    from .norms_ir import NormsTargetUnsupported, build_ir, unsupported_items
+    from .norms_ir import NormsTargetUnsupported, check_versions, unsupported_items
     if target not in ("opa", "solidity") or not norms_declared(sos):
         return []
-    ir_of = build_ir
+    versions = list(versions or [])
     if target == "opa":
         from .opa.norms_monitor_rego import generate_norms_monitor_rego as gen
         from .opa.norms_monitor_rego import monitor_filename, rego_ir as ir_of
+        if versions:
+            from .opa.norms_monitor_rego import generate_norms_monitor_rego_versions
+
+            def gen(sos, contract):
+                return generate_norms_monitor_rego_versions(sos, contract, versions)
     else:
         from .solidity.norms_monitor_sol import generate_norms_monitor_sol as gen
         from .solidity.norms_monitor_sol import monitor_name, solidity_ir as ir_of
+        if versions:
+            from .solidity.norms_monitor_sol import generate_norms_monitor_sol_versions
+
+            def gen(sos, contract):
+                return generate_norms_monitor_sol_versions(sos, contract, versions)
 
         def monitor_filename(contract_id: str) -> str:
             return f"{monitor_name(contract_id)}.sol"
@@ -97,6 +115,10 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
         entry = {"contract": contract.id, "file": monitor_filename(contract.id),
                  "text": None, "reasons": [], "left_out": []}
         try:
+            # a contract whose running instances switch to this version (K.11),
+            # unless the monitor is given the other versions of the run
+            if not versions:
+                check_versions(sos, contract, target)
             ir = ir_of(sos, contract)
             entry["left_out"] = unsupported_items(ir)
             entry["text"] = gen(sos, contract)
@@ -106,28 +128,53 @@ def norms_monitors(sos: SoSDefinition, target: str) -> list[dict]:
     return out
 
 
-def _generate_target(sos: SoSDefinition, output_dir: Path, target: str) -> None:
+def _generate_target(sos: SoSDefinition, output_dir: Path, target: str,
+                     versions: list | None = None) -> None:
+    versions = list(versions or [])
+    if versions and target not in ("solidity", "opa", "unity-csharp"):
+        raise ValueError(f"target {target!r} does not take the other versions of a run "
+                         f"(--version): the python target applies them at run time "
+                         f"(run_versions of its norms monitor)")
     if target == "python":
         _generate_python(sos, output_dir)
     elif target == "solidity":
         from .solidity import generate_solidity
-        monitors = norms_monitors(sos, target)
+        monitors = norms_monitors(sos, target, versions)
         generate_solidity(sos, output_dir)
         _write_monitors(output_dir, monitors)
     elif target == "opa":
         from .opa import generate_rego
-        monitors = norms_monitors(sos, target)
+        monitors = norms_monitors(sos, target, versions)
         generate_rego(sos, output_dir)
         _write_monitors(output_dir, monitors)
     elif target == "unity-csharp":
         from .unity_csharp import generate_unity_csharp
-        generate_unity_csharp(sos, output_dir)
+        if not versions:
+            _check_unity_versions(sos)
+        generate_unity_csharp(sos, output_dir, versions=versions)
     elif target == "agent-rego":
         from .agent_policy import generate_agent_rego
         generate_agent_rego(sos, output_dir)
     elif target == "agent-cedar":
         from .agent_policy import generate_agent_cedar
         generate_agent_cedar(sos, output_dir)
+
+
+def _check_unity_versions(sos: SoSDefinition) -> None:
+    """The Unity C# target keeps lifecycle instances with their deadlines; it
+    cannot move one that started under the version this one replaces
+    (Appendix K, K.11). Refuse such a version."""
+    from .norms_ir import switching_contracts
+    switching = switching_contracts(sos)
+    moved = [c.id for c in sos.contracts if c.lifecycle is not None and c.id in switching]
+    if moved:
+        raise ValueError(
+            f"target 'unity-csharp': this version replaces another (amendment.previous, or "
+            f"from cadl 0.3.35 an effective time other than period 1 without previous:, "
+            f"which may come after another version) and "
+            f"the running instances of {', '.join(moved)} switch to it (Appendix K, K.4); the "
+            f"generated lifecycle instances cannot be moved to a new version, so the file is "
+            f"refused (K.11); declare 'keep' for these contracts in amendment.transitional")
 
 
 def _write_monitors(output_dir: Path, monitors: list[dict]) -> None:
@@ -149,6 +196,9 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
       - norms_monitor.py   Monitor of the norms extension (Appendix F), for
                            a file that declares norms 0.1; it does not
                            import cadl
+      - version.py         The version of the model (Appendix K, K.11), for
+                           a file that declares amendment 0.1 with an
+                           amendment: block
       - __init__.py        Package exports
     """
     from .actor_gen import generate_actors_module
@@ -178,22 +228,73 @@ def _generate_python(sos: SoSDefinition, output_dir: Path) -> None:
         if sos.protocols:
             _write(output_dir / "protocols.py", generate_protocols_module(sos.protocols))
 
-        from ..regimes import checked as checked_regimes, declared_value
+        from ..regimes import checked as checked_regimes, declared_value, initial_regime
         bindings = checked_regimes(sos)
         declared_params = {
             key: declared_value(sos, key)
             for b in (bindings or []) for key in b.parameters
         }
         _write(output_dir / "transitions.py",
-               generate_transitions_module(sos.transitions, bindings, declared_params))
-        _write(output_dir / "metrics.py", generate_metrics_module(sos.metrics))
+               generate_transitions_module(sos.transitions, bindings, declared_params,
+                                           initial_regime(sos)))
+        _write(output_dir / "metrics.py",
+               generate_metrics_module(sos.metrics, _metric_schedules(sos), _metric_run(sos)))
         _write(output_dir / "runtime.py", generate_runtime_module(sos))
 
     if monitor is not None:
         _write(output_dir / f"{MODULE_NAME}.py", monitor)
 
+    from .version_gen import generate_version_module, has_version_module
+    if has_version_module(sos):
+        # the version of the model, for the host (Appendix K, K.11)
+        _write(output_dir / "version.py", generate_version_module(sos))
+
     # Generate __init__.py
     _write(output_dir / "__init__.py", _generate_init(sos, norms_monitor=monitor is not None))
+
+
+def _metric_schedules(sos: SoSDefinition) -> dict:
+    """The schedules of the metrics of a file that declares amendment 0.1
+    (Appendix K, K.5), for the target checks of metrics.py (K.11)."""
+    from ..amendment import amendment_declared, analyse
+    if not amendment_declared(sos) or getattr(sos, "amendment", None) is None:
+        return {}
+    a = analyse(sos)
+    out = {}
+    for m in a.metrics:
+        if not m.get("schedule"):
+            continue
+        entries = []
+        for e in m["schedule"]:
+            (form, v), = e["from"].items()
+            if form == "version":
+                when = {"effective": a.effective} if v == a.version else None
+            else:
+                when = dict(e["from"])
+            entries.append((when, e["target"]))
+        out[m["id"]] = entries
+    return out
+
+
+def _metric_run(sos: SoSDefinition) -> dict | None:
+    """For a file that declares amendment 0.1 with an amendment: block, what
+    the target checks of metrics.py need to judge in a run with versions
+    (Appendix K, K.11, from cadl 0.3.35); None otherwise."""
+    from .version_gen import has_version_module
+    if not has_version_module(sos):
+        return None
+    from ..amendment import analyse
+    a = analyse(sos)
+    windows, schedules = {}, {}
+    for m in a.metrics:
+        window = (m.get("measure") or {}).get("window")
+        if window is not None:
+            from fractions import Fraction
+            v = Fraction(window.value) / 1000
+            windows[m["id"]] = int(v) if v.denominator == 1 else float(v)
+        if m.get("schedule"):
+            schedules[m["id"]] = [(dict(e["from"]), e["target"]) for e in m["schedule"]]
+    return {"version": a.version, "windows": windows, "schedules": schedules}
 
 
 def _write(path: Path, content: str) -> None:

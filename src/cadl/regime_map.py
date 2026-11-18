@@ -32,6 +32,12 @@ class RegimeMap:
     states: dict[str, RegimeState] = field(default_factory=dict)
     transitions: list[TransitionDef] = field(default_factory=list)
     initial_state: str | None = None
+    # The regime bindings of `regimes:` (Appendix A, A.7.1): one
+    # cadl.regimes.RegimeBinding per regime, or None for a file without the
+    # block (the output is then that of a file without bindings) or with a
+    # block that breaks R-1 to R-6 (`bindings_broken`).
+    bindings: list | None = None
+    bindings_broken: bool = False
 
     # ------------------------------------------------------------------
     # Construction
@@ -39,8 +45,14 @@ class RegimeMap:
 
     @classmethod
     def from_sos(cls, sos: SoSDefinition) -> RegimeMap:
-        """Build a regime map from an SoS definition."""
-        return cls.from_transitions(sos.transitions)
+        """Build a regime map from an SoS definition, with the regime
+        bindings of `regimes:` when the file has the block."""
+        from .regimes import checked, declared
+        rm = cls.from_transitions(sos.transitions)
+        if declared(sos) and rm.states:
+            rm.bindings = checked(sos)
+            rm.bindings_broken = rm.bindings is None
+        return rm
 
     @classmethod
     def from_transitions(cls, transitions: list[TransitionDef]) -> RegimeMap:
@@ -210,6 +222,7 @@ class RegimeMap:
         for name in dead:
             lines.append(f'  "{name}" [color=red, fontcolor=red];')
 
+        lines.extend(self._dot_bindings())
         lines.append("")
 
         # Edges
@@ -225,8 +238,32 @@ class RegimeMap:
         lines.append("}")
         return "\n".join(lines)
 
+    def _binding_lines(self, b: Any) -> list[str]:
+        """The bindings of one regime as lines of text."""
+        out = [f"{k} = {_value_text(v)}" for k, v in b.parameters.items()]
+        out.append(f"in force: {', '.join(b.active) or 'no contract'}")
+        if b.suspended:
+            out.append(f"not in force: {', '.join(b.suspended)}")
+        return out
+
+    def _dot_bindings(self) -> list[str]:
+        if self.bindings is None:
+            return []
+        lines = []
+        for b in self.bindings:
+            label = "\\n".join([b.name] + [_dot_escape(x) for x in self._binding_lines(b)])
+            lines.append(f'  "{b.name}" [label="{label}"];')
+        return lines
+
     def to_json(self) -> dict[str, Any]:
         """Export the regime map as a JSON-serializable dict."""
+        out = self._to_json()
+        if self.bindings is not None or self.bindings_broken:
+            from .regimes import to_ir_bindings
+            out["regimes"] = None if self.bindings is None else to_ir_bindings(self.bindings)
+        return out
+
+    def _to_json(self) -> dict[str, Any]:
         return {
             "initial_state": self.initial_state,
             "states": sorted(self.states.keys()),
@@ -270,6 +307,17 @@ class RegimeMap:
             lines.append(f"  {name}{suffix}")
         lines.append("")
 
+        if self.bindings is not None:
+            lines.append("Regime bindings (A.7.1):")
+            for b in self.bindings:
+                lines.append(f"  {b.name}:")
+                lines.extend(f"    {x}" for x in self._binding_lines(b))
+            lines.append("")
+        elif self.bindings_broken:
+            lines.append("Regime bindings (A.7.1): not shown, the regimes: block has errors "
+                         "(see cadl check)")
+            lines.append("")
+
         lines.append("Transitions:")
         for t in self.transitions:
             cond = f" when {t.condition}" if t.condition else ""
@@ -296,3 +344,15 @@ class RegimeMap:
             lines.append("  No cycles detected")
 
         return "\n".join(lines)
+
+
+def _value_text(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    return str(v)
+
+
+def _dot_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"')

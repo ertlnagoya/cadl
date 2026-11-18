@@ -4328,6 +4328,22 @@ class NormsModel:
             if self.staggered:
                 self._add(f"{px}started", None, None, False,
                           f"instance {t.inst + 1} has started")
+        # versions of a run (Appendix K, K.11): per instance the version it
+        # follows, the version of a waiting switch (in_states) and the class
+        # of its lifecycle state
+        self.k11 = getattr(self.tr, "k11", None) if self.versioned else None
+        self.L = len(getattr(self.tr, "lc_reps", None) or []) if self.k11 else 0
+        if self.k11:
+            V = len(self.vtrs)
+            for t in trs:
+                px = t.px
+                self._add(f"{px}iv", 0, V - 1, 0, "the version the instance follows (K.11)")
+                if self.L:
+                    self._add(f"{px}wt", 0, V - 1, 0,
+                              "the version of a waiting switch (in_states), 0: none")
+                    self._add(f"{px}lc", 0, self.L - 1, 0,
+                              "the class of the lifecycle state ("
+                              + ", ".join(self.tr.lc_reps) + ")")
         if self.versioned:
             self._init_versions()
             return
@@ -4425,6 +4441,15 @@ class NormsModel:
                               f"assumption {text!r} (0: decided or not in force)")
                     self._add(px + slot["age"], 0, slot["window"] + 1, 0,
                               f"observations since assumption {text!r} began")
+                    inn = slot["in"]
+                    if any(inn[a] and not inn[b] and inn[c] for a in range(len(inn))
+                           for b in range(a + 1, len(inn)) for c in range(b + 1, len(inn))):
+                        # a later version has the item again: it continues
+                        # when it was decided true or false, else it is new
+                        # (F.6 closes an undecided item, keeps a decided one)
+                        slot["dd"] = slot["var"].replace("as_", "dd_")
+                        self._add(px + slot["dd"], None, None, False,
+                                  f"assumption {text!r} has been decided true or false")
         self.edge_preds = sorted(set().union(*(t.edge_preds for vts in self.vt for t in vts)))
         for pid in self.edge_preds:
             self._add(f"pe_{pid}", None, None, False,
@@ -4519,7 +4544,7 @@ class NormsModel:
         return tuple(ch.vector[p] for p in term.preds)
 
     def step(self, ch: Choice, end: Any, first: bool = False, w: int = 0,
-             amend: bool = False) -> dict:
+             amend: bool = False, var: tuple = (), lca: tuple = ()) -> dict:
         """The updates of the command for choice `ch`: the steps of F.5 in
         their order within one observation, for every instance. `end` is a
         boolean for one instance; for several, a mask whose bit k says that
@@ -4528,7 +4553,10 @@ class NormsModel:
         the version in force before the observation; `amend`: the
         observation amends every running instance to version w + 1.
         `first`: the command of the first observation, from the initial
-        state (its updates are constants)."""
+        state (its updates are constants). For the versions of a run
+        (K.11), `var` gives per instance (the version it follows, the
+        version of a waiting switch, the class of its lifecycle state
+        before the observation) and `lca` the class after it."""
         _generation_time()
         ir = self.ir
         step = ir.V("step")
@@ -4539,9 +4567,25 @@ class NormsModel:
             k = t.inst
             ends = bool(mask >> k & 1)
             starting = bool(mask >> (n + k) & 1) if self.staggered else first
-            pre = self.vt[k][w]
-            cur = self.vt[k][w + 1] if amend else pre
-            part = self._inst_step(cur, ch, ends, pre if amend else None, starting)
+            extra: dict = {}
+            if self.k11:
+                iv, wt, lcb = var[k]
+                if starting:
+                    path, wt2 = [w + 1 if amend else w], 0
+                else:
+                    path, wt2 = self._k11_switch(t, iv, wt, lcb, w, amend)
+                cur = self.vt[k][path[-1]]
+                olds = [self.vt[k][x] for x in path[:-1]]
+                part = self._inst_step(cur, ch, ends, olds or None, starting)
+                extra[f"{t.px}iv"] = ir.C(0 if ends else path[-1])
+                if self.L:
+                    extra[f"{t.px}wt"] = ir.C(0 if ends else wt2)
+                    extra[f"{t.px}lc"] = ir.C(0 if ends else lca[k])
+                part.update(extra)
+            else:
+                pre = self.vt[k][w]
+                cur = self.vt[k][w + 1] if amend else pre
+                part = self._inst_step(cur, ch, ends, pre if amend else None, starting)
             if self.multi and not starting and not ends:
                 # an instance that has not started or has ended does not change
                 running = ir.NOT(ir.V(f"{t.px}ended"))
@@ -4570,17 +4614,47 @@ class NormsModel:
             out["step"] = step if end else ir.ADD(step, 1)
         return self._simplify(out, first)
 
+    def _k11_switch(self, tr: Translator, iv: int, wt: int, lcb: int, w: int,
+                    amend: bool) -> tuple:
+        """(the versions the instance follows during the observation, the
+        first the one before it; the version of a waiting switch after it)
+        as norms_eval.VersionTracker.step decides them (K.11): a waiting
+        switch whose state holds is made first, then the version that takes
+        effect applies its rule (keep, switch, or switch in_states), and a
+        waiting switch is dropped when a later version takes effect."""
+        rules = tr.k11["rules"]
+        lc_in = getattr(tr, "lc_in", {})
+        path, p = [iv], wt
+        if p and lcb in lc_in.get(p, ()):
+            path.append(p)
+            p = 0
+        if amend:
+            v = w + 1
+            rule, states = rules[v]
+            p = 0
+            if rule == "keep":
+                pass
+            elif not states or lcb in lc_in.get(v, ()):
+                path.append(v)
+            else:
+                p = v
+        return path, p
+
     def _inst_step(self, tr: Translator, ch: Choice, end: bool, old: Any = None,
                    start: bool = False) -> dict:
         """The updates of one instance (F.5, one observation). With
         versions, `tr` is the version in force after this observation's
         amendment and `old` the version before it (None: no amendment).
-        `start`: this is the first observation of the instance."""
+        `start`: this is the first observation of the instance. `old` may
+        be a list: the instance is amended through each of them in turn
+        (K.11: a waiting switch and a version that takes effect)."""
         ir = self.ir
         px = tr.px
         msgs = set(ch.messages)
         step = ir.V("step")
-        pre = old or tr                   # the version at the start of the observation
+        olds = old if isinstance(old, list) else ([old] if old is not None else [])
+        old = olds or None
+        pre = olds[0] if olds else tr     # the version at the start of the observation
         if self.versioned:
             norms = tr.model_norms()
             pre_norms = pre.model_norms()
@@ -4628,8 +4702,10 @@ class NormsModel:
             if n.starts:
                 S[n.id] = ir.C(ACTIVE) if start else S[n.id]
         amend_viol: dict = {}
-        if old is not None:
-            amend_viol = self._amend_ir(old, tr, S, el, slots, ht, sf, stems)
+        pend: dict = {}
+        for a, b in zip(olds, olds[1:] + [tr]):
+            for nid, cond in self._amend_ir(a, b, S, el, slots, ht, sf, stems, pend).items():
+                amend_viol[nid] = ir.OR(amend_viol.get(nid, ir.FALSE), cond)
         # assume: items
         if self.versioned:
             af = self._items_versioned(old, tr, ch, out, start)
@@ -4816,7 +4892,7 @@ class NormsModel:
         return out
 
     def _amend_ir(self, old: Translator, new: Translator, S: dict, el: dict, slots: dict,
-                  ht: dict, sf: dict, stems: dict) -> dict:
+                  ht: dict, sf: dict, stems: dict, pend: dict | None = None) -> dict:
         """The amendment from version `old` to `new` at this observation,
         before step 1 (F.6, as norms_eval._Engine._amend applies it). Changes
         S, el, slots, ht, sf in place; returns the conditions under which a
@@ -4844,12 +4920,18 @@ class NormsModel:
                 # candidates pending before this observation (F.6: a late
                 # instance with one is decided by step 4, not here)
                 pending = ir.FALSE
-                if o.id in slots and nd.content_text == o.content_text:
+                pend = {} if pend is None else pend
+                if o.id in slots and o.id not in pend:
                     stem = stems[o.id]
-                    pending = ir.OR(ir.V(f"ht_{stem}"), ir.V(f"sf_{stem}"),
-                                    *(ir.NOT(ir.EQ(ir.V(f"sl_{stem}_{a}"), 0))
-                                      for a in range(len(slots[o.id]))))
+                    pend[o.id] = ir.OR(ir.V(f"ht_{stem}"), ir.V(f"sf_{stem}"),
+                                       *(ir.NOT(ir.EQ(ir.V(f"sl_{stem}_{a}"), 0))
+                                         for a in range(len(slots[o.id]))))
+                if o.id in slots and nd.content_text == o.content_text:
+                    pending = pend[o.id]
                 if nd.content_text != o.content_text and o.id in slots:
+                    # an amendment after this one in the same observation
+                    # finds no candidate of an instance in force
+                    pend[o.id] = ir.AND(ir.NOT(inforce), pend[o.id])
                     # the candidates are kept only when the content is the same
                     slots[o.id] = [ir.ITE(inforce, ir.C(0), x) for x in slots[o.id]]
                     ht[o.id] = ir.AND(ir.NOT(inforce), ht[o.id])
@@ -4896,8 +4978,11 @@ class NormsModel:
         ir = self.ir
         px = tr.px
         af = ir.V(f"{px}af") if self.has(f"{px}af") else ir.FALSE
+        olds = old if isinstance(old, list) else ([old] if old is not None else [])
+        old = olds[0] if olds else None
         v_new = tr.version
         v_old = old.version if old is not None else v_new
+        chain_vs = [o.version for o in olds] + [v_new]
         terms = {it["text"]: it["term"] for it in tr.model_items}
         for text, slot in self.item_slots.items():
             in_old, in_new = slot["in"][v_old], slot["in"][v_new]
@@ -4906,13 +4991,19 @@ class NormsModel:
                     af = ir.TRUE
                 continue
             code, age = ir.V(px + slot["var"]), ir.V(px + slot["age"])
+            dd = ir.V(px + slot["dd"]) if "dd" in slot else None
             if start:
                 # an instance that starts under a later version
                 code, age = ir.C(1 if slot["in"][v_old] else 0), ir.C(0)
-            if old is not None and in_new and not in_old:
-                code, age = ir.C(1), ir.C(0)
-            elif old is not None and in_old and not in_new:
-                code = ir.C(0)
+                dd = ir.FALSE if dd is not None else None
+            # the amendments of this observation, one after the other
+            for a, b in zip(chain_vs, chain_vs[1:]):
+                if slot["in"][a] and not slot["in"][b]:
+                    code = ir.C(0)
+                elif not slot["in"][a] and slot["in"][b]:
+                    new = ir.TRUE if dd is None else ir.NOT(dd)
+                    code = ir.ITE(new, ir.C(1), code)
+                    age = ir.ITE(new, ir.C(0), age)
             if in_new:
                 t = terms[text]
                 p, dt, df, du = self._tstep_ir(code, t.op, ir.EQ(age, t.window + 1),
@@ -4920,8 +5011,12 @@ class NormsModel:
                 out[px + slot["var"]] = p
                 out[px + slot["age"]] = ir.ITE(ir.LE(age, slot["window"]), ir.ADD(age, 1), age)
                 af = ir.OR(af, df)
+                if dd is not None:
+                    dd = ir.OR(dd, dt, df)
             else:
                 out[px + slot["var"]] = code
+            if dd is not None:
+                out[px + slot["dd"]] = dd
         return af
 
     def _simplify(self, out: dict, first: bool) -> dict:
@@ -4982,16 +5077,56 @@ class NormsModel:
         return [(w, amend) for w in (range(1) if first else range(V))
                 for amend in (False, True) if not (amend and w == V - 1)]
 
+    def _variants(self, first: bool, w: int) -> list:
+        """For the versions of a run (K.11): the states of the instances that
+        a command distinguishes, per instance (the version it follows, the
+        version of a waiting switch, the class of its lifecycle state). An
+        instance that has not started, or has ended, is in (0, 0, 0)."""
+        if not self.k11:
+            return [()]
+        rules = self.k11["rules"]
+        one = []
+        if first:
+            one = [(0, 0, 0)]
+        else:
+            for iv in range(w + 1):
+                for wt in [0] + [v for v in range(iv + 1, w + 1)
+                                 if rules[v] is not None and rules[v][1]]:
+                    for lc in range(self.L or 1):
+                        one.append((iv, wt, lc))
+        return list(itertools.product(one, repeat=len(self.trs)))
+
+    def _lc_choices(self) -> list:
+        """The classes of the lifecycle state after an observation, per instance."""
+        if not self.L:
+            return [()]
+        return list(itertools.product(range(self.L), repeat=len(self.trs)))
+
+    def choice_index(self, ch_index: int, amend: bool, lca: tuple = ()) -> int:
+        """The index of a command's choice: the choice of the environment,
+        whether a version takes effect, and the lifecycle classes after it."""
+        a = len(self.tr.choices)
+        x = 0
+        for k, c in enumerate(lca):
+            x += c * (self.L ** k)
+        return ch_index + a * (int(amend) + 2 * x)
+
     def command_count(self) -> int:
         """The number of commands before they are built (F.12 limits)."""
         a = len(self.tr.choices)
-        return sum(a * len(self.patterns(first)) * len(self._versions_at(first))
-                   for first in (True, False))
+        lcs = len(self._lc_choices())
+        return sum(a * len(self.patterns(first)) * lcs * len(self._variants(first, w))
+                   for first in (True, False) for w, _amend in self._versions_at(first))
 
-    def _guard(self, first: bool, w: int, pat: Any) -> str:
+    def _guard(self, first: bool, w: int, pat: Any, var: tuple = ()) -> str:
         parts = ["step=0" if first else "step>0"]
         if self.versioned:
             parts.append(f"ver={w}")
+        if self.k11 and not first:
+            for t, (iv, wt, lc) in zip(self.trs, var):
+                parts.append(f"{t.px}iv={iv}")
+                if self.L:
+                    parts += [f"{t.px}wt={wt}", f"{t.px}lc={lc}"]
         if not self.multi:
             parts.insert(0, "!ended")
             parts.append("(early_end | step=H)" if pat else "step<H")
@@ -5031,12 +5166,14 @@ class NormsModel:
         A = len(self.tr.choices)
         for first in (True, False):
             for w, amend in self._versions_at(first):
-                for ch in self.tr.choices:
-                    for pat in self.patterns(first):
-                        j = ch.index + (A if amend else 0)
-                        upd = self.step(ch, pat, first, w, amend)
-                        out.append((make_label(j, pat), ch, pat, self._guard(first, w, pat),
-                                    upd))
+                for var in self._variants(first, w):
+                    for lca in self._lc_choices():
+                        for ch in self.tr.choices:
+                            for pat in self.patterns(first):
+                                j = self.choice_index(ch.index, amend, lca)
+                                upd = self.step(ch, pat, first, w, amend, var, lca)
+                                out.append((make_label(j, pat), ch, pat,
+                                            self._guard(first, w, pat, var), upd))
         return out
 
     def all_ended(self, s: dict) -> bool:
@@ -5132,7 +5269,13 @@ class NormsModel:
 
     def step_text(self, j: int, end: Any) -> str:
         ch, amend = split_choice(self.tr, j)
-        return ("amend; " if amend else "") + self.choice_text(ch, end)
+        head = ""
+        if amend:
+            head = "next version takes effect; " if self.k11 else "amend; "
+        lca = lc_choice(self.tr, j, len(self.trs))
+        if self.L:
+            head += "state " + ", ".join(self.tr.lc_reps[c] for c in lca) + "; "
+        return head + self.choice_text(ch, end)
 
     def choice_text(self, ch: Choice, end: bool) -> str:
         msgs = ", ".join(self.tr.atoms[i].text() for i in ch.messages) or "no message"
@@ -5412,8 +5555,7 @@ def instance_path(tr: Any, path: list) -> list:
 
 def _amends_before(tr: Any, path: list, n: int) -> int:
     """The number of amendments of a path before observation n."""
-    a = len(tr.choices)
-    return sum(1 for j, _e in path[:n] if j >= a)
+    return sum(1 for j, _e in path[:n] if split_choice(tr, j)[1])
 
 
 def base_version(tr: Any, path: list) -> int:
@@ -5421,7 +5563,11 @@ def base_version(tr: Any, path: list) -> int:
     (an instance that starts after an amendment is one of the new version)."""
     if not getattr(tr, "version_names", None):
         return 0
-    return _amends_before(tr, path, instance_span(tr, path)[0])
+    first = instance_span(tr, path)[0]
+    if getattr(tr, "k11", None):
+        # the instance follows the version in force at its first observation
+        return _amends_before(tr, path, first + 1)
+    return _amends_before(tr, path, first)
 
 
 def base_file(tr: Any, path: list) -> str | None:
@@ -5440,13 +5586,22 @@ def trace_lines(tr: Translator, path: list) -> list[str]:
     lines = []
     first, last = instance_span(tr, path)
     amended = _amends_before(tr, path, first)
+    k11 = getattr(tr, "k11", None)
     for n in range(first, last + 1):
         j, end = path[n]
         ch, amend = split_choice(tr, j)
         obs: dict = {"t": _t(tr.step_ms, n)}
         if n == first:
             obs["bindings"] = dict(sorted(tr.bindings.items()))
-        if amend:
+        if k11:
+            # the version in force (K.11), and the lifecycle state after
+            # the observation (in_states)
+            amended += amend
+            obs["version"] = k11["names"][amended]
+            lca = lc_choice(tr, j, getattr(tr, "n_instances", 1))
+            if lca:
+                obs["state"] = tr.lc_reps[lca[getattr(tr, "inst", 0)]]
+        elif amend:
             obs["amend"] = tr.version_names[amended]
             amended += 1
         if tr.quantities:
@@ -5461,9 +5616,21 @@ def trace_lines(tr: Translator, path: list) -> list[str]:
 
 def split_choice(tr: Any, j: int) -> tuple:
     """(choice, amend): with versions, a choice index j >= the number of
-    choices also amends the contract to the next version (F.6)."""
+    choices also amends the contract to the next version (F.6); for the
+    versions of a run (K.11), the next version takes effect. For a run
+    with in_states, j also gives the lifecycle classes (lc_choice)."""
     a = len(tr.choices)
-    return tr.choices[j % a], j >= a
+    return tr.choices[j % a], (j // a) % 2 == 1
+
+
+def lc_choice(tr: Any, j: int, instances: int = 1) -> tuple:
+    """The classes of the lifecycle state after the observation, per
+    instance, of a choice index (K.11 with in_states); () without them."""
+    reps = getattr(tr, "lc_reps", None) if getattr(tr, "k11", None) else None
+    if not reps:
+        return ()
+    x = j // (2 * len(tr.choices))
+    return tuple((x // len(reps) ** k) % len(reps) for k in range(instances))
 
 
 def parse_label(label: str) -> tuple:
@@ -5500,6 +5667,12 @@ def _base_contract(tr: Any, path: list) -> ContractDef:
 
 
 def evaluate_path(tr: Translator, path: list) -> dict:
+    k11 = getattr(tr, "k11", None)
+    if k11:
+        from .norms_eval import evaluate as _evaluate, parse_trace_versions
+        chain = k11["chain"]
+        trace = parse_trace_versions(trace_lines(tr, path), chain=chain)
+        return _evaluate(chain.infos[0].sos, trace, tr.contract.id, chain=chain)
     trace = parse_trace(trace_lines(tr, path))
     versions = getattr(tr, "version_sos", {})
     return run_trace(_base_contract(tr, path), trace, versions.get if versions else None,
@@ -5547,23 +5720,34 @@ def compare_path(model: NormsModel, pm: PrismModel, path: list) -> list[str]:
             k = times[h["t"]] - first
             for m in range(k, length):
                 seq[m] = h["state"]
-        # a norm added by an amendment: absent in the model before it, and
-        # present from it on (norms-eval keeps no state for it before)
-        added = []
-        if n.id not in {d.id for d in _base_contract(tr, path).norms}:
-            vs = getattr(tr, "version_sos", {})
-            for a in result.get("amendments", []):
-                c = next((c for c in vs[a["file"]].contracts if c.id == tr.contract.id), None)
-                if c is not None and n.id in {d.id for d in c.norms}:
-                    added.append(times[a["t"]] - first)
-                    break
+        # a norm that the instance does not have (not yet added by an
+        # amendment, or removed by one and perhaps added again by a later
+        # one): absent in the model exactly then (norms-eval keeps no state
+        # for it; its history starts when it is added)
+        present = n.id in {d.id for d in _base_contract(tr, path).norms}
+        changes = []
+        vs = getattr(tr, "version_sos", {})
+        for a in result.get("amendments", []):
+            c = next((c for c in vs[a["file"]].contracts if c.id == tr.contract.id), None)
+            removed = any(e["norm"] == n.id and e["effect"] == "removed" for e in a["effects"])
+            if present and removed:
+                present = False
+                changes.append((times[a["t"]] - first, False))
+            elif not present and c is not None and n.id in {d.id for d in c.norms}:
+                present = True
+                changes.append((times[a["t"]] - first, True))
+        base_present = n.id in {d.id for d in _base_contract(tr, path).norms}
         for k, s in enumerate(states):
             got = STATE_NAMES[s[f"st_{n.stem}"]]
-            if added and (got == "absent") != (k < added[0]):
-                diffs.append(f"{n.uid} at observation {first + k}: model {got}, added by the "
-                             f"amendment at observation {first + added[0]}")
+            have = base_present
+            for at, now in changes:
+                if at <= k:
+                    have = now
+            if (got == "absent") != (not have):
+                diffs.append(f"{n.uid} at observation {first + k}: model {got}, the instance "
+                             f"{'has' if have else 'does not have'} the norm in norms-eval")
                 break
-            if got == "absent" and added:
+            if got == "absent":
                 got = "inactive"
             if got != seq[k]:
                 diffs.append(f"{n.uid} at observation {first + k}: model {got}, norms-eval "
@@ -5625,9 +5809,19 @@ def random_paths(tr: Translator, count: int, seed: int = 0, p_message: float = 0
             if path and rng.random() < p_keep:
                 prev = split_choice(tr, path[-1][0])[0].values
                 j = by_values[(msgs, json_text(dict(sorted(prev.items()))))]
-            amended = sum(1 for jj, _e in path if jj >= len(tr.choices))
+            amended = sum(1 for jj, _e in path if split_choice(tr, jj)[1])
             if amended < len(getattr(tr, "version_names", [])) and rng.random() < p_amend:
                 j += len(tr.choices)
+            reps = getattr(tr, "lc_reps", None) if getattr(tr, "k11", None) else None
+            if reps:
+                # the lifecycle state after the observation, per instance:
+                # mostly the one before
+                before = lc_choice(tr, path[-1][0], instances) if path else (0,) * instances
+                x = 0
+                for k in range(instances):
+                    c = before[k] if rng.random() < 0.6 else rng.randrange(len(reps))
+                    x += c * len(reps) ** k
+                j += 2 * len(tr.choices) * x
             if instances == 1:
                 end = n == tr.horizon or (not full_length and rng.random() < p_end)
                 path.append((j, end))
@@ -5787,6 +5981,69 @@ def _build_model(sos: SoSDefinition, contract_id, bindings, members, step, horiz
     return NormsModel(tr)
 
 
+def _transitional(vs: SoSDefinition, contract_id: str) -> tuple | None:
+    """(rule, in_states) of the contract in a version that declares the
+    amendment extension with an amendment: block (Appendix K, K.4), or None
+    for a file without the block (an amendment to it switches, F.6)."""
+    from .amendment import amendment_declared, analyse
+    raw = getattr(vs, "amendment", None)
+    if not amendment_declared(vs) or raw is None or not raw.has_block:
+        return None
+    a = analyse(vs)
+    rule, states = a.transitional.get(contract_id, (a.transitional_default, []))
+    return rule, list(states or [])
+
+
+def _versions_of_run(tr: Translator, sos: SoSDefinition, contract: ContractDef,
+                     names: list, soses: list) -> None:
+    """Versions of a run (Appendix K, K.11) for a version whose
+    transitional rule for the contract is `keep` or `switch` with
+    `in_states:`: every file declares the extension with an amendment:
+    block, they form one sequence by previous: in the order given, and the
+    model follows K.11 instead of amending every instance (F.6). Sets
+    `tr.k11` (the chain, the rule of each version, the names) and, for
+    `in_states:`, `tr.lc_reps` (one lifecycle state per class of the states
+    that the rules tell apart, the initial state first) and `tr.lc_in`
+    (per version, the classes of its in_states)."""
+    rules = [_transitional(vs, contract.id) for vs in soses]
+    if not any(r is not None and (r[0] == "keep" or r[1]) for r in rules):
+        return
+    if _transitional(sos, contract.id) is None or any(r is None for r in rules):
+        raise NormsCheckError(
+            "--version: a version whose transitional rule is keep or switch with in_states "
+            "is applied as Appendix K, K.11 says, which needs every version, the file too, to "
+            "declare 'amendment: 0.1' with an amendment: block")
+    from .norms_eval import NormsEvalError, VersionChain, version_info
+    try:
+        infos = [version_info(sos)] + [version_info(vs, n) for n, vs in zip(names, soses)]
+        chain = VersionChain(infos)
+    except NormsEvalError as e:
+        raise NormsCheckError(f"--version: {e}") from None
+    if [i.sos for i in chain.infos] != [sos] + list(soses):
+        raise NormsCheckError(
+            "--version: give the later versions in the order of their sequence by previous: "
+            "(Appendix K, K.11), after the version of the file")
+    tr.k11 = {"chain": chain, "rules": [None] + rules,
+              "names": [i.name for i in chain.infos]}
+    lc = contract.lifecycle
+    sets = [set(r[1]) if r is not None and r[1] else None for r in [None] + rules]
+    if lc is None or not any(sets):
+        return
+
+    def sig(state: str) -> tuple:
+        return tuple(state in x for x in sets if x is not None)
+    reps = [lc.initial]
+    seen = {sig(lc.initial)}
+    for st in lc.states:
+        if st in lc.terminal or sig(st) in seen:
+            continue
+        seen.add(sig(st))
+        reps.append(st)
+    tr.lc_reps = reps
+    tr.lc_in = {v: {c for c, rep_ in enumerate(reps) if rep_ in x}
+                for v, x in enumerate(sets) if x is not None}
+
+
 def _version_translators(tr: Translator, sos: SoSDefinition, contract: ContractDef,
                          versions: list, bindings: dict, members: dict, step_ms, horizon,
                          domains) -> list:
@@ -5843,6 +6100,11 @@ def _version_translators(tr: Translator, sos: SoSDefinition, contract: ContractD
     tr.version_names = names
     tr.version_sos = dict(zip(names, soses))
     tr.version_paths = paths_of
+    _versions_of_run(tr, sos, contract, names, soses)
+    if getattr(tr, "k11", None):
+        # the amendments of a run with versions are logged as "version NAME"
+        for name, vs in zip(tr.k11["names"][1:], soses):
+            tr.version_sos[f"version {name}"] = vs
     return out
 
 
