@@ -490,13 +490,14 @@ class TestMonitor:
 
 class TestRefusals:
     def test_norms_check_in_states(self):
-        with pytest.raises(NormsCheckError, match="in_states"):
-            build_model(load_version(V1), versions=[V2])
+        # from cadl 0.3.36 the model follows K.11 (tests/test_norms_check_versions.py)
+        m = build_model(load_version(V1), versions=[V2])
+        assert m.k11 is not None and m.tr.lc_reps == ["Assigned", "PickedUp"]
 
     def test_norms_check_keep(self, tmp_path):
         v2 = _variant(tmp_path, "k.cadl", "2", "1", 2, "    transitional: { default: keep }\n")
-        with pytest.raises(NormsCheckError, match="is keep"):
-            build_model(load_version(V1), versions=[v2])
+        m = build_model(load_version(V1), versions=[v2])
+        assert m.k11 is not None and m.L == 0
 
     def test_norms_check_switch_accepted(self, tmp_path):
         v2 = _variant(tmp_path, "s.cadl", "2", "1", 2, "")
@@ -505,7 +506,7 @@ class TestRefusals:
     @pytest.mark.parametrize("target", ["solidity", "opa"])
     def test_d5_monitor_of_a_switching_contract(self, target, tmp_path):
         [m] = norms_monitors(parse_file(V2), target)
-        assert m["text"] is None and "cannot take over a running instance" in m["reasons"][0]
+        assert m["text"] is None and "needs the other versions" in m["reasons"][0]
         [m] = norms_monitors(parse_file(V1), target)          # no previous:
         assert m["text"] is not None
         keep = _variant(tmp_path, "k.cadl", "2", "1", 2, "    transitional: { default: keep }\n")

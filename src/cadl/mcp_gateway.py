@@ -72,6 +72,7 @@ from typing import Any, Callable
 from . import agents as G
 from .audit_log import AuditKeyError, canonical, loads_unique, read_key
 from .gateway_core import (  # noqa: F401 - the names of this module before 0.3.25
+    gateway_regime_key,
     gateway_versions,
     _AFTER_DEADLINE,
     _IDENT_HOLD_RE,
@@ -152,7 +153,8 @@ class Gateway(EnforcementPoint):
                  allow_methods: tuple = (),
                  run_id: str | None = None,
                  hold_key: bytes | None = None,
-                 run_versions: list | None = None, base=None) -> None:
+                 run_versions: list | None = None, base=None,
+                 regime_key: bytes | None = None) -> None:
         self.to_client = to_client
         self.to_server = to_server
         self.filter_tools = filter_tools
@@ -176,7 +178,7 @@ class Gateway(EnforcementPoint):
         self._check_approvable(self.server)
         self._open(audit, trace_out, key, inbox, init, clock, wall, approver_keys,
                    insecure_approvals, run_id, hold_key=hold_key, run_versions=run_versions,
-                   base=base)
+                   base=base, regime_key=regime_key)
 
     # --- client -> server -------------------------------------------------------
 
@@ -594,7 +596,7 @@ def cli_gateway(args) -> int:
                        hold_key=read_key(args.hold_key) if args.hold_key else None,
                        insecure_approvals=args.insecure_approvals,
                        allow_methods=tuple(args.allow_method),
-                       **gateway_versions(args))
+                       **gateway_versions(args), **gateway_regime_key(args))
         code = serve(gw_args, server, poll=args.poll, restore_signals=False)
     except (GatewayError, AuditKeyError, TraceError) as e:
         print(f"Error: {e}", file=sys.stderr)

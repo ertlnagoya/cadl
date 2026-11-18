@@ -80,21 +80,25 @@ class NormsTargetUnsupported(ValueError):
         super().__init__("; ".join(self.reasons))
 
 
-def check_regimes(sos: SoSDefinition, contract: ContractDef, target: str) -> None:
-    """Raise `NormsTargetUnsupported` for a contract that some regime of
-    `regimes:` does not have in force (Appendix A, A.7.1): the monitors of
-    the Rego and Solidity targets do not read the current regime, so they
-    could not leave out the observations at which the contract is not in
-    force (F.5)."""
+def regime_data(sos: SoSDefinition, contract: ContractDef) -> dict | None:
+    """The regimes of a file with `regimes:` (Appendix A, A.7.1) for the
+    monitor of a contract that some regime does not have in force:
+    ``{"regimes": [...], "out": [regimes without the contract in force],
+    "initial": regime}``; None when every regime has it in force (the
+    monitor is then that of the file without the block) or the file has no
+    block. The monitors of the Rego and Solidity targets then follow the
+    current regime as `cadl norms-eval` does (F.5, "Contracts not in
+    force")."""
     if not sos.transitions:
-        return
-    from ..regimes import checked, suspended_somewhere
-    apart = suspended_somewhere(checked(sos), contract.id)
-    if apart:
-        raise NormsTargetUnsupported([
-            f"the regime(s) {', '.join(apart)} do not have the contract in force "
-            f"(regimes:, Appendix A, A.7.1), and the norms monitor of the {target} "
-            f"target does not read the current regime"])
+        return None
+    from ..norms_eval import regime_bindings
+    b = regime_bindings(sos)
+    if b is None:
+        return None
+    out = [r for r in b.regimes if not b.in_force(contract.id, r)]
+    if not out:
+        return None
+    return {"regimes": list(b.regimes), "out": out, "initial": b.initial}
 
 
 def switching_contracts(sos: SoSDefinition) -> dict:
@@ -129,9 +133,9 @@ def check_versions(sos: SoSDefinition, contract: ContractDef, target: str) -> No
     if rule is not None:
         raise NormsTargetUnsupported([
             f"this version replaces {_previous(sos)} and its transitional rule for "
-            f"{contract.id} is {rule} (Appendix K, K.4), and the norms monitor of the "
-            f"{target} target cannot take over a running instance of the old version "
-            f"(it does not apply amendments, F.6); the python target does (K.11)"])
+            f"{contract.id} is {rule} (Appendix K, K.4): to take over a running instance "
+            f"of the old version the norms monitor of the {target} target needs the other "
+            f"versions of the run (cadl codegen --version FILE, from cadl 0.3.36; K.11)"])
 
 
 def _previous(sos: SoSDefinition) -> str:

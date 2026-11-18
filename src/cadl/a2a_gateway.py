@@ -102,6 +102,7 @@ from .a2a_push import PushError, PushPolicy, check_auth, deliver
 from . import agents as G
 from .audit_log import AuditKeyError, canonical, loads_unique, read_key
 from .gateway_core import (
+    gateway_regime_key,
     gateway_versions,
     _IDENT_RE,
     INTERNAL_ERROR,
@@ -416,7 +417,8 @@ class A2AGateway(EnforcementPoint):
                  push_timeout: float = 10.0,
                  push_tls: ssl.SSLContext | None = None,
                  resolve: Callable[..., list] | None = None,
-                 run_versions: list | None = None, base=None) -> None:
+                 run_versions: list | None = None, base=None,
+                 regime_key: bytes | None = None) -> None:
         self._load(file)
         self.receiver = self._actor(agent_actor, "--agent-actor")
         decl = next((a for a in self.sos.actors if a.id.name == self.receiver["name"]), None)
@@ -512,7 +514,7 @@ class A2AGateway(EnforcementPoint):
         self.upstream_ids = itertools.count(1)
         self._open(audit, trace_out, key, inbox, init, clock, wall, approver_keys,
                    insecure_approvals, run_id, hold_key=hold_key, run_versions=run_versions,
-                   base=base)
+                   base=base, regime_key=regime_key)
 
     def _step(self, line: dict, close: bool = False) -> dict:
         """As in the enforcement point; nothing more is decided or recorded
@@ -2822,7 +2824,7 @@ def cli_gateway(args) -> int:
                        upstream_binding=args.upstream_binding,
                        push_allow=args.push_allow, push_url=args.push_url,
                        push_timeout=args.push_timeout, push_tls=push_tls,
-                       **gateway_versions(args))
+                       **gateway_versions(args), **gateway_regime_key(args))
         code = serve(gw_args, listen=args.listen, port_file=args.port_file,
                      tls_cert=args.tls_cert, tls_key=args.tls_key, poll=args.poll,
                      max_readers=args.max_readers, read_timeout=args.read_timeout,

@@ -5,8 +5,9 @@ F.5, "Contracts not in force"), cadl 0.3.33.
   key ``regime`` of an observation and judge a contract instance on the
   projection of the trace: the observations at which the contract is in
   force, with deadlines and intervals on the clock of the contract;
-- the generated Solidity and Rego read the current regime;
-- the targets that cannot read it refuse what the bindings would change;
+- the generated Solidity and Rego read the current regime; from cadl
+  0.3.36 so do their norms monitors, the Unity C# target and the
+  boundary policies (tests/test_regime_targets.py);
 - `cadl regime-map` shows the bindings.
 """
 
@@ -755,20 +756,16 @@ def test_rego_main_parameters(tmp_path):
     assert "regime" not in (plain / "routing.rego").read_text()
 
 
-# === Targets that do not read the regime ============================================
+# === Targets that read the regime (cadl 0.3.36; tests/test_regime_targets.py) ======
 
 @pytest.mark.parametrize("target", ["opa", "solidity"])
 def test_norms_monitors_of_opa_and_solidity(target):
+    """From cadl 0.3.36 the monitors of the Rego and Solidity targets read the
+    current regime (they were refused in 0.3.33 to 0.3.35)."""
     sos = parse(_with_regimes(EXAMPLE, "DELIVERY_SLA"))
     [m] = norms_monitors(sos, target)
-    assert m["text"] is None and "STORM do not have the contract in force" in m["reasons"][0]
-    # the public generators refuse it too
-    from cadl.codegen.norms_ir import NormsTargetUnsupported
-    from cadl.codegen.opa.norms_monitor_rego import generate_norms_monitor_rego
-    from cadl.codegen.solidity.norms_monitor_sol import generate_norms_monitor_sol
-    gen = generate_norms_monitor_rego if target == "opa" else generate_norms_monitor_sol
-    with pytest.raises(NormsTargetUnsupported, match="STORM do not have the contract"):
-        gen(sos, sos.contracts[0])
+    assert m["text"] is not None and m["reasons"] == []
+    assert ("norms-monitor-regimes" in m["text"])
     # a contract that every regime has in force: the monitor of the file
     # without the block (no norm reads a parameter)
     other = _with_regimes(EXAMPLE, "DELIVERY_SLA").replace(
@@ -780,9 +777,8 @@ def test_norms_monitors_of_opa_and_solidity(target):
 
 def test_unity_csharp(tmp_path):
     sos = parse(_with_regimes(EXAMPLE, "DELIVERY_SLA"))
-    with pytest.raises(ValueError, match="'unity-csharp' cannot apply the regime bindings"):
-        generate(sos, tmp_path / "u", target="unity-csharp")
-    assert not (tmp_path / "u").exists()
+    generate(sos, tmp_path / "u", target="unity-csharp")
+    assert (tmp_path / "u" / "Generated" / "CadlRegimes.cs").exists()
     # in force in every regime: the code of the file without the block
     other = parse(_with_regimes(EXAMPLE, "DELIVERY_SLA").replace(
         "suspended: [DELIVERY_SLA]", "suspended: []"))
@@ -794,15 +790,20 @@ def test_unity_csharp(tmp_path):
 
 
 def test_boundary_policy_of_the_agent_extension():
+    """build_policy without regimes=True still refuses; the decision
+    function, the generated policies, agents-run and the gateways (from
+    0.3.36, tests/test_agents_regimes_0336.py) read the regime."""
     from cadl.agents import build_policy
     path = ROOT / "examples" / "agents_tool_governance.cadl"
     sos = parse(_with_regimes(path, "ASSISTED_REPORTING"))
     assert type_check(sos).ok
     with pytest.raises(ValueError, match="boundary policy cannot apply the regime bindings"):
         build_policy(sos)
+    policy = build_policy(sos, regimes=True)
+    assert policy["regimes"]["out"] == {"NORMAL": [], "STORM": ["ASSISTED_REPORTING"]}
     kept = parse(_with_regimes(path, "ASSISTED_REPORTING").replace(
         "suspended: [ASSISTED_REPORTING]", "suspended: []"))
-    assert build_policy(kept) == build_policy(parse_file(path))
+    assert build_policy(kept) == build_policy(parse_file(path)) == build_policy(kept, regimes=True)
 
 
 # === cadl regime-map ================================================================

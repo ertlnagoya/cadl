@@ -327,8 +327,8 @@ IR_MUTANTS = {
     "pending candidates are ignored": (
         "if o.id in slots and nd.content_text == o.content_text:", "if False:"),
     "pending ignores candidates decided while suspended": (
-        'pending = ir.OR(ir.V(f"ht_{stem}"), ir.V(f"sf_{stem}"),',
-        "pending = ir.OR(ir.FALSE, ir.FALSE,"),
+        'pend[o.id] = ir.OR(ir.V(f"ht_{stem}"), ir.V(f"sf_{stem}"),',
+        "pend[o.id] = ir.OR(ir.FALSE, ir.FALSE,"),
     "pending kept when the content changes": (
         "if o.id in slots and nd.content_text == o.content_text:", "if o.id in slots:"),
 }

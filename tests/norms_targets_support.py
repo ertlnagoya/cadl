@@ -142,6 +142,248 @@ def reference(sos, lines: list, contract: str | None = None, skip: set = frozens
     return {"steps": steps, "quantities": sorted(names)}
 
 
+def reference_regimes(sos, lines: list, contract: str | None = None,
+                      skip: set = frozenset()) -> dict:
+    """`reference` for a file with `regimes:` and a trace that may name
+    regimes (Appendix A, A.7.1; F.5, "Contracts not in force"): the steps of
+    the norms monitor of the Python target, from the engine on the
+    projection of the trace. At an observation left out (the contract is
+    not in force and the instance does not end there) the snapshot has no
+    change and no deadline. {"error": text, "never": bool} when `cadl
+    norms-eval` refuses the trace; "never" when the contract is never in
+    force and the instance does not end (a monitor then reports nothing)."""
+    from cadl.norms_eval import (
+        _ContractClock, _regime_ends_at, _RegimeEngine, evaluate, parse_trace_regimes,
+        regime_bindings, Trace,
+    )
+    c = select_contract(sos, contract)
+    actors = declared_actors(sos)
+    b = regime_bindings(sos)
+    try:
+        trace = parse_trace_regimes(lines, bindings=b)
+        evaluate(sos, trace, c.id)
+    except (TraceError, NormsEvalError) as e:
+        return {"error": str(e), "never": "is not in force at any observation" in str(e)}
+
+    def run(names):
+        trace = parse_trace_regimes(lines, bindings=b)
+        obs = trace.observations
+        last = len(obs) - 1
+        clock = _ContractClock(b, c.id)
+        kept = Trace(observations=[], bindings=trace.bindings, request=trace.request)
+        dummy = _Engine(c, Trace(observations=[]), None, actors)
+        eng = None
+        steps, end_at = [], None
+        nv = ne = nu = nt = 0
+        before = _marks(dummy, skip)
+        for i, o in enumerate(obs):
+            inside, o.c = clock.step(o.t, getattr(o, "regime", None))
+            o.out = not inside
+            if not inside and not _regime_ends_at(o, c.lifecycle, i == last):
+                marks = _marks(eng or dummy, skip)
+                steps.append(dict(marks, violations=[], events=[], unauthorised=[], powers=[],
+                                  changes=[], next_deadline=None, ended=False))
+                continue
+            kept.observations.append(o)
+            n = len(kept.observations) - 1
+            if eng is None:
+                eng = _RegimeEngine(c, kept, None, actors)
+                eng.ev.known = set(names)
+            elif eng.lifecycle is not None:
+                eng._fill_states(n)
+            ended = eng._step(n, i == last)
+            eng._finish_items()
+            snap = _snapshot(eng, nv, ne, nu, nt, skip, before, o.t)
+            snap["next_deadline"] = None if ended or o.out else _regime_deadline(eng, o)
+            steps.append(snap)
+            before = {k: snap[k] for k in ("norms", "assume", "guarantee")}
+            nv, ne, nu = len(eng.violations), len(eng.inst_events), len(eng.unauthorised)
+            nt = len(eng.timeline)
+            if ended:
+                end_at = i
+                break
+        return steps, end_at
+
+    all_names: set = set()
+    for o in parse_trace_regimes(lines, bindings=b).observations:
+        all_names.update(o.values)
+    _, end_at = run(all_names)
+    names: set = set()
+    for o in parse_trace_regimes(lines, bindings=b).observations[:None if end_at is None
+                                                                 else end_at + 1]:
+        names.update(o.values)
+    steps, _ = run(names)
+    return {"steps": steps, "quantities": sorted(names)}
+
+
+def _regime_deadline(eng, o):
+    """next_deadline() of the Python monitor with regimes: on the clock of
+    the contract, as a time of the trace."""
+    c = o.c
+    due = [c + max(x.deadline - x.elapsed(c), 0) for x in eng.norms
+           if x.state == "active" and not x.frozen and x.deadline is not None
+           and x.d.kind in ("obligation", "prohibition") and x.elapsed(c) <= x.deadline]
+    return _round(min(due) - c + o.t) if due else None
+
+
+def _vmarks(eng) -> dict:
+    """The marks of the norms monitor of the Python target (its _marks): the
+    norms by id, the items by identity, with their positions."""
+    out = {"norms": {x.d.id: [x.state, x.verdict] for x in eng.norms}}
+    for key in ("assume", "guarantee"):
+        out[key] = [(id(it), _item_mark(key, it)) for it in eng.items[key]]
+    return out
+
+
+def _vchanges(before: dict, eng) -> list:
+    """The changes as the norms monitor of the Python target reports them
+    (its _changes): a norm new in the version has no previous state, a
+    removed one no state; an item is followed by its identity."""
+    out = []
+    for x in eng.norms:
+        old = before["norms"].get(x.d.id, [None, None])
+        if old != [x.state, x.verdict]:
+            out.append(["norm", x.d.id, old[0], old[1], x.state, x.verdict])
+    ids = {x.d.id for x in eng.norms}
+    for nid, old in before["norms"].items():
+        if nid not in ids:
+            out.append(["norm", nid, old[0], old[1], None, None])
+    for key, kind in (("assume", "assumption"), ("guarantee", "guarantee")):
+        prev = dict(before[key])
+        for pos, it in enumerate(eng.items[key], start=1):
+            now = _item_mark(key, it)
+            old = prev.get(id(it), "pending")
+            if old != now:
+                out.append([kind, pos, old, now])
+    return sorted(out, key=json.dumps)
+
+
+def reference_versions(soses: list, lines: list, contract: str | None = None) -> dict:
+    """`reference` for the versions of a run (Appendix K, K.11): `soses`
+    are the versions (the first is the file of the monitor); the trace may
+    name the version in force with the key ``version``. The steps of the
+    norms monitor of the Python target with run_versions, from the engine of
+    `cadl norms-eval`; the changes as that monitor reports them."""
+    from cadl.norms_eval import (
+        Trace, VersionChain, VersionTracker, _VersionEngine, parse_trace_versions,
+        run_version_trace, version_info,
+    )
+    chain = VersionChain([version_info(x) for x in soses])
+    cid = select_contract(soses[0], contract).id
+    try:
+        trace = parse_trace_versions(lines, chain=chain)
+        run_version_trace(cid, trace, chain, declared_actors)
+    except (TraceError, NormsEvalError) as e:
+        return {"error": str(e)}
+    trace = parse_trace_versions(lines, chain=chain)
+    obs = trace.observations
+    names: set = set()
+    ended_at = None
+    # the names of the quantities: those of the observations up to the end
+    eng_probe = None
+    tr2 = parse_trace_versions(lines, chain=chain)
+    tracker = VersionTracker(chain, cid)
+    first = tr2.observations[0]
+    start = chain.infos[tracker.start(first.t, getattr(first, "version", None))]
+    c0 = next(c for c in start.sos.contracts if c.id == cid)
+    for o in tr2.observations:
+        o.amend = None
+    eng_probe = _VersionEngine(c0, tr2, chain, tracker, declared_actors(start.sos))
+    eng_probe.run()
+    ended_at = eng_probe.ended_at
+    for o in obs[:None if ended_at is None else ended_at + 1]:
+        names.update(o.values)
+    tracker = VersionTracker(chain, cid)
+    start = chain.infos[tracker.start(obs[0].t, getattr(obs[0], "version", None))]
+    c0 = next(c for c in start.sos.contracts if c.id == cid)
+    kept = Trace(observations=[], bindings=trace.bindings, request=trace.request)
+    eng = None
+    steps = []
+    nv = ne = nu = nt = 0
+    last = len(obs) - 1
+    for n, o in enumerate(obs):
+        o.amend = None
+        kept.observations.append(o)
+        if eng is None:
+            eng = _VersionEngine(c0, kept, chain, tracker, declared_actors(start.sos))
+            eng.ev.known = set(names)
+            before = {"norms": {x.d.id: ["inactive", "pending"] for x in eng.norms},
+                      "assume": [(id(i), "pending") for i in eng.items["assume"]],
+                      "guarantee": [(id(i), "pending") for i in eng.items["guarantee"]]}
+        elif eng.lifecycle is not None:
+            eng._fill_states(n)
+        ended = eng._step(n, n == last)
+        eng._finish_items()
+        snap = {
+            "norms": {x.d.id: [x.state, x.verdict] for x in eng.norms},
+            "assume": [_item_mark("assume", i) for i in eng.items["assume"]],
+            "guarantee": [_item_mark("guarantee", i) for i in eng.items["guarantee"]],
+            "violations": [[v["norm"], v["verdict"], v["reparation_activated"], v["transition"],
+                            v["severity"], v["sanction"]] for v in eng.violations[nv:]],
+            "events": [[e["name"], e["performer"]] for e in eng.inst_events[ne:]],
+            "unauthorised": [[u["act"], u["performer"]] for u in eng.unauthorised[nu:]],
+            "powers": [],
+            "changes": _vchanges(before, eng),
+            "next_deadline": _next_deadline(eng, o.t),
+            "ended": eng.ended_at is not None,
+        }
+        for entry in eng.timeline[nt:]:
+            if entry["kind"] == "power":
+                m = _POWER_RE.match(entry["text"])
+                snap["powers"].append([m.group(2), m.group(1), m.group(3)])
+        steps.append(snap)
+        before = _vmarks(eng)
+        nv, ne, nu = len(eng.violations), len(eng.inst_events), len(eng.unauthorised)
+        nt = len(eng.timeline)
+        if ended:
+            break
+    effects = sorted({e["effect"] for a in eng.amendments for e in a["effects"]})
+    return {"steps": steps, "quantities": sorted(names), "follows": tracker.follows,
+            "effects": effects}
+
+
+def compare_versions(refs: list, got: list) -> list:
+    """`compare` for runs with versions: the changes of a step that ends at
+    the finish are those of the finish (the monitor reports the finish on
+    its own)."""
+    bad = []
+    for i, (ref, g) in enumerate(zip(refs, got)):
+        if "error" in ref:
+            if not any(st.get("error") for st in g["steps"]):
+                bad.append((i, "the monitor accepted the trace", ref["error"]))
+            continue
+        errors = [st for st in g["steps"] if st.get("error")]
+        if errors:
+            bad.append((i, "the monitor refused an observation", errors[0]))
+            continue
+        for k, want in enumerate(ref["steps"]):
+            have = dict(g["steps"][k])
+            if (k == len(ref["steps"]) - 1 and g.get("finish") is not None
+                    and not have["ended"]):
+                f = dict(g["finish"])
+                f["violations"] = have["violations"] + f["violations"]
+                for key in ("events", "unauthorised", "powers"):
+                    f[key] = have[key]
+                f["changes"] = _merge_v(have["changes"], f["changes"])
+                have = f
+            if have != want:
+                bad.append((i, k, want, have))
+                break
+    return bad
+
+
+def _merge_v(first: list, second: list) -> list:
+    """The changes of two consecutive reports as one (by norm id and item position)."""
+    state = {}
+    for c in first + second:
+        k = (c[0], c[1])
+        old = state[k][0] if k in state else (c[2:4] if c[0] == "norm" else [c[2]])
+        new = c[4:6] if c[0] == "norm" else [c[3]]
+        state[k] = (old, new)
+    out = [[k[0], k[1], *old, *new] for k, (old, new) in state.items() if old != new]
+    return sorted(out, key=json.dumps)
+
+
 def compare(refs: list, got: list, count_steps: list | None = None) -> list:
     """Mismatches between the reference and the snapshots of a monitor
     (lists of {"steps": [...], "finish": snapshot or None})."""
@@ -457,11 +699,26 @@ def sol_run(lines: list, quantities: list) -> dict:
     return {"begin": [bindings, request, list(quantities)], "steps": steps}
 
 
-def run_evm(compiled: dict, monitor: str, runs: list, tmp: Path) -> list:
+def sol_run_regimes(lines: list, quantities: list) -> dict:
+    """`sol_run` for a trace that names regimes: setRegime before the
+    observation that names one."""
+    run = sol_run([json.dumps({k: v for k, v in r.items() if k != "regime"})
+                   for r in records(lines)], quantities)
+    for st, rec in zip(run["steps"], records(lines)):
+        if "regime" in rec:
+            st["regime"] = rec["regime"]
+    return run
+
+
+def run_evm(compiled: dict, monitor: str, runs: list, tmp: Path, ctor_args: int = 1,
+            ids: bool = False) -> list:
     libs = ["Monitor.sol:CadlNormsValues", "Monitor.sol:CadlNormsEval",
             "Monitor.sol:CadlNormsWindows", "Monitor.sol:CadlNormsMulti",
             "Monitor.sol:CadlNormsItems", "Monitor.sol:CadlNormsActs"]
-    job = {"contracts": compiled, "libraries": libs, "monitor": monitor, "runs": runs}
+    if "Monitor.sol:CadlNormsVersions" in compiled:
+        libs.append("Monitor.sol:CadlNormsVersions")
+    job = {"contracts": compiled, "libraries": libs, "monitor": monitor, "runs": runs,
+           "ctor_args": ctor_args, "ids": ids}
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / "job.json").write_text(json.dumps(job), encoding="utf-8")
     proc = subprocess.run([evm_python(), "-I", str(HERE / "norms_evm_driver.py"),

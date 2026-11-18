@@ -26,6 +26,14 @@ CadlNormsWindows (one operator), to the segment tree of CadlNormsMulti
 observations), or, from cadl 0.3.32, to `General` in CadlNormsMulti, which
 decides it per observation (six or more operators, `until` in a nesting,
 an operand that combines a nested operator with other parts).
+
+From cadl 0.3.36, `generate_norms_monitor_sol_versions` writes the monitor
+of a contract that follows the versions of a run (Appendix K, K.11;
+`cadl codegen -t solidity FILE --version OTHER ...`): the constructor fills
+the definitions of every version, the base is read through the norms and
+items of the instance (`_versions_base`), and norms_monitor_versions.sol
+adds the version in force (set by the orchestrator) and the amendment of
+F.6.
 """
 
 from __future__ import annotations
@@ -42,6 +50,60 @@ from ..norms_ir import (
 )
 
 BASE = Path(__file__).with_name("norms_monitor_base.sol")
+REGIMES_PART = Path(__file__).with_name("norms_monitor_regimes.sol")
+
+# The lines of the base that the monitor of a contract not in force in some
+# regime reads differently (Appendix A, A.7.1; F.5): the base runs on the
+# clock of the contract, `now` and the times of the events are times of the
+# trace (the clock plus `shift`), the lifecycle state given while the
+# contract was not in force is the state before its first observation, and
+# observe, finish and nextDeadline are those of norms_monitor_regimes.sol.
+_REGIME_EDITS = [
+    ("    int256[] obsT;\n",
+     "    int256[] obsT;\n    int256[] obsNow;         // the times of the trace (now); obsT: the clock\n"),
+    ('if (h == keccak256("now")) return Val(K_N, data.obsT[p], "");',
+     'if (h == keccak256("now")) return Val(K_N, data.obsNow[p], "");'),
+    ("    int256 failedAt;\n}",
+     "    int256 failedAt;\n    int256 shift;              // the time of the trace minus the clock\n}"),
+    ("emit InstitutionalEvent(buf[i].name, buf[i].performer, buf[i].source, t);",
+     "emit InstitutionalEvent(buf[i].name, buf[i].performer, buf[i].source, t + m.shift);"),
+    ("emit PowerExercised(d.id, act.performer, act.desc, t);",
+     "emit PowerExercised(d.id, act.performer, act.desc, t + m.shift);"),
+    ("emit Unauthorised(act.desc, act.performer, t);",
+     "emit Unauthorised(act.desc, act.performer, t + m.shift);"),
+    ("repActivated, transition, t);", "repActivated, transition, t + m.shift);"),
+    ("ns[i], nv[i], t);", "ns[i], nv[i], t + m.shift);"),
+    ("emit ItemChanged(false, i + 1, k, am[i], t);", "emit ItemChanged(false, i + 1, k, am[i], t + m.shift);"),
+    ("emit ItemChanged(true, i + 1, k, gm[i], t);", "emit ItemChanged(true, i + 1, k, gm[i], t + m.shift);"),
+    ("        m.data.obsT.push(t);\n",
+     "        m.data.obsT.push(t);\n        m.data.obsNow.push(t + m.shift);\n"),
+    ("string memory before = n == 0 ? m.lcInitial : m.lc;",
+     "string memory before = n == 0 && bytes(m.lc).length == 0 ? m.lcInitial : m.lc;"),
+    ("bool hasState, string calldata state, bool end) external onlyReporter {\n"
+     "        require(t >= -MAX_T",
+     "bool hasState, string calldata state, bool end) internal {\n        require(t >= -MAX_T"),
+    ("    function observe(int256 t, ValIn[] calldata values, Msg[] calldata msgs,\n"
+     "                     bool hasState, string calldata state, bool end) internal {",
+     "    function observeCore(int256 t, ValIn[] calldata values, Msg[] calldata msgs,\n"
+     "                         bool hasState, string calldata state, bool end) internal {"),
+    ("function finish() external onlyReporter {", "function finishCore() internal {"),
+    ("function nextDeadline() external view returns (bool has, int256 due) {",
+     "function nextDeadlineCore() internal view returns (bool has, int256 due) {"),
+]
+
+# What the regime part adds to the runtime code of the monitor (bytes),
+# measured with solc 0.8.24 and 0.8.37 and rounded up.
+REGIMES_RUNTIME = 3300
+
+
+def _base(regimes: dict | None) -> str:
+    text = BASE.read_text(encoding="utf-8").rstrip("\n")
+    if regimes is None:
+        return text
+    for old, new in _REGIME_EDITS:
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+    return text + "\n\n" + REGIMES_PART.read_text(encoding="utf-8").rstrip("\n")
 SCALE = 10 ** 6
 _OPS = {"lit": 0, "name": 1, "sym": 2, "mem": 3, "req": 4, "not": 5, "and": 6, "or": 7,
         "bin": 8, "in": 9, "within": 10, "throughout": 11, "until": 12}
@@ -73,12 +135,24 @@ def estimated_initcode(text: str) -> int:
     (solc 0.8.24 or later, with the optimizer, 1 or 200 runs): the runtime code and the constructor,
     which grows with its statements and its texts. Fitted to compiled
     monitors (1.8 to 3.6 x 10^4 bytes) and kept above each of them."""
-    ctor = text.split("is CadlNormsMonitorBase {", 1)[1]
+    ctor = text.rsplit("    constructor(address reporter_", 1)[1]
     statements = sum(1 for line in ctor.splitlines() if line.strip().endswith(";"))
     texts = sum(len(h) // 2 for h in re.findall(r'hex"([0-9a-f]*)"', ctor))
     # fitted with --optimize-runs 1; the factor covers the default of 200 runs,
     # whose code is up to 6 % larger (the generated files ask for 1 run)
-    return int(1.08 * (17500 + 72 * statements + 1.3 * texts))
+    # the regime part (norms_monitor_regimes.sol) adds to the runtime code
+    base = 17500 + (REGIMES_RUNTIME if " is CadlNormsMonitorRegimes {" in text else 0)
+    versions = [VERSIONS_RUNTIME if " is CadlNormsMonitorVersions {" in text else None,
+                VERSIONS_RUNTIME + REGIMES_VERSIONS_RUNTIME
+                if " is CadlNormsMonitorRegimesVersions {" in text else None]
+    added = next((x for x in versions if x is not None), None)
+    if added is not None:
+        # a monitor with versions (norms_monitor_versions.sol): fitted to
+        # compiled monitors of two and three versions, with and without
+        # regimes (3.2 to 4.3 x 10^4 bytes), and kept 3 % above each of them
+        return int(1.03 * (RUNTIME_ESTIMATE["monitor"] + added + 58 * statements
+                           + 1.3 * texts + 3000))
+    return int(1.08 * (base + 72 * statements + 1.3 * texts))
 
 
 def monitor_name(contract_id: str) -> str:
@@ -453,12 +527,24 @@ def _node_lines(nodes: list[dict], skip: set, general: frozenset = frozenset()) 
     return out
 
 
+def _header(name: str, regimes: dict | None) -> list[str]:
+    if regimes is None:
+        return [f"contract {name} is CadlNormsMonitorBase {{",
+                "    /// reporter_: the address that records the observations (the deployer when zero)",
+                "    constructor(address reporter_) CadlNormsMonitorBase(reporter_) {"]
+    return [f"contract {name} is CadlNormsMonitorRegimes {{",
+            "    /// reporter_: the address that records the observations (the deployer when zero);",
+            "    /// orchestrator_: the address that sets the current regime (the deployer when zero)",
+            "    constructor(address reporter_, address orchestrator_)",
+            "            CadlNormsMonitorRegimes(reporter_, orchestrator_) {"]
+
+
 def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str:
     """The Solidity text of the monitor of one contract. Raises
     `NormsTargetUnsupported` for a contract that cannot be monitored."""
     check_contract_id(contract.id)
-    from ..norms_ir import check_regimes
-    check_regimes(sos, contract, 'solidity')
+    from ..norms_ir import regime_data
+    regimes = regime_data(sos, contract)
     ir = solidity_ir(sos, contract)
     skip = {k for it in ir["items"]["guarantee"] if it.get("unsupported") and it["expr"] is not None
             for k in _subtree(ir["exprs"], it["expr"])}
@@ -556,8 +642,12 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
     body += rule_lines
     body += item_lines
 
+    if regimes is not None:
+        body.append(f"        regime = {_s(regimes['initial'])};")
+        body += [f"        _regime({_s(r)}, {str(r in regimes['out']).lower()});"
+                 for r in regimes["regimes"]]
     name = monitor_name(contract.id)
-    base = BASE.read_text(encoding="utf-8").rstrip("\n")
+    base = _base(regimes)
     lines = [
         "// SPDX-License-Identifier: Apache-2.0",
         f"// Norms monitor of contract {sanitize_id(contract.id)} (Appendix F of the CADL",
@@ -572,16 +662,603 @@ def generate_norms_monitor_sol(sos: SoSDefinition, contract: ContractDef) -> str
         base,
         "",
         "// The model of the contract: the constructor fills it.",
-        f"contract {name} is CadlNormsMonitorBase {{",
-        "    /// reporter_: the address that records the observations (the deployer when zero)",
-        "    constructor(address reporter_) CadlNormsMonitorBase(reporter_) {",
+        *_header(name, regimes),
         *body,
         "    }",
         "}",
         "",
     ]
     text = "\n".join(lines)
-    big = {k: v for k, v in RUNTIME_ESTIMATE.items() if v > RUNTIME_LIMIT}
+    estimate = dict(RUNTIME_ESTIMATE)
+    if regimes is not None:
+        estimate["monitor"] += REGIMES_RUNTIME
+    big = {k: v for k, v in estimate.items() if v > RUNTIME_LIMIT}
+    if big:
+        raise NormsTargetUnsupported([
+            f"the runtime code of {', '.join(big)} is estimated above the limit of "
+            f"{RUNTIME_LIMIT} bytes of EIP-170"])
+    size = estimated_initcode(text)
+    if size > INITCODE_LIMIT:
+        raise NormsTargetUnsupported([
+            f"the monitor is too large: its creation code is estimated at {size} bytes, above "
+            f"the limit of {INITCODE_LIMIT} bytes of EIP-3860"])
+    return text
+
+
+# --- Versions of a run (Appendix K, K.11; F.6) -------------------------------------
+
+VERSIONS_PART = Path(__file__).with_name("norms_monitor_versions.sol")
+_FILL_MARK = ("    // =========================================================================\n"
+              "    // Filling the model")
+_ITEMS_LIB = re.compile(r"library CadlNormsItems \{.*?\n\}\n", re.S)
+
+# CadlNormsItems of the monitor with versions: the items of the instance,
+# each with its definition (def), the observation it starts at (start) and
+# whether an amendment closed it (closed).
+_VERSION_ITEMS = """library CadlNormsItems {
+    /// assume: before guarantee: (an assumption that fails excuses a
+    /// guarantee that fails at the same observation). Returns whether an
+    /// assumption has failed, now or before.
+    function step(Monitor storage m, uint256 n, bool failed) public returns (bool) {
+        for (uint256 i = 0; i < m.assumeRecs.length; i++) {
+            ItemRec storage r = m.assumeRecs[i];
+            if (itemStep(m.assumeItems[r.def], r, m.data, n) == 2) failed = true;
+        }
+        for (uint256 i = 0; i < m.guaranteeRecs.length; i++) {
+            ItemRec storage r = m.guaranteeRecs[i];
+            if (itemStep(m.guaranteeItems[r.def], r, m.data, n) == 2) r.verdict = failed ? 3 : 2;
+        }
+        return failed;
+    }
+
+    /// 2 when the item has just been found false
+    function itemStep(Item storage it, ItemRec storage r, EvalData storage data, uint256 n) internal returns (uint8) {
+        if (it.broken || it.unsupported || r.closed || r.value != 0) return 0;
+        if (it.temporal) {
+            Val memory v = CadlNormsEval.evaluate(data, it.root, r.start, n);
+            if (v.k == K_D) return 0;
+            if (v.k != K_B && v.k != K_N) { r.value = 3; return 0; }
+            r.value = v.n != 0 ? 1 : 2;
+            return r.value;
+        }
+        Val memory w = CadlNormsEval.evaluate(data, it.root, n, n);
+        if ((w.k == K_B || w.k == K_N) && w.n != 0) { r.seen = true; return 0; }
+        if (w.k == K_B || w.k == K_N) { r.value = 2; return 2; }
+        return 0;
+    }
+
+    function finish(Monitor storage m, bool endHere) public {
+        for (uint256 i = 0; i < m.assumeRecs.length; i++) finishItem(m.assumeItems[m.assumeRecs[i].def], m.assumeRecs[i], endHere);
+        for (uint256 i = 0; i < m.guaranteeRecs.length; i++) finishItem(m.guaranteeItems[m.guaranteeRecs[i].def], m.guaranteeRecs[i], endHere);
+    }
+
+    function finishItem(Item storage it, ItemRec storage r, bool endHere) internal {
+        if (it.broken || it.unsupported || r.closed) return;
+        if (r.value == 0 && !it.temporal && endHere && r.seen) r.value = 1;
+        if (r.value == 1) r.verdict = 1;
+    }
+
+    /// The first observation that a temporal item not decided reads (its
+    /// start), or n.
+    function low(Monitor storage m, uint256 n) public view returns (uint256) {
+        n = lowIn(m.assumeItems, m.assumeRecs, n);
+        return lowIn(m.guaranteeItems, m.guaranteeRecs, n);
+    }
+
+    function lowIn(Item[] storage items, ItemRec[] storage rs, uint256 n) internal view returns (uint256) {
+        for (uint256 i = 0; i < rs.length; i++) {
+            Item storage it = items[rs[i].def];
+            if (it.temporal && !it.broken && !it.unsupported && !rs[i].closed && rs[i].value == 0
+                && rs[i].start < n) n = rs[i].start;
+        }
+        return n;
+    }
+}
+"""
+
+# The lines of the base that the monitor with versions reads differently
+# (after _versions_base has read the norms and their temporal contents
+# through the definitions of the instance, Monitor.dp and Monitor.sl).
+_VERSION_EDITS = [
+    ("struct ItemRec { uint8 value; bool seen; uint8 verdict; }",
+     "struct ItemRec { uint8 value; bool seen; uint8 verdict; bool closed; uint256 start; uint256 def; uint256 uid; }"),
+    ("    // (3, see `generals`), or none (0)\n    uint8 tmode;\n}",
+     "    // (3, see `generals`), or none (0)\n    uint8 tmode;\n"
+     "    // on_amendment (0 carry_over, 1 discharge, 2 transform to transformTo)\n"
+     "    uint8 onAm; string transformTo;\n}"),
+    ("    bool failed;               // an assumption has failed\n    int256 failedAt;\n",
+     "    bool failed;               // an assumption has failed\n    int256 failedAt;\n"
+     "    // --- the versions of the run (see norms_monitor_versions.sol)\n"
+     "    mapping(uint256 => uint256) dp;      // a norm of the instance -> its definition\n"
+     "    mapping(uint256 => uint256) sl;      // a definition -> the slot of its temporal content\n"
+     "    mapping(uint256 => bytes32) idh;     // a definition -> keccak256 of its id\n"
+     "    mapping(bytes32 => uint256) vdef;    // keccak256(version, id hash) -> definition + 1\n"
+     "    uint256[] vnlo;                      // the first definition of each version (and the end)\n"
+     "    uint256[] valo;                      // the same for assume: and guarantee: items and rules\n"
+     "    uint256[] vglo;\n"
+     "    uint256[] vrlo;\n"
+     "    mapping(uint256 => uint8) vrule;     // the transitional rule of the contract in a version\n"
+     "    mapping(bytes32 => bool) vstate;     // keccak256(version, state hash): in_states\n"
+     "    uint256 rlo;                         // the counts-as rules of the version followed\n"
+     "    uint256 rhi;\n"
+     "    uint256 vin;                         // the version in force (set by the orchestrator)\n"
+     "    uint256 vcur;                        // the version in force at the last observation\n"
+     "    uint256 vfol;                        // the version the instance follows\n"
+     "    uint256 vpend;                       // a waiting switch (when vpendSet)\n"
+     "    bool vpendSet;\n"
+     "    uint256[] vpath;                     // the versions of the amendments of an observation\n"
+     "    uint256 uid;                         // the items created so far\n"
+     "    bytes32[] amendViolated;             // the norms violated by the amendments of an observation\n"),
+    # the counts-as rules of the version followed
+    ("Ev[] memory buf = new Ev[](m.rules.length * (msgs.length + 1));",
+     "Ev[] memory buf = new Ev[]((m.rhi - m.rlo) * (msgs.length + 1));"),
+    ("for (uint256 i = 0; i < m.rules.length; i++) {",
+     "for (uint256 i = m.rlo; i < m.rhi; i++) {"),
+    # the version and the amendments before the observation is recorded
+    ("        bool endHere = record(t, values, hasState, state, end);\n",
+     "        planVersions();\n        bool endHere = record(t, values, hasState, state, end);\n"),
+    ("""    function runStep(uint256 n, int256 t, Msg[] calldata msgs, bool endHere) internal {
+        (uint8[] memory ns, uint8[] memory nv, uint8[] memory am, uint8[] memory gm) = marks();
+        step(n, t, msgs, endHere);
+        emitChanges(ns, nv, am, gm, t);
+        // the first observation that a later step can read: this one, and
+        // the first while a temporal item is not decided (the candidates of
+        // a temporal content keep what they need in their window)
+        uint256 keep = n > 0 && CadlNormsItems.pending(m.assumeItems, m.assumeRecs, m.guaranteeItems,
+                                                       m.guaranteeRecs) ? 0 : n;""",
+     """    /// The version the instance starts with, or the versions it is
+    /// amended to, before an observation is recorded (norms_monitor_versions.sol).
+    function planVersions() internal virtual;
+
+    function runStep(uint256 n, int256 t, Msg[] calldata msgs, bool endHere) internal {
+        VMarks memory before = CadlNormsVersions.marks(m);
+        if (n > 0) CadlNormsVersions.amendPath(m, n, t);
+        step(n, t, msgs, endHere);
+        CadlNormsVersions.changes(m, before, t);
+        // the first observation that a later step can read: this one, and
+        // the start of a temporal item that is not decided (the candidates of
+        // a temporal content keep what they need in their window)
+        uint256 keep = CadlNormsItems.low(m, n);"""),
+    ("""        (uint8[] memory ns, uint8[] memory nv, uint8[] memory am, uint8[] memory gm) = marks();
+        uint256 n = m.observations - 1;
+        settle(n, m.data.obsT[n]);
+        finishItems(true);
+        emitChanges(ns, nv, am, gm, m.data.obsT[n]);""",
+     """        VMarks memory before = CadlNormsVersions.marks(m);
+        uint256 n = m.observations - 1;
+        settle(n, m.data.obsT[n]);
+        finishItems(true);
+        CadlNormsVersions.changes(m, before, m.data.obsT[n]);"""),
+    ("m.failed = CadlNormsItems.step(m.assumeItems, m.assumeRecs, m.guaranteeItems, m.guaranteeRecs, m.data, n, was);",
+     "m.failed = CadlNormsItems.step(m, n, was);"),
+    ("uint256[] memory violated = judge(n, t, msgs, created);",
+     "uint256[] memory violated = vfirst(m, judge(n, t, msgs, created));"),
+    ("CadlNormsItems.finish(m.assumeItems, m.assumeRecs, m.guaranteeItems, m.guaranteeRecs, endHere);",
+     "CadlNormsItems.finish(m, endHere);"),
+    # the reparation by its id, among the norms of the instance (F.5)
+    ("""        bool repActivated = false;
+        if (activate && d.reparation >= 0) {
+            uint256 rp = uint256(d.reparation);""",
+     """        bool repActivated = false;
+        int256 rep = activate && d.hasReparationId ? vfind(m, keccak256(bytes(d.reparationId))) : int256(-1);
+        if (rep >= 0) {
+            uint256 rp = uint256(rep);"""),
+    ("""        if (repActivated) {
+            uint256 rp = uint256(d.reparation);""",
+     """        if (repActivated) {
+            uint256 rp = uint256(rep);"""),
+    # the slot of the content, once
+    ("""    function judgeWindow(uint256 i, uint256 n, int256 t, bool open) internal returns (bool hit, bool closed) {
+        bool empty;
+        if (m.normDefs[m.dp[i]].tmode == 1) (hit, empty) = CadlNormsWindows.judge(m.windows[m.sl[m.dp[i]]], m.data, m.temporals[m.sl[m.dp[i]]], n, t, open);
+        else if (m.normDefs[m.dp[i]].tmode == 2) (hit, empty) = CadlNormsMulti.judge(m.multis[m.sl[m.dp[i]]], m.data, n, t, open);
+        else (hit, empty) = CadlNormsMulti.gjudge(m.generals[m.sl[m.dp[i]]], m.data, n, open);""",
+     """    function judgeWindow(uint256 i, uint256 n, int256 t, bool open) internal returns (bool hit, bool closed) {
+        bool empty;
+        uint256 s = m.sl[m.dp[i]];
+        uint8 mode = m.normDefs[m.dp[i]].tmode;
+        if (mode == 1) (hit, empty) = CadlNormsWindows.judge(m.windows[s], m.data, m.temporals[s], n, t, open);
+        else if (mode == 2) (hit, empty) = CadlNormsMulti.judge(m.multis[s], m.data, n, t, open);
+        else (hit, empty) = CadlNormsMulti.gjudge(m.generals[s], m.data, n, open);"""),
+    # filling: definitions only (the instance has its own norms and items)
+    ("""        d.reparation = -1;
+        NormRec storage r = m.recs.push();
+        r.act = -1;
+    }""", """        d.reparation = -1;
+        uint256 i = m.normDefs.length - 1;
+        m.sl[i] = i;
+        m.idh[i] = keccak256(bytes(id));
+        m.vdef[keccak256(abi.encode(m.vnlo.length - 1, m.idh[i]))] = i + 1;
+    }"""),
+    ("""        m.assumeItems.push(Item(text, temporal_, broken, unsupported, root));
+        m.assumeRecs.push(ItemRec(0, false, V_PENDING));""",
+     "        m.assumeItems.push(Item(text, temporal_, broken, unsupported, root));"),
+    ("""        m.guaranteeItems.push(Item(text, temporal_, broken, unsupported, root));
+        m.guaranteeRecs.push(ItemRec(0, false, V_PENDING));""",
+     "        m.guaranteeItems.push(Item(text, temporal_, broken, unsupported, root));"),
+]
+
+
+REGIMES_VERSIONS_PART = Path(__file__).with_name("norms_monitor_regimes_versions.sol")
+
+# The times of the changes of the monitor with versions and regimes are
+# times of the trace (as in the regime part, see _REGIME_EDITS).
+_REGIMES_VERSIONS_EDITS = [
+    ("    function changes(Monitor storage m, VMarks memory b, int256 t) public {\n",
+     "    function changes(Monitor storage m, VMarks memory b, int256 t) public {\n"
+     "        t += m.shift;\n"),
+]
+
+
+def _versions_base(regimes: bool = False) -> str:
+    """The base as the monitor with versions reads it, and the versions part;
+    with `regimes`, also as the monitor of a contract not in force reads it,
+    and the part that combines them."""
+    text = BASE.read_text(encoding="utf-8").rstrip("\n")
+    if regimes:
+        for old, new in _REGIME_EDITS:
+            assert text.count(old) == 1, old
+            text = text.replace(old, new)
+    assert text.count(_FILL_MARK) == 1
+    head, tail = text.split(_FILL_MARK, 1)
+    assert len(_ITEMS_LIB.findall(head)) == 1
+    head = _ITEMS_LIB.sub(lambda _: _VERSION_ITEMS, head)
+    # the norms of the instance, by their definitions and the slots of their contents
+    head = head.replace("m.normDefs.length", "m.recs.length")
+    head = re.sub(r"m\.normDefs\[(\w+)\]", r"m.normDefs[m.dp[\1]]", head)
+    head = re.sub(r"m\.(windows|temporals|multis|generals)\[(\w+)\]", r"m.\1[m.sl[m.dp[\2]]]", head)
+    text = head + _FILL_MARK + tail
+    for old, new in _VERSION_EDITS:
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+    text += "\n\n" + VERSIONS_PART.read_text(encoding="utf-8").rstrip("\n")
+    if regimes:
+        for old, new in _REGIMES_VERSIONS_EDITS:
+            assert text.count(old) == 1, old
+            text = text.replace(old, new)
+        text += "\n\n" + REGIMES_VERSIONS_PART.read_text(encoding="utf-8").rstrip("\n")
+    return text
+
+
+_RULES = {"keep": 0, "switch": 1}
+_ON_AMENDMENT = {None: 0, "carry_over": 0, "discharge": 1, "transform": 2}
+
+
+def _shift_term(t: dict | None, off: int) -> None:
+    if t is None or t.get("error"):
+        return
+    if t.get("expr") is not None:
+        t["expr"] += off
+    if t.get("args") is not None:
+        t["args"] = [a + off for a in t["args"]]
+
+
+def _shift_ir(ir: dict, off: int) -> dict:
+    """A copy of `ir` whose node indices start at `off` (the nodes of the
+    versions before it come first)."""
+    import copy
+    ir = copy.deepcopy(ir)
+    for nd in ir["exprs"]:
+        for key in _NODE_KEYS.get(nd["op"], ()):
+            nd[key] += off
+        if nd["op"] == "in":
+            nd["items"] = [i + off for i in nd["items"]]
+    for nd in ir["norms"]:
+        for key in ("trigger", "until", "content"):
+            _shift_term(nd[key], off)
+        if nd.get("temporal"):
+            nd["temporal"]["node"] += off
+        for sp in nd.get("multi") or []:
+            sp["node"] += off
+            if "p" in sp:
+                sp["p"] += off
+        if nd.get("general"):
+            for op in nd["general"]["ops"]:
+                op["node"] += off
+    for r in ir["rules"]:
+        if not r["error"]:
+            _shift_term(r["when"], off)
+            _shift_term(r["if"], off)
+    for key in ("assume", "guarantee"):
+        for it in ir["items"][key]:
+            if it["expr"] is not None:
+                it["expr"] += off
+    return ir
+
+
+_NODE_KEYS = {"not": ("x",), "within": ("x",), "throughout": ("x",), "and": ("l", "r"),
+              "or": ("l", "r"), "bin": ("l", "r"), "in": ("l",), "until": ("p", "q")}
+
+
+def _shape(nodes: list[dict], root: int) -> str:
+    """The subtree of a node with its node indices relative to the root,
+    to compare a content across versions."""
+    import json as _json
+    order = sorted(_subtree(nodes, root))
+    pos = {k: i for i, k in enumerate(order)}
+    out = []
+    for k in order:
+        nd = dict(nodes[k])
+        for key in _NODE_KEYS.get(nd["op"], ()):
+            nd[key] = pos[nd[key]]
+        if nd["op"] == "in":
+            nd["items"] = [pos[i] for i in nd["items"]]
+        out.append(nd)
+    return _json.dumps(out, sort_keys=True, default=str)
+
+
+def _window_shape(nd: dict, nodes: list[dict]) -> str:
+    """How the Solidity monitor decides a temporal content (the specs with
+    node indices relative to the content)."""
+    import json as _json
+    root = nd["content"]["expr"]
+    order = sorted(_subtree(nodes, root))
+    pos = {k: i for i, k in enumerate(order)}
+
+    def rel(x):
+        if isinstance(x, dict):
+            return {k: (pos[v] if k in ("node", "p") and isinstance(v, int) else rel(v))
+                    for k, v in x.items()}
+        if isinstance(x, list):
+            return [rel(v) for v in x]
+        return x
+    return _json.dumps({k: rel(nd.get(k)) for k in ("temporal", "multi", "general")},
+                       sort_keys=True, default=str)
+
+
+def versions_chain(sos_list: list, contract_id: str) -> tuple:
+    """(the chain of the versions, the contract in each, in the order of the
+    sequence by previous:). Raises `NormsTargetUnsupported`."""
+    from ...norms_eval import NormsEvalError, VersionChain, version_info
+    try:
+        chain = VersionChain([version_info(s) for s in sos_list])
+    except NormsEvalError as e:
+        raise NormsTargetUnsupported([f"the versions of the run: {e}"]) from None
+    contracts = []
+    for info in chain.infos:
+        c = next((c for c in info.sos.contracts if c.id == contract_id), None)
+        if c is None:
+            raise NormsTargetUnsupported([
+                f"version {info.name} has no contract {contract_id}; the monitor follows "
+                f"the contract through every version of the run"])
+        contracts.append(c)
+    return chain, contracts
+
+
+# What the versions part adds to the runtime code of the monitor (bytes),
+# and the runtime code of the libraries it changes or adds, measured with
+# solc 0.8.24 and 0.8.37, the optimizer with 1 and with 200 runs, plus 3 %.
+VERSIONS_RUNTIME = 3500
+# and what the part for versions with regimes adds to that
+REGIMES_VERSIONS_RUNTIME = 3600
+VERSIONS_LIBRARIES = {"CadlNormsItems": 2550, "CadlNormsVersions": 13700}
+
+
+def generate_norms_monitor_sol_versions(sos: SoSDefinition, contract: ContractDef,
+                                        versions: list) -> str:
+    """The Solidity monitor of one contract that follows the versions of a
+    run (Appendix K, K.11): `sos` and `versions` (parsed files) are the
+    versions; they form one sequence by previous:. The orchestrator sets the
+    version in force with setVersion."""
+    check_contract_id(contract.id)
+    chain, contracts = versions_chain([sos, *versions], contract.id)
+    names = chain.names()
+    # versions with regime bindings (K.11, "Versions and regimes")
+    regimes = any(info.regimes is not None for info in chain.infos)
+    irs = []
+    for info, c in zip(chain.infos, contracts):
+        ir = solidity_ir(info.sos, c)
+        if any(it.get("unsupported") for it in ir["items"]["guarantee"]):
+            raise NormsTargetUnsupported([
+                f"version {info.name} has a guarantee: item that the Solidity monitor leaves "
+                f"out; with versions the items continue by their text across versions, so "
+                f"every item must be monitored"])
+        irs.append(ir)
+    for v in range(1, len(irs)):
+        if irs[v]["lifecycle"] != irs[0]["lifecycle"]:
+            raise NormsTargetUnsupported([
+                f"the lifecycle of {contract.id} in version {names[v]} differs from that in "
+                f"version {names[0]}; the Solidity monitor with versions keeps one lifecycle "
+                f"(its states, initial and terminal states) for every version"])
+        if irs[v]["actors"] != irs[0]["actors"]:
+            raise NormsTargetUnsupported([
+                f"the actors declared in version {names[v]} differ from those in version "
+                f"{names[0]}; the Solidity monitor with versions keeps one declaration of "
+                f"the actors for every version"])
+    # the nodes of every version, one after the other
+    offsets, exprs = [], []
+    shifted = []
+    for ir in irs:
+        offsets.append(len(exprs))
+        s = _shift_ir(ir, len(exprs))
+        exprs.extend(s["exprs"])
+        shifted.append(s)
+    for s in shifted:
+        s["exprs"] = exprs
+    # the slots of the temporal contents: a norm shares the slot of the same
+    # norm in an earlier version whose content is the same text (F.6 keeps its
+    # candidates); it must then read the same way
+    defs_src = [{d.id: d for d in c.norms} for c in contracts]
+    shares: list[dict] = []
+    for v, s in enumerate(shifted):
+        sh = {}
+        for nd in s["norms"]:
+            c = nd["content"]
+            if not (c and c.get("kind") == "predicate" and not c.get("error")) or not (
+                    nd.get("temporal") or nd.get("multi") or nd.get("general")):
+                continue
+            text = (defs_src[v][nd["id"]].content or "").strip()
+            for u in range(v):
+                prev = next((x for x in shifted[u]["norms"] if x["id"] == nd["id"]), None)
+                if prev is None or (defs_src[u][nd["id"]].content or "").strip() != text:
+                    continue
+                pc = prev["content"]
+                same = (pc and pc.get("kind") == "predicate" and not pc.get("error")
+                        and _shape(exprs, pc["expr"]) == _shape(exprs, c["expr"])
+                        and _window_shape(prev, exprs) == _window_shape(nd, exprs))
+                if not same:
+                    raise NormsTargetUnsupported([
+                        f"norm {nd['id']} has the same content in versions {names[u]} and "
+                        f"{names[v]}, but the Solidity monitor reads it differently in them; "
+                        f"F.6 keeps its pending candidates across the amendment"])
+                sh[nd["id"]] = (u, prev)
+                break
+        shares.append(sh)
+
+    body: list[str] = []
+    body.append(f"        contractId = {_s(irs[0]['contract'])};")
+    for name, (indexed, lo, hi) in irs[0]["actors"].items():
+        body.append(f"        _actor({_s(name)}, {str(bool(indexed)).lower()}, "
+                    f"{str(lo is not None).lower()}, {int(lo or 0)}, "
+                    f"{str(hi is not None).lower()}, {int(hi or 0)});")
+    lc = irs[0]["lifecycle"]
+    if lc is not None:
+        body.append("        m.data.hasLifecycle = true;")
+        body.append(f"        m.lcInitial = {_s(lc['initial'] or '')};")
+        for st in lc["states"]:
+            body.append(f"        m.lcStates[keccak256(bytes({_s(st)}))] = true;")
+        for st in lc["terminal"]:
+            body.append(f"        m.lcTerminal[keccak256(bytes({_s(st)}))] = true;")
+    general = frozenset(op["node"] for s in shifted for nd in s["norms"] if nd.get("general")
+                        for op in nd["general"]["ops"])
+    body += _node_lines(exprs, set(), general)
+    tnames = sorted({n for s in shifted for n in temporal_names(s)})
+    for name in tnames:
+        body.append(f"        m.temporalName[keccak256(bytes({_s(name)}))] = true;")
+
+    terms: list[str] = []
+    count = [0]
+
+    def term(t: dict | None) -> int:
+        if t is None:
+            return -1
+        j = count[0]
+        count[0] += 1
+        if t.get("error"):
+            terms.append(f"        _term(4, {_s(t['text'])}, 0, \"\", false);")
+            return j
+        kind = _TERMS[t["kind"]]
+        if t["kind"] == "message":
+            has_args = t["args"] is not None
+            terms.append(f"        tm = _term({kind}, {_s(t['text'])}, 0, {_s(t['name'])}, "
+                         f"{str(has_args).lower()});")
+            terms.append(f"        _pat(tm.sender, {_pat_args(t['sender'])});")
+            terms.append(f"        _pat(tm.receiver, {_pat_args(t['receiver'])});")
+            terms.extend(f"        tm.args.push({a});" for a in (t["args"] or []))
+        else:
+            root = t.get("expr") or 0
+            terms.append(f"        _term({kind}, {_s(t['text'])}, {root}, \"\", false);")
+        return j
+
+    version_lines: list[str] = []
+    def_pos = 0
+    pos_of: list[dict] = []
+    for v, (info, s) in enumerate(zip(chain.infos, shifted)):
+        rule, states = info.rule_for(contract.id)
+        code = 0 if rule == "keep" else (2 if states else 1)
+        if v == 0:
+            code = 0
+        if regimes:
+            b = info.regimes
+            version_lines.append(f"        _version({_s(info.name)}, {code}, "
+                                 f"{_s(b.initial or '') if b is not None else chr(34) * 2});")
+            for r in (b.regimes if b is not None else []):
+                version_lines.append(f"        _versionRegime({_s(r)}, "
+                                     f"{str(not b.in_force(contract.id, r)).lower()});")
+        else:
+            version_lines.append(f"        _version({_s(info.name)}, {code});")
+        if v > 0 and rule != "keep":
+            version_lines += [f"        _versionState({_s(st)});" for st in (states or [])]
+        pos_of.append({})
+        src = defs_src[v]
+        for nd in s["norms"]:
+            pos_of[v][nd["id"]] = def_pos
+            def_pos += 1
+            trig, until, content = term(nd["trigger"]), term(nd["until"]), term(nd["content"])
+            deadline = nd["deadline"]
+            version_lines.append(
+                f"        d = _norm({_s(nd['id'])}, {_KINDS[nd['kind']]}, "
+                f"{trig}, {until}, {content}, "
+                f"{str(deadline is not None).lower()}, "
+                f"{scaled(deadline, 'deadline') if deadline is not None else 0}, "
+                f"{str(nd['target']).lower()});")
+            if nd["id"] in shares[v]:
+                u, _ = shares[v][nd["id"]]
+                version_lines.append(f"        _shareContent({pos_of[u][nd['id']]});")
+            else:
+                version_lines += _window_lines(s, nd)
+            if nd["bearer"] is not None:
+                version_lines.append("        d.hasBearer = true;")
+                version_lines.append(f"        _pat(d.bearer, {_pat_args(nd['bearer'])});")
+            version_lines.append(f"        d.severity = {_s(nd['severity'])};")
+            if nd["sanction"] is not None:
+                version_lines.append("        d.hasSanction = true;")
+                version_lines.append(f"        d.sanction = {_s(nd['sanction'])};")
+            if nd["reparation_id"] is not None:
+                version_lines.append("        d.hasReparationId = true;")
+                version_lines.append(f"        d.reparationId = {_s(nd['reparation_id'])};")
+            if nd["transition"] is not None:
+                version_lines.append("        d.hasTransition = true;")
+                version_lines.append(f"        d.transition = {_s(nd['transition'])};")
+            for kind in EFFECT_KINDS:
+                version_lines += [f"        d.{kind}.push({x});" for x in nd["effects"][kind]]
+            d = src[nd["id"]]
+            how = d.on_amendment or "carry_over"
+            if _ON_AMENDMENT.get(how, 0):
+                version_lines.append(f"        _onAmendment({_ON_AMENDMENT[how]}, "
+                                     f"{_s(d.transform_to or '')});")
+        for r in s["rules"]:
+            when = -1 if r["error"] else term(r["when"])
+            cond = -1 if r["error"] else term(r["if"])
+            version_lines.append(f"        m.rules.push(Rule({_s(r['creates'])}, "
+                                 f"{str(r['error']).lower()}, {when}, {cond}));")
+        for key, fn in (("assume", "_assume"), ("guarantee", "_guarantee")):
+            for it in s["items"][key]:
+                root = it["expr"] if it["expr"] is not None else 0
+                version_lines.append(
+                    f"        {fn}({_s(it['text'])}, {str(it['temporal']).lower()}, "
+                    f"{str(bool(it['error'])).lower()}, {str(bool(it.get('unsupported'))).lower()}, "
+                    f"{root});")
+    version_lines.append("        _versionsEnd();")
+    body += ["        Term storage tm;"] if any("tm = " in line for line in terms) else []
+    body += terms
+    body.append("        NormDef storage d;")
+    body += version_lines
+
+    name = monitor_name(contract.id)
+    parent = "CadlNormsMonitorRegimesVersions" if regimes else "CadlNormsMonitorVersions"
+    lines = [
+        "// SPDX-License-Identifier: Apache-2.0",
+        f"// Norms monitor of contract {sanitize_id(contract.id)} (Appendix F of the CADL",
+        "// specification, norms 0.1) that follows the versions of a run (Appendix K, K.11):",
+        f"// versions {', '.join(names)}. Generated by `cadl codegen -t solidity --version ...`.",
+        "// Do not edit.",
+        "// Compile with solc 0.8.24 to 0.8.37 and --optimize --optimize-runs 1 (without the",
+        "// optimizer the runtime code exceeds the limit of EIP-170); deploy and link the",
+        "// libraries CadlNormsValues, CadlNormsEval, CadlNormsWindows, CadlNormsMulti,",
+        "// CadlNormsItems, CadlNormsActs and CadlNormsVersions, in this order.",
+        f"// Checked with solc {' and '.join(SOLC_CHECKED)}.",
+        f"pragma solidity >={SOLC_CHECKED[0]} <={SOLC_CHECKED[1]};",
+        "",
+        _versions_base(regimes),
+        "",
+        "// The model of the contract in every version: the constructor fills it.",
+        f"contract {name} is {parent} {{",
+        "    /// reporter_: the address that records the observations (the deployer when zero);",
+        "    /// orchestrator_: the address that sets the version in force"
+        + (" and the current regime" if regimes else "") + " (the deployer when zero)",
+        "    constructor(address reporter_, address orchestrator_)",
+        f"            {parent}(reporter_, orchestrator_) {{",
+        *body,
+        "    }",
+        "}",
+        "",
+    ]
+    text = "\n".join(lines)
+    estimate = dict(RUNTIME_ESTIMATE)
+    estimate["monitor"] += VERSIONS_RUNTIME + (REGIMES_VERSIONS_RUNTIME if regimes else 0)
+    estimate.update(VERSIONS_LIBRARIES)
+    big = {k: v for k, v in estimate.items() if v > RUNTIME_LIMIT}
     if big:
         raise NormsTargetUnsupported([
             f"the runtime code of {', '.join(big)} is estimated above the limit of "

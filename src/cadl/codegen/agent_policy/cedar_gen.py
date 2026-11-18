@@ -119,16 +119,28 @@ def _policy(pid: str, effect: str, when: str | None = None,
 
 def generate_agent_cedar_text(sos: SoSDefinition) -> tuple[str, dict]:
     """The Cedar policy text and the side table."""
-    policy = build_policy(sos)
+    policy = build_policy(sos, regimes=True)
     contracts = policy["contracts"]
+    bound = policy.get("regimes")
     servers = {name: d for name, d in policy["actors"].items()
                if d["kind"] == "tool_server"}
     is_tool_server = _any(
         [_ref_cond(_server_ref(name, d), "resource") for name, d in servers.items()])
     several = len(contracts) > 1
 
+    def in_force(c: dict) -> str | None:
+        """The regimes that have the contract in force, as a test on the
+        context (regimes:, Appendix A, A.7.1); None when every regime has."""
+        if bound is None or not any(c["id"] in out for out in bound["out"].values()):
+            return None
+        names = ", ".join(json.dumps(r, ensure_ascii=False) for r in bound["regimes"]
+                          if c["id"] not in bound["out"][r])
+        return f"(context has regime && [{names}].contains(context.regime))"
+
     def governed(c: dict) -> str:
-        return _governed(c, is_tool_server if servers else None)
+        cond = _governed(c, is_tool_server if servers else None)
+        test = in_force(c)
+        return cond if test is None else f"({cond} && {test})"
 
     blocks: list[list[str]] = []
     roles: dict[str, dict] = {}
@@ -137,6 +149,13 @@ def generate_agent_cedar_text(sos: SoSDefinition) -> tuple[str, dict]:
              comment: str = "", **info) -> None:
         blocks.append(_policy(pid, effect, when, unless, comment))
         roles[pid] = {"effect": effect, "role": role, **info}
+
+    if bound is not None:
+        names = ", ".join(json.dumps(r, ensure_ascii=False) for r in bound["regimes"])
+        emit("regime", "regime", "forbid",
+             unless=f"context has regime && [{names}].contains(context.regime)",
+             comment="The current regime (regimes:, Appendix A, A.7.1): a request without a\n"
+                     "regime of the file in context.regime is denied.")
 
     # Step 1 of G.5: a message that no enforced contract governs is allowed.
     governed_any = _any([governed(c) for c in contracts])
@@ -170,6 +189,8 @@ def generate_agent_cedar_text(sos: SoSDefinition) -> tuple[str, dict]:
             # The norm of a contract applies only to a message it governs.
             if not {n["sender"]["text"], n["receiver"]["text"]} <= party_texts:
                 cond = f"{cond} && {governed(c)}"
+            elif in_force(c) is not None:
+                cond = f"{cond} && {in_force(c)}"
             emit(f"{c['id']}.{n['id']}", n["kind"],
                  "forbid" if n["kind"] == "prohibition" else "permit",
                  when=cond,
@@ -249,6 +270,8 @@ def generate_agent_cedar_text(sos: SoSDefinition) -> tuple[str, dict]:
         "entities": _entities(policy),
     }
 
+    if bound is not None:
+        table["regimes"] = bound
     lines = _readme(policy, non_static, no_effect, delegable, several)
     for block in blocks:
         lines.append("")
@@ -293,6 +316,12 @@ def _readme(policy, non_static, no_effect, delegable, several) -> list[str]:
         "//",
         "// Request: principal = CADL::Actor::\"<sender>\", action =",
         "// CADL::Action::\"<message name>\", resource = CADL::Actor::\"<receiver>\".",
+        *([] if "regimes" not in policy else [
+            "// Context: {\"regime\": \"<the current regime>\"} (regimes:, Appendix A, A.7.1);",
+            "// a contract that the regime does not have in force governs no message,",
+            "// and a request without a regime of the file is denied (forbid \"regime\").",
+            "// The test reads context.regime only after `context has regime`, so it",
+            "// does not raise an evaluation error."]),
         "// A member of an actor set is CADL::Actor::\"NAME[3]\" and MUST be stored",
         "// with the parent CADL::ActorSet::\"NAME\"; a policy about the set does not",
         f"// match a member stored without it. {TABLE_FILENAME} lists the",
