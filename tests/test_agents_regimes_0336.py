@@ -426,7 +426,8 @@ def compare_norms(result: dict, ref: dict, cid: str) -> list:
     released = {g["norm"] for rel in result["releases"] if rel["released"]
                 for g in rel["grounds"] if g["contract"] == cid}
     bad = []
-    for a, b in zip(inst["norms"], ref["norms"], strict=True):
+    assert len(inst["norms"]) == len(ref["norms"])
+    for a, b in zip(inst["norms"], ref["norms"]):
         assert a["id"] == b["id"]
         if a["id"] in released:
             continue
