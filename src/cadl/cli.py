@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     # decisions-verify command
     dverify_cmd = subparsers.add_parser(
         "decisions-verify",
-        help="Verify a decision record: how amendments were decided (decisions 0.1, "
+        help="Verify a decision record: how amendments were decided (decisions 0.2, "
              "Appendix L)",
         description="Verify a decision record (Appendix L): the hash chain of G.8, the "
                     "fields and references of every entry, the roles of the parties, the "

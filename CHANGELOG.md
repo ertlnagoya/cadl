@@ -4,6 +4,33 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.38] — 2026-11-21
+
+### Added
+
+- Decision records, decisions 0.2 (format `cadl-decisions/2`; a record of
+  `cadl-decisions/1` is read as before):
+  - A party gives `layers`, the layers on which it decides (`rule`,
+    `contract`, `regulation`, or `null` for any). A decision that adopts a
+    proposal changing a layer outside its decider's `layers` is an error
+    (L-5), and so is a party that acts on behalf of another on layers the
+    other does not decide (L-8).
+  - A follow-up gives `fulfilled_by`: the `type` of the entry that fulfils
+    it and, for a measurement, `of`, `same_method_as` (a measurement whose
+    `method`, that is, runs and conditions, it must have) and `subjects`
+    (the metrics it must give); `null` for any later entry. The new finding
+    `fulfilment not shown` reports an entry that names a follow-up in
+    `fulfils` without meeting it; such an entry does not fulfil the
+    follow-up, so `open follow-up` can follow.
+  - `DecisionChain` writes `cadl-decisions/2` and fills `layers: null` and
+    `fulfilled_by: null` when a writer leaves them out;
+    `DecisionChain(format="cadl-decisions/1")` writes the old format.
+  - `examples/decisions_robot_town.jsonl`: the follow-up of D1 asks for a
+    re-measurement under the conditions of period 1; the measurement of
+    period 2 claims it with other seeds (`fulfilment not shown`), and the
+    re-measurement `F2.D1.f1` fulfils it. The parties give their layers,
+    with a regulator for the `regulation` layer.
+
 ## [0.3.37] — 2026-11-20
 
 ### Added

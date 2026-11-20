@@ -9,7 +9,7 @@ import pytest
 
 from cadl.audit_log import AuditKeyError, file_sha256
 from cadl.cli import main
-from cadl.decisions import FORMAT, DecisionChain, verify
+from cadl.decisions import FORMAT, FORMAT_1, DecisionChain, verify
 
 ROOT = Path(__file__).parent.parent
 EXAMPLES = ROOT / "examples"
@@ -21,16 +21,19 @@ KEY = b"0123456789abcdef-test-key"
 T = "2026-11-18T09:00:00Z"
 
 
-def _party(pid, kind, roles, name=None, actor=None, model=None, on_behalf_of=None):
+def _party(pid, kind, roles, name=None, actor=None, model=None, on_behalf_of=None,
+           layers=None):
     return {"id": pid, "kind": kind, "roles": roles, "name": name, "actor": actor,
-            "model": model, "on_behalf_of": on_behalf_of}
+            "model": model, "on_behalf_of": on_behalf_of, "layers": layers}
 
 
 PARTIES = [
-    _party("operator", "human", ["owner", "decider"], "service operator", "OPERATOR"),
+    _party("operator", "human", ["owner", "decider"], "service operator", "OPERATOR",
+           layers=["rule", "contract"]),
+    _party("regulator", "human", ["decider"], "regulator", layers=["regulation"]),
     _party("llm", "llm", ["proposer", "advisor"], model="claude-opus-5-5"),
     _party("steward", "tool", ["assessor", "decider"], "town.steward",
-           model="cadl-robot-town (main)"),
+           model="cadl-robot-town (main)", layers=["rule"]),
     _party("A", "agent", ["voter"], "company A"),
     _party("B", "agent", ["voter"], "company B"),
     _party("C", "agent", ["voter"], "company C"),
@@ -115,13 +118,19 @@ def period1(v2_attach: str = "amendment_robot_town_v2.cadl") -> list:
                  "is no company's right.")),
         _e("D1.f1", "follow_up", "operator", text="Re-measure C's utility and the road "
                                                   "violations", due={"period": 2},
-           decision="D1"),
+           decision="D1",
+           fulfilled_by={"type": "measurement", "of": "in_force", "same_method_as": "P1.m0",
+                         "subjects": ["metric:utility@C", "metric:late_deliveries"]}),
         _e("V2", "version", "steward", attachments=[v2], version="2", previous="1",
            effective={"period": 2}, source_sha256=file_sha256(V2), decision="D1"),
         _e("P2.m0", "measurement", "steward", point=2, fulfils=["D1.f1"], of="in_force",
            version="2", method={"runs": 5, "window": "1h", "description": "seeds 101-105"},
            values={"on_time_deliveries": 223.8, "late_deliveries": 4.2, "blocked_s": 936},
            per_party={"C": {"utility": 56.3}}, compared_with=None, runs_better=None),
+        _e("F2.D1.f1", "measurement", "steward", point=2, fulfils=["D1.f1"], of="in_force",
+           version="2", method={"runs": 5, "window": "1h", "description": "seeds 1-5"},
+           values={"on_time_deliveries": 131.0, "late_deliveries": 1.2, "blocked_s": 985},
+           per_party={"C": {"utility": 19.0}}, compared_with="P1.m0", runs_better=5),
     ]
 
 
@@ -160,8 +169,9 @@ def rules(result) -> list:
 def test_period1_is_valid_with_its_findings(tmp_path):
     r = verify(record(tmp_path), versions=[V1])
     assert r["valid"], r["errors"]
-    assert r["entries"] == 14 and r["complete"]
-    assert kinds(r) == ["against recommendation", "override", "prediction missed", "unknowns"]
+    assert r["entries"] == 15 and r["complete"]
+    assert kinds(r) == ["against recommendation", "fulfilment not shown", "override",
+                        "prediction missed", "unknowns"]
     missed = [f for f in r["findings"] if f["finding"] == "prediction missed"]
     assert [f["entry"] for f in missed] == ["P1.2"] and "B" in missed[0]["text"]
     assert sorted(Path(v).name for v in r["versions_checked"]) == [V1.name, V2.name]
@@ -273,7 +283,7 @@ def test_roles_and_references(tmp_path):
 def test_llm_and_tool_parties_give_their_model(tmp_path):
     import cadl.decisions as d
     parties = [dict(p) for p in PARTIES]
-    parties[1]["model"] = None
+    parties[2]["model"] = None
     p = tmp_path / "decisions.jsonl"
     chain = DecisionChain(run_id=RUN_ID)
     lines = [chain.header({"name": "RobotTown", "version": "1", "source_sha256": None},
@@ -295,7 +305,7 @@ def test_version_entry_names_its_decision(tmp_path):
 
 def test_llm_deciding_on_behalf_of_the_operator(tmp_path):
     parties = PARTIES + [_party("llm-decider", "llm", ["decider"], model="claude-opus-5-5",
-                                on_behalf_of="operator")]
+                                on_behalf_of="operator", layers=["rule", "contract"])]
     entries = period1()
     d = entries[10]
     d.update(by="llm-decider", choice="keep", procedure="vote", result="1", generated=GEN,
@@ -526,3 +536,141 @@ def test_end_record_count_is_not_a_boolean(tmp_path):
 def test_given_version_that_does_not_exist(tmp_path):
     r = verify(record(tmp_path), versions=[tmp_path / "missing.cadl"])
     assert any("not found" in n for n in r["not_checked"])
+
+
+# --- decisions 0.2: layers and fulfilment ----------------------------------------
+
+def test_period1_fulfilment_by_other_seeds_is_not_shown(tmp_path):
+    r = verify(record(tmp_path))
+    shown = [f for f in r["findings"] if f["finding"] == "fulfilment not shown"]
+    assert [f["entry"] for f in shown] == ["P2.m0"]
+    assert "seeds 101-105" in shown[0]["text"] and "P1.m0" in shown[0]["text"]
+    assert "open follow-up" not in kinds(r)       # F2.D1.f1 fulfils it
+
+
+def test_only_a_wrong_fulfilment_leaves_the_follow_up_open(tmp_path):
+    entries = period1()[:-1]
+    r = verify(record(tmp_path, entries))
+    assert {"fulfilment not shown", "open follow-up"} <= set(kinds(r))
+
+
+def test_fulfilment_conditions(tmp_path):
+    import copy
+    base = period1()
+    # a decision cannot fulfil a promise to re-measure
+    entries = copy.deepcopy(base)[:-2] + [
+        _e("D2", "decision", "operator", point=2, fulfils=["D1.f1"], basis=["D1.f1"],
+           question=None, options=["keep"], choice="keep", procedure="single", rule=None,
+           affected=[], result="2", **_ev("keep the rules"))]
+    r = verify(record(tmp_path, entries))
+    assert any("decision entry" in f["text"] for f in r["findings"]
+               if f["finding"] == "fulfilment not shown")
+    # a measurement without a promised subject
+    entries = copy.deepcopy(base)
+    entries[-1]["per_party"] = {"B": {"utility": 37.2}}
+    r = verify(record(tmp_path, entries))
+    assert any("metric:utility@C" in f["text"] for f in r["findings"]
+               if f["finding"] == "fulfilment not shown")
+    # a measurement of something else
+    entries = copy.deepcopy(base)
+    entries[-1]["of"] = "P1.2"
+    r = verify(record(tmp_path, entries))
+    assert any("measures P1.2" in f["text"] for f in r["findings"])
+    # fulfilled_by null: any later entry fulfils it, as in decisions 0.1
+    entries = copy.deepcopy(base)[:-1]
+    next(e for e in entries if e["id"] == "D1.f1")["fulfilled_by"] = None
+    r = verify(record(tmp_path, entries))
+    assert not {"fulfilment not shown", "open follow-up"} & set(kinds(r))
+
+
+def test_malformed_fulfilled_by(tmp_path):
+    import copy
+    for bad in ({"type": "nothing", "of": None, "same_method_as": None, "subjects": []},
+                {"type": "decision", "of": "in_force", "same_method_as": None, "subjects": []},
+                {"type": "measurement", "of": "P9", "same_method_as": None, "subjects": []},
+                {"type": "measurement", "of": None, "same_method_as": "D1", "subjects": []},
+                {"type": "measurement", "of": None, "same_method_as": None,
+                 "subjects": ["vote:A"]},
+                {"type": "measurement", "of": None, "same_method_as": None,
+                 "subjects": ["metric:x@nobody"]},
+                {"type": "measurement"}):
+        entries = copy.deepcopy(period1())
+        next(e for e in entries if e["id"] == "D1.f1")["fulfilled_by"] = bad
+        r = verify(record(tmp_path, entries))
+        assert {"L-1", "L-4"} & set(rules(r)), bad
+
+
+def test_a_decider_adopts_only_changes_of_its_layers(tmp_path):
+    entries = period1()
+    entries[2]["changes"][0]["layer"] = "regulation"
+    r = verify(record(tmp_path, entries))
+    assert any(e["rule"] == "L-5" and "regulation" in e["what"] for e in r["errors"])
+    entries[2]["changes"][0]["layer"] = "contract"
+    assert "L-5" not in rules(verify(record(tmp_path, entries)))
+
+
+def test_a_delegate_decides_within_the_layers_of_its_principal(tmp_path):
+    for layers, ok in ((["rule"], True), (["rule", "contract"], True),
+                       (["regulation"], False), (None, False)):
+        parties = PARTIES + [_party("llm-decider", "llm", ["decider"], model="m",
+                                    on_behalf_of="operator", layers=layers)]
+        chain = DecisionChain(run_id=RUN_ID)
+        p = tmp_path / "d.jsonl"
+        lines = [chain.header({"name": "x", "version": None, "source_sha256": None},
+                              parties, T)] + [chain.end()]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert ("L-8" in rules(verify(p))) is not ok, layers
+
+
+def test_bad_layers_of_a_party(tmp_path):
+    for bad in (["law"], ["rule", "rule"], "rule", [1]):
+        parties = [dict(x) for x in PARTIES]
+        parties[0]["layers"] = bad
+        chain = DecisionChain(run_id=RUN_ID)
+        p = tmp_path / "d.jsonl"
+        lines = [chain.header({"name": "x", "version": None, "source_sha256": None},
+                              parties, T)] + [chain.end()]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert "L-1" in rules(verify(p)), bad
+
+
+def test_writer_fills_the_fields_of_0_2(tmp_path):
+    """A writer of decisions 0.1 that names no layers and no fulfilled_by still writes a
+    valid record of decisions 0.2."""
+    parties = [{k: v for k, v in x.items() if k != "layers"} for x in PARTIES]
+    entries = [{k: v for k, v in e.items() if k != "fulfilled_by"} for e in period1()]
+    chain = DecisionChain(run_id=RUN_ID)
+    lines = [chain.header({"name": "RobotTown", "version": "1",
+                           "source_sha256": file_sha256(V1)}, parties, T)]
+    lines += [chain.entry(e) for e in entries] + [chain.end()]
+    import shutil
+    shutil.copy(V2, tmp_path / V2.name)
+    p = tmp_path / "d.jsonl"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    r = verify(p)
+    assert r["valid"], r["errors"]
+    assert json.loads(lines[0])["parties"][0]["layers"] is None
+
+
+def test_records_of_decisions_0_1_are_read_as_before(tmp_path):
+    parties = [{k: v for k, v in x.items() if k != "layers"} for x in PARTIES]
+    entries = [{k: v for k, v in e.items() if k != "fulfilled_by"} for e in period1()]
+    chain = DecisionChain(run_id=RUN_ID, format=FORMAT_1)
+    lines = [chain.header({"name": "RobotTown", "version": "1",
+                           "source_sha256": file_sha256(V1)}, parties, T)]
+    lines += [chain.entry(e) for e in entries] + [chain.end()]
+    import shutil
+    shutil.copy(V2, tmp_path / V2.name)
+    p = tmp_path / "d.jsonl"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    r = verify(p)
+    assert r["valid"], r["errors"]
+    assert json.loads(lines[0])["decisions_format"] == FORMAT_1
+    assert "fulfilment not shown" not in kinds(r)
+    # the fields of 0.2 are not fields of a record of 0.1
+    chain = DecisionChain(run_id=RUN_ID, format=FORMAT_1)
+    lines = [chain.header({"name": "RobotTown", "version": "1",
+                           "source_sha256": file_sha256(V1)}, PARTIES, T)]
+    lines += [chain.entry(e) for e in period1()] + [chain.end()]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert "L-1" in rules(verify(p))

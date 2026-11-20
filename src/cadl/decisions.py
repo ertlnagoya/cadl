@@ -1,4 +1,4 @@
-"""Decision records (Appendix L, decisions 0.1): writing and verifying.
+"""Decision records (Appendix L, decisions 0.2): writing and verifying.
 
 A decision record is a file of JSON Lines beside a model that records how
 its amendments were decided: the parties and their roles, then entries
@@ -16,6 +16,11 @@ LLM or a tool made them.
 ``verify(path)`` checks L-1 to L-8, and, for the versions whose CADL
 files are at hand, L-9 to L-11; it reports the findings of L.6 for
 review. ``DecisionChain`` writes a record.
+
+decisions 0.2 (format ``cadl-decisions/2``) adds the ``layers`` of a party
+(the layers on which it decides) and the ``fulfilled_by`` of a follow-up
+(what a fulfilling entry must be). A record of ``cadl-decisions/1`` is
+read as before, without them.
 """
 
 from __future__ import annotations
@@ -40,14 +45,17 @@ from .audit_log import (
     written,
 )
 
-FORMAT = "cadl-decisions/1"
+FORMAT = "cadl-decisions/2"
+FORMAT_1 = "cadl-decisions/1"
+FORMATS = (FORMAT_1, FORMAT)
 KEEP = "keep"
 
 ROLES = ("owner", "proposer", "assessor", "voter", "advisor", "decider", "affected")
 PARTY_KINDS = ("human", "organisation", "agent", "llm", "tool")
 HEADER_FIELDS = ("decisions_format", "hash", "key_id", "run_id", "model", "time_base",
                  "started", "previous", "parties")
-PARTY_FIELDS = ("id", "kind", "roles", "name", "actor", "model", "on_behalf_of")
+PARTY_FIELDS_1 = ("id", "kind", "roles", "name", "actor", "model", "on_behalf_of")
+PARTY_FIELDS = PARTY_FIELDS_1 + ("layers",)
 END_FIELDS = ("decisions_end", "entries")
 COMMON = ("id", "type", "point", "written", "by", "basis", "fulfils", "attachments",
           "generated")
@@ -64,7 +72,7 @@ TYPES = {
     "decision": ("question", "options", "choice", "procedure", "rule", "affected",
                  "result") + EVIDENCE,
     "version": ("version", "previous", "effective", "source_sha256", "decision"),
-    "follow_up": ("text", "due", "decision"),
+    "follow_up": ("text", "due", "decision", "fulfilled_by"),
     "correction": ("corrects", "text"),
     "note": ("text",),
 }
@@ -78,7 +86,9 @@ LAYERS = ("rule", "contract", "regulation")
 ROLES_IN_MEASURE = ("goal", "watch", "guard")
 FINDINGS = ("override", "against recommendation", "delegated", "unknowns",
             "prediction missed", "affected not measured", "unmeasured choice",
-            "reading not decided", "open follow-up", "corrected", "open record")
+            "reading not decided", "open follow-up", "fulfilment not shown", "corrected",
+            "open record")
+FULFILLED_BY = ("type", "of", "same_method_as", "subjects")
 
 _ID_RE = re.compile(r"[A-Za-z0-9_.\-]+")
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
@@ -102,11 +112,14 @@ class DecisionChain:
     for every entry, then ``end()`` for a complete record. Each call returns
     one line without the newline."""
 
-    def __init__(self, key: Optional[bytes] = None, run_id: Optional[str] = None):
+    def __init__(self, key: Optional[bytes] = None, run_id: Optional[str] = None,
+                 format: str = FORMAT):
         run_id = run_id or new_run_id()
         if not is_run_id(run_id):
             raise ValueError("a run id is 32 lowercase hexadecimal digits")
-        self.run_id, self.key = run_id, key
+        if format not in FORMATS:
+            raise ValueError(f"the format is one of {', '.join(FORMATS)}")
+        self.run_id, self.key, self.format = run_id, key, format
         self.seq, self.prev, self.entries, self.ended = 0, GENESIS, 0, False
 
     def _line(self, fields: dict) -> str:
@@ -126,8 +139,12 @@ class DecisionChain:
                previous: Optional[dict] = None) -> str:
         if self.seq != 0:
             raise ValueError("the header is the first line")
+        if self.format == FORMAT:
+            # decisions 0.2: a party without `layers` decides on any layer
+            parties = [p if not isinstance(p, dict) or "layers" in p else {**p, "layers": None}
+                       for p in parties]
         return self._line({
-            "decisions_format": FORMAT,
+            "decisions_format": self.format,
             "hash": "sha256" if self.key is None else "hmac-sha256",
             "key_id": None if self.key is None else key_id(self.key),
             "run_id": self.run_id, "model": model, "time_base": time_base,
@@ -138,6 +155,9 @@ class DecisionChain:
         if self.seq == 0:
             raise ValueError("the header comes first")
         self.entries += 1
+        if self.format == FORMAT and fields.get("type") == "follow_up" \
+                and "fulfilled_by" not in fields:
+            fields = {**fields, "fulfilled_by": None}    # decisions 0.2: any later entry
         return self._line(fields)
 
     def end(self) -> str:
@@ -166,6 +186,7 @@ class _Record:
         self.parties: dict[str, dict] = {}
         self.entries: list[dict] = []       # without integrity fields
         self.lines: dict[str, int] = {}     # entry id -> line number
+        self.format = FORMAT
         self.index: dict[str, int] = {}     # entry id -> position in entries
         self.complete = False
 
@@ -290,8 +311,10 @@ def _read(data: bytes, key, rec: _Record, out: dict) -> None:
             raise _Stop("L-2", n, "'prev' is not the digest of the previous line (a line was "
                                   "deleted, inserted, moved or changed)")
         if n == 1:
-            if obj.get("decisions_format") != FORMAT:
-                raise _Stop("L-1", 1, f"the first line is not a header of {FORMAT}")
+            if obj.get("decisions_format") not in FORMATS:
+                raise _Stop("L-1", 1, "the first line is not a header of "
+                                      f"{' or '.join(FORMATS)}")
+            rec.format = obj["decisions_format"]
             algorithm = obj.get("hash")
             if algorithm not in ALGORITHMS:
                 raise _Stop("L-1", 1, f"unknown hash algorithm {algorithm!r}")
@@ -361,12 +384,12 @@ SHAPE = {
                  "affected": _LS, "result": _S0, **SHAPE_EVIDENCE},
     "version": {"version": _S, "previous": _S0, "effective": _D, "source_sha256": _S,
                 "decision": _S0},
-    "follow_up": {"text": _S, "due": _D0, "decision": _S0},
+    "follow_up": {"text": _S, "due": _D0, "decision": _S0, "fulfilled_by": _D0},
     "correction": {"corrects": _S, "text": _S},
     "note": {"text": _S},
 }
 SHAPE_PARTY = {"id": _S, "kind": _S, "roles": _LS, "name": _S0, "actor": _S0, "model": _S0,
-               "on_behalf_of": _S0}
+               "on_behalf_of": _S0, "layers": "list or null"}
 # the members of objects inside lists: name -> (keys, member shapes)
 _NUM = "number"
 _SCALAR = "number, text or null"
@@ -387,6 +410,7 @@ MEMBERS = {
     "rec_options": {"option": _S, "summary": _S, "affected": _S},
     "method": {"runs": _I0, "window": _S0, "description": _S0},
     "generated": {"model": _S, "request_digest": _S},
+    "fulfilled_by": {"type": _S0, "of": _S0, "same_method_as": _S0, "subjects": _LS},
 }
 
 
@@ -411,6 +435,15 @@ class _Verifier:
         self.rec, self.out = rec, out
         self.models: dict[str, Any] = {}      # sha256 -> (path, analysis)
         self.bad: set = set()                 # ids of entries whose shape is wrong
+
+    @property
+    def v1(self) -> bool:
+        return self.rec.format == FORMAT_1
+
+    def fields_of(self, t: str) -> tuple:
+        if self.v1 and t == "follow_up":
+            return ("text", "due", "decision")
+        return TYPES[t]
 
     # --- reporting ---------------------------------------------------------
     def err(self, rule: str, e: Optional[dict], what: str, line: Optional[int] = None) -> None:
@@ -468,6 +501,8 @@ class _Verifier:
         ok = self.members(e, "attachments", e["attachments"], "attachments")
         if e["generated"] is not None:
             ok = self.members(e, "generated", [e["generated"]], "generated") and ok
+        if e.get("fulfilled_by") is not None:
+            ok = self.members(e, "fulfilled_by", [e["fulfilled_by"]], "fulfilled_by") and ok
         if "predictions" in e:
             ok = self.members(e, "predictions", e["predictions"], "predictions") and ok
         if t == "proposal":
@@ -522,6 +557,13 @@ class _Verifier:
             if ob is not None and (ob not in self.rec.parties or ob == p["id"]):
                 self.err("L-8", None, f"party '{p['id']}': on_behalf_of {ob!r} is not "
                                       "another party", line=1)
+            elif ob is not None:
+                mine, theirs = p.get("layers"), self.rec.parties[ob].get("layers")
+                if theirs is not None and (mine is None or set(mine) - set(theirs)):
+                    self.err("L-8", None, f"party '{p['id']}' acts on behalf of '{ob}' on the "
+                                          f"layers {', '.join(mine) if mine else 'all'}; "
+                                          f"'{ob}' decides on {', '.join(theirs) or 'none'}",
+                             line=1)
         last_point = None
         for i, e in enumerate(self.rec.entries):
             eid = e.get("id")
@@ -540,7 +582,7 @@ class _Verifier:
                 e["_bad"] = True
                 self.bad.add(eid)
                 continue
-            want = set(COMMON) | set(TYPES[t]) | {"_line"}
+            want = set(COMMON) | set(self.fields_of(t)) | {"_line"}
             if set(e) != want:
                 miss, extra = sorted(want - set(e)), sorted(set(e) - want)
                 self.err("L-1", e, f"a {t} entry " + "; ".join(
@@ -563,8 +605,9 @@ class _Verifier:
                 last_point = e["point"]
 
     def party(self, p: Any) -> None:
-        if not isinstance(p, dict) or set(p) != set(PARTY_FIELDS):
-            self.err("L-1", None, f"a party has the fields {', '.join(PARTY_FIELDS)}: {p!r}"[:300],
+        fields = PARTY_FIELDS_1 if self.v1 else PARTY_FIELDS
+        if not isinstance(p, dict) or set(p) != set(fields):
+            self.err("L-1", None, f"a party has the fields {', '.join(fields)}: {p!r}"[:300],
                      line=1)
             return
         if not self.shape(p, SHAPE_PARTY, "a party", line=1):
@@ -582,6 +625,12 @@ class _Verifier:
         if not p["roles"] or any(r not in ROLES for r in p["roles"]):
             self.err("L-1", None, f"party '{pid}': roles {p['roles']!r} are not roles of L.2",
                      line=1)
+        layers = p.get("layers")
+        if layers is not None and (not all(isinstance(x, str) and x in LAYERS for x in layers)
+                                   or len(set(layers)) != len(layers)):
+            self.err("L-1", None, f"party '{pid}': layers {layers!r} are not distinct layers of "
+                                  f"{', '.join(LAYERS)}", line=1)
+            p = {**p, "layers": None}
         if p["kind"] in ("llm", "tool") and not p["model"]:
             self.err("L-8", None, f"party '{pid}' of kind {p['kind']} gives no model", line=1)
         self.rec.parties[pid] = p
@@ -740,6 +789,15 @@ class _Verifier:
                                    f"'{e['by']}' ({party.get('kind')})")
         elif e["rule"] is not None:
             self.err("L-1", e, "rule is null unless the procedure is automatic")
+        adopted = self.adopted(e)
+        layers = (self.rec.parties.get(e["by"]) or {}).get("layers")
+        if adopted is not None and layers is not None:
+            outside = sorted({c["layer"] for c in adopted.get("changes") or []
+                              if c.get("layer") and c["layer"] not in layers})
+            if outside:
+                self.err("L-5", e, f"'{e['by']}' decides on the layers "
+                                   f"{', '.join(layers) or 'none'}; {adopted['id']} changes "
+                                   f"{', '.join(outside)}")
         if proc in ("vote", "override"):
             on = self.voted_on(e)
             given = {x["id"] for x in self.basis(e, "vote") if x["proposal"] == on}
@@ -776,6 +834,25 @@ class _Verifier:
         self.ref(e, "decision", e["decision"], ("decision",), null=True)
         if e["due"] is not None and _point_key(e["due"]) is None:
             self.err("L-1", e, "due is a time point or null")
+        fb = e.get("fulfilled_by")
+        if fb is None:
+            return
+        if fb["type"] is not None and fb["type"] not in TYPES:
+            self.err("L-1", e, f"fulfilled_by: type {fb['type']!r} is not a type of L.4")
+        measured = ("of", "same_method_as", "subjects")
+        if fb["type"] != "measurement" and any(fb[k] for k in measured):
+            self.err("L-1", e, "fulfilled_by: of, same_method_as and subjects are for a "
+                               "measurement")
+        if fb["of"] not in (None, "in_force"):
+            self.ref(e, "fulfilled_by of", fb["of"], ("proposal",))
+        self.ref(e, "fulfilled_by same_method_as", fb["same_method_as"], ("measurement",),
+                 null=True)
+        for s in fb["subjects"]:
+            m = _SUBJECT_RE.fullmatch(s)
+            if not m or m.group("voter"):
+                self.err("L-1", e, f"fulfilled_by: subject {s!r} is not metric:<name>[@<party>]")
+            elif m.group("party") and m.group("party") not in self.rec.parties:
+                self.err("L-1", e, f"fulfilled_by: subject {s!r} names no party")
 
     def t_correction(self, e):
         self.ref(e, "corrects", e["corrects"], ())
@@ -986,7 +1063,17 @@ class _Verifier:
     # --- findings -------------------------------------------------------------
     def findings(self) -> None:
         entries = self.good()
-        fulfilled = {f for e in entries for f in e["fulfils"]}
+        fulfilled = set()
+        for e in entries:
+            for f in e["fulfils"]:
+                fu = self.entry(f)
+                if fu is None or fu.get("type") != "follow_up":
+                    continue
+                why = self.unmet(e, fu)
+                if why:
+                    self.find("fulfilment not shown", e, f"names {f} in fulfils, but {why}")
+                else:
+                    fulfilled.add(f)
         corrected = {e["corrects"] for e in entries if e["type"] == "correction"}
         for i, e in enumerate(entries):
             try:
@@ -997,6 +1084,27 @@ class _Verifier:
             self.find("open record", {"id": None, "_line": self.out["lines"]},
                       "the record has no end record: it is still being written, or its writer "
                       "did not finish")
+
+    def unmet(self, e: dict, fu: dict) -> Optional[str]:
+        """Why e does not meet the fulfilled_by of the follow-up fu, or None."""
+        fb = fu.get("fulfilled_by")
+        if fb is None:
+            return None
+        if fb["type"] is not None and e["type"] != fb["type"]:
+            return f"it is a {e['type']} entry, and {fu['id']} is fulfilled by a {fb['type']}"
+        if e["type"] != "measurement":
+            return None
+        if fb["of"] is not None and e["of"] != fb["of"]:
+            return f"it measures {e['of']}, and {fu['id']} asks for {fb['of']}"
+        same = self.entry(fb["same_method_as"])
+        if same is not None and same.get("type") == "measurement" \
+                and e["method"] != same["method"]:
+            return (f"its method ({_method_text(e['method'])}) is not that of "
+                    f"{same['id']} ({_method_text(same['method'])})")
+        missing = [s for s in fb["subjects"] if _subject_value(e, s) is None]
+        if missing:
+            return f"it gives no value for {', '.join(missing)}"
+        return None
 
     def entry_findings(self, i, e, entries, fulfilled, corrected) -> None:
         t = e["type"]
@@ -1092,6 +1200,18 @@ class _Verifier:
                               f"expected {subject} to {exp} under {opt}; measured "
                               f"{_num(got)}" + (f" against {_num(base)}" if base is not None
                                                 else "") + f" ({x['id']})")
+
+
+def _method_text(m: dict) -> str:
+    return "; ".join(f"{k} {m[k]}" for k in ("runs", "window", "description")
+                     if m.get(k) is not None) or "none"
+
+
+def _subject_value(m: dict, subject: str):
+    s = _SUBJECT_RE.fullmatch(subject)
+    if not s or s.group("voter"):
+        return None
+    return _value(m, s.group("metric"), s.group("party"))
 
 
 def _value(m: Optional[dict], name: str, party: Optional[str]):
