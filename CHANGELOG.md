@@ -4,6 +4,41 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.37] — 2026-11-20
+
+### Added
+
+- Decision records (Appendix L, decisions 0.1): `cadl decisions-verify
+  RECORD.jsonl` checks a record of how the amendments of a model were
+  decided, and `cadl.decisions.DecisionChain` writes one. A record is a
+  file of JSON Lines with the integrity fields of the audit log (G.8):
+  a header with the model and the parties (roles `owner`, `proposer`,
+  `assessor`, `voter`, `advisor`, `decider`, `affected`; `on_behalf_of`
+  for a party that acts in place of another, such as an LLM deciding for
+  the service operator), the entries, and an end record.
+  - Errors L-1 to L-8: the chain (also with `--key`, `--run-id`,
+    `--anchor`), the fields of every line, unique ids, references to
+    earlier entries of the right type and points that do not decrease,
+    the roles of the parties, the choice of a decision and the votes
+    behind `vote` and `override`, the decision of a `version` entry, and
+    the same evidence fields from every party, a person, an LLM or a
+    tool: `reason` (not empty; an `automatic` decision gives `rule` and
+    is made by a tool), `assumptions`, `unknowns`, `predictions`; a
+    `model` for every LLM and tool party.
+  - L-9 to L-11 against the CADL files of the versions (the `.cadl`
+    attachments of the `version` entries and `--version FILE`): the
+    SHA-256, `sos.version`, `previous:` and `effective:`; the changes of
+    a proposal against the amendable parameters of the version in force
+    (K.3); the authority of K.3 and the quorum. What could not be checked
+    is listed under `not_checked`.
+  - Findings for review: `override`, `against recommendation`,
+    `delegated`, `unknowns`, `prediction missed`, `affected not
+    measured`, `unmeasured choice`, `reading not decided`, `open
+    follow-up`, `corrected`, `open record`.
+  - `examples/decisions_robot_town.jsonl`: period 1 of the robot town of
+    Course D (L.9), with `amendment_robot_town_v2.cadl` as the version it
+    adopts.
+
 ## [0.3.36] — 2026-11-18
 
 ### Changed
