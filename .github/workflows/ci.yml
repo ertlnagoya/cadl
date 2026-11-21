@@ -14,10 +14,16 @@ jobs:
     name: Test (Python ${{ matrix.python-version }})
     # ubuntu-latest is Ubuntu 26.04 from October 2026, which has no Python 3.9
     runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
+    # A pull request runs the oldest and the newest Python; a push to master
+    # or main runs every version. The setups that one Python version is
+    # enough for (PRISM-games and the EVM) run on EXTRAS_PYTHON, which is
+    # 3.14 in a pull request and 3.12 in a push.
+    env:
+      EXTRAS_PYTHON: ${{ github.event_name == 'pull_request' && '3.14' || '3.12' }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.9", "3.14"]' || '["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]') }}
 
     steps:
       - uses: actions/checkout@v4
@@ -89,7 +95,7 @@ jobs:
       # SHA-256; its `prism` script goes into CADL_PRISM_GAMES, not on PATH,
       # where it would hide PRISM. One Python version is enough.
       - name: Install PRISM-games
-        if: ${{ matrix.python-version == '3.12' }}
+        if: ${{ matrix.python-version == env.EXTRAS_PYTHON }}
         env:
           PRISM_GAMES_VERSION: "3.2.4"
           PRISM_GAMES_SHA256: "11fb5c67d9897493588e0198d3c3fa3bbb28b4eee9b128b8d15f86b87fffec6b"
@@ -115,7 +121,7 @@ jobs:
       # EVM tests take the first CADL_NORMS_EVM_CASES traces of
       # tests/test_norms_eval.py, so that the job stays short.
       - name: Set up an EVM and solc for the Solidity monitor tests
-        if: ${{ matrix.python-version == '3.12' }}
+        if: ${{ matrix.python-version == env.EXTRAS_PYTHON }}
         env:
           SOLCX_BINARY_PATH: ${{ runner.temp }}/solcx
         run: |
