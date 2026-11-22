@@ -152,6 +152,34 @@ def main(argv: list[str] | None = None) -> int:
     averify_cmd.add_argument("--format", choices=["text", "json"], default="text",
                              help="Output format (default: text)")
 
+    # decisions-verify command
+    dverify_cmd = subparsers.add_parser(
+        "decisions-verify",
+        help="Verify a decision record: how amendments were decided (decisions 0.2, "
+             "Appendix L)",
+        description="Verify a decision record (Appendix L): the hash chain of G.8, the "
+                    "fields and references of every entry, the roles of the parties, the "
+                    "same evidence fields from every party whether a person, an LLM or a "
+                    "tool (L-1 to L-8), and, against the CADL files of the versions that are "
+                    "at hand, the versions, the amendable parameters and the authority of "
+                    "K.3 (L-9 to L-11). Reports the findings of L.6 for review. Exit status: "
+                    "0 no error, 1 errors, 2 usage error.")
+    dverify_cmd.add_argument("record", type=Path, metavar="DECISIONS.jsonl",
+                             help="Decision record (JSON Lines)")
+    dverify_cmd.add_argument("--key", type=Path, default=None, metavar="FILE",
+                             help="Key file of a keyed record (HMAC-SHA256)")
+    dverify_cmd.add_argument("--run-id", default=None, metavar="HEX",
+                             help="Also require this run id in the header")
+    dverify_cmd.add_argument("--anchor", default=None, metavar="DIGEST",
+                             help="Also require this digest of the last line, kept outside "
+                                  "the record")
+    dverify_cmd.add_argument("--version", dest="versions", action="append", default=[],
+                             type=Path, metavar="FILE.cadl",
+                             help="A CADL file of a version of the model (repeatable), in "
+                                  "addition to the files that the version entries attach")
+    dverify_cmd.add_argument("--format", choices=["text", "json"], default="text",
+                             help="Output format (default: text)")
+
     # mcp-gateway command
     gw_cmd = subparsers.add_parser(
         "mcp-gateway",
@@ -736,6 +764,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_agents_run(args)
     elif args.command == "audit-verify":
         return _cmd_audit_verify(args)
+    elif args.command == "decisions-verify":
+        return _cmd_decisions_verify(args)
     elif args.command == "mcp-gateway":
         from .mcp_gateway import cli_gateway
         return cli_gateway(args)
@@ -1642,6 +1672,31 @@ def _cmd_audit_verify(args: argparse.Namespace) -> int:
             raise AuditKeyError(f"File not found: {args.audit}")
         result = verify(args.audit, key=key, source_sha256=source, allow_open=args.open,
                         run_id=args.run_id, anchor=args.anchor)
+    except (AuditKeyError, OSError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_verify_text(result))
+    return 0 if result["valid"] else 1
+
+
+def _cmd_decisions_verify(args: argparse.Namespace) -> int:
+    """Exit status: 0 no error, 1 errors, 2 usage error."""
+    import json
+    from .audit_log import AuditKeyError, read_key
+    from .decisions import format_verify_text, verify
+
+    try:
+        key = read_key(args.key) if args.key is not None else None
+        if not args.record.is_file():
+            raise AuditKeyError(f"File not found: {args.record}")
+        for v in args.versions:
+            if not v.is_file():
+                raise AuditKeyError(f"File not found: {v}")
+        result = verify(args.record, key=key, run_id=args.run_id, anchor=args.anchor,
+                        versions=args.versions)
     except (AuditKeyError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

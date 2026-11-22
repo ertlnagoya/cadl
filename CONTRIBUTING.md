@@ -24,7 +24,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Python 3.9 or later is required; CI runs 3.9 through 3.14.
+Python 3.9 or later is required. CI runs 3.9 and 3.14 on a pull request, and 3.9 through 3.14 on a push to master.
 
 ## Before you open a pull request
 
