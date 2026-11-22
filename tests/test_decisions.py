@@ -9,7 +9,7 @@ import pytest
 
 from cadl.audit_log import AuditKeyError, file_sha256
 from cadl.cli import main
-from cadl.decisions import FORMAT, FORMAT_1, DecisionChain, verify
+from cadl.decisions import FORMAT, FORMAT_1, FORMAT_2, DecisionChain, verify
 
 ROOT = Path(__file__).parent.parent
 EXAMPLES = ROOT / "examples"
@@ -351,6 +351,16 @@ def test_amendability_and_authority_against_the_model(tmp_path):
     assert "L-11" in rules(r)
 
 
+def test_a_proposal_outside_k3_that_no_decision_adopts_is_a_finding(tmp_path):
+    entries = period1()
+    other = dict(entries[2], id="P1.3", predictions=[],
+                 changes=[{"parameter": "block_k", "from": "3", "to": "9", "layer": "rule"}])
+    entries.insert(3, other)
+    r = verify(record(tmp_path, entries), versions=[V1])
+    assert r["valid"], r["errors"]
+    assert [f["entry"] for f in r["findings"] if f["finding"] == "not amendable"] == ["P1.3"]
+
+
 def test_changed_version_file(tmp_path):
     p = record(tmp_path)
     (tmp_path / V2.name).write_text(V2.read_text(encoding="utf-8") + "\n# changed\n",
@@ -674,3 +684,99 @@ def test_records_of_decisions_0_1_are_read_as_before(tmp_path):
     lines += [chain.entry(e) for e in period1()] + [chain.end()]
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     assert "L-1" in rules(verify(p))
+
+
+# --- decisions 0.3: delegations -----------------------------------------------
+
+def _deleg(eid="G1", by="operator", to="llm-decider", layers=("rule", "contract"),
+           procedures=("single", "vote"), until=None, point=1, reason="The operator lets "
+           "the LLM answer the decision requests."):
+    return _e(eid, "delegation", by, point=point, to=to,
+              layers=None if layers is None else list(layers),
+              procedures=None if procedures is None else list(procedures),
+              conditions=["answer the requests of the steward"], until=until, reason=reason)
+
+
+def _delegated_record(tmp_path, delegation, procedure="vote", choice="keep", fmt=FORMAT,
+                      to_layers=("rule", "contract")):
+    parties = PARTIES + [_party("llm-decider", "llm", ["decider"], model="claude-opus-5-5",
+                                on_behalf_of="operator", layers=list(to_layers))]
+    entries = period1()
+    d = entries[10]
+    d.update(by="llm-decider", choice=choice, procedure=procedure,
+             result="1" if choice == "keep" else d["result"], generated=GEN,
+             **_ev("Adopting it means overriding a majority vote."))
+    entries = ([] if delegation is None else [delegation]) + entries[:11]
+    import shutil
+    shutil.copy(V2, tmp_path / V2.name)
+    p = tmp_path / "decisions.jsonl"
+    chain = DecisionChain(run_id=RUN_ID, format=fmt)
+    lines = [chain.header({"name": "RobotTown", "version": "1",
+                           "source_sha256": file_sha256(V1)}, parties, T)]
+    lines += [chain.entry(e) for e in entries] + [chain.end()]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return verify(p, versions=[V1])
+
+
+def test_a_decision_within_a_delegation_is_not_reported_as_delegated(tmp_path):
+    r = _delegated_record(tmp_path, _deleg())
+    assert r["valid"], r["errors"]
+    assert "delegated" not in kinds(r)
+    assert r["delegated_under"] == {"D1": "G1"}
+    from cadl.decisions import format_verify_text
+    assert "made within a delegation: G1: D1" in format_verify_text(r)
+
+
+def test_a_decision_outside_its_delegation_is_reported(tmp_path):
+    r = _delegated_record(tmp_path, None)
+    assert [f["text"] for f in r["findings"] if f["finding"] == "delegated"] == [
+        "'llm-decider' (llm) decided on behalf of 'operator', with no delegation"]
+    r = _delegated_record(tmp_path, _deleg(procedures=["single"]))
+    assert any("G1 does not give the procedure vote" in f["text"] for f in r["findings"])
+    r = _delegated_record(tmp_path, _deleg(layers=["contract"]), procedure="override",
+                          choice="P1.2")
+    assert any("G1 does not give the layer rule" in f["text"] for f in r["findings"])
+    r = _delegated_record(tmp_path, _deleg(layers=[]))
+    assert any("G1 gives no layers" in f["text"] for f in r["findings"])
+    r = _delegated_record(tmp_path, _deleg(point=1, until={"period": 1}))
+    assert r["delegated_under"] == {"D1": "G1"}
+
+
+def test_a_later_delegation_replaces_an_earlier_one(tmp_path):
+    parties = PARTIES + [_party("llm-decider", "llm", ["decider"], model="claude-opus-5-5",
+                                on_behalf_of="operator", layers=["rule", "contract"])]
+    entries = period1()
+    d = entries[10]
+    d.update(by="llm-decider", choice="keep", procedure="vote", result="1", generated=GEN,
+             **_ev("Keep."))
+    entries = [_deleg("G1"), _deleg("G2", layers=[])] + entries[:11]
+    import shutil
+    shutil.copy(V2, tmp_path / V2.name)
+    p = tmp_path / "decisions.jsonl"
+    chain = DecisionChain(run_id=RUN_ID)
+    lines = [chain.header({"name": "RobotTown", "version": "1",
+                           "source_sha256": file_sha256(V1)}, parties, T)]
+    lines += [chain.entry(e) for e in entries] + [chain.end()]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    r = verify(p, versions=[V1])
+    assert r["valid"], r["errors"]
+    assert any("G2 gives no layers" in f["text"] for f in r["findings"])
+
+
+def test_a_bad_delegation_is_an_error(tmp_path):
+    assert "L-8" in rules(_delegated_record(tmp_path, _deleg(by="regulator")))
+    assert "L-5" in rules(_delegated_record(tmp_path, _deleg(by="llm")))
+    assert "L-8" in rules(_delegated_record(tmp_path, _deleg(layers=["regulation"])))
+    assert "L-1" in rules(_delegated_record(tmp_path, _deleg(layers=["road"])))
+    assert "L-1" in rules(_delegated_record(tmp_path, _deleg(procedures=["ask"])))
+    assert "L-1" in rules(_delegated_record(tmp_path, _deleg(to="nobody")))
+    assert "L-8" in rules(_delegated_record(tmp_path, _deleg(reason=" ")))
+    assert "L-1" in rules(_delegated_record(tmp_path, _deleg(until={"period": 0})))
+
+
+def test_a_delegation_is_not_an_entry_of_decisions_0_2(tmp_path):
+    r = _delegated_record(tmp_path, _deleg(), fmt=FORMAT_2)
+    assert "L-1" in rules(r)
+    r = _delegated_record(tmp_path, None, fmt=FORMAT_2)
+    assert r["valid"], r["errors"]
+    assert "delegated" in kinds(r)

@@ -4,6 +4,32 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.39] — 2026-11-22
+
+### Added
+
+- Decision records, decisions 0.3 (format `cadl-decisions/3`; records of
+  `cadl-decisions/1` and `/2` are read as before):
+  - The entry type `delegation`: a party (a decider) lets another party,
+    one whose `on_behalf_of` names it, decide in its place: `to`, `layers`
+    (or `null` for every layer of `to`; an empty list ends it),
+    `procedures` (or `null` for any), `conditions` (in words, not checked),
+    `until` (a point, or `null`) and `reason`. A later delegation from the
+    same party to the same party replaces it. A delegation to a party that
+    does not act on behalf of its `by`, or on layers beyond those of `to`,
+    is an error (L-8).
+  - The finding `delegated` is reported only for a decision made on behalf
+    of another party that no delegation in force covers (with no
+    delegation, after its `until`, outside its layers, or by a procedure it
+    does not give); the text says which. `verify()` returns
+    `delegated_under` (decision → delegation) for the decisions that a
+    delegation covers, and `cadl decisions-verify` lists them.
+  - L-10 is an error only for a proposal that a decision adopts. A proposal
+    outside the amendable range of K.3 that no decision adopts is reported
+    as the new finding `not amendable`: the record shows faithfully what was
+    proposed and that the checks turned it down.
+  - `DecisionChain` writes `cadl-decisions/3`.
+
 ## [0.3.38] — 2026-11-21
 
 ### Added

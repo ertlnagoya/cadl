@@ -21,6 +21,12 @@ decisions 0.2 (format ``cadl-decisions/2``) adds the ``layers`` of a party
 (the layers on which it decides) and the ``fulfilled_by`` of a follow-up
 (what a fulfilling entry must be). A record of ``cadl-decisions/1`` is
 read as before, without them.
+
+decisions 0.3 (format ``cadl-decisions/3``) adds the entry type
+``delegation``: a party lets another decide in its place, on some layers,
+by some procedures, until some point. A decision made on behalf of another
+party within a delegation in force is not reported as delegated. A record
+of ``cadl-decisions/2`` is read as before, without delegations.
 """
 
 from __future__ import annotations
@@ -45,9 +51,10 @@ from .audit_log import (
     written,
 )
 
-FORMAT = "cadl-decisions/2"
+FORMAT = "cadl-decisions/3"
+FORMAT_2 = "cadl-decisions/2"
 FORMAT_1 = "cadl-decisions/1"
-FORMATS = (FORMAT_1, FORMAT)
+FORMATS = (FORMAT_1, FORMAT_2, FORMAT)
 KEEP = "keep"
 
 ROLES = ("owner", "proposer", "assessor", "voter", "advisor", "decider", "affected")
@@ -73,21 +80,22 @@ TYPES = {
                  "result") + EVIDENCE,
     "version": ("version", "previous", "effective", "source_sha256", "decision"),
     "follow_up": ("text", "due", "decision", "fulfilled_by"),
+    "delegation": ("to", "layers", "procedures", "conditions", "until", "reason"),
     "correction": ("corrects", "text"),
     "note": ("text",),
 }
 # the role that `by` must have (L-5); None: any party
 ROLE_OF = {"objective": "owner", "proposal": "proposer", "measurement": "assessor",
            "check": "assessor", "vote": "voter", "recommendation": "advisor",
-           "decision": "decider"}
+           "decision": "decider", "delegation": "decider"}
 PROCEDURES = ("single", "vote", "override", "automatic")
 EXPECTED = ("increase", "decrease", "unchanged", "yes", "no")
 LAYERS = ("rule", "contract", "regulation")
 ROLES_IN_MEASURE = ("goal", "watch", "guard")
 FINDINGS = ("override", "against recommendation", "delegated", "unknowns",
             "prediction missed", "affected not measured", "unmeasured choice",
-            "reading not decided", "open follow-up", "fulfilment not shown", "corrected",
-            "open record")
+            "reading not decided", "open follow-up", "fulfilment not shown", "not amendable",
+            "corrected", "open record")
 FULFILLED_BY = ("type", "of", "same_method_as", "subjects")
 
 _ID_RE = re.compile(r"[A-Za-z0-9_.\-]+")
@@ -139,7 +147,7 @@ class DecisionChain:
                previous: Optional[dict] = None) -> str:
         if self.seq != 0:
             raise ValueError("the header is the first line")
-        if self.format == FORMAT:
+        if self.format != FORMAT_1:
             # decisions 0.2: a party without `layers` decides on any layer
             parties = [p if not isinstance(p, dict) or "layers" in p else {**p, "layers": None}
                        for p in parties]
@@ -155,7 +163,7 @@ class DecisionChain:
         if self.seq == 0:
             raise ValueError("the header comes first")
         self.entries += 1
-        if self.format == FORMAT and fields.get("type") == "follow_up" \
+        if self.format != FORMAT_1 and fields.get("type") == "follow_up" \
                 and "fulfilled_by" not in fields:
             fields = {**fields, "fulfilled_by": None}    # decisions 0.2: any later entry
         return self._line(fields)
@@ -242,7 +250,8 @@ def verify(path, key: Optional[bytes] = None, run_id: Optional[str] = None,
     ``errors`` (``rule``, ``line``, ``entry``, ``what``), ``findings``
     (``finding``, ``entry``, ``line``, ``text``), ``not_checked``, and what
     was read: ``lines``, ``entries``, ``parties``, ``complete``, ``hash``,
-    ``key_id``, ``run_id``, ``last_digest``, ``versions_checked``.
+    ``key_id``, ``run_id``, ``last_digest``, ``versions_checked``, and
+    ``delegated_under`` (decision id -> the delegation that covers it).
 
     ``versions`` are CADL files of versions of the model, in addition to the
     files that the ``attachments`` of the ``version`` entries name (relative
@@ -253,6 +262,7 @@ def verify(path, key: Optional[bytes] = None, run_id: Optional[str] = None,
         "file": str(path), "valid": False, "errors": [], "findings": [], "not_checked": [],
         "lines": 0, "entries": 0, "parties": 0, "complete": False, "hash": None,
         "key_id": None, "run_id": None, "last_digest": None, "versions_checked": [],
+        "delegated_under": {},
     }
     rec = _Record()
     try:
@@ -385,6 +395,8 @@ SHAPE = {
     "version": {"version": _S, "previous": _S0, "effective": _D, "source_sha256": _S,
                 "decision": _S0},
     "follow_up": {"text": _S, "due": _D0, "decision": _S0, "fulfilled_by": _D0},
+    "delegation": {"to": _S, "layers": _L0, "procedures": _L0, "conditions": _LS,
+                   "until": _D0, "reason": _S},
     "correction": {"corrects": _S, "text": _S},
     "note": {"text": _S},
 }
@@ -435,6 +447,7 @@ class _Verifier:
         self.rec, self.out = rec, out
         self.models: dict[str, Any] = {}      # sha256 -> (path, analysis)
         self.bad: set = set()                 # ids of entries whose shape is wrong
+        self.adopted_ids: set = set()         # choices of the decisions (L-10)
 
     @property
     def v1(self) -> bool:
@@ -577,7 +590,8 @@ class _Verifier:
                 e["_bad"] = True
                 continue
             self.rec.index[eid] = i
-            if not isinstance(t, str) or t not in TYPES:
+            if not isinstance(t, str) or t not in TYPES or (
+                    t == "delegation" and self.rec.format != FORMAT):
                 self.err("L-1", e, f"unknown type {t!r}"[:300])
                 e["_bad"] = True
                 self.bad.add(eid)
@@ -854,6 +868,70 @@ class _Verifier:
             elif m.group("party") and m.group("party") not in self.rec.parties:
                 self.err("L-1", e, f"fulfilled_by: subject {s!r} names no party")
 
+    def t_delegation(self, e):
+        to = self.rec.parties.get(e["to"])
+        if to is None:
+            self.err("L-1", e, f"to {e['to']!r} is not a party of the header")
+            return
+        if to.get("on_behalf_of") != e["by"]:
+            self.err("L-8", e, f"'{e['to']}' does not act on behalf of '{e['by']}' "
+                               f"(its on_behalf_of is {to.get('on_behalf_of')!r})")
+        layers = e["layers"]
+        if layers is not None:
+            if not all(isinstance(x, str) and x in LAYERS for x in layers) \
+                    or len(set(layers)) != len(layers):
+                self.err("L-1", e, f"layers {layers!r} are not distinct layers of "
+                                   f"{', '.join(LAYERS)}")
+            elif to.get("layers") is not None and set(layers) - set(to["layers"]):
+                self.err("L-8", e, f"'{e['to']}' acts on the layers "
+                                   f"{', '.join(to['layers']) or 'none'}; the delegation gives "
+                                   f"{', '.join(layers)}")
+        elif to.get("layers") is not None:
+            pass                                # null: every layer of `to`
+        procs = e["procedures"]
+        if procs is not None and (not all(isinstance(x, str) and x in PROCEDURES for x in procs)
+                                  or len(set(procs)) != len(procs)):
+            self.err("L-1", e, f"procedures {procs!r} are not distinct procedures of "
+                               f"{', '.join(PROCEDURES)}")
+        until = e["until"]
+        if until is not None:
+            if _point_key(until) is None:
+                self.err("L-1", e, f"until {until!r} is not a point")
+            elif _later(e["point"], until):
+                self.err("L-4", e, f"until {_point_text(until)} is before the point of the "
+                                   "delegation")
+        if not e["reason"].strip():
+            self.err("L-8", e, f"a delegation gives a reason ('{e['by']}')")
+
+    def delegation_for(self, d: dict) -> tuple[Optional[dict], Optional[str]]:
+        """The delegation in force that covers a decision made on behalf of another party,
+        or None and why the last delegation (if any) does not cover it."""
+        party = self.rec.parties.get(d["by"], {})
+        last = None
+        for e in self.rec.entries:
+            if e.get("_line", 0) >= d.get("_line", 0):
+                break
+            if e.get("type") == "delegation" and not e.get("_bad") \
+                    and e["by"] == party.get("on_behalf_of") and e["to"] == d["by"]:
+                last = e
+        if last is None:
+            return None, None
+        if last["until"] is not None and _point_key(last["until"]) is not None \
+                and _later(last["until"], d["point"]):
+            return None, f"{last['id']} ended at {_point_text(last['until'])}"
+        layers = last["layers"] if last["layers"] is not None else party.get("layers")
+        if layers is not None:
+            if not layers:
+                return None, f"{last['id']} gives no layers"
+            prop = self.adopted(d)
+            outside = sorted({c["layer"] for c in (prop or {}).get("changes") or []
+                              if c.get("layer") and c["layer"] not in layers})
+            if outside:
+                return None, f"{last['id']} does not give the layer {', '.join(outside)}"
+        if last["procedures"] is not None and d["procedure"] not in last["procedures"]:
+            return None, f"{last['id']} does not give the procedure {d['procedure']}"
+        return last, None
+
     def t_correction(self, e):
         self.ref(e, "corrects", e["corrects"], ())
 
@@ -954,6 +1032,7 @@ class _Verifier:
                 if mine is not None and mine != theirs:
                     self.err("L-9", e, f"{got[0].name} has {name} {mine!r}; the entry says "
                                        f"{theirs!r}")
+        self.adopted_ids = {e["choice"] for e in self.good() if e["type"] == "decision"}
         for e in self.good():
             try:
                 if e["type"] == "proposal" and e["kind"] == "amendment":
@@ -982,21 +1061,29 @@ class _Verifier:
                                                  "amendable parameters (K.3)"))
             return
         from .amendment import quantity
+
+        def bad_change(what: str) -> None:
+            # decisions 0.3: an error only for a proposal that a decision adopts; a proposal
+            # that no decision adopts is reported as a finding (its proposer proposed it)
+            if e["id"] in self.adopted_ids:
+                self.err("L-10", e, what)
+            else:
+                self.find("not amendable", e, what + "; no decision adopts it")
         params = {p.id: p for p in got[1].parameters}
         for c in e["changes"]:
             p = params.get(c["parameter"])
             if p is None:
-                self.err("L-10", e, f"{c['parameter']!r} is not an amendable parameter of "
+                bad_change(f"{c['parameter']!r} is not an amendable parameter of "
                                     "the version in force")
                 continue
             old, new = quantity(c["from"]), quantity(c["to"])
             if old is None or new is None or p.value is None or old.kind != p.value.kind \
                     or new.kind != p.value.kind:
-                self.err("L-10", e, f"{p.id}: from and to are "
+                bad_change(f"{p.id}: from and to are "
                                     f"{p.value.kind if p.value else '?'}s")
                 continue
             if old.value != p.value.value:
-                self.err("L-10", e, f"{p.id}: from {c['from']} is not its value "
+                bad_change(f"{p.id}: from {c['from']} is not its value "
                                     f"{p.value.text()}")
             bad = []
             if p.min is not None and new.value < p.min.value:
@@ -1010,7 +1097,7 @@ class _Verifier:
             if mc is not None and abs(new.value - p.value.value) > mc:
                 bad.append(f"more than {p.max_steps} step(s)")
             if bad:
-                self.err("L-10", e, f"{p.id} → {c['to']}: {'; '.join(bad)}")
+                bad_change(f"{p.id} → {c['to']}: {'; '.join(bad)}")
 
     def authority(self, d: dict) -> None:
         proc = d["procedure"]
@@ -1130,8 +1217,14 @@ class _Verifier:
                                      f"{self.voted_on(d)}")
         party = self.rec.parties.get(d["by"], {})
         if party.get("on_behalf_of"):
-            self.find("delegated", d, f"'{d['by']}' ({party.get('kind')}) decided on behalf "
-                                      f"of '{party['on_behalf_of']}'")
+            g, why = self.delegation_for(d)
+            if g is not None:
+                self.out["delegated_under"][d["id"]] = g["id"]
+            else:
+                self.find("delegated", d, f"'{d['by']}' ({party.get('kind')}) decided on behalf "
+                                          f"of '{party['on_behalf_of']}'"
+                          + (f", outside a delegation: {why}" if why else
+                             ", with no delegation"))
         for r in self.basis(d, "recommendation"):
             if r["recommends"] is not None and r["recommends"] != d["choice"]:
                 self.find("against recommendation", d,
@@ -1262,6 +1355,13 @@ def format_verify_text(result: dict) -> str:
         for f in result["findings"]:
             lines.append(f"    {f['finding']}" + (f" [{f['entry']}]" if f["entry"] else "")
                          + f": {f['text']}")
+    under = result.get("delegated_under") or {}
+    if under:
+        by: dict = {}
+        for d, g in under.items():
+            by.setdefault(g, []).append(d)
+        lines.append("  made within a delegation: " + "; ".join(
+            f"{g}: {', '.join(ds)}" for g, ds in by.items()))
     for n in result["not_checked"]:
         lines.append(f"  not checked: {n}")
     return "\n".join(lines)
