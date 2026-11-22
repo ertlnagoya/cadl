@@ -698,7 +698,7 @@ def _deleg(eid="G1", by="operator", to="llm-decider", layers=("rule", "contract"
 
 
 def _delegated_record(tmp_path, delegation, procedure="vote", choice="keep", fmt=FORMAT,
-                      to_layers=("rule", "contract")):
+                      to_layers=("rule", "contract"), decision_period=None):
     parties = PARTIES + [_party("llm-decider", "llm", ["decider"], model="claude-opus-5-5",
                                 on_behalf_of="operator", layers=list(to_layers))]
     entries = period1()
@@ -706,6 +706,8 @@ def _delegated_record(tmp_path, delegation, procedure="vote", choice="keep", fmt
     d.update(by="llm-decider", choice=choice, procedure=procedure,
              result="1" if choice == "keep" else d["result"], generated=GEN,
              **_ev("Adopting it means overriding a majority vote."))
+    if decision_period is not None:
+        d["point"] = {"period": decision_period}
     entries = ([] if delegation is None else [delegation]) + entries[:11]
     import shutil
     shutil.copy(V2, tmp_path / V2.name)
@@ -740,6 +742,16 @@ def test_a_decision_outside_its_delegation_is_reported(tmp_path):
     assert any("G1 gives no layers" in f["text"] for f in r["findings"])
     r = _delegated_record(tmp_path, _deleg(point=1, until={"period": 1}))
     assert r["delegated_under"] == {"D1": "G1"}
+
+
+def test_a_delegation_covers_the_points_up_to_its_until(tmp_path):
+    # D1 is made at period 1: a delegation until period 3 covers it, one until period 0
+    # has ended when D1 is made at period 2
+    r = _delegated_record(tmp_path, _deleg(point=1, until={"period": 3}))
+    assert r["delegated_under"] == {"D1": "G1"}
+    r = _delegated_record(tmp_path, _deleg(point=1, until={"period": 1}), decision_period=2)
+    assert r["delegated_under"] == {}
+    assert any("G1 ended at period 1" in f["text"] for f in r["findings"])
 
 
 def test_a_later_delegation_replaces_an_earlier_one(tmp_path):

@@ -4,6 +4,17 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.40] — 2026-11-23
+
+### Fixed
+
+- `cadl decisions-verify`: a delegation with `until` covered the decisions made
+  after its `until` and reported those made before it as `delegated` ("ended
+  at …"); the comparison was the wrong way round. A delegation now covers the
+  points from its own point to its `until`, as Appendix L says. Records whose
+  delegations have `until: null`, as those of cadl-robot-town, are not
+  affected.
+
 ## [0.3.39] — 2026-11-22
 
 ### Added

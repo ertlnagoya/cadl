@@ -917,7 +917,7 @@ class _Verifier:
         if last is None:
             return None, None
         if last["until"] is not None and _point_key(last["until"]) is not None \
-                and _later(last["until"], d["point"]):
+                and _later(d["point"], last["until"]):
             return None, f"{last['id']} ended at {_point_text(last['until'])}"
         layers = last["layers"] if last["layers"] is not None else party.get("layers")
         if layers is not None:
