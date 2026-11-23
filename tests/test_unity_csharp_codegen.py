@@ -259,3 +259,84 @@ class TestTargetedPost:
         broadcast = body.index("foreach (var inst in _instances.Values)")
         assert targeted < broadcast
         assert "return;" in body[targeted:broadcast]
+
+
+class TestMonitorAfterClose:
+    """A monitor that moves the instance to a terminal state closes it; the
+    other monitors of the same tick are not evaluated any more (#90)."""
+
+    SRC = '''\
+sos:
+  name: "Repro1"
+  type: Collaborative
+  version: "0.1.0"
+  extensions:
+    - sos-dsl: 0.1
+  actors:
+    - { id: A, role: "a", autonomy: high }
+    - { id: B, role: "b", autonomy: high }
+  contracts:
+    - id: C1
+      parties: [A, B]
+      assume: ["A.x >= 0"]
+      guarantee: ["B.y >= 0"]
+      lifecycle:
+        states: [Open, Failed]
+        initial: Open
+        terminal: [Failed]
+      monitors:
+        - id: m_first
+          observe: ["A.x"]
+          sampling: periodic(1s)
+          rule: "A.x > 5"
+          on_match: { transition: Failed, severity: Major }
+        - id: m_second
+          observe: ["A.x"]
+          sampling: periodic(1s)
+          rule: "A.x > 3"
+          on_match: { transition: Failed, severity: Critical }
+'''
+
+    def _generate(self, tmp_path):
+        target = tmp_path / "unity"
+        generate_unity_csharp(parse(self.SRC), target)
+        return target
+
+    def test_each_monitor_checks_closed(self, tmp_path):
+        text = (self._generate(tmp_path) / "Generated" / "C1Monitors.cs").read_text()
+        assert text.count("if (_owner.Closed) return;") == 2
+
+    def test_second_monitor_not_evaluated_after_close(self, tmp_path):
+        # Compiled with Mono's Roslyn csc when it is installed (mcs lacks
+        # `in` parameters); the CI runners skip it.
+        import shutil
+        import subprocess
+        if not (shutil.which("csc") and shutil.which("mono")):
+            pytest.skip("Mono (csc, mono) is not installed")
+        target = self._generate(tmp_path)
+        main = tmp_path / "Main.cs"
+        main.write_text("""
+using System; using System.Collections.Generic; using CADL.SosDsl;
+class M { static void Main() {
+  var rt = new ContractRuntime();
+  rt.Events.Subscribe(e => {
+    if (e.Kind == ContractEventKind.Lifecycle && e.Cause == "open") return;
+    Console.WriteLine(e.TMs + " " + e.Kind + " " + e.DetectedBy + " " + e.FromState + " " + e.ToState);
+  });
+  rt.Register(new C1Contract("c1", rt, 0));
+  var a = new Dictionary<string, object>{{"x", 0L}};
+  rt.UpdateWorld(new Dictionary<string, object>{{"A", a}});
+  for (long t = 0; t <= 3000; t++) {
+    if (t == 1500) { a["x"] = 10L; rt.UpdateWorld(new Dictionary<string, object>{{"A", a}}); }
+    rt.Tick(t);
+  }
+}}
+""")
+        exe = tmp_path / "m.exe"
+        sources = [str(p) for p in target.rglob("*.cs")]
+        subprocess.run(["csc", "-nologo", "-nowarn:219,162,168", f"-out:{exe}", str(main), *sources],
+                       check=True)
+        out = subprocess.run(["mono", str(exe)], check=True, capture_output=True,
+                             text=True).stdout.splitlines()
+        assert out == ["2000 Violation monitor:m_first  ",
+                       "2000 Lifecycle  Open Failed"], out

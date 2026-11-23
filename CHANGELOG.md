@@ -4,6 +4,16 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `codegen --target unity-csharp`: when a monitor moved the instance to a
+  terminal state, the other monitors of the same tick or event were still
+  evaluated, so a second violation and a move from the terminal state to
+  itself (for example `Violated -> Violated`) could be reported. Each
+  monitor now returns at once when the instance is closed (#90).
+
 ## [0.3.41] — 2026-11-23
 
 ### Added

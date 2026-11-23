@@ -1126,6 +1126,9 @@ def _emit_monitors(contract: ContractDef, cls: str, ns: str) -> str:
 
         eval_methods.append(
             f"        private void {method}(long nowMs, ContractRuntime rt) {{\n"
+            # Another monitor of the same tick or event may have moved the
+            # instance to a terminal state: a closed instance is finished.
+            f"            if (_owner.Closed) return;\n"
             f"            var snap = rt.SnapshotFor(_owner);\n"
             f"            if (!PredicateEvaluator.Evaluate({rule_lit}, snap)) return;\n"
             f"            rt.Emit(new ContractEvent {{\n"
