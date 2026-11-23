@@ -250,8 +250,11 @@ def verify(path, key: Optional[bytes] = None, run_id: Optional[str] = None,
     ``errors`` (``rule``, ``line``, ``entry``, ``what``), ``findings``
     (``finding``, ``entry``, ``line``, ``text``), ``not_checked``, and what
     was read: ``lines``, ``entries``, ``parties``, ``complete``, ``hash``,
-    ``key_id``, ``run_id``, ``last_digest``, ``versions_checked``, and
-    ``delegated_under`` (decision id -> the delegation that covers it).
+    ``key_id``, ``run_id``, ``last_digest``, ``versions_checked``,
+    ``delegated_under`` (decision id -> the delegation that covers it), and
+    ``predictions``: how many predictions there are, how many a later entry
+    checked (``checked``, of which ``missed``), and, for the rest, why not
+    (``not_checked``: ``keep``, ``no later entry``, ``cannot compare``).
 
     ``versions`` are CADL files of versions of the model, in addition to the
     files that the ``attachments`` of the ``version`` entries name (relative
@@ -263,6 +266,8 @@ def verify(path, key: Optional[bytes] = None, run_id: Optional[str] = None,
         "lines": 0, "entries": 0, "parties": 0, "complete": False, "hash": None,
         "key_id": None, "run_id": None, "last_digest": None, "versions_checked": [],
         "delegated_under": {},
+        "predictions": {"total": 0, "checked": 0, "missed": 0, "not_checked": {
+            "keep": 0, "no later entry": 0, "cannot compare": 0}},
     }
     rec = _Record()
     try:
@@ -1264,35 +1269,69 @@ class _Verifier:
 
     def predictions(self, i: int, e: dict, entries: list) -> None:
         later = entries[i + 1:]
+        tally = self.out["predictions"]
         for pr in e["predictions"]:
-            m = _SUBJECT_RE.fullmatch(pr["subject"])
-            opt, exp = pr["option"], pr["expected"]
-            if not m or opt == KEEP:
-                continue
-            if m.group("voter"):
-                for v in later:
-                    if v["type"] == "vote" and v["by"] == m.group("voter") \
-                            and v["proposal"] == opt and exp in ("yes", "no") \
-                            and v["value"] != exp:
-                        self.find("prediction missed", e,
-                                  f"expected {m.group('voter')} to vote {exp} on {opt}; "
-                                  f"it voted {v['value']} ({v['id']})")
-                continue
-            name, who = m.group("metric"), m.group("party")
-            for x in later:
-                if x["type"] != "measurement" or x["of"] != opt:
+            tally["total"] += 1
+            why = self.prediction(e, pr, later)
+            if why is None:
+                tally["checked"] += 1
+            elif why == "missed":
+                tally["checked"] += 1
+                tally["missed"] += 1
+            else:
+                tally["not_checked"][why] += 1
+
+    def prediction(self, e: dict, pr: dict, later: list) -> Optional[str]:
+        """Check one prediction against the later entries. Returns None when a later
+        entry bears it out, "missed" when one contradicts it (reported), or why no
+        later entry checks it: "keep", "no later entry", or "cannot compare"."""
+        m = _SUBJECT_RE.fullmatch(pr["subject"])
+        opt, exp = pr["option"], pr["expected"]
+        if opt == KEEP:
+            return "keep"
+        if not m:
+            return "cannot compare"
+        seen, verdicts = False, []
+        if m.group("voter"):
+            for v in later:
+                if v["type"] != "vote" or v["by"] != m.group("voter") or v["proposal"] != opt:
                     continue
-                got = _value(x, name, who)
-                if got is None:
+                seen = True
+                if exp not in ("yes", "no"):
                     continue
-                base_m = self.entry(x["compared_with"])
-                base = _value(base_m, name, who) if base_m else None
-                if _meets(exp, got, base) is False:
-                    subject = name + (f" of {who}" if who else "")
+                verdicts.append(v["value"] == exp)
+                if v["value"] != exp:
                     self.find("prediction missed", e,
-                              f"expected {subject} to {exp} under {opt}; measured "
-                              f"{_num(got)}" + (f" against {_num(base)}" if base is not None
-                                                else "") + f" ({x['id']})")
+                              f"expected {m.group('voter')} to vote {exp} on {opt}; "
+                              f"it voted {v['value']} ({v['id']})")
+            return _verdict(verdicts, seen)
+        name, who = m.group("metric"), m.group("party")
+        for x in later:
+            if x["type"] != "measurement" or x["of"] != opt:
+                continue
+            seen = True
+            got = _value(x, name, who)
+            if got is None:
+                continue
+            base_m = self.entry(x["compared_with"])
+            base = _value(base_m, name, who) if base_m else None
+            ok = _meets(exp, got, base)
+            verdicts.append(ok)
+            if ok is False:
+                subject = name + (f" of {who}" if who else "")
+                self.find("prediction missed", e,
+                          f"expected {subject} to {exp} under {opt}; measured "
+                          f"{_num(got)}" + (f" against {_num(base)}" if base is not None
+                                            else "") + f" ({x['id']})")
+        return _verdict(verdicts, seen)
+
+
+def _verdict(verdicts: list, seen: bool) -> Optional[str]:
+    if False in verdicts:
+        return "missed"
+    if True in verdicts:
+        return None
+    return "cannot compare" if seen else "no later entry"
 
 
 def _method_text(m: dict) -> str:
@@ -1362,6 +1401,14 @@ def format_verify_text(result: dict) -> str:
             by.setdefault(g, []).append(d)
         lines.append("  made within a delegation: " + "; ".join(
             f"{g}: {', '.join(ds)}" for g, ds in by.items()))
+    pr = result.get("predictions") or {}
+    if pr.get("total"):
+        nc = pr["not_checked"]
+        rest = sum(nc.values())
+        lines.append(f"  predictions: {pr['total']}; checked by a later entry: {pr['checked']} "
+                     f"(missed: {pr['missed']}); not checked: {rest}"
+                     + (" (" + ", ".join(f"{k}: {v}" for k, v in nc.items() if v) + ")"
+                        if rest else ""))
     for n in result["not_checked"]:
         lines.append(f"  not checked: {n}")
     return "\n".join(lines)

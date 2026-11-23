@@ -4,6 +4,18 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.41] — 2026-11-23
+
+### Added
+
+- `cadl decisions-verify` counts the predictions of a record: how many a later
+  entry checked (and of those, how many it contradicted), and why the others
+  were not checked: about `keep`, no later measurement of their option or vote
+  of their party, or no value that can be compared. The text output gives one
+  line, `predictions: …`; the JSON result has `predictions`. A prediction that
+  no later entry checks was until now indistinguishable from one that held.
+  The findings do not change.
+
 ## [0.3.40] — 2026-11-23
 
 ### Fixed
