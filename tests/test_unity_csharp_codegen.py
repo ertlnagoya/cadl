@@ -261,6 +261,40 @@ class TestTargetedPost:
         assert "return;" in body[targeted:broadcast]
 
 
+def _run_csharp(tmp_path, src, contract_cls, events, horizon):
+    """Generate the Unity C# of src, compile it with Mono's csc, open one
+    instance of contract_cls, post events [(t, name)] and tick every 1 ms up
+    to horizon. Returns the lifecycle and violation records as lines."""
+    import shutil
+    import subprocess
+    if not (shutil.which("csc") and shutil.which("mono")):
+        pytest.skip("Mono (csc, mono) is not installed")
+    target = tmp_path / "unity"
+    generate_unity_csharp(parse(src), target)
+    posts = "\n".join(f'    if (t == {t}) rt.PostEvent("{n}", t);' for t, n in events)
+    main = tmp_path / "Main.cs"
+    main.write_text("""
+using System; using System.Collections.Generic; using CADL.SosDsl;
+class M { static void Main() {
+  var rt = new ContractRuntime();
+  rt.Events.Subscribe(e => {
+    if (e.Kind == ContractEventKind.Lifecycle && e.Cause == "open") return;
+    Console.WriteLine(e.TMs + " " + e.Kind + " " + e.FromState + " " + e.ToState);
+  });
+  rt.Register(new %s("i1", rt, 0));
+  for (long t = 0; t <= %d; t++) {
+%s
+    rt.Tick(t);
+  }
+}}
+""" % (contract_cls, horizon, posts))
+    exe = tmp_path / "m.exe"
+    subprocess.run(["csc", "-nologo", "-nowarn:219,162,168", f"-out:{exe}", str(main),
+                    *[str(p) for p in target.rglob("*.cs")]], check=True)
+    return subprocess.run(["mono", str(exe)], check=True, capture_output=True,
+                          text=True).stdout.splitlines()
+
+
 class TestDeadlineScope:
     """A deadline is scoped to the from states of its transition (L-4) and
     restarts on every entry into one of them, a self-loop included (#91)."""
@@ -296,36 +330,6 @@ sos:
           - { id: ping, from: Waiting, to: Waiting, on: "A -> B : ping" }
 '''
 
-    def _run(self, tmp_path, events, horizon):
-        import shutil
-        import subprocess
-        if not (shutil.which("csc") and shutil.which("mono")):
-            pytest.skip("Mono (csc, mono) is not installed")
-        target = tmp_path / "unity"
-        generate_unity_csharp(parse(self.SRC), target)
-        posts = "\n".join(f'    if (t == {t}) rt.PostEvent("{n}", t);' for t, n in events)
-        main = tmp_path / "Main.cs"
-        main.write_text("""
-using System; using System.Collections.Generic; using CADL.SosDsl;
-class M { static void Main() {
-  var rt = new ContractRuntime();
-  rt.Events.Subscribe(e => {
-    if (e.Kind == ContractEventKind.Lifecycle && e.Cause == "open") return;
-    Console.WriteLine(e.TMs + " " + e.Kind + " " + e.FromState + " " + e.ToState);
-  });
-  rt.Register(new C2Contract("c2", rt, 0));
-  for (long t = 0; t <= %d; t++) {
-%s
-    rt.Tick(t);
-  }
-}}
-""" % (horizon, posts))
-        exe = tmp_path / "m.exe"
-        subprocess.run(["csc", "-nologo", "-nowarn:219,162,168", f"-out:{exe}", str(main),
-                        *[str(p) for p in target.rglob("*.cs")]], check=True)
-        return subprocess.run(["mono", str(exe)], check=True, capture_output=True,
-                              text=True).stdout.splitlines()
-
     def test_clears_all_deadlines_on_a_transition(self, out_dir):
         text = (out_dir / "Generated" / "DeliverySlaContract.cs").read_text()
         body = text[text.index("public void FireTransition"):text.index("public void JumpToState")]
@@ -333,10 +337,33 @@ class M { static void Main() {
         assert body.index("_deadlines.Clear();") < body.index("rt.Emit(")
 
     def test_leaving_the_from_state_cancels_the_deadline(self, tmp_path):
-        out = self._run(tmp_path, [(1000, "A -> B : req"), (2000, "A -> B : cancel")], 10000)
+        out = _run_csharp(tmp_path, self.SRC, "C2Contract", [(1000, "A -> B : req"), (2000, "A -> B : cancel")], 10000)
         assert out == ["1000 Lifecycle Idle Waiting", "2000 Lifecycle Waiting Idle"], out
 
     def test_self_loop_restarts_the_deadline(self, tmp_path):
-        out = self._run(tmp_path, [(1000, "A -> B : req"), (4000, "A -> B : ping")], 10000)
+        out = _run_csharp(tmp_path, self.SRC, "C2Contract", [(1000, "A -> B : req"), (4000, "A -> B : ping")], 10000)
         assert out == ["1000 Lifecycle Idle Waiting", "4000 Lifecycle Waiting Waiting",
                        "9000 Violation  ", "9000 Lifecycle Waiting Failed"], out
+
+
+class TestTwoDeadlinesAtOnce:
+    """Two deadlines of one state expire in the same tick: the first forced
+    move ends the other one (it used to index past the rebuilt list)."""
+
+    SRC = TestDeadlineScope.SRC.replace(
+        "        states: [Idle, Waiting, Done, Failed]",
+        "        states: [Idle, Waiting, Late, Done, Failed]").replace(
+        "          - { id: ping, from: Waiting, to: Waiting, on: \"A -> B : ping\" }",
+        "          - id: ack\n"
+        "            from: Waiting\n"
+        "            to: Waiting\n"
+        "            on: \"B -> A : ack\"\n"
+        "            deadline: 5s\n"
+        "            on_violation: { transition: Late, severity: Minor }\n"
+        "          - { id: late_done, from: Late, to: Done, on: \"B -> A : ans\" }")
+
+    def test_one_forced_move(self, tmp_path):
+        out = _run_csharp(tmp_path, self.SRC, "C2Contract", [(1000, "A -> B : req")], 10000)
+        assert out[0] == "1000 Lifecycle Idle Waiting", out
+        assert len(out) == 3, out
+        assert out[1] == "6000 Violation  " and out[2].startswith("6000 Lifecycle Waiting "), out

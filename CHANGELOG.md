@@ -15,6 +15,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   on a self-loop and on a move between two `from` states of its transition, as
   a forced move already did (E.5). Before, a self-loop kept the running deadline
   and armed a second one (#91).
+- `codegen --target unity-csharp`: when two deadlines of one state expired in
+  the same tick, the second was looked up in the list that the first forced
+  move had rebuilt, which could throw `ArgumentOutOfRangeException`. The first
+  forced move now ends the other deadlines of the old state.
 
 ## [0.3.41] — 2026-11-23
 

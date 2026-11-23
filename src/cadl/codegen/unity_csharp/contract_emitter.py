@@ -997,6 +997,10 @@ namespace {ns} {{
                     }});
                     JumpToState(rt, d.TargetState, nowMs, "deadline");
                     if (Closed) return;
+                    // The move replaced the list: the other deadlines of
+                    // the old state have ended, and none of the new state
+                    // is due yet.
+                    break;
                 }}
             }}
             // 2) Periodic monitors
