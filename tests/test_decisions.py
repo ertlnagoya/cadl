@@ -174,6 +174,8 @@ def test_period1_is_valid_with_its_findings(tmp_path):
                         "prediction missed", "unknowns"]
     missed = [f for f in r["findings"] if f["finding"] == "prediction missed"]
     assert [f["entry"] for f in missed] == ["P1.2"] and "B" in missed[0]["text"]
+    assert r["predictions"] == {"total": 4, "checked": 4, "missed": 1, "not_checked": {
+        "keep": 0, "no later entry": 0, "cannot compare": 0}}
     assert sorted(Path(v).name for v in r["versions_checked"]) == [V1.name, V2.name]
     assert not [n for n in r["not_checked"] if n.startswith("L-1")]
 
@@ -495,6 +497,25 @@ def test_a_later_version_names_its_decision(tmp_path):
     entries[12]["decision"] = None
     r = verify(record(tmp_path, entries))
     assert "L-7" in rules(r)
+
+
+def test_the_predictions_no_later_entry_checks_are_counted(tmp_path, capsys):
+    entries = period1()
+    entries[2]["predictions"] = [
+        _pred("P1.2", "metric:blocked_s", "decrease"),            # checked, met
+        _pred("P1.2", "vote:B", "yes"),                           # checked, missed
+        _pred("keep", "metric:blocked_s", "unchanged"),           # about keep
+        _pred("P1.2", "metric:utility@D", "increase"),            # no value of D
+        _pred("P9", "metric:blocked_s", "decrease"),              # nothing measures P9
+        _pred("P1.2", "vote:A", "probably"),                      # not yes or no
+    ]
+    r = verify(record(tmp_path, entries))
+    assert r["predictions"] == {"total": 6, "checked": 2, "missed": 1, "not_checked": {
+        "keep": 1, "no later entry": 1, "cannot compare": 2}}
+    assert main(["decisions-verify", str(tmp_path / "decisions.jsonl")]) in (0, 1)
+    out = capsys.readouterr().out
+    assert ("predictions: 6; checked by a later entry: 2 (missed: 1); not checked: 4 "
+            "(keep: 1, no later entry: 1, cannot compare: 2)") in out
 
 
 def test_a_small_rise_is_not_a_missed_prediction(tmp_path):
