@@ -4,6 +4,18 @@ All notable changes to the CADL language and toolchain are documented in
 this file. The format follows [Keep a Changelog](https://keepachangelog.com/)
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `codegen --target unity-csharp`: a deadline kept running after the instance
+  left the `from` state of its transition by another transition, and was then
+  reported as violated in the new state (L-4). Every transition now drops the
+  armed deadlines and arms those of the new state, so a deadline also restarts
+  on a self-loop and on a move between two `from` states of its transition, as
+  a forced move already did (E.5). Before, a self-loop kept the running deadline
+  and armed a second one (#91).
+
 ## [0.3.41] — 2026-11-23
 
 ### Added

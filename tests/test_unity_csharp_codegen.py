@@ -259,3 +259,84 @@ class TestTargetedPost:
         broadcast = body.index("foreach (var inst in _instances.Values)")
         assert targeted < broadcast
         assert "return;" in body[targeted:broadcast]
+
+
+class TestDeadlineScope:
+    """A deadline is scoped to the from states of its transition (L-4) and
+    restarts on every entry into one of them, a self-loop included (#91)."""
+
+    SRC = '''\
+sos:
+  name: "Repro2"
+  type: Collaborative
+  version: "0.1.0"
+  extensions:
+    - sos-dsl: 0.1
+  actors:
+    - { id: A, role: "a", autonomy: high }
+    - { id: B, role: "b", autonomy: high }
+  contracts:
+    - id: C2
+      parties: [A, B]
+      assume: ["A.x >= 0"]
+      guarantee: ["B.y >= 0"]
+      lifecycle:
+        states: [Idle, Waiting, Done, Failed]
+        initial: Idle
+        terminal: [Done, Failed]
+        transitions:
+          - { id: request, from: Idle, to: Waiting, on: "A -> B : req" }
+          - id: answer
+            from: Waiting
+            to: Done
+            on: "B -> A : ans"
+            deadline: 5s
+            on_violation: { transition: Failed, severity: Major }
+          - { id: withdraw, from: Waiting, to: Idle, on: "A -> B : cancel" }
+          - { id: ping, from: Waiting, to: Waiting, on: "A -> B : ping" }
+'''
+
+    def _run(self, tmp_path, events, horizon):
+        import shutil
+        import subprocess
+        if not (shutil.which("csc") and shutil.which("mono")):
+            pytest.skip("Mono (csc, mono) is not installed")
+        target = tmp_path / "unity"
+        generate_unity_csharp(parse(self.SRC), target)
+        posts = "\n".join(f'    if (t == {t}) rt.PostEvent("{n}", t);' for t, n in events)
+        main = tmp_path / "Main.cs"
+        main.write_text("""
+using System; using System.Collections.Generic; using CADL.SosDsl;
+class M { static void Main() {
+  var rt = new ContractRuntime();
+  rt.Events.Subscribe(e => {
+    if (e.Kind == ContractEventKind.Lifecycle && e.Cause == "open") return;
+    Console.WriteLine(e.TMs + " " + e.Kind + " " + e.FromState + " " + e.ToState);
+  });
+  rt.Register(new C2Contract("c2", rt, 0));
+  for (long t = 0; t <= %d; t++) {
+%s
+    rt.Tick(t);
+  }
+}}
+""" % (horizon, posts))
+        exe = tmp_path / "m.exe"
+        subprocess.run(["csc", "-nologo", "-nowarn:219,162,168", f"-out:{exe}", str(main),
+                        *[str(p) for p in target.rglob("*.cs")]], check=True)
+        return subprocess.run(["mono", str(exe)], check=True, capture_output=True,
+                              text=True).stdout.splitlines()
+
+    def test_clears_all_deadlines_on_a_transition(self, out_dir):
+        text = (out_dir / "Generated" / "DeliverySlaContract.cs").read_text()
+        body = text[text.index("public void FireTransition"):text.index("public void JumpToState")]
+        assert "_deadlines[i].TransitionId == transitionId" not in body
+        assert body.index("_deadlines.Clear();") < body.index("rt.Emit(")
+
+    def test_leaving_the_from_state_cancels_the_deadline(self, tmp_path):
+        out = self._run(tmp_path, [(1000, "A -> B : req"), (2000, "A -> B : cancel")], 10000)
+        assert out == ["1000 Lifecycle Idle Waiting", "2000 Lifecycle Waiting Idle"], out
+
+    def test_self_loop_restarts_the_deadline(self, tmp_path):
+        out = self._run(tmp_path, [(1000, "A -> B : req"), (4000, "A -> B : ping")], 10000)
+        assert out == ["1000 Lifecycle Idle Waiting", "4000 Lifecycle Waiting Waiting",
+                       "9000 Violation  ", "9000 Lifecycle Waiting Failed"], out
