@@ -8,6 +8,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `codegen --target unity-csharp`: when a monitor moved the instance to a
+  terminal state, the other monitors of the same tick or event were still
+  evaluated, so a second violation and a move from the terminal state to
+  itself (for example `Violated -> Violated`) could be reported. Each
+  monitor now returns at once when the instance is closed (#90).
 - `codegen --target unity-csharp`: a deadline kept running after the instance
   left the `from` state of its transition by another transition, and was then
   reported as violated in the new state (L-4). Every transition now drops the
