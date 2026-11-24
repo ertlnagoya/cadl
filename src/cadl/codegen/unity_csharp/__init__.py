@@ -5,8 +5,8 @@ that, when dropped into a Unity project's ``Assets/Scripts/SoSDsl/``,
 implement the per-instance contract lifecycle and declarative monitors
 described by the SoS-DSL extension.
 
-The semantics of the generated runtime mirror the Python reference
-runtime in ``cadl-raspimouse-simulator/cadl/runtime/engine.py``:
+The generated runtime is meant to follow the same semantics as the Python
+reference runtime in ``raspimouse-swarm-simulator/cadl/runtime/engine.py``:
 
   - Lifecycle state machine driven by ``Tick`` (sim time) and
     ``PostEvent`` (port messages).
@@ -200,9 +200,21 @@ Generated/      # one set of files per contract that declares lifecycle:
 3. Subscribe to `runtime.OnLifecycle` / `runtime.OnViolation` to
    render visuals or write logs.
 
-The generator's semantics match the Python runtime in
-`cadl-raspimouse-simulator/cadl/runtime/engine.py` — a generated
-contract that passes the Python tests behaves the same in Unity.
+The runtime follows the dynamic semantics of the specification
+(Appendix E.5, informative) and is meant to agree with the Python
+runtime in `raspimouse-swarm-simulator/cadl/runtime/engine.py`. The
+two are compared by differential testing outside this repository, not
+by a shared test suite: test a contract in Unity as well before relying
+on results obtained with the Python runtime.
+
+The host has duties of its own (Appendix E.8): it calls `Tick` with the
+simulated time (deadlines are detected at the first tick at or after
+their expiry, and a periodic monitor's period is the minimum interval
+between samples), and, for a transition whose `on:` is a rule, it
+evaluates the rule after each world update and posts an event named by
+the rule text when the rule becomes true. Events are handled at once,
+so when several rules become true after the same update, post their
+events in the declaration order of the transitions that use them.
 
 Reward and sanction *execution* is intentionally out of scope (v0.1):
 violation events are recorded but not actuated.

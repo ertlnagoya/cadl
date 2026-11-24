@@ -6,6 +6,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `codegen --target unity-csharp`: the generated README no longer says that a
+  contract that passes the Python tests behaves the same in Unity. It says
+  that the two runtimes are compared outside the repository, not by a shared
+  test suite, and lists the host's duties (calling `Tick`, posting rule events
+  in the declaration order of the transitions that use them).
+
 ## [0.3.42] — 2026-11-24
 
 ### Fixed
