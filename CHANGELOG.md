@@ -13,6 +13,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   evaluated, so a second violation and a move from the terminal state to
   itself (for example `Violated -> Violated`) could be reported. Each
   monitor now returns at once when the instance is closed (#90).
+- `codegen --target unity-csharp`: a deadline kept running after the instance
+  left the `from` state of its transition by another transition, and was then
+  reported as violated in the new state (L-4). Every transition now drops the
+  armed deadlines and arms those of the new state, so a deadline also restarts
+  on a self-loop and on a move between two `from` states of its transition, as
+  a forced move already did (E.5). Before, a self-loop kept the running deadline
+  and armed a second one (#91).
+- `codegen --target unity-csharp`: when two deadlines of one state expired in
+  the same tick, the second was looked up in the list that the first forced
+  move had rebuilt, which could throw `ArgumentOutOfRangeException`. The first
+  forced move now ends the other deadlines of the old state.
 
 ## [0.3.41] — 2026-11-23
 

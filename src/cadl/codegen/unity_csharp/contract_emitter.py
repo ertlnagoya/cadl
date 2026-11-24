@@ -997,6 +997,10 @@ namespace {ns} {{
                     }});
                     JumpToState(rt, d.TargetState, nowMs, "deadline");
                     if (Closed) return;
+                    // The move replaced the list: the other deadlines of
+                    // the old state have ended, and none of the new state
+                    // is due yet.
+                    break;
                 }}
             }}
             // 2) Periodic monitors
@@ -1012,10 +1016,11 @@ namespace {ns} {{
             var oldState = _state;
             _state = toState;
 
-            // cancel any deadline tied to this transition
-            for (int i = _deadlines.Count - 1; i >= 0; i--) {{
-                if (_deadlines[i].TransitionId == transitionId) _deadlines.RemoveAt(i);
-            }}
+            // A deadline is scoped to the from states of its transition
+            // (L-4) and restarts on every entry into one of them, a
+            // self-loop included (E.5): drop them all and arm those of
+            // the new state below.
+            _deadlines.Clear();
 
             rt.Emit(new ContractEvent {{
                 Kind = ContractEventKind.Lifecycle,
