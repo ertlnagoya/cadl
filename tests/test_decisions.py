@@ -529,6 +529,16 @@ def test_a_small_rise_is_not_a_missed_prediction(tmp_path):
     assert [f for f in r["findings"] if f["finding"] == "prediction missed"]
 
 
+def test_a_missed_unchanged_prediction_reads_as_english(tmp_path):
+    entries = period1()
+    entries[2]["predictions"] = [_pred("P1.2", "metric:on_time_deliveries", "unchanged")]
+    entries[3]["values"]["on_time_deliveries"] = 140.0       # 121.8 before
+    r = verify(record(tmp_path, entries))
+    texts = [f["text"] for f in r["findings"] if f["finding"] == "prediction missed"]
+    assert texts and texts[0].startswith(
+        "expected on_time_deliveries to stay unchanged under P1.2;")
+
+
 def test_points_at_instants_are_compared_in_utc(tmp_path):
     entries = period1()[:3]
     entries[0]["point"] = {"at": "2026-11-18T10:00:00+09:00"}   # 01:00 UTC

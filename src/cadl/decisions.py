@@ -1320,7 +1320,8 @@ class _Verifier:
             if ok is False:
                 subject = name + (f" of {who}" if who else "")
                 self.find("prediction missed", e,
-                          f"expected {subject} to {exp} under {opt}; measured "
+                          f"expected {subject} to "
+                          f"{'stay unchanged' if exp == 'unchanged' else exp} under {opt}; measured "
                           f"{_num(got)}" + (f" against {_num(base)}" if base is not None
                                             else "") + f" ({x['id']})")
         return _verdict(verdicts, seen)

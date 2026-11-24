@@ -24,6 +24,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   the same tick, the second was looked up in the list that the first forced
   move had rebuilt, which could throw `ArgumentOutOfRangeException`. The first
   forced move now ends the other deadlines of the old state.
+- `decisions-verify`: a missed prediction that a metric stays unchanged
+  was reported as "expected on_time_deliveries to unchanged under P5.2".
+  It now reads "to stay unchanged".
 
 ## [0.3.41] — 2026-11-23
 
