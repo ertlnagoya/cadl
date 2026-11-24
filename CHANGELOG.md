@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.42] — 2026-11-24
+
 ### Fixed
 
 - `codegen --target unity-csharp`: when a monitor moved the instance to a
