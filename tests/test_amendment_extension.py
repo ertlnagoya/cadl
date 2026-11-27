@@ -649,3 +649,129 @@ def test_previous_unchecked_without_old_version(tmp_path):
     r = diff(old, V2, tmp_path)
     assert "previous_unchecked" in kinds(r, "warning")
     assert "previous_mismatch" not in kinds(r)
+
+
+# --- Reverting an amendment (amendment.reverts) ------------------------------------
+
+def _hold(text: str, value: str) -> str:
+    """V2 with hold_limit declared as 120s in [60s, 300s] by steps of 60s
+    (max_steps 1), set to `value`."""
+    return edit(text, ("deadline: 60s", f"deadline: {value}"),
+                ("        value: 60s\n        min: 10s\n        max: 120s\n        step: 10s",
+                 f"        value: {value}\n        min: 60s\n        max: 300s\n        step: 60s"))
+
+
+def _version(text: str, version: str, previous: str, period: int, reverts=None) -> str:
+    block = f'    previous: "{previous}"\n'
+    if reverts is not None:
+        block += f'    reverts: "{reverts}"\n'
+    return edit(text, ('version: "2"', f'version: "{version}"'),
+                ('    previous: "1"\n', block),
+                ("effective: { period: 2 }", f"effective: {{ period: {period} }}"))
+
+
+BASE_V2 = _hold(V2, "120s")                                   # version 2: 120s
+V2_3 = _version(_hold(V2, "240s"), "2.3", "2.2", 5)           # after v2.1–v2.3: 240s
+V2_4 = _version(_hold(V2, "120s"), "2.4", "2.3", 6, reverts="2")
+
+
+def diff_base(old_text: str, new_text: str, base_text, tmp_path) -> dict:
+    a, b = tmp_path / "old.cadl", tmp_path / "new.cadl"
+    a.write_text(old_text, encoding="utf-8")
+    b.write_text(new_text, encoding="utf-8")
+    old, new = load(a), load(b)
+    assert type_check(old).ok and type_check(new).ok
+    base = None
+    if base_text is not None:
+        c = tmp_path / "base.cadl"
+        c.write_text(base_text, encoding="utf-8")
+        base = load(c)
+        assert type_check(base).ok
+    return diff_versions(old, new, base)
+
+
+class TestReverts:
+    def test_one_step_is_the_limit_without_reverts(self, tmp_path):
+        new = edit(V2_4, ('    reverts: "2"\n', ""))
+        r = diff_base(V2_3, new, None, tmp_path)
+        assert "outside_amendability" in kinds(r)
+        assert has(r["errors"], "hold_limit", "moves by 120s, more than 1 step of 60s")
+
+    def test_one_shot_reversion_with_base(self, tmp_path):
+        r = diff_base(V2_3, V2_4, BASE_V2, tmp_path)
+        assert r["ok"], r["errors"]
+        assert "parameter_reverted" in kinds(r, "info")
+        assert "parameter_changed" not in kinds(r, "info")
+        assert r["reverts"] == "2" and r["base_version"] == "2"
+        assert [(p["id"], p["old"], p["new"]) for p in r["parameters"] if p["changed"]] == [
+            ("hold_limit", "240s", "120s")]
+        text = format_diff_text(r)
+        assert "reverts to: version 2 (checked against" in text
+        assert "restores the value of version 2" in text
+
+    def test_without_base_it_is_unchecked(self, tmp_path):
+        r = diff_base(V2_3, V2_4, None, tmp_path)
+        assert not r["ok"]
+        assert "reverts_unchecked" in kinds(r, "warning")
+        assert "outside_amendability" in kinds(r)
+        assert r["reverts"] == "2" and r["base_version"] is None
+        assert "reverts to: version 2 (not checked)" in format_diff_text(r)
+
+    def test_reverts_mismatch(self, tmp_path):
+        other = edit(BASE_V2, ('version: "2"', 'version: "2.1"'))
+        r = diff_base(V2_3, V2_4, other, tmp_path)
+        assert "reverts_mismatch" in kinds(r)
+        assert "outside_amendability" in kinds(r)
+        assert r["base_version"] is None
+
+    def test_a_value_other_than_the_base_keeps_the_step_limit(self, tmp_path):
+        new = _version(_hold(V2, "120s"), "2.4", "2.3", 6, reverts="2")
+        base = _hold(V2, "60s")    # version 2 had 60s, not 120s
+        r = diff_base(V2_3, new, base, tmp_path)
+        assert "outside_amendability" in kinds(r)
+        assert "parameter_reverted" not in kinds(r, "info")
+        assert has(r["errors"], "hold_limit", "more than 1 step of 60s")
+
+    def test_range_still_applies(self, tmp_path):
+        # A base value outside the old range is still an error.
+        old = edit(V2_3, ("        min: 60s\n        max: 300s",
+                          "        min: 180s\n        max: 300s"))
+        r = diff_base(old, V2_4, BASE_V2, tmp_path)
+        assert has(r["errors"], "hold_limit", "below min 180s")
+
+    def test_base_unused(self, tmp_path):
+        r = diff_base(V1, V2, V1, tmp_path)
+        assert r["ok"] and "base_unused" in kinds(r, "warning")
+
+    def test_effective_is_still_checked(self, tmp_path):
+        new = edit(V2_4, ("effective: { period: 6 }", "effective: { period: 2 }"))
+        r = diff_base(V2_3, new, BASE_V2, tmp_path)
+        assert "effective_not_later" in kinds(r)
+
+    def test_check_rejects_reverting_to_itself(self):
+        assert has(errors(edit(V2, ('    previous: "1"\n', '    previous: "1"\n    reverts: "2"\n'))),
+                   "amendment.reverts '2' is the version of this file", "K-2")
+        assert has(errors(edit(V2, ('    previous: "1"\n', '    previous: "1"\n    reverts: [1]\n'))),
+                   "amendment.reverts must be a version", "K-2")
+
+    def test_ir(self):
+        assert ir(parse(V2_4))["reverts"] == "2"
+        assert ir(parse(V2))["reverts"] is None
+
+    def test_cli(self, tmp_path, capsys):
+        paths = {}
+        for name, text in (("v2", BASE_V2), ("v2_3", V2_3), ("v2_4", V2_4)):
+            paths[name] = tmp_path / f"{name}.cadl"
+            paths[name].write_text(text, encoding="utf-8")
+        assert main(["amend-diff", str(paths["v2_3"]), str(paths["v2_4"])]) == 1
+        capsys.readouterr()
+        code = main(["amend-diff", str(paths["v2_3"]), str(paths["v2_4"]),
+                     "--base", str(paths["v2"]), "--format", "json"])
+        out = json.loads(capsys.readouterr().out)
+        assert code == 0 and out["ok"]
+        assert out["reverts"] == "2" and out["base_version"] == "2"
+        assert out["base"] == str(paths["v2"])
+        assert "parameter_reverted" in {f["kind"] for f in out["findings"]}
+        assert main(["amend-diff", str(paths["v2_3"]), str(paths["v2_4"]),
+                     "--base", str(tmp_path / "none.cadl")]) == 2
+        capsys.readouterr()

@@ -605,6 +605,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Compare two versions of a model under the declared amendability (Appendix K, K.7)")
     adiff_cmd.add_argument("old", type=Path, help="Old version of the CADL file")
     adiff_cmd.add_argument("new", type=Path, help="New version of the CADL file")
+    adiff_cmd.add_argument("--base", type=Path, default=None, metavar="BASE",
+                           help="The earlier version that NEW reverts to (amendment.reverts); "
+                                "a parameter that NEW restores to its value in BASE is not "
+                                "held to the step limit (max_steps)")
     adiff_cmd.add_argument("--format", choices=["text", "json"], default="text",
                            help="Output format (default: text)")
 
@@ -1693,7 +1697,7 @@ def _cmd_norms_diff(args: argparse.Namespace) -> int:
 def _cmd_amend_diff(args: argparse.Namespace) -> int:
     """Exit status: 0 when the changes respect the declared amendability,
     1 when they do not or the new version is invalid, 2 on a usage error
-    (a missing or invalid old version)."""
+    (a missing or invalid old or base version)."""
     from .amendment import diff_versions, format_diff_text, load
     from .type_checker import type_check
 
@@ -1717,13 +1721,21 @@ def _cmd_amend_diff(args: argparse.Namespace) -> int:
     if not args.new.exists():
         print(f"Error: File not found: {args.new}", file=sys.stderr)
         return 2
+    base = None
+    if args.base is not None:
+        base, why = read(args.base)
+        if base is None:
+            print(f"Error: {why}", file=sys.stderr)
+            return 2
     new, why = read(args.new)
     if new is None:
         result = {"parameters": [], "contracts": [], "findings": [], "invalid": [why],
                   "errors": [why], "ok": False}
     else:
-        result = diff_versions(old, new)
+        result = diff_versions(old, new, base)
     result = {"old": str(args.old), "new": str(args.new), **result}
+    if args.base is not None:
+        result["base"] = str(args.base)
     if args.format == "json":
         import json
         print(json.dumps(result, indent=2, ensure_ascii=False))
