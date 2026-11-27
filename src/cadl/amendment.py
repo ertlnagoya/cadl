@@ -10,7 +10,8 @@ keys ``schedule:`` and ``measure:``. They declare
   the step and the largest change of one amendment, and the places of the
   model that hold the value (``at:``);
 - the identity of this version of the model (``sos.version``), the version
-  it replaces (``previous:``), when it takes effect (``effective:``) and
+  it replaces (``previous:``), the earlier version whose parameter values
+  it restores (``reverts:``), when it takes effect (``effective:``) and
   what happens to contract instances that are running at that time
   (``transitional:``);
 - the records of human decisions that the version rests on
@@ -47,7 +48,7 @@ TRANSITIONAL_RULES = ("keep", "switch")
 DECISION_KINDS = ("gsn", "record")
 AGGREGATES = ("mean", "median", "min", "max", "sum", "last")
 
-_BLOCK_KEYS = ("previous", "effective", "transitional", "decisions", "layers", "parameters")
+_BLOCK_KEYS = ("previous", "reverts", "effective", "transitional", "decisions", "layers", "parameters")
 _LAYER_KEYS = ("decided_by", "procedure", "quorum", "voters")
 _PARAM_KEYS = ("id", "layer", "value", "min", "max", "step", "max_steps", "unit", "safety",
                "at", "decision") + _LAYER_KEYS
@@ -505,6 +506,7 @@ class Analysis:
     infos: list = field(default_factory=list)
     version: Optional[str] = None
     previous: Optional[str] = None
+    reverts: Optional[str] = None       # the earlier version whose values this one restores
     effective: Optional[dict] = None
     transitional_default: str = "switch"
     transitional: dict = field(default_factory=dict)   # contract id -> (rule, in_states)
@@ -614,6 +616,13 @@ class _Checker:
             elif prev == a.version:
                 self.err("K-2", f"amendment.previous '{prev}' is the version of this file")
             a.previous = prev
+        if block.get("reverts") is not None:
+            rev = _scalar_text(block["reverts"])
+            if rev is None:
+                self.err("K-2", "amendment.reverts must be a version (a scalar)")
+            elif rev == a.version:
+                self.err("K-2", f"amendment.reverts '{rev}' is the version of this file")
+            a.reverts = rev
         if block.get("effective") is not None:
             a.effective = self.time_form(block["effective"], _TIME_FORMS,
                                          "amendment.effective", "K-3")
@@ -1222,6 +1231,7 @@ def ir(sos: SoSDefinition) -> Optional[dict]:
     return {
         "version": a.version,
         "previous": a.previous,
+        "reverts": a.reverts,
         "effective": a.effective,
         "transitional": {
             "default": a.transitional_default,
@@ -1288,7 +1298,8 @@ def _contract_of(path: list) -> Optional[str]:
     return None
 
 
-def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
+def diff_versions(old: SoSDefinition, new: SoSDefinition,
+                  base: Optional[SoSDefinition] = None) -> dict:
     """Compare two versions of a model under the declaration of the old one.
 
     Returns a JSON-serializable dict: the versions, ``parameters[]`` (each
@@ -1298,7 +1309,15 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
     ``findings[]``, ``errors`` (texts of the error-level findings) and
     ``ok``. A change is explained when it is the change of a declared
     parameter at the places of its ``at:``; every other change of the
-    rules is an error."""
+    rules is an error.
+
+    A new version that declares ``reverts: X`` restores the parameter
+    values of the earlier version X. With ``base`` (version X), a changed
+    parameter whose new value is its value in X is not held to the step
+    limit (``max_steps``) of the old declaration (finding
+    ``parameter_reverted``); its range and steps are still checked. Without
+    ``base`` the reversion is not checked (warning ``reverts_unchecked``)
+    and every change is checked as usual."""
     oa, na = analyse(old), analyse(new)
     if not amendment_declared(old):
         # Without the declaration nothing of the old version is amendable.
@@ -1325,6 +1344,31 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
             "error", "previous_mismatch",
             f"the new version names '{na.previous}' as previous, but the old version is "
             f"'{oa.version}'"))
+    # Reversion to an earlier version (reverts:)
+    base_values: Optional[dict] = None   # parameter id -> value in the version reverted to
+    base_version: Optional[str] = None
+    if na.reverts is not None and base is None:
+        findings.append(_finding(
+            "warning", "reverts_unchecked",
+            f"the new version reverts to version '{na.reverts}', but that version is not "
+            f"given, so the reversion is not checked and every change is held to the step "
+            f"limit; give the version it reverts to with --base to check it"))
+    elif na.reverts is not None:
+        ba = analyse(base)
+        if ba.version != na.reverts:
+            findings.append(_finding(
+                "error", "reverts_mismatch",
+                f"the new version reverts to version '{na.reverts}', but the base version "
+                f"is '{ba.version}'"))
+        else:
+            base_version = ba.version
+            base_values = ({p.id: p.value for p in ba.parameters if p.value is not None}
+                           if amendment_declared(base) else {})
+    elif base is not None:
+        findings.append(_finding(
+            "warning", "base_unused",
+            "a base version is given, but the new version declares no amendment.reverts; "
+            "the base version is not used"))
     if oa.version is not None and na.version == oa.version:
         findings.append(_finding("error", "same_version",
                                  f"both versions are '{oa.version}'"))
@@ -1398,13 +1442,23 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
                 ((q.value.value - p.min.value) / p.step.value).denominator != 1:
             bad.append(f"not on the steps of {p.step.text()} from {p.min.text()}")
         mc = p.max_change()
-        if mc is not None and abs(delta) > mc:
-            n = p.max_steps
+        n = p.max_steps
+        too_far = mc is not None and abs(delta) > mc
+        reverted = base_values is not None and base_values.get(pid) == q.value
+        if too_far and not reverted:
             bad.append(f"moves by {Quantity(p.value.kind, abs(delta)).text()}, more than "
                        f"{n} step{'s' if n > 1 else ''} of {p.step.text()}")
         if bad:
             findings.append(_finding("error", "outside_amendability",
                                      f"{what}: {'; '.join(bad)}", parameter=pid))
+        elif reverted:
+            waived = (f"; it moves by {Quantity(p.value.kind, abs(delta)).text()}, more than "
+                      f"{n} step{'s' if n > 1 else ''} of {p.step.text()}, but the step limit "
+                      f"does not apply to a reversion" if too_far else "")
+            findings.append(_finding(
+                "info", "parameter_reverted",
+                f"{what}: restores the value of version {base_version}{waived}",
+                parameter=pid))
         else:
             findings.append(_finding("info", "parameter_changed", what, parameter=pid))
         # The change applies at the places of the old declaration.
@@ -1541,6 +1595,7 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition) -> dict:
     return {
         "old_version": oa.version, "new_version": na.version,
         "previous": na.previous, "effective": na.effective,
+        "reverts": na.reverts, "base_version": base_version,
         "decisions": list(na.decisions),
         "parameters": params_out,
         "contracts": contracts_out,
@@ -1577,6 +1632,10 @@ def format_diff_text(result: dict) -> str:
     if result.get("effective"):
         (k, v), = result["effective"].items()
         lines.append(f"  takes effect: {k} {v}")
+    if result.get("reverts"):
+        how = (f"checked against {result.get('base', 'the base version')}"
+               if result.get("base_version") is not None else "not checked")
+        lines.append(f"  reverts to: version {result['reverts']} ({how})")
     if result.get("decisions"):
         lines.append("  decisions: " + ", ".join(f"{d['id']} ({d['ref']})"
                                                   for d in result["decisions"]))

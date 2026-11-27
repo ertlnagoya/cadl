@@ -6,6 +6,23 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.44] — 2026-11-27
+
+### Added
+
+- Amendment extension (Appendix K): `amendment.reverts: "<version>"` declares
+  that a version restores the parameter values of an earlier version (K-2: a
+  scalar, not the file's own `sos.version`; in the IR as `reverts`).
+  `cadl amend-diff OLD NEW --base BASE` (and `diff_versions(old, new, base)`)
+  does not hold a changed parameter to the step limit (`max_steps`) when its
+  new value equals its value in BASE (info `parameter_reverted`); `min`/`max`
+  and the steps of the old declaration still apply. A BASE that is not the
+  version named by `reverts:` is an error (`reverts_mismatch`); without
+  `--base` the reversion is not checked (warning `reverts_unchecked`) and the
+  step limit stands; `--base` for a version without `reverts:` is a warning
+  (`base_unused`). The result gains `reverts` and `base_version` (and `base`
+  from the CLI). A reversion no longer needs a chain of one-step versions.
+
 ## [0.3.43] — 2026-11-25
 
 ### Changed
