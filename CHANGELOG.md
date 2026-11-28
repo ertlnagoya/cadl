@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.45] — 2026-11-28
+
 ### Added
 
 - Amendment extension (Appendix K): `amendment.versioning` declares how the
