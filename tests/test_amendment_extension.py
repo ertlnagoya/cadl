@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from cadl.amendment import diff_versions, format_diff_text, ir, load
+from cadl.amendment import diff_versions, format_diff_text, ir, load, next_version
 from cadl.cli import _ir_to_dict, main
 from cadl.parser import parse, parse_file
 from cadl.sim import lower_to_ir
@@ -774,4 +774,156 @@ class TestReverts:
         assert "parameter_reverted" in {f["kind"] for f in out["findings"]}
         assert main(["amend-diff", str(paths["v2_3"]), str(paths["v2_4"]),
                      "--base", str(tmp_path / "none.cadl")]) == 2
+        capsys.readouterr()
+
+
+# --- Numbering and period step of the next version (amendment.versioning) -----------
+
+def _versioning(text: str, block: str) -> str:
+    """`text` with `block` (the lines under `versioning:`) after `previous:`."""
+    return edit(text, ('    previous: "', f"    versioning:\n{block}    previous: \""))
+
+
+DOTTED = "      scheme: dotted\n      period_step: 3\n"
+INTEGER = "      scheme: integer\n      period_step: 3\n"
+
+
+class TestVersioning:
+    def test_next_version(self):
+        assert next_version("2", "dotted") == "2.1"
+        assert next_version("2.3", "dotted") == "2.4"
+        assert next_version("2.9", "dotted") == "2.10"
+        assert next_version("1.2.3", "dotted") == "1.2.4"
+        assert next_version("3", "integer") == "4"
+        for v, scheme in (("2.x", "dotted"), ("2.", "dotted"), ("2.1", "integer"),
+                          ("2", "semver")):
+            with pytest.raises(ValueError):
+                next_version(v, scheme)
+
+    def test_no_block_is_unchanged(self, tmp_path):
+        old = _version(V2, "2.3", "2.2", 5)
+        new = _version(V2, "7", "2.3", 6)   # any number, one period later
+        r = diff_base(old, new, None, tmp_path)
+        assert r["ok"], r["errors"]
+        assert r["versioning"] is None
+        assert not {"version_not_next", "period_too_soon"} & kinds(r)
+        assert not {"versioning_changed", "versioning_unchecked"} & kinds(r, "warning")
+        assert ir(parse(V2))["versioning"] is None
+
+    def test_dotted_ok(self, tmp_path):
+        old = _versioning(_version(V2, "2.3", "2.2", 5), DOTTED)
+        new = _versioning(_version(V2, "2.4", "2.3", 8), DOTTED)
+        r = diff_base(old, new, None, tmp_path)
+        assert r["ok"], r["errors"]
+        assert r["versioning"] == {"scheme": "dotted", "period_step": 3}
+        assert "versioning_changed" not in kinds(r, "warning")
+        assert "versioning (old version): scheme dotted, period_step 3" in format_diff_text(r)
+        assert ir(parse(old))["versioning"] == {"scheme": "dotted", "period_step": 3}
+
+    def test_dotted_from_a_major_version(self, tmp_path):
+        old = _versioning(_version(V2, "2", "1", 2), DOTTED)
+        new = _versioning(_version(V2, "2.1", "2", 5), DOTTED)
+        assert diff_base(old, new, None, tmp_path)["ok"]
+
+    def test_integer_ok(self, tmp_path):
+        old = _versioning(_version(V2, "4", "3", 5), INTEGER)
+        new = _versioning(_version(V2, "5", "4", 9), INTEGER)
+        r = diff_base(old, new, None, tmp_path)
+        assert r["ok"], r["errors"]
+
+    def test_wrong_next_version(self, tmp_path):
+        old = _versioning(_version(V2, "2.3", "2.2", 5), DOTTED)
+        new = _versioning(_version(V2, "2.5", "2.3", 8), DOTTED)
+        r = diff_base(old, new, None, tmp_path)
+        assert not r["ok"] and "version_not_next" in kinds(r)
+        assert has(r["errors"], "'2.5'", "next version of '2.3' is '2.4'")
+        f = next(f for f in r["findings"] if f["kind"] == "version_not_next")
+        assert f["expected"] == "2.4"
+        # Under integer, 2.4 does not follow 2.3 either, and 2.3 has no next version.
+        old = _versioning(_version(V2, "4", "3", 5), INTEGER)
+        new = _versioning(_version(V2, "4.1", "4", 9), INTEGER)
+        assert has(diff_base(old, new, None, tmp_path)["errors"], "next version of '4' is '5'")
+
+    def test_period_too_soon(self, tmp_path):
+        old = _versioning(_version(V2, "2.3", "2.2", 5), DOTTED)
+        new = _versioning(_version(V2, "2.4", "2.3", 7), DOTTED)
+        r = diff_base(old, new, None, tmp_path)
+        assert not r["ok"] and kinds(r) == {"period_too_soon"}
+        assert has(r["errors"], "period 7", "needs period 8 or later")
+
+    def test_reversion_follows_the_rules(self, tmp_path):
+        old = _versioning(V2_3, DOTTED)
+        new = _versioning(_version(_hold(V2, "120s"), "2.4", "2.3", 8, reverts="2"), DOTTED)
+        r = diff_base(old, new, BASE_V2, tmp_path)
+        assert r["ok"], r["errors"]
+        assert "parameter_reverted" in kinds(r, "info")
+        # A reversion is a new version: its number and period are checked.
+        bad = _versioning(V2_4, DOTTED)   # period 6 < 5 + 3
+        r = diff_base(old, bad, BASE_V2, tmp_path)
+        assert kinds(r) == {"period_too_soon"}
+        bad = _versioning(_version(_hold(V2, "120s"), "2.1", "2.3", 8, reverts="2"), DOTTED)
+        r = diff_base(old, bad, BASE_V2, tmp_path)
+        assert kinds(r) == {"version_not_next"}
+
+    def test_dropping_or_changing_is_a_warning(self, tmp_path):
+        old = _versioning(_version(V2, "2.3", "2.2", 5), DOTTED)
+        dropped = _version(V2, "2.4", "2.3", 8)
+        r = diff_base(old, dropped, None, tmp_path)
+        assert r["ok"] and "versioning_changed" in kinds(r, "warning")
+        # The old version's rules still apply to this step.
+        assert "version_not_next" in kinds(diff_base(old, _version(V2, "3", "2.3", 8),
+                                                     None, tmp_path))
+        changed = _versioning(_version(V2, "2.4", "2.3", 8), "      scheme: dotted\n")
+        r = diff_base(old, changed, None, tmp_path)
+        assert r["ok"] and has([f["text"] for f in r["findings"]
+                                if f["kind"] == "versioning_changed"], "(period_step)")
+        added = _versioning(_version(V2, "2.4", "2.3", 8), DOTTED)
+        r = diff_base(_version(V2, "2.3", "2.2", 5), added, None, tmp_path)
+        assert r["ok"] and "versioning_changed" in kinds(r, "warning")
+
+    def test_unchecked(self, tmp_path):
+        old = _versioning(_version(V2, "2.x", "2.2", 5), DOTTED)
+        new = _versioning(_version(V2, "2.y", "2.x", 8), DOTTED)
+        r = diff_base(old, new, None, tmp_path)
+        assert r["ok"] and "versioning_unchecked" in kinds(r, "warning")
+        old = _versioning(edit(_version(V2, "2.3", "2.2", 5), (
+            "effective: { period: 5 }", "effective: { at: 2026-12-01 }")), DOTTED)
+        new = _versioning(edit(_version(V2, "2.4", "2.3", 5), (
+            "effective: { period: 5 }", "effective: { at: 2027-01-01 }")), DOTTED)
+        r = diff_base(old, new, None, tmp_path)
+        assert r["ok"] and has([f["text"] for f in r["findings"]
+                                if f["kind"] == "versioning_unchecked"], "period_step 3")
+
+    def test_check_rejects_an_invalid_scheme(self):
+        errs = errors(_versioning(V2, "      scheme: semver\n"))
+        assert has(errs, "amendment.versioning.scheme must be one of dotted, integer",
+                   "'semver'", "K-2")
+
+    def test_check_rejects_an_invalid_period_step(self):
+        for bad in ("0", "-1", "1.5", "true", "three"):
+            errs = errors(_versioning(V2, f"      period_step: {bad}\n"))
+            assert has(errs, "amendment.versioning.period_step must be a positive integer",
+                       "K-3"), bad
+
+    def test_check_other_problems(self):
+        assert has(errors(edit(V2, ('    previous: "', '    versioning: dotted\n    previous: "'))),
+                   "amendment.versioning must be a mapping", "K-1")
+        assert has(errors(_versioning(V2, "      schema: dotted\n")),
+                   "amendment.versioning: unknown key 'schema'", "K-1")
+        assert result(_versioning(V2, DOTTED)).ok
+        assert result(_versioning(V2, "      period_step: 1\n")).ok
+        # A version that the scheme cannot continue is a warning.
+        r = result(_versioning(edit(V2, ('version: "2"', 'version: "2.x"')), DOTTED))
+        assert r.ok and has(r.warnings, "does not have the form of the scheme dotted", "K-2")
+        r = result(_versioning(edit(V2, ('version: "2"', 'version: 1.10')), DOTTED))
+        assert r.ok and has(r.warnings, "read as a number", "K-2")
+
+    def test_cli(self, tmp_path, capsys):
+        a, b = tmp_path / "a.cadl", tmp_path / "b.cadl"
+        a.write_text(_versioning(_version(V2, "2.3", "2.2", 5), DOTTED), encoding="utf-8")
+        b.write_text(_versioning(_version(V2, "2.5", "2.3", 6), DOTTED), encoding="utf-8")
+        assert main(["amend-diff", str(a), str(b), "--format", "json"]) == 1
+        out = json.loads(capsys.readouterr().out)
+        assert {"version_not_next", "period_too_soon"} <= {f["kind"] for f in out["findings"]}
+        assert main(["check", str(a)]) == 0
         capsys.readouterr()

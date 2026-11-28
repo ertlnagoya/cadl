@@ -11,7 +11,9 @@ keys ``schedule:`` and ``measure:``. They declare
   model that hold the value (``at:``);
 - the identity of this version of the model (``sos.version``), the version
   it replaces (``previous:``), the earlier version whose parameter values
-  it restores (``reverts:``), when it takes effect (``effective:``) and
+  it restores (``reverts:``), how the next version is numbered and how
+  far its effective period must advance (``versioning:``), when it takes
+  effect (``effective:``) and
   what happens to contract instances that are running at that time
   (``transitional:``);
 - the records of human decisions that the version rests on
@@ -48,7 +50,10 @@ TRANSITIONAL_RULES = ("keep", "switch")
 DECISION_KINDS = ("gsn", "record")
 AGGREGATES = ("mean", "median", "min", "max", "sum", "last")
 
-_BLOCK_KEYS = ("previous", "reverts", "effective", "transitional", "decisions", "layers", "parameters")
+_BLOCK_KEYS = ("previous", "reverts", "versioning", "effective", "transitional", "decisions",
+               "layers", "parameters")
+_VERSIONING_KEYS = ("scheme", "period_step")
+VERSION_SCHEMES = ("dotted", "integer")
 _LAYER_KEYS = ("decided_by", "procedure", "quorum", "voters")
 _PARAM_KEYS = ("id", "layer", "value", "min", "max", "step", "max_steps", "unit", "safety",
                "at", "decision") + _LAYER_KEYS
@@ -507,6 +512,7 @@ class Analysis:
     version: Optional[str] = None
     previous: Optional[str] = None
     reverts: Optional[str] = None       # the earlier version whose values this one restores
+    versioning: Optional[dict] = None   # scheme and/or period_step, as declared
     effective: Optional[dict] = None
     transitional_default: str = "switch"
     transitional: dict = field(default_factory=dict)   # contract id -> (rule, in_states)
@@ -569,6 +575,41 @@ def _pos_int(v) -> Optional[int]:
     return v
 
 
+_DIGITS_RE = re.compile(r"[0-9]+")
+
+
+def next_version(version: str, scheme: str) -> str:
+    """The version that follows ``version`` under a numbering scheme of
+    ``amendment.versioning.scheme`` (Appendix K, K-2).
+
+    - ``"dotted"``: the next version of ``"M"`` (no dot) is ``"M.1"``, and
+      of ``"M.n"``, where ``n`` after the last dot is a whole number, is
+      ``"M.(n+1)"``: ``"2"`` → ``"2.1"``, ``"2.3"`` → ``"2.4"``,
+      ``"2.9"`` → ``"2.10"``, ``"1.2.3"`` → ``"1.2.4"``.
+    - ``"integer"``: the next version of the whole number ``"n"`` is
+      ``"n+1"``: ``"3"`` → ``"4"``.
+
+    Raises :class:`ValueError` for an unknown scheme or a version that does
+    not have the form of the scheme (``"2.x"`` under ``dotted``, ``"2.1"``
+    under ``integer``)."""
+    text = str(version).strip()
+    if scheme == "integer":
+        if not _DIGITS_RE.fullmatch(text):
+            raise ValueError(f"version {version!r} is not a whole number (scheme integer)")
+        return str(int(text) + 1)
+    if scheme == "dotted":
+        if not text or text.startswith(".") or text.endswith(".") or ".." in text:
+            raise ValueError(f"version {version!r} is not of the form M or M.n (scheme dotted)")
+        if "." not in text:
+            return text + ".1"
+        head, last = text.rsplit(".", 1)
+        if not _DIGITS_RE.fullmatch(last):
+            raise ValueError(f"version {version!r}: '{last}' after the last dot is not a "
+                             f"whole number (scheme dotted)")
+        return f"{head}.{int(last) + 1}"
+    raise ValueError(f"unknown version scheme {scheme!r} (allowed: {', '.join(VERSION_SCHEMES)})")
+
+
 class _Checker:
     """Applies K-1 to K-13 to one version and builds the :class:`Analysis`."""
 
@@ -623,6 +664,8 @@ class _Checker:
             elif rev == a.version:
                 self.err("K-2", f"amendment.reverts '{rev}' is the version of this file")
             a.reverts = rev
+        if block.get("versioning") is not None:
+            self.versioning(block["versioning"])
         if block.get("effective") is not None:
             a.effective = self.time_form(block["effective"], _TIME_FORMS,
                                          "amendment.effective", "K-3")
@@ -632,6 +675,41 @@ class _Checker:
         self.parameters(block.get("parameters"))
         self.metrics()
         return a
+
+    # K-2 (scheme), K-3 (period_step)
+    def versioning(self, v) -> None:
+        if not isinstance(v, dict):
+            self.err("K-1", "amendment.versioning must be a mapping")
+            return
+        self.unknown_keys(v, _VERSIONING_KEYS, "amendment.versioning")
+        out: dict = {}
+        if v.get("scheme") is not None:
+            scheme = v["scheme"]
+            if not isinstance(scheme, str) or scheme not in VERSION_SCHEMES:
+                self.err("K-2", f"amendment.versioning.scheme must be one of "
+                                f"{', '.join(VERSION_SCHEMES)}, not {scheme!r}")
+            else:
+                out["scheme"] = scheme
+                if self.a.version is not None:
+                    try:
+                        next_version(self.a.version, scheme)
+                    except ValueError:
+                        self.warn("K-2", f"sos.version '{self.a.version}' does not have the "
+                                         f"form of the scheme {scheme}, so the next version "
+                                         f"cannot be computed")
+                    else:
+                        if scheme == "dotted" and isinstance(self.raw.sos.get("version"), float):
+                            self.warn("K-2", f"sos.version {self.raw.sos['version']!r} is read "
+                                             f"as a number (1.10 is 1.1); quote it under the "
+                                             f"scheme dotted")
+        if v.get("period_step") is not None:
+            n = _pos_int(v["period_step"])
+            if n is None:
+                self.err("K-3", f"amendment.versioning.period_step must be a positive "
+                                f"integer, not {v['period_step']!r}")
+            else:
+                out["period_step"] = n
+        self.a.versioning = out
 
     # K-3
     def time_form(self, v, forms, where: str, rule: str) -> Optional[dict]:
@@ -1232,6 +1310,7 @@ def ir(sos: SoSDefinition) -> Optional[dict]:
         "version": a.version,
         "previous": a.previous,
         "reverts": a.reverts,
+        "versioning": a.versioning,
         "effective": a.effective,
         "transitional": {
             "default": a.transitional_default,
@@ -1298,6 +1377,58 @@ def _contract_of(path: list) -> Optional[str]:
     return None
 
 
+def _check_versioning(oa: Analysis, na: Analysis, findings: list) -> None:
+    """The rules of the old version's ``versioning:`` for the new version."""
+    vo = oa.versioning or {}
+    vn = na.versioning or {}
+    if oa.versioning is not None or na.versioning is not None:
+        if oa.versioning is not None and na.versioning is None:
+            findings.append(_finding(
+                "warning", "versioning_changed",
+                "the new version drops amendment.versioning; the versions after it are not "
+                "held to a numbering or a period step"))
+        elif oa.versioning is None:
+            findings.append(_finding(
+                "warning", "versioning_changed",
+                "amendment.versioning is declared only in the new version; it applies to "
+                "the versions after it"))
+        elif vo != vn:
+            changed = [k for k in _VERSIONING_KEYS if vo.get(k) != vn.get(k)]
+            findings.append(_finding(
+                "warning", "versioning_changed",
+                f"amendment.versioning changes ({', '.join(changed)}); a change of the "
+                f"numbering is not itself covered by the declaration"))
+    scheme = vo.get("scheme")
+    if scheme is not None and oa.version is not None:
+        try:
+            expected = next_version(oa.version, scheme)
+        except ValueError as e:
+            findings.append(_finding("warning", "versioning_unchecked",
+                                     f"the version number is not checked: {e}"))
+        else:
+            if na.version != expected:
+                findings.append(_finding(
+                    "error", "version_not_next",
+                    f"the new version is '{na.version}', but under the scheme {scheme} of "
+                    f"the old version the next version of '{oa.version}' is '{expected}'",
+                    expected=expected))
+    step = vo.get("period_step")
+    if step is not None:
+        po = (oa.effective or {}).get("period")
+        pn = (na.effective or {}).get("period")
+        if po is None or pn is None:
+            findings.append(_finding(
+                "warning", "versioning_unchecked",
+                f"period_step {step} is not checked: the effective time of "
+                f"{'the old' if po is None else 'the new'} version is not a period"))
+        elif pn < po + step:
+            findings.append(_finding(
+                "error", "period_too_soon",
+                f"the new version takes effect at period {pn}, but period_step {step} of "
+                f"the old version needs period {po + step} or later (period {po} + {step})",
+                expected=po + step))
+
+
 def diff_versions(old: SoSDefinition, new: SoSDefinition,
                   base: Optional[SoSDefinition] = None) -> dict:
     """Compare two versions of a model under the declaration of the old one.
@@ -1317,11 +1448,22 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition,
     limit (``max_steps``) of the old declaration (finding
     ``parameter_reverted``); its range and steps are still checked. Without
     ``base`` the reversion is not checked (warning ``reverts_unchecked``)
-    and every change is checked as usual."""
+    and every change is checked as usual.
+
+    When the old version declares ``versioning:``, the new version follows
+    it (a reversion too, since it is a new version): its ``sos.version``
+    must be :func:`next_version` of the old one under ``scheme`` (error
+    ``version_not_next``), and its effective period at least the old one
+    plus ``period_step`` (error ``period_too_soon``). What cannot be
+    checked (an old version that does not have the form of the scheme, or
+    an effective time that is not a period on both sides) is a warning
+    ``versioning_unchecked``. A ``versioning:`` that the new version drops,
+    changes or adds is a change of the declaration, a warning
+    ``versioning_changed``, as for ``amendability_changed``."""
     oa, na = analyse(old), analyse(new)
     if not amendment_declared(old):
         # Without the declaration nothing of the old version is amendable.
-        oa.parameters, oa.layers = [], {}
+        oa.parameters, oa.layers, oa.versioning = [], {}, None
     oraw = getattr(old, "amendment", None)
     nraw = getattr(new, "amendment", None)
     import copy
@@ -1390,6 +1532,7 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition,
                 "warning", "effective_not_comparable",
                 f"the old version takes effect from {ko} {vo} and the new one from {kn} {vn}; "
                 f"a period and a time cannot be compared, so their order is not checked"))
+    _check_versioning(oa, na, findings)
 
     # Parameters, under the declaration of the old version
     old_params = {p.id: p for p in oa.parameters}
@@ -1596,6 +1739,7 @@ def diff_versions(old: SoSDefinition, new: SoSDefinition,
         "old_version": oa.version, "new_version": na.version,
         "previous": na.previous, "effective": na.effective,
         "reverts": na.reverts, "base_version": base_version,
+        "versioning": oa.versioning,
         "decisions": list(na.decisions),
         "parameters": params_out,
         "contracts": contracts_out,
@@ -1636,6 +1780,10 @@ def format_diff_text(result: dict) -> str:
         how = (f"checked against {result.get('base', 'the base version')}"
                if result.get("base_version") is not None else "not checked")
         lines.append(f"  reverts to: version {result['reverts']} ({how})")
+    if result.get("versioning"):
+        v = result["versioning"]
+        lines.append("  versioning (old version): " + ", ".join(
+            f"{k} {v[k]}" for k in _VERSIONING_KEYS if k in v))
     if result.get("decisions"):
         lines.append("  decisions: " + ", ".join(f"{d['id']} ({d['ref']})"
                                                   for d in result["decisions"]))

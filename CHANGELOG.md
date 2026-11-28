@@ -6,6 +6,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Amendment extension (Appendix K): `amendment.versioning` declares how the
+  next version is numbered (`scheme: dotted`: the next version of `M` is
+  `M.1` and of `M.n` is `M.(n+1)`; `scheme: integer`: of `n` is `n+1`) and how
+  far its effective period must advance (`period_step:`). Both keys are
+  optional. `cadl check` requires `scheme:` to be `dotted` or `integer` (K-2)
+  and `period_step:` to be a positive integer (K-3), and warns about a
+  `sos.version` the scheme cannot continue (K-2). `cadl amend-diff` (and
+  `diff_versions`) applies the old version's `versioning:` to the new one,
+  reversions included: error `version_not_next` (naming the expected version)
+  and error `period_too_soon`; warning `versioning_unchecked` when the rule
+  cannot be applied; and warning `versioning_changed` when the new version
+  drops, changes or adds the block (as `amendability_changed`). The result
+  and the IR gain `versioning`. New public helper
+  `cadl.amendment.next_version(version, scheme)`. A model without
+  `versioning:` is checked as before.
+
 ## [0.3.44] — 2026-11-27
 
 ### Added
