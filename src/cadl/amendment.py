@@ -1421,6 +1421,15 @@ def _check_versioning(oa: Analysis, na: Analysis, findings: list) -> None:
                 "warning", "versioning_unchecked",
                 f"period_step {step} is not checked: the effective time of "
                 f"{'the old' if po is None else 'the new'} version is not a period"))
+        elif na.reverts is not None:
+            # A reversion is not held to period_step: it may take effect from the
+            # next period, so that a change found unsafe can be withdrawn in time.
+            # (A period not after the old one is already effective_not_later.)
+            if po < pn < po + step:
+                findings.append(_finding(
+                    "info", "period_step_reverted",
+                    f"the new version reverts to version '{na.reverts}'; period_step {step} "
+                    f"does not apply to a reversion (period {pn}, the old version's period {po})"))
         elif pn < po + step:
             findings.append(_finding(
                 "error", "period_too_soon",
