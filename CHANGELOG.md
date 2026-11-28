@@ -6,6 +6,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.46] — 2026-11-28
+
+### Changed
+
+- Amendment extension (Appendix K): a reversion (`reverts:`) is no longer held
+  to `versioning.period_step`, so that a change found unsafe can be withdrawn
+  from the next period. It must still take effect after the old version,
+  as every new version, and an effective period before the old
+  version's period plus `period_step` is reported as info
+  (`period_step_reverted`). Its version number is checked as before
+  (`version_not_next`).
+
 ## [0.3.45] — 2026-11-28
 
 ### Added

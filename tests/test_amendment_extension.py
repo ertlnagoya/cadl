@@ -857,10 +857,15 @@ class TestVersioning:
         r = diff_base(old, new, BASE_V2, tmp_path)
         assert r["ok"], r["errors"]
         assert "parameter_reverted" in kinds(r, "info")
-        # A reversion is a new version: its number and period are checked.
-        bad = _versioning(V2_4, DOTTED)   # period 6 < 5 + 3
+        # A reversion is a new version: its number is checked, but it is not held
+        # to period_step; it only has to take effect after the old version.
+        soon = _versioning(V2_4, DOTTED)   # period 6 < 5 + 3
+        r = diff_base(old, soon, BASE_V2, tmp_path)
+        assert r["ok"], r["errors"]
+        assert "period_step_reverted" in kinds(r, "info")
+        bad = _versioning(_version(_hold(V2, "120s"), "2.4", "2.3", 5, reverts="2"), DOTTED)
         r = diff_base(old, bad, BASE_V2, tmp_path)
-        assert kinds(r) == {"period_too_soon"}
+        assert "effective_not_later" in kinds(r) and "period_too_soon" not in kinds(r)
         bad = _versioning(_version(_hold(V2, "120s"), "2.1", "2.3", 8, reverts="2"), DOTTED)
         r = diff_base(old, bad, BASE_V2, tmp_path)
         assert kinds(r) == {"version_not_next"}
